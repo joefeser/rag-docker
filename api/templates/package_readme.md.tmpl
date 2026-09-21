@@ -1,0 +1,60 @@
+# RAG package — @@COLLECTION_NAME@@
+
+This archive is a portable copy of one RAG collection: its chunks and their
+vectors, the settings it was tuned with, and — at `with-sources` fidelity — the
+original documents it was built from.
+
+- **Collection:** `@@COLLECTION_NAME@@`
+- **Chunks:** @@CHUNK_COUNT@@
+- **Source documents:** @@SOURCE_DOCUMENT_COUNT@@
+- **Fidelity:** `@@FIDELITY@@`
+- **Embedding model:** `@@EMBED_MODEL@@` (@@EMBED_DIMENSIONS@@ dimensions)
+- **Created:** @@CREATED_AT@@
+- **Package id:** `@@ID8@@`
+
+@@INCLUDE:encryption@@
+
+## What fidelity means
+
+@@INCLUDE:fidelity_table@@
+
+This package is **`@@FIDELITY@@`**. @@FIDELITY_NOTE@@
+
+## Prerequisite: the embedding model must match
+
+@@INCLUDE:embedding_rule@@
+
+## Importing
+
+1. Copy this `.tar.gz` into the target instance's `./exports/` directory.
+2. Open the web UI and go to **Transfer → Import**, or call the API directly:
+
+```bash
+curl -X POST http://localhost:8080/api/import \
+  -H 'Content-Type: application/json' \
+  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"}'
+```
+
+3. Poll the returned `job_id` at `GET /api/import/job/{job_id}`.
+
+`on_conflict` is required and has no default. It is one of `abort` (fail if the
+name is taken), `rename` (import under a free name) or `replace` (overwrite,
+but only after this package has been proven to import cleanly).
+
+## The filename is a label, not an input
+
+This package is:
+
+```
+@@PACKAGE_FILENAME@@
+```
+
+@@INCLUDE:naming@@
+
+## Querying it
+
+@@RETRIEVE_SECTION@@
+
+## Contents
+
+@@INCLUDE:contents@@

@@ -1,0 +1,52 @@
+# Build context exclusions for the api image.
+#
+# The Dockerfile ends with `COPY . .`, so anything left in this directory is
+# baked into the image unless excluded here.
+
+# Python bytecode and tool caches. Platform-specific and never useful in the
+# image; they also bust the `COPY . .` layer cache on every local test run.
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# A local virtualenv would shadow the image's site-packages.
+.venv/
+venv/
+env/
+ENV/
+
+# Runtime data. UPLOAD_DIR is the named volume ingest_uploads mounted at
+# /app/uploads, so anything here would be baked in and then hidden by the mount.
+uploads/
+
+# OS and editor noise
+.DS_Store
+**/.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Local environment files.
+#
+# NOTE: config.py sets `env_file = ".env"`, so a .env placed in this directory
+# WOULD be read at runtime if it were copied in. It is excluded deliberately --
+# secrets do not belong in an image layer. docker-compose.yml supplies every
+# setting the API needs as explicit environment variables. If you need local
+# overrides, add them to the `api` service's `environment:` block instead.
+.env
+.env.*
+
+# Version control
+.git
+.gitignore
+
+# Read directly by the builder; no need to ship them inside the image.
+Dockerfile
+.dockerignore

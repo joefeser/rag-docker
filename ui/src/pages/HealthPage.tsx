@@ -1,0 +1,68 @@
+import { useState, useEffect } from 'react'
+import { api, HealthResult, MetricsResult } from '../api/client'
+import LatencyCharts from '../components/LatencyCharts'
+
+export default function HealthPage() {
+  const [health, setHealth] = useState<HealthResult | null>(null)
+  const [metrics, setMetrics] = useState<MetricsResult | null>(null)
+
+  async function load() {
+    try {
+      const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
+      setHealth(h)
+      setMetrics(m)
+    } catch { /* ignore */ }
+  }
+
+  useEffect(() => {
+    load()
+    const interval = setInterval(load, 30000)
+    return () => clearInterval(interval)
+  }, [])
+
+  function StatusBadge({ status }: { status: string }) {
+    return (
+      <span className={`inline-block w-2 h-2 rounded-full mr-2 ${status === 'ok' ? 'bg-green-500' : 'bg-red-500'}`} />
+    )
+  }
+
+  return (
+    <div className="max-w-4xl mx-auto">
+      <h1 className="text-2xl font-bold mb-6">Health Dashboard</h1>
+      {health && (
+        <div className="grid grid-cols-3 gap-4 mb-8">
+          <div className="bg-white border rounded p-4">
+            <div className="flex items-center text-sm font-medium mb-1">
+              <StatusBadge status={health.services.weaviate.status} />
+              Weaviate
+            </div>
+            <div className="text-xs text-gray-500">{health.services.weaviate.latency_ms}ms</div>
+          </div>
+          <div className="bg-white border rounded p-4">
+            <div className="flex items-center text-sm font-medium mb-1">
+              <StatusBadge status={health.services.ollama.llm.status} />
+              LLM ({health.services.ollama.llm.model})
+            </div>
+            <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
+          </div>
+          <div className="bg-white border rounded p-4">
+            <div className="flex items-center text-sm font-medium mb-1">
+              <StatusBadge status={health.services.ollama.embed.status} />
+              Embed ({health.services.ollama.embed.model})
+            </div>
+            <div className="text-xs text-gray-500">{health.services.ollama.embed.latency_ms}ms</div>
+          </div>
+        </div>
+      )}
+      {metrics && metrics.total_records > 0 && (
+        <div className="bg-white border rounded p-4">
+          <h2 className="font-semibold mb-4">Latency Trends ({metrics.total_records} queries in ring buffer)</h2>
+          <LatencyCharts data={metrics} />
+        </div>
+      )}
+      {metrics && metrics.total_records === 0 && (
+        <p className="text-gray-400 text-sm">No query data yet. Run some Q&A queries to populate charts.</p>
+      )}
+    </div>
+  )
+}

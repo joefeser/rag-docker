@@ -1,0 +1,633 @@
+# RAG Docker — Export / Import Specification
+
+**Status:** specification
+**Depends on:** `RAG_EXPORT_ANALYSIS.md` (findings, measurements, rationale)
+**Platform contracts:** `SPECIFICATIONS.md`
+
+This document is the contract. Where it conflicts with the analysis, this wins;
+where it is silent, the analysis explains the reasoning.
+
+---
+
+## 1. Scope and Settled Decisions
+
+Export one collection as a portable package; import it into another instance and
+tune it there.
+
+| Decision | Value | Source |
+|---|---|---|
+| Package scope | one collection | confirmed |
+| Source documents | retained, and exported | confirmed |
+| Models in package | optional, off by default | confirmed |
+| Tuning after import | retrieval, re-chunk, re-embed, continue ingesting | confirmed |
+| Source storage | new `rag_sources` volume | confirmed |
+| Transport | mounted `./exports` directory | confirmed |
+| Pre-retention collections | declared `chunks-only`, no reconstruction | confirmed |
+| Gold-standard sessions | exported; invalidated on re-chunk | confirmed |
+| Duplicate documents | content-addressed, stored once per collection | **decided here** (§2.2) |
+| Sessions of a replaced collection | retained, marked orphaned, count reported | **decided here** (§8, rule 4) |
+
+### Out of scope
+
+Incremental export, encryption, signing, merging two corpora into one
+collection, migration to another vector store, and cross-version vector
+portability guarantees beyond those in §7.2.
+
+---
+
+## 2. Prerequisite A — Source Document Retention
+
+Export cannot ship what the system throws away. This MUST land before export.
+
+### 2.1 Storage
+
+- A new Docker volume **`rag_sources`**, mounted at `/app/sources` in the api
+  service. It is separate from `ingest_uploads` because it grows with the corpus
+  while that volume holds only small config and session files.
+- Layout: `/app/sources/<collection>/<sha256>` — the raw bytes, named by digest,
+  no extension.
+- A per-collection index `/app/sources/<collection>/index.json` maps each digest
+  to its logical filenames, media type, size and first-seen timestamp.
+
+### 2.2 Ingest changes
+
+`api/services/ingest_pipeline.py` currently deletes its temp directory in a
+`finally` block (line 108). It MUST instead, for each accepted file, compute the
+SHA-256 of the raw bytes and copy it into the collection's source directory
+before the temp directory is removed.
+
+**Duplicates are content-addressed and stored once.** A file already present by
+digest is not written again; its `index.json` entry gains the additional logical
+filename. Rationale: re-ingesting the same document is common, the storage is
+proportional to the corpus rather than to upload count, and it makes "have we
+seen this document?" answerable. The cost is that the original upload filename is
+no longer the storage key, which `index.json` exists to solve.
+
+Retention MUST NOT change chunking, embedding, or any existing response shape.
+
+### 2.3 Deletion
+
+`DELETE /collections/{name}` MUST remove `/app/sources/<collection>/` entirely.
+Without this, storage leaks silently and invisibly — the volume is not surfaced
+anywhere in the UI.
+
+### 2.4 Pre-existing collections
+
+Collections ingested before this change have no source directory. They are not
+reconstructed. Their exports are `chunks-only` (§4.3) and the UI MUST label them
+as such wherever export is offered, so the lower fidelity is visible before the
+user ships the package, not after.
+
+### 2.5 Disk
+
+Storage becomes proportional to the corpus. `README.md`'s guidance (20 GB
+minimum, 32 GB recommended) assumes the current behaviour and MUST be restated as
+"plus the size of your document corpus".
+
+---
+
+## 3. Prerequisite B — Retrieval Settings Persistence
+
+Also required before export, because a package ships a script that claims to
+carry the corpus's parameters.
+
+### 3.1 Storage
+
+`{UPLOAD_DIR}/retrieval_configs/<collection>.json`, mirroring the existing
+`ingest_configs/` convention.
+
+| Field | Type | Default |
+|---|---|---|
+| `collection` | string | — |
+| `retrieval_mode` | enum `hnsw`\|`flat`\|`hybrid`\|`semantic` | `hnsw` |
+| `top_k` | integer 1–50 | `5` |
+| `alpha` | number 0–1 | `0.75` |
+| `ef` | integer, optional | — |
+| `response_format` | enum `end_user`\|`engineer` | `end_user` |
+
+### 3.2 Endpoints
+
+- `GET /retrieval/config/{collection}` → the saved config, or the defaults above
+  with `is_default: true`, matching how `/ingest/config/{collection}` behaves.
+- `POST /retrieval/config` → upsert; collection in the **body**, not the path.
+
+The path shape deliberately mirrors ingest config, including the asymmetry that
+GET takes the collection in the path and POST in the body. `SPECIFICATIONS.md`
+documented that asymmetry incorrectly for ingest once already; it is stated
+explicitly here so it is not repeated.
+
+### 3.3 UI change
+
+`ui/src/context/QueryConfigContext.tsx` MUST read and write through these
+endpoints instead of `sessionStorage`. Settings become per-collection and durable
+rather than per-browser-tab.
+
+`POST /query` keeps accepting `retrieval_mode`, `top_k` and `alpha` per request —
+saved settings are defaults, not a constraint.
+
+---
+
+## 4. Package Format
+
+### 4.1 Filename (normative)
+
+```
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
+```
+
+- `<collection-slug>`: stored collection name, lowercased, each run of characters
+  outside `[a-z0-9]` replaced by `-`, leading/trailing `-` trimmed.
+- `<YYYYMMDDTHHMMSSZ>`: UTC, basic ISO 8601, no separators.
+- `<id8>`: first 8 lowercase hex of the manifest digest (§4.4).
+
+The archive MUST expand to a single directory of the same name minus `.tar.gz`.
+
+**The filename is a label, never an input.** The slug is lossy: it lowercases a
+name Weaviate capitalised, and two distinct collections can slug identically.
+Import MUST read the collection name from `manifest.json` and MUST NOT parse the
+filename.
+
+### 4.2 Layout
+
+```
+ragpkg-.../
+├── README.md               generated; §9
+├── manifest.json           §4.4
+├── collection.json         schema, index type, distance metric, HNSW params
+├── chunks.jsonl            one object per line; §4.5
+├── ingest_config.json      present if the collection has one
+├── retrieval_config.json   §3.1
+├── retrieve.py             generated; §5
+├── goldstandard/
+│   └── <session_id>.json   sessions whose `collection` matches
+├── sources/                present only when fidelity is `with-sources`
+│   ├── index.json
+│   └── <sha256>            raw bytes
+└── models/                 present only when models are bundled
+```
+
+### 4.3 Fidelity
+
+| Value | Meaning |
+|---|---|
+| `with-sources` | `sources/` present; every tuning path in §7 available |
+| `chunks-only` | no `sources/`; re-chunking unavailable, re-embedding approximate |
+
+Fidelity is recorded in the manifest and MUST be shown by the UI before export
+and on import.
+
+### 4.4 `manifest.json`
+
+```json
+{
+  "package_format": 1,
+  "created_at": "2026-09-18T14:30:22Z",
+  "produced_by": {"platform": "rag-docker", "weaviate": "1.39.4"},
+  "collection": {
+    "name": "Policies",
+    "chunk_count": 1842,
+    "source_document_count": 37
+  },
+  "embedding": {"model": "nomic-embed-text", "dimensions": 768},
+  "llm": {"model": "phi3.5"},
+  "chunking": {"strategy": "overlap", "chunk_size": 1000, "chunk_overlap": 200},
+  "fidelity": "with-sources",
+  "models_bundled": false,
+  "files": {"chunks.jsonl": "sha256:...", "collection.json": "sha256:..."}
+}
+```
+
+`collection.name` is authoritative. `embedding` is the field import checks
+hardest (§6.2).
+
+`files` covers every file except `manifest.json`, `README.md` and `retrieve.py`.
+
+**Correction.** An earlier revision of this section excluded only the first two.
+That is impossible: `<id8>` (§4.1) is the manifest digest, and both `README.md`
+and `retrieve.py` embed it (§5.1.4), so putting their digests in `files` would
+make the manifest depend on files that depend on the manifest. The assembly
+order in the implementation plan already had it right. The three excluded files
+are exactly the ones generated from the manifest, and the package `README.md`
+states which they are, so nothing is silently unverified.
+
+Every other file in the package MUST appear in `files`; an unlisted file is a
+defect, because import verifies only what is listed.
+
+### 4.5 `chunks.jsonl`
+
+One JSON object per line:
+
+```json
+{"id":"<uuid>","vector":[0.92,1.23,"…768 floats"],
+ "properties":{"content":"…","source_file":"policy.pdf","source_type":"pdf",
+ "chunk_index":14,"chunk_strategy":"overlap","chunk_size":1000,
+ "chunk_overlap":200,"created_at":"2026-09-10T14:23:01Z"},
+ "source_sha256":"…"}
+```
+
+- `properties` carries the eight stored properties, unchanged.
+- `source_sha256` links the chunk to its file in `sources/`, and is `null` in
+  `chunks-only` packages.
+- Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%
+  smaller after gzip and is rejected (`RAG_EXPORT_ANALYSIS.md` §6).
+
+---
+
+## 5. The Retrieval Script
+
+`retrieve.py` is generated at export from `manifest.json` and
+`retrieval_config.json`.
+
+### 5.1 Requirements
+
+1. **Standard library only.** `urllib.request`, `json`, `argparse`. Anything
+   needing `pip install` fails in the air-gapped case this project targets.
+2. **Targets the RAG API** (`POST /query`), not Weaviate and Ollama directly.
+   Reimplementing the pipeline would drift from `rag_pipeline.py`.
+3. **Baked defaults, overridable by flags:**
+
+```
+python retrieve.py "who approves overtime?"
+python retrieve.py --top-k 10 --mode hybrid "who approves overtime?"
+python retrieve.py --api-url http://localhost:9090/api "..."
+python retrieve.py --timeout 900 "..."
+```
+
+   Defaults: collection and parameters from the package; `--api-url` defaults to
+   `http://localhost:8080/api`; `--timeout` defaults to 600 seconds, because
+   generation runs on CPU and a single answer was measured at 236 s.
+4. **Records its provenance** — the source manifest's `id8` and `created_at` in a
+   header comment, so a script separated from its package can still be traced.
+5. **Exit codes:** `0` success, `2` bad usage, `3` API unreachable, `4` collection
+   absent, `5` API returned an error.
+
+   Three cases are less obvious than they look and are normative:
+
+   - A **gateway status** (502/503/504) is `3`, not `5`. The reference deployment
+     puts nginx in front of the API, so a stopped API answers with a gateway
+     error rather than refusing the connection. Reporting that as "the API
+     rejected your query" sends the user to debug a query when the fix is to
+     start the stack.
+   - A **timeout** is `3`, with its own message naming the elapsed limit. It is
+     not a connection failure and must not be reported as one.
+   - A **404 without the error envelope** is `5`, not `4`. Only a body carrying
+     `error.code == "COLLECTION_NOT_FOUND"` means the collection is absent; a
+     bare 404 means something else answered, usually a mistyped `--api-url`.
+6. **Legible failures.** Unreachable API, missing collection and a non-200
+   response each produce one sentence naming the cause and the next step — not a
+   traceback.
+
+### 5.2 Generation is conditional
+
+If Prerequisite B (§3) is not in place, the exporter MUST omit `retrieve.py` and
+record `"retrieve_script": false` in the manifest. A script carrying API defaults
+while claiming to carry the corpus's tuned parameters is worse than no script,
+because nothing signals the discrepancy.
+
+---
+
+## 6. Export and Import
+
+Both are long-running and both follow the existing job-and-poll pattern used by
+`/ingest/upload`.
+
+### 6.1 Export
+
+`POST /export` with `{"collection": "<name>", "include_models": false}` → `202`
+and `{"job_id": "..."}`. `GET /export/job/{job_id}` reports progress and, on
+completion, the written filename.
+
+- Export of a collection that does not exist fails immediately with
+  `COLLECTION_NOT_FOUND`, before any job is created.
+- Only one export per collection may run at a time; a second request while one is
+  in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
+  concurrent exports would race on the temporary file described below.
+- The package is written to `/app/exports` (host `./exports`), never streamed.
+- Chunks are read with `include_vector=True`, paged, so memory does not scale
+  with collection size.
+- Export MUST NOT block ingest or query.
+- Writing is atomic: build under a temporary name in the same directory and
+  rename on success, so a partial file is never mistaken for a package.
+
+### 6.2 Import validation order
+
+`POST /import` with `{"filename": "<name in ./exports>", "on_conflict": "..."}`
+→ `202` + `job_id`.
+
+Checks run in this order and stop at the first failure:
+
+| # | Check | On failure |
+|---|---|---|
+| 1 | File exists and is a readable `.tar.gz` | `PACKAGE_UNREADABLE` |
+| 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
+| 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
+| 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
+| 5 | Collection name collision | resolved per `on_conflict` |
+
+Check 4 is a refusal, not a warning. Vectors from a different model are
+meaningless rather than merely different, and a collection built from them
+answers every query confidently and wrongly. The error MUST name both models and
+both dimension counts, and state that re-embedding is available when the package
+is `with-sources`.
+
+### 6.3 Bundled models
+
+`include_models` defaults to `false`. When `true`, `models/` contains the
+**embedding model and the LLM named in the manifest**, as the Ollama manifest and
+blob files required to serve them, under `models/<model-name>/`:
+
+```
+models/
+├── nomic-embed-text/
+│   ├── manifest.json          the Ollama manifest, verbatim
+│   └── blobs/
+│       └── sha256-<hex>       config and layer blobs it names
+└── phi3.5/
+    ├── manifest.json
+    └── blobs/
+        └── sha256-<hex>
+```
+
+Blobs are resolved **through each model's manifest**, never by copying the blob
+store: the store is shared by every model on the machine, so a naive copy would
+bundle unrelated weights. Ollama writes blob filenames with a hyphen
+(`sha256-<hex>`) while manifests reference them with a colon (`sha256:<hex>`).
+
+Every model file appears in the package manifest's `files` map and is digest
+verified on import like any other file.
+
+**The API service must mount the Ollama model volume** (`ollama_models:/ollama`)
+for any of this to work. Installing a model means writing its exact manifest and
+blobs: offline there is no registry to pull from, and rebuilding the model
+through Ollama's HTTP API would reconstruct its template, params and license
+from the config blob — a reproduction, not the model that produced the vectors.
+Where the volume is not mounted, export records a warning and bundles nothing,
+and import reports that models were not checked rather than assuming.
+
+The embedding model is the one that matters: vectors are meaningless without the
+model that produced them. The LLM is included for completeness so a package can
+stand alone, and is the larger share of the ~2.5 GB.
+
+On import:
+
+| Target state | Behaviour |
+|---|---|
+| Model already present by name | skip; do not overwrite. A target's existing model is assumed deliberate |
+| Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding |
+| Model absent, package does not bundle it | fail with `EMBEDDING_MODEL_MISSING`, naming the model and stating that it must be pulled or a `with-models` package used |
+
+`EMBEDDING_MODEL_MISSING` is distinct from `EMBEDDING_MISMATCH` (§6.2): one means
+the target has nothing to embed with, the other means it has the wrong thing. The
+remedies differ, so the errors must too.
+
+Blobs are written before the manifest. The manifest is what makes Ollama
+consider a model present, so writing it last means an interrupted install leaves
+unreferenced blobs rather than a model that cannot be served. A blob already
+present is skipped: the names are content addresses, so a matching name is a
+matching file.
+
+Because models are content-addressed, a model that travels in a package and is
+installed on the target is **byte-identical** to the one that produced the
+vectors, and Ollama reports the same model ID.
+
+Bundling models does not change fidelity (§4.3), which describes source documents
+only.
+
+### 6.4 Conflict handling
+
+`on_conflict` is required and has no default:
+
+| Value | Behaviour |
+|---|---|
+| `abort` | fail with `COLLECTION_EXISTS` |
+| `rename` | import as `<name>_imported_<id8>`; the new name is reported |
+| `replace` | delete the existing collection and its sources, then import |
+
+**Correction — the separator is an underscore, not a hyphen.** An earlier
+revision specified `<name>-imported-<id8>`. Weaviate rejects that name with a
+422: collection names must match `[A-Za-z][A-Za-z0-9_]*`. Verified against the
+live server, along with two related facts that import relies on:
+
+- Weaviate **capitalises the first character** of a collection name and stores
+  it that way, so `policies` and `Policies` are the same collection. Collision
+  checks MUST compare the canonical form or `abort` will miss a collision and
+  the import will fail later, less clearly.
+- Only the first character is normalised: `CASETEST` is a different collection
+  from `Casetest`.
+
+If the renamed target is also taken — which happens when the same package is
+imported twice — a numeric suffix is appended (`..._2`, `..._3`).
+
+### 6.5 Atomicity
+
+A failure part-way MUST leave no partial collection, and MUST NOT destroy the
+collection it was importing over. `replace` therefore deletes only after the
+incoming package has been proven to insert cleanly.
+
+**Correction — "promote" is not available.** An earlier revision required
+building into a temporary collection and renaming it on success. **Weaviate has
+no rename**: `client.collections` exposes create, delete, exists, get, list_all
+and export_config, and `config.update` cannot change a name (verified against
+weaviate-client 4.23.1). The guarantee is therefore met differently depending on
+whether anything is at risk:
+
+| `on_conflict` | Strategy |
+|---|---|
+| `abort` | Fails before any build if the name is taken, so the build target is always new. Built directly; deleted on failure. |
+| `rename` | The target name is new by construction. Built directly; deleted on failure. |
+| `replace` | Built into `<name>__importing_<id8>` first. Only once that succeeds is the existing collection deleted and the real one built. |
+
+`replace` therefore performs **two insert passes**. That is the cost of a
+non-destructive replace in a database that cannot rename, and it is paid only
+when there is an existing collection to protect.
+
+If the second pass fails, the staging collection MUST be kept and named in the
+error, so the imported data is recoverable rather than lost. It MUST NOT be
+named when the staging build itself failed — there is nothing there to recover,
+and pointing the user at a collection that does not exist is worse than silence.
+
+### 6.5.1 Surviving a hard kill
+
+The guarantees above rely on cleanup code running. A `SIGKILL`, an OOM kill or
+`docker compose kill` skips it entirely, so the API MUST also repair the damage
+at startup. Nothing can legitimately be mid-import before the app serves its
+first request, which is what makes this safe.
+
+| Left behind by | Detected at startup by | Action |
+|---|---|---|
+| `replace` staging (`<name>__importing_<id8>`) | the name marker | delete; it is internal and would otherwise appear in the collection list as if it were real |
+| a tuning rebuild (`<name>__tuning_<id8>`) | the name marker | delete |
+| `abort`/`rename` partial target | an in-progress marker file recording the expected chunk count | delete **only if** the collection's actual count differs from the expected one |
+| an extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete; twelve of these were found holding 152 MB after kill testing, and a `with-models` package leaves 2.3 GB behind each time |
+
+The count comparison is required, not an optimisation. A marker that outlives a
+*successful* import — a failed unlink, a full disk — must never cost the user a
+complete collection.
+
+Both sweeps MUST log what they removed and say that the package is still in
+`./exports` and can simply be imported again. Nothing here is unrecoverable:
+import never modifies or deletes the package it read.
+
+---
+
+## 7. Tuning After Import
+
+### 7.1 Available operations
+
+| Goal | Requires | Mechanism |
+|---|---|---|
+| Change mode / `top_k` / `alpha` | nothing | per-request on `POST /query`; persist via §3.2 |
+| Change index type or distance metric | nothing | rebuild collection, re-insert the same vectors |
+| Change chunk size / overlap / strategy | `with-sources` | re-ingest from `sources/` |
+| Change embedding model | `with-sources` preferred | re-embed; dimensions may change, so the collection is rebuilt |
+| Add documents | matching embedding model | normal ingest |
+
+### 7.2 Re-embedding a `chunks-only` package
+
+Permitted, with a stated limitation: vectors are regenerated from stored chunk
+text, so **chunk boundaries cannot change**. The API MUST reject a request that
+combines re-embedding with new chunking parameters on a `chunks-only` collection
+rather than silently ignoring one of them.
+
+### 7.3 Gold-standard invalidation
+
+Any operation that changes chunk identity — re-chunking, or re-embedding that
+rebuilds the collection — MUST mark every gold-standard session for that
+collection `stale`, recording why and when. Sessions are not deleted and are not
+remapped: a wrong remap corrupts an evaluation baseline silently, which is worse
+than an honest stale flag.
+
+Changing only the index type or distance metric does **not** change chunk
+identity, and MUST NOT mark sessions stale.
+
+**Sessions are cached in memory as well as on disk.** Anything that writes a
+session file directly, without going through the gold-standard service, will be
+silently undone: the cache still holds the previous version and the next
+flagging pass writes it back over the file. Import hit exactly this — a restored
+session reverted to the orphaned state of the collection it replaced. Every
+writer MUST go through the service.
+
+---
+
+## 8. Lifecycle Rules
+
+1. Deleting a collection deletes its sources, its ingest and retrieval configs,
+   and leaves its gold-standard sessions orphaned per rule 4 below.
+2. Exports in `./exports` are never deleted automatically.
+3. Import never modifies the package file.
+4. **Replaced collections:** when `on_conflict=replace` removes an existing
+   collection, its gold-standard sessions are **retained and marked orphaned**,
+   and the import result reports how many. Silent deletion destroys evaluation
+   work; refusing the import would block a legitimate operation over data the
+   user may not care about. Reporting lets them decide afterwards.
+
+---
+
+## 9. Generated `README.md`
+
+Every package contains one, generated from the manifest so it cannot drift:
+
+- what this package is, its collection name, chunk and document counts
+- the fidelity and what that permits and forbids
+- the filename convention, and that the manifest is authoritative
+- exact import steps for this package
+- how to run `retrieve.py`, or why it is absent
+- the embedding-model requirement, stated as a prerequisite
+- a plain statement that the package is **not encrypted** and may contain
+  sensitive documents
+
+---
+
+## 10. Help Page
+
+A new route `/help/transfer`, available to AI Engineer and Developer roles.
+
+It MUST cover: what a package contains and omits; the naming convention;
+both fidelity levels and why older collections are `chunks-only`; the
+embedding-model rule; the tuning table from §7.1; how to run `retrieve.py`; and
+where packages live (`./exports`).
+
+The page and the generated `README.md` MUST be produced from one shared source.
+This project has already found five places where documentation and implementation
+drifted apart, three of them affecting the running UI.
+
+**How this is done.** The shared blocks live in `api/templates/partials/` —
+`encryption.md`, `fidelity_table.md`, `embedding_rule.md`, `naming.md`,
+`contents.md` and `retrieve_usage.md`. Both `package_readme.md.tmpl` and
+`help_transfer.md.tmpl` pull them in with `@@INCLUDE:<name>@@`, and the API
+renders the help page on request rather than the UI holding its own copy. Editing
+a partial changes the in-app page and the next package's README together.
+
+`retrieve_usage` appears in a package README only when that package ships
+`retrieve.py`; the help page always carries it.
+
+---
+
+## 11. Error Codes
+
+All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
+
+| Code | Meaning |
+|---|---|
+| `PACKAGE_UNREADABLE` | missing or not a readable archive |
+| `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
+| `PACKAGE_CORRUPT` | digest mismatch; names the file |
+| `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
+| `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
+| `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
+| `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
+| `SOURCES_REQUIRED` | tuning needs `with-sources`; package is `chunks-only` |
+| `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
+| `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
+| `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
+| `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |
+| `IMPORT_FAILED` | an unexpected error during import; the message carries the cause |
+
+---
+
+## 12. Packaging and Offline Implications
+
+- `docker-compose.yml` gains the `rag_sources` volume and an `./exports` bind
+  mount on the api service.
+- `package.sh` and `package-offline.sh` MUST include `exports/` as an empty
+  directory and MUST exclude its contents — the same trap already hit with
+  `ingest-inbox/`, where excluding the contents also dropped the directory.
+- The offline bundle does **not** carry `rag_sources` or `weaviate_data`: it
+  ships the system, packages ship the content. That separation is the point.
+
+---
+
+## 13. Acceptance Criteria
+
+| # | Criterion |
+|---|---|
+| E1 | Ingesting a document leaves its bytes in `rag_sources/<collection>/<sha256>` with an `index.json` entry |
+| E2 | Ingesting the same file twice stores one copy and records both logical names |
+| E3 | Deleting a collection removes its source directory entirely |
+| E4 | `GET/POST /retrieval/config` round-trips; the UI no longer writes `rag_query_config` to `sessionStorage` |
+| E5 | Export produces a file matching the §4.1 pattern in `./exports` |
+| E6 | Manifest digests match every file listed |
+| E7 | A collection with sources exports `fidelity: with-sources`; a pre-retention one exports `chunks-only` |
+| E8 | `python retrieve.py "question"` returns an answer with no third-party packages installed |
+| E9 | `retrieve.py --top-k 10` overrides the baked default |
+| E10 | `retrieve.py` exits 3 with one sentence when the stack is down |
+| E11 | Import into a clean instance reproduces chunk count and answers equivalently |
+| E12 | Import refuses `EMBEDDING_MISMATCH` when the target uses a different embedding model |
+| E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
+| E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
+| E15 | An import that fails part-way leaves no partial or temporary collection |
+| E16 | Re-chunking marks the collection's gold-standard sessions `stale` |
+| E17 | Re-chunking a `chunks-only` collection fails `SOURCES_REQUIRED` |
+| E18 | `replace` reports the number of orphaned sessions |
+| E19 | Package `README.md` states the collection name, fidelity and encryption warning |
+| E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
+| E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
+| E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
+
+---
+
+## 14. Deferred
+
+Incremental export, encryption and signing, corpus merging, cross-vector-store
+migration, gold-standard remapping after re-chunk, and HTTP transport as an
+alternative to the mounted directory.

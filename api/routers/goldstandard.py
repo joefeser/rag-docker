@@ -1,0 +1,102 @@
+from __future__ import annotations
+from pathlib import Path
+
+from fastapi import APIRouter
+from fastapi.responses import FileResponse
+
+from config import settings
+from models.schemas import (
+    GenerateRequest,
+    GenerateResponse,
+    GoldPair,
+    PatchPairRequest,
+    RegenerateRequest,
+    SaveRequest,
+    SaveResponse,
+    SessionResponse,
+)
+from services import goldstandard as gs
+from services import weaviate_client as wc
+from utils import api_error
+
+router = APIRouter(prefix="/goldstandard")
+
+
+@router.post("/generate", response_model=GenerateResponse, status_code=202)
+async def generate(body: GenerateRequest):
+    if not await wc.collection_exists(body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
+
+    result = await gs.start_generation(
+        collection=body.collection,
+        sample_size=body.sample_size,
+        seed=body.seed,
+    )
+    return GenerateResponse(**result)
+
+
+@router.get("/session/{session_id}", response_model=SessionResponse)
+async def get_session(session_id: str):
+    session = gs.get_session(session_id)
+    if session is None:
+        return api_error(404, "SESSION_NOT_FOUND", f"Session '{session_id}' not found.")
+    pairs = []
+    for p in session.get("pairs", []):
+        try:
+            pairs.append(GoldPair(**p))
+        except Exception:
+            pass
+    return SessionResponse(
+        session_id=session["session_id"],
+        status=session["status"],
+        pairs_total=session["pairs_total"],
+        pairs_attempted=session.get("pairs_attempted", session["pairs_completed"]),
+        pairs_completed=session["pairs_completed"],
+        pairs_failed=session.get("pairs_failed", 0),
+        pairs=pairs,
+        collection=session.get("collection", ""),
+        errors=session.get("errors", []),
+    )
+
+
+@router.patch("/session/{session_id}/pair/{pair_id}", response_model=GoldPair)
+async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
+    updates = body.model_dump(exclude_none=True)
+    pair = await gs.update_pair(session_id, pair_id, updates)
+    if pair is None:
+        return api_error(404, "PAIR_NOT_FOUND", f"Pair '{pair_id}' not found in session '{session_id}'.")
+    return GoldPair(**pair)
+
+
+@router.post("/regenerate", response_model=GoldPair)
+async def regenerate(body: RegenerateRequest):
+    try:
+        pair = await gs.regenerate_pair(body.session_id, body.pair_id)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
+    if pair is None:
+        return api_error(404, "PAIR_NOT_FOUND", f"Pair '{body.pair_id}' not found in session '{body.session_id}'.")
+    return GoldPair(**pair)
+
+
+@router.post("/save", response_model=SaveResponse)
+async def save(body: SaveRequest):
+    result = await gs.save_session(body.session_id, body.filename)
+    if result is None:
+        return api_error(404, "SESSION_NOT_FOUND", f"Session '{body.session_id}' not found.")
+    return SaveResponse(**result)
+
+
+@router.get("/download/{filename}")
+async def download(filename: str):
+    base = Path(settings.upload_dir).resolve()
+    target = (base / filename).resolve()
+    if not str(target).startswith(str(base) + "/"):
+        return api_error(400, "INVALID_PATH", "Invalid filename.")
+    if not target.exists():
+        return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
+    return FileResponse(
+        path=str(target),
+        media_type="application/json",
+        filename=filename,
+    )

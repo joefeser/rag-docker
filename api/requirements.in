@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# Direct dependencies -- the human-maintained intent. EDIT THIS FILE.
+#
+# This file is NOT installed by the Dockerfile. The build installs the fully
+# pinned set (direct + transitive) from requirements.txt, generated from it.
+#
+# To add, remove, or bump a dependency -- run these from the REPO ROOT:
+#   1. edit api/requirements.in
+#   2. resolve it against the CURRENT image, which already has CPU-only torch:
+#        docker run --rm -v "$PWD/api/requirements.in:/r.in:ro" rag-docker-api \
+#          pip install --quiet --dry-run --report /dev/stdout -r /r.in \
+#          | python -c 'import json,sys; d=json.load(sys.stdin); \
+#              print("\n".join(i["metadata"]["name"]+"=="+i["metadata"]["version"] \
+#                               for i in d.get("install",[])))'
+#      That prints exactly what is missing from the lock. Add those lines to
+#      api/requirements.txt, keeping it LC_ALL=C sorted.
+#   3. docker compose build api   # confirm the lock installs cleanly
+#   4. docker run --rm rag-docker-api pip freeze \
+#        | grep -viE '^(torch|torchvision)==' | LC_ALL=C sort > /tmp/pins.txt
+#      diff that against requirements.txt to confirm nothing else moved.
+#   5. commit BOTH files together
+#
+# An earlier version of this note said to edit requirements.in and rebuild, then
+# freeze. That does not work: api/Dockerfile installs requirements.txt and never
+# reads requirements.in, so the rebuild resolves nothing new and the freeze
+# returns the old set unchanged. The `.md` ingest dependency was missing for
+# exactly this reason -- `unstructured[pdf,docx,csv]` omitted the `md` extra, and
+# no rebuild would ever have revealed it.
+#
+# Note the drift between the floors below and what actually resolved: these
+# ranges are open-ended, so re-locking can pull major versions (for example
+# langchain-text-splitters 0.3 -> 1.1.2). Always test after re-locking.
+#
+# torch and torchvision are not listed here. They arrive transitively via
+# sentence-transformers and unstructured, and api/Dockerfile installs them from
+# the PyTorch CPU index first to avoid ~4.1 GB of unusable NVIDIA CUDA packages.
+# ---------------------------------------------------------------------------
+
+fastapi>=0.111                    # resolved: 0.141.1
+uvicorn[standard]>=0.30           # resolved: 0.52.4
+pydantic-settings>=2.3            # resolved: 2.15.0
+weaviate-client>=4.6              # resolved: 4.23.1
+httpx>=0.27                       # resolved: 0.28.1
+unstructured[pdf,docx,csv,md]>=0.14  # resolved: 0.27.5 -- 'md' extra pulls `markdown`,
+                                  # without which .md ingestion fails at runtime
+langchain-text-splitters>=0.3     # resolved: 1.1.2
+sentence-transformers>=3.0        # resolved: 6.0.1
+python-multipart>=0.0.9           # resolved: 0.0.32

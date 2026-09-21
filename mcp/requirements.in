@@ -1,0 +1,16 @@
+# ---------------------------------------------------------------------------
+# Direct dependencies -- the human-maintained intent. EDIT THIS FILE.
+#
+# requirements.txt is the generated lock and is what the Dockerfile installs.
+# Regenerate it from the repo root after editing this file:
+#   docker compose build mcp
+#   docker run --rm rag-docker-mcp:latest pip freeze | LC_ALL=C sort > /tmp/pins.txt
+#   awk '/^[a-zA-Z0-9]/{exit} {print}' mcp/requirements.txt > /tmp/header.txt
+#   cat /tmp/header.txt /tmp/pins.txt > mcp/requirements.txt
+#
+# Upper bounds are deliberate: the SDK renamed FastMCP -> MCPServer between
+# 1.x and 2.x, so a major bump here is a breaking change, not a routine one.
+# ---------------------------------------------------------------------------
+
+mcp>=2.2,<3
+httpx>=0.28,<0.29

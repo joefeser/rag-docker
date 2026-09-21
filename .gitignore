@@ -1,0 +1,57 @@
+# ── Distribution artefacts ───────────────────────────────────────────────────
+# package-offline.sh writes a ~4.6 GB tar of every image plus the model weights,
+# and package.sh writes a source zip. Both are build outputs, reproducible from
+# the tree, and far too large to version.
+rag-docker-offline.tar
+rag-docker.zip
+*.tar
+*.tar.gz
+*.zip
+# Staging directory used while assembling the offline bundle.
+offline/
+
+# ── User content ─────────────────────────────────────────────────────────────
+# Export packages contain the corpus byte for byte — original documents at
+# `with-sources` fidelity, chunk text always. They are somebody's data, not
+# project source, and a package with bundled models is ~2.3 GB.
+exports/*
+!exports/.gitkeep
+# Read-only drop directory for file ingestion.
+ingest-inbox/*
+!ingest-inbox/.gitkeep
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*/.env
+*/.env.*
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node / UI build ──────────────────────────────────────────────────────────
+node_modules/
+ui/dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# ── Editor and OS ────────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ── Local scratch ────────────────────────────────────────────────────────────
+# Compose override is how a machine-specific tweak is applied; it should not
+# travel with the project.
+docker-compose.override.yml
+*.local.yml
