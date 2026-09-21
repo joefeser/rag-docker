@@ -408,6 +408,24 @@ and a timestamp. They are not remapped onto the new chunks — a wrong remap
 corrupts a baseline silently, which is worse than an honest flag. Deleting or
 replacing a collection marks its sessions `orphaned` and reports how many.
 
+## Verifying a change
+
+```bash
+docker compose up -d
+bash scripts/verify/all.sh                  # everything, ~20 min
+RAG_SKIP_SLOW=1 bash scripts/verify/all.sh  # skip LLM work, ~3 min
+```
+
+Runs the acceptance criteria in this project's specifications against the live
+stack — ingest, retrieval, gold standard, export/import, tuning, and the UI in a
+real headless browser. Exits non-zero on the first failure, so it can gate a
+commit.
+
+These are integration tests on purpose. Every defect this project has produced
+was invisible to a unit test of the same function: a parser dependency missing
+from the image, an endpoint returning 200 where it should have refused, vectors
+surviving a vectorizer. See `scripts/verify/README.md`.
+
 ## Dependency management
 
 Both services pin their dependencies, so a rebuild six months from now installs the same versions as today.

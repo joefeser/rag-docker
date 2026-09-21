@@ -1223,6 +1223,100 @@ def delete(collection: str) -> None:
     shutil.rmtree(collection_dir(collection), ignore_errors=True)
 ```
 
+### api/services/ingest_config.py
+
+```python
+"""Per-collection chunking settings.
+
+Extracted from the ingest router because three places needed the same on-disk
+convention: the router that serves it, the exporter that packages it, and
+collection deletion that must remove it. The third was missing, so a new
+collection silently inherited the chunking settings of a deleted one with the
+same name -- and each copy of the path logic was a chance for them to drift.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from pathlib import Path
+
+from config import settings
+
+log = logging.getLogger(__name__)
+
+CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
+
+DEFAULTS = {
+    "chunking_strategy": "overlap",
+    "chunk_size": 1000,
+    "chunk_overlap": 200,
+    "similarity_threshold": None,
+    "min_chunk_size": 100,
+}
+
+_DIR: Path | None = None
+
+
+def _dir() -> Path:
+    global _DIR
+    if _DIR is None:
+        _DIR = Path(settings.upload_dir) / "ingest_configs"
+        _DIR.mkdir(parents=True, exist_ok=True)
+    return _DIR
+
+
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+
+def _path(collection: str) -> Path:
+    return _dir() / f"{_safe_name(collection)}.json"
+
+
+def load(collection: str) -> dict | None:
+    """Saved config, or None when the collection has never been configured."""
+    p = _path(collection)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        log.warning("Unreadable ingest config for %r; falling back to defaults", collection)
+        return None
+
+
+def resolve(collection: str) -> tuple[dict, bool]:
+    """Return (config, is_default). Never raises; always usable."""
+    saved = load(collection)
+    if saved is None:
+        return {"collection": collection, **DEFAULTS}, True
+    merged = {"collection": collection, **DEFAULTS, **saved}
+    merged["collection"] = collection
+    return merged, False
+
+
+def save(config: dict) -> dict:
+    collection = config["collection"]
+    p = _path(collection)
+    # Written via a temp file in the same directory so a crash cannot leave a
+    # half-written config behind.
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config, indent=2, sort_keys=True))
+    tmp.replace(p)
+    return config
+
+
+def delete(collection: str) -> None:
+    """Remove a collection's chunking settings.
+
+    Called when the collection is deleted (spec §8 rule 1). Without this a
+    recreated collection of the same name picks up settings the user never
+    chose for it.
+    """
+    _path(collection).unlink(missing_ok=True)
+```
+
 ### api/services/retrieval_config.py
 
 ```python
@@ -1329,6 +1423,7 @@ from weaviate.classes.config import Configure, Property, DataType, VectorDistanc
 from weaviate.classes.query import MetadataQuery
 
 from config import settings
+from services import ingest_config
 from services import retrieval_config
 from services import sources
 
@@ -1461,6 +1556,7 @@ def _delete_collection_sync(name: str) -> int:
     # surfaced nowhere in the UI, so a leak here would be invisible.
     sources.delete(name)
     retrieval_config.delete(name)
+    ingest_config.delete(name)
     # Gold-standard sessions are kept and flagged, never deleted (spec §8 rule 4):
     # they are evaluation work the user may still want, and the pairs stay
     # readable even with the collection gone. Imported here rather than at module
@@ -2693,6 +2789,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from config import settings
+from services import ingest_config
 from services import model_bundle
 from services import retrieval_config
 from services import sources
@@ -2849,15 +2946,8 @@ def render_help(embed_dimensions: int | str) -> str:
 
 
 def _ingest_config(collection: str) -> dict | None:
-    safe = re.sub(r"[^a-zA-Z0-9_]", "_", collection)
-    p = Path(settings.upload_dir) / "ingest_configs" / f"{safe}.json"
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except (OSError, ValueError):
-        _log.warning("Unreadable ingest config for %r; omitting from package", collection)
-        return None
+    """The collection's saved chunking settings, or None."""
+    return ingest_config.load(collection)
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:
@@ -4631,14 +4721,12 @@ from pydantic import BaseModel
 
 from config import settings
 from models.schemas import IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from utils import api_error
 
 router = APIRouter(prefix="/ingest")
-
-_CONFIGS_DIR: Path | None = None
-
 
 class SaveIngestConfigBody(BaseModel):
     collection: str
@@ -4647,28 +4735,6 @@ class SaveIngestConfigBody(BaseModel):
     chunk_overlap: int = 200
     similarity_threshold: float | None = None
     min_chunk_size: int = 100
-
-
-def _configs_dir() -> Path:
-    global _CONFIGS_DIR
-    if _CONFIGS_DIR is None:
-        _CONFIGS_DIR = Path(settings.upload_dir) / "ingest_configs"
-        _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
-    return _CONFIGS_DIR
-
-
-def _safe_name(name: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-
-def _load_config(collection: str) -> dict | None:
-    p = _configs_dir() / f"{_safe_name(collection)}.json"
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return None
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -4715,29 +4781,14 @@ async def job_status(job_id: str):
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
 async def get_ingest_config(collection: str):
-    cfg = await asyncio.to_thread(_load_config, collection)
-    is_default = cfg is None
-    if is_default:
-        cfg = {
-            "collection": collection,
-            "chunking_strategy": "overlap",
-            "chunk_size": 1000,
-            "chunk_overlap": 200,
-            "similarity_threshold": None,
-            "min_chunk_size": 100,
-        }
+    cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
-
-
-def _write_config(p: Path, data: str) -> None:
-    p.write_text(data)
 
 
 @router.post("/config", response_model=IngestConfigResponse, status_code=201)
 async def save_ingest_config(body: SaveIngestConfigBody):
     cfg = body.model_dump()
-    p = _configs_dir() / f"{_safe_name(body.collection)}.json"
-    await asyncio.to_thread(_write_config, p, json.dumps(cfg, indent=2))
+    await asyncio.to_thread(ingest_config.save, cfg)
     return IngestConfigResponse(is_default=False, **cfg)
 ```
 
@@ -8000,7 +8051,1630 @@ export default function HealthPage() {
 
 ---
 
-## 5. Packaging and Offline Distribution
+## 5. Verification Suite
+
+Integration tests for the acceptance criteria in Section 10 of
+`SPECIFICATIONS.md` and Section 13 of `RAG_EXPORT_SPECIFICATIONS.md`.
+They require a running stack; `scripts/verify/README.md` explains why unit
+tests would not have caught the defects this project actually produced.
+
+### scripts/verify/README.md
+
+````markdown
+# Verification suite
+
+Integration tests that run the acceptance criteria in `SPECIFICATIONS.md` §10
+and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a live stack.
+
+```bash
+docker compose up -d          # they need the stack running
+
+bash scripts/verify/all.sh                    # everything, ~20 min
+RAG_SKIP_SLOW=1 bash scripts/verify/all.sh    # skip LLM work, ~3 min
+bash scripts/verify/all.sh 02 04              # only the named suites
+```
+
+Exits non-zero if any check fails.
+
+## Why integration tests
+
+Every defect this project has actually produced was invisible to a unit test of
+the same code:
+
+- `.md` files could never be ingested — the `markdown` package was missing from
+  the image, so `unstructured.partition.md` failed at import time. The function
+  was correct.
+- `PATCH /goldstandard/.../pair/...` returned 200 and silently rewrote approved
+  content. The handler did exactly what it was written to do.
+- Explicit vectors survive Weaviate's vectorizer — the entire import design
+  rests on that, and only the database can confirm it.
+- A recreated collection inherited a deleted one's chunking settings, because
+  deletion removed two of the three things it should have.
+
+These tests talk to the running API, the real Weaviate and the real model, and
+drive the UI in a real browser.
+
+## Layout
+
+| File | Covers |
+|---|---|
+| `all.sh` | entry point; runs the suites and aggregates |
+| `lib.sh` | shared helpers: checks, job polling, cleanup |
+| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
+| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
+| `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
+| `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
+
+## Environment
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RAG_API` | `http://localhost:8080/api` | where the API is |
+| `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks) |
+| `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
+| `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
+| `RAG_NETWORK` | detected | compose network for the browser container |
+
+## Writing a check
+
+`check <name> <exit-status> [detail]` — pass `$?` straight in:
+
+```bash
+[ "$status" = completed ] && [ "$chunks" -gt 0 ]
+check "the job stored chunks" $? "status=$status chunks=$chunks"
+```
+
+Two rules the hard way:
+
+- **Never pipe an API response through `echo`.** Shells interpret backslash
+  escapes, and an LLM-generated answer containing `\n` becomes invalid JSON.
+  Pipe `curl` straight into `python3`, or capture to a file.
+- **Make a failing assertion fail loudly.** A check that compares two empty
+  strings passes and proves nothing. Several early versions of these tests
+  passed vacuously — asserting on a selector that matched nothing, or comparing
+  a count to itself.
+
+## Cleaning up
+
+Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
+the end. If a run is interrupted:
+
+```bash
+curl -s localhost:8080/api/collections | python3 -c \
+  "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
+  | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
+```
+````
+
+### scripts/verify/all.sh
+
+```bash
+#!/usr/bin/env bash
+#
+# Run every verification suite against a running stack.
+#
+#   bash scripts/verify/all.sh              # everything (~20 min, LLM-bound)
+#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~3 min)
+#   RAG_ALLOW_RESTART=1 bash scripts/verify/all.sh  # also restart the stack
+#   bash scripts/verify/all.sh 02 04        # only the named suites
+#
+# Exits non-zero if any check fails, so it can gate a commit or a release.
+#
+# These are integration tests: they need the stack up, because the defects this
+# project actually produced -- a missing parser dependency, a silent 200 where a
+# 422 belonged, vectors that survive a vectorizer -- are all invisible to unit
+# tests of the same code.
+set -uo pipefail
+cd "$(dirname "$0")"
+REPO_ROOT="$(cd ../.. && pwd)"
+
+API="${RAG_API:-http://localhost:8080/api}"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+
+code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
+if [ "$code" != "200" ]; then
+  printf '\nNo healthy API at %s (HTTP %s).\n' "$API" "$code"
+  printf 'Start the stack first:  docker compose up -d\n\n'
+  exit 2
+fi
+
+printf '\nBuilding fixtures in %s\n' "$FIX"
+rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
+export RAG_FIXTURES="$FIX"
+
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui)
+if [ "$#" -gt 0 ]; then
+  SUITES=()
+  for want in "$@"; do
+    for s in "${ALL[@]}"; do
+      case "$s" in "$want"*) SUITES+=("$s") ;; esac
+    done
+  done
+else
+  SUITES=("${ALL[@]}")
+fi
+[ "${#SUITES[@]}" -gt 0 ] || { printf 'No suite matched: %s\n' "$*"; exit 2; }
+
+started=$(python3 -c "import time;print(time.time())")
+declare -a RESULTS
+overall=0
+for suite in "${SUITES[@]}"; do
+  printf '\n──────────────────────────────────────────────────────────────\n'
+  printf '  %s\n' "$suite"
+  printf '──────────────────────────────────────────────────────────────\n'
+  if bash "./$suite.sh"; then
+    RESULTS+=("  ok    $suite")
+  else
+    RESULTS+=("  FAIL  $suite")
+    overall=1
+  fi
+done
+elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
+
+printf '\n══════════════════════════════════════════════════════════════\n'
+printf '  Summary  (%dm%02ds)\n' "$((elapsed/60))" "$((elapsed%60))"
+printf '══════════════════════════════════════════════════════════════\n'
+printf '%s\n' "${RESULTS[@]}"
+if [ "$overall" -eq 0 ]; then
+  printf '\n  All suites passed.\n\n'
+else
+  printf '\n  At least one suite failed.\n\n'
+fi
+exit "$overall"
+```
+
+### scripts/verify/lib.sh
+
+```bash
+#!/usr/bin/env bash
+# Shared helpers for the verification suites.
+#
+# Sourced, never executed. Every suite expects a running stack and leaves the
+# instance as it found it.
+#
+# A note on JSON and the shell: never round-trip an API response through `echo`.
+# zsh and bash interpret backslash escapes differently, and an LLM-generated
+# answer containing \n will be silently corrupted into invalid JSON. Pipe curl
+# straight into python3, or capture to a file. This cost real debugging time
+# more than once.
+
+set -uo pipefail
+
+API="${RAG_API:-http://localhost:8080/api}"
+# Collections and packages created by the suites all carry this prefix so
+# cleanup can find them without guessing.
+PREFIX="${RAG_TEST_PREFIX:-Vfy}"
+# Suites that need an LLM call are slow (20-60s each). Set RAG_SKIP_SLOW=1 for
+# a structural-only run.
+SKIP_SLOW="${RAG_SKIP_SLOW:-0}"
+
+PASS=0; FAIL=0; SKIP=0
+FAILED_NAMES=()
+
+_c_pass=$'\033[32m'; _c_fail=$'\033[31m'; _c_skip=$'\033[33m'; _c_off=$'\033[0m'
+[ -t 1 ] || { _c_pass=""; _c_fail=""; _c_skip=""; _c_off=""; }
+
+section() { printf '\n  %s\n' "$1"; }
+
+# check <name> <condition-exit-status> [detail]
+check() {
+  local name="$1" ok="$2" detail="${3:-}"
+  if [ "$ok" = "0" ]; then
+    PASS=$((PASS+1)); printf '    %sPASS%s  %s\n' "$_c_pass" "$_c_off" "$name"
+  else
+    FAIL=$((FAIL+1)); FAILED_NAMES+=("$name")
+    printf '    %sFAIL%s  %s%s\n' "$_c_fail" "$_c_off" "$name" "${detail:+  — $detail}"
+  fi
+}
+
+# check_eq <name> <actual> <expected>
+check_eq() {
+  local name="$1" actual="$2" expected="$3"
+  [ "$actual" = "$expected" ]
+  check "$name" $? "got '$actual', wanted '$expected'"
+}
+
+skip() {
+  SKIP=$((SKIP+1)); printf '    %sSKIP%s  %s%s\n' "$_c_skip" "$_c_off" "$1" "${2:+  — $2}"
+}
+
+# jq-free JSON field read: api_get <path> | jfield <expr>
+# `expr` is python indexing against the parsed document, e.g. ['status']
+jfield() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)" 2>/dev/null; }
+
+api_get()  { curl -s -m 120 "$API$1"; }
+api_code() { curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
+api_post() { curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+api_post_code() { curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+
+require_stack() {
+  local code
+  code=$(api_code "$API/health")
+  if [ "$code" != "200" ]; then
+    printf '\n  Cannot reach a healthy API at %s (HTTP %s).\n' "$API" "$code"
+    printf '  Start the stack first:  docker compose up -d\n\n'
+    exit 2
+  fi
+}
+
+# wait_for_job <url-path> [timeout-seconds] — polls until status is terminal.
+# Echoes the final status.
+wait_for_job() {
+  local path="$1" limit="${2:-600}" waited=0 status=""
+  while [ "$waited" -lt "$limit" ]; do
+    status=$(api_get "$path" | jfield "['status']")
+    case "$status" in
+      completed|failed|partial|cancelled) printf '%s' "$status"; return 0 ;;
+    esac
+    sleep 2; waited=$((waited+2))
+  done
+  printf 'timeout'; return 1
+}
+
+make_collection() {
+  api_post "/collections" "{\"name\":\"$1\",\"index_type\":\"${2:-hnsw}\",\"distance_metric\":\"${3:-cosine}\",\"hnsw_config\":{\"efConstruction\":128,\"maxConnections\":64,\"ef\":64}}" >/dev/null
+}
+
+drop_collection() { curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
+
+# Remove every collection and package this run created.
+cleanup_prefixed() {
+  local names
+  names=$(api_get "/collections" | python3 -c "
+import json,sys
+for c in json.load(sys.stdin)['collections']:
+    if c['name'].startswith('$PREFIX'): print(c['name'])" 2>/dev/null)
+  for n in $names; do drop_collection "$n"; done
+  rm -f "${REPO_ROOT:-.}"/exports/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
+}
+
+summary() {
+  printf '\n  %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+  if [ "$FAIL" -gt 0 ]; then
+    printf '  failed:\n'
+    printf '    - %s\n' "${FAILED_NAMES[@]}"
+    return 1
+  fi
+  return 0
+}
+```
+
+### scripts/verify/fixtures.py
+
+```python
+#!/usr/bin/env python3
+"""Write the test corpus used by the verification suites.
+
+    python3 fixtures.py <output-dir>
+
+Everything is generated from the standard library so the suites have no
+dependencies of their own — the PDF and DOCX are written by hand rather than
+pulled from a document library.
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+import zipfile
+
+PARAGRAPHS = [
+    "Overtime Approval. Requests relating to overtime must be submitted in writing "
+    "to the responsible manager, who reviews them within five working days.",
+    "Approval for overtime is granted by the department head, except where the "
+    "amount exceeds the delegated limit, in which case the finance director approves.",
+    "Expense Reimbursement. Employees submit receipts within thirty days of the "
+    "expense being incurred. Claims without receipts are refused.",
+    "Remote Work. Staff may work remotely up to three days each week with written "
+    "agreement from their line manager and the people team.",
+    "Records of every decision are retained for seven years in the central archive, "
+    "and are available to auditors on request.",
+    "Travel Booking. Flights must be booked at least fourteen days in advance. "
+    "Rail travel is preferred for journeys under four hours.",
+]
+ONE_LINER = PARAGRAPHS[0]
+
+
+def _pdf(paragraphs: list[str]) -> bytes:
+    """A minimal single-page PDF. Hand-built to avoid a writer dependency."""
+    lines: list[str] = []
+    for para in paragraphs:
+        cur = ""
+        for word in para.split():
+            if len(cur) + len(word) + 1 > 82:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = (cur + " " + word).strip()
+        lines.extend([cur, ""])
+
+    stream = b"BT /F1 11 Tf 54 740 Td 14 TL\n"
+    for line in lines:
+        safe = (line.encode("ascii", "replace")
+                    .replace(b"(", b"").replace(b")", b"").replace(b"\\", b""))
+        stream += b"(" + safe + b") Tj T*\n"
+    stream += b"ET"
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+        b"/Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += str(number).encode() + b" 0 obj\n" + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 " + str(len(objects) + 1).encode() + b"\n0000000000 65535 f \n"
+    for offset in offsets:
+        out += ("%010d 00000 n \n" % offset).encode()
+    out += (b"trailer\n<< /Size " + str(len(objects) + 1).encode()
+            + b" /Root 1 0 R >>\nstartxref\n" + str(xref).encode() + b"\n%%EOF\n")
+    return bytes(out)
+
+
+def _docx(text: str) -> bytes:
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>")
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-'
+        'officedocument.wordprocessingml.document.main+xml"/></Types>')
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+    import io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document)
+    return buf.getvalue()
+
+
+def write(target: pathlib.Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    body = "\n\n".join(PARAGRAPHS) + "\n"
+
+    # One of each supported type. `.md` is here because it silently failed to
+    # ingest until the `markdown` dependency was added.
+    (target / "policies.txt").write_text(body)
+    (target / "policies.md").write_text("# Policies\n\n" + body)
+    (target / "policies.csv").write_text(
+        "policy,detail\n" + "".join(f'p{i},"{p}"\n' for i, p in enumerate(PARAGRAPHS)))
+    (target / "policies.json").write_text(json.dumps(
+        [{"policy": f"p{i}", "detail": p} for i, p in enumerate(PARAGRAPHS)], indent=2))
+    (target / "policies.pdf").write_bytes(_pdf(PARAGRAPHS))
+    (target / "policies.docx").write_bytes(_docx(ONE_LINER))
+
+    # Edge cases.
+    # Two fragments under any sensible min_chunk_size, for the merge rule.
+    (target / "tiny.txt").write_text("Short.\n\nAlso short.\n\n" + ONE_LINER + "\n")
+    # Right extension, unparseable content — one bad file must not fail a batch.
+    (target / "broken.pdf").write_bytes(b"%PDF-1.4\nnot a real pdf body\n%%EOF\n")
+    # Unsupported types, which must be reported rather than dropped in silence.
+    (target / "notes.xyz").write_text("unsupported\n")
+    (target / "notes.rtf").write_text("also unsupported\n")
+
+    # A ZIP mixing supported and unsupported members.
+    with zipfile.ZipFile(target / "batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        for name in ("policies.txt", "policies.md", "policies.pdf",
+                     "notes.xyz", "notes.rtf"):
+            z.write(target / name, arcname=name)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: fixtures.py <output-dir>")
+    out = pathlib.Path(sys.argv[1])
+    write(out)
+    for path in sorted(out.iterdir()):
+        print(f"  {path.name:16s} {path.stat().st_size:7d} bytes")
+```
+
+### scripts/verify/validate_package.py
+
+```python
+"""Validate one export package against RAG_EXPORT_SPECIFICATIONS.md §4.
+
+    python3 validate_package.py <path-to-ragpkg-*.tar.gz>
+
+Exits non-zero if any clause fails. Checks the filename convention, that <id8>
+really is the manifest digest, every listed digest, that nothing in the archive
+is unlisted, the chunks.jsonl record shape, source content-addressing, and the
+generated README and retrieve.py.
+"""
+import ast, hashlib, json, re, sys, tarfile, tempfile
+from pathlib import Path
+
+archive = Path(sys.argv[1])
+fails = []
+def check(name, ok, detail=""):
+    print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""))
+    if not ok: fails.append(name)
+
+# E5 — filename (§4.1)
+NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz$")
+m = NAME_RE.match(archive.name)
+check("E5 filename matches the §4.1 pattern", m is not None, archive.name)
+if not m:
+    sys.exit(1)
+slug, ts, id8 = m.groups()
+
+with tempfile.TemporaryDirectory() as td:
+    with tarfile.open(archive, "r:gz") as tar:
+        names = tar.getnames()
+        tar.extractall(td)
+    root = Path(td)
+    tops = {n.split("/")[0] for n in names}
+    check("archive expands to a single directory", len(tops) == 1, str(tops))
+    check("that directory is the filename minus .tar.gz",
+          tops == {archive.name[:-len(".tar.gz")]}, str(tops))
+    pkg = root / archive.name[:-len(".tar.gz")]
+
+    manifest = json.loads((pkg / "manifest.json").read_text())
+
+    # §4.1 — id8 is the manifest digest prefix
+    digest = hashlib.sha256((pkg / "manifest.json").read_bytes()).hexdigest()
+    check("<id8> is the first 8 hex of the manifest digest",
+          digest[:8] == id8, f"manifest={digest[:8]} filename={id8}")
+
+    # §4.1 — slug is derived from the authoritative name
+    name = manifest["collection"]["name"]
+    expect = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    check("slug derives from manifest collection name", slug == expect,
+          f"{name!r} -> {expect!r}, filename has {slug!r}")
+
+    # E6 — every listed digest matches
+    bad = []
+    for rel, want in manifest["files"].items():
+        f = pkg / rel
+        if not f.is_file():
+            bad.append(f"{rel}: listed but missing"); continue
+        got = "sha256:" + hashlib.sha256(f.read_bytes()).hexdigest()
+        if got != want: bad.append(f"{rel}: digest mismatch")
+    check(f"E6 all {len(manifest['files'])} listed digests verify", not bad, "; ".join(bad[:3]))
+
+    # No file in the package is silently unlisted
+    UNDIGESTED = {"manifest.json", "README.md", "retrieve.py"}
+    on_disk = {str(p.relative_to(pkg)) for p in pkg.rglob("*") if p.is_file()}
+    unlisted = on_disk - set(manifest["files"]) - UNDIGESTED
+    check("no file is unlisted and undigested", not unlisted, str(sorted(unlisted)))
+    overlap = UNDIGESTED & set(manifest["files"])
+    check("generated files are not in the digest map (would be circular)",
+          not overlap, str(sorted(overlap)))
+
+    # §4.2 — required layout
+    for req in ("manifest.json", "collection.json", "chunks.jsonl",
+                "retrieval_config.json", "README.md"):
+        check(f"§4.2 contains {req}", (pkg / req).is_file())
+
+    # §4.4 — manifest shape
+    for key in ("package_format", "created_at", "produced_by", "collection",
+                "embedding", "llm", "chunking", "fidelity", "models_bundled", "files"):
+        check(f"§4.4 manifest has {key}", key in manifest)
+    check("package_format is 1", manifest.get("package_format") == 1)
+    check("created_at is UTC ISO-8601 with Z",
+          bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", manifest["created_at"])),
+          manifest["created_at"])
+    check("embedding.dimensions is an int", isinstance(manifest["embedding"]["dimensions"], int),
+          str(manifest["embedding"]))
+
+    # §4.3 — fidelity
+    fid = manifest["fidelity"]
+    check("fidelity is one of the two spec values", fid in ("with-sources", "chunks-only"), fid)
+    has_sources_dir = (pkg / "sources").is_dir()
+    check("sources/ present iff fidelity is with-sources",
+          has_sources_dir == (fid == "with-sources"), f"{fid}, dir={has_sources_dir}")
+
+    # §4.5 — chunks.jsonl
+    lines = (pkg / "chunks.jsonl").read_text().strip().split("\n")
+    lines = [l for l in lines if l]
+    check("chunk_count matches chunks.jsonl lines",
+          len(lines) == manifest["collection"]["chunk_count"],
+          f"{len(lines)} lines vs {manifest['collection']['chunk_count']}")
+    EIGHT = {"content","source_file","source_type","chunk_index",
+             "chunk_strategy","chunk_size","chunk_overlap","created_at"}
+    probs = []
+    for i, line in enumerate(lines):
+        rec = json.loads(line)
+        if set(rec) != {"id","vector","properties","source_sha256"}:
+            probs.append(f"line {i+1}: keys {sorted(rec)}")
+        elif set(rec["properties"]) != EIGHT:
+            probs.append(f"line {i+1}: properties {sorted(rec['properties'])}")
+        elif len(rec["vector"]) != manifest["embedding"]["dimensions"]:
+            probs.append(f"line {i+1}: vector len {len(rec['vector'])}")
+        elif not all(isinstance(v,(int,float)) for v in rec["vector"]):
+            probs.append(f"line {i+1}: vector not all numbers")
+    check("§4.5 every chunk has the 4 fields, 8 properties and a full vector",
+          not probs, "; ".join(probs[:3]))
+
+    if fid == "with-sources":
+        idx = json.loads((pkg / "sources" / "index.json").read_text())
+        stored = {p.name for p in (pkg / "sources").iterdir() if p.name != "index.json"}
+        check("every indexed source document is present",
+              set(idx["documents"]) == stored,
+              f"index={len(idx['documents'])} files={len(stored)}")
+        bad = [d for d in stored if hashlib.sha256((pkg/"sources"/d).read_bytes()).hexdigest() != d]
+        check("source files are content-addressed correctly", not bad, str(bad[:2]))
+
+    # Generated files
+    readme = (pkg / "README.md").read_text()
+    check("README has no unsubstituted placeholders",
+          not re.search(r"@@[A-Z_0-9]+@@", readme),
+          str(set(re.findall(r"@@[A-Z_0-9]+@@", readme))))
+    check("E19 README states the collection name", name in readme)
+    check("E19 README states the fidelity", fid in readme)
+    check("E19 README carries the encryption warning", "not encrypted" in readme.lower())
+
+    if manifest.get("retrieve_script"):
+        rp = pkg / "retrieve.py"
+        check("retrieve.py present when retrieve_script is true", rp.is_file())
+        src = rp.read_text()
+        check("retrieve.py has no unsubstituted placeholders",
+              not re.search(r"@@[A-Z_0-9]+@@", src),
+              str(set(re.findall(r"@@[A-Z_0-9]+@@", src))))
+        try:
+            ast.parse(src); ok = True; err = ""
+        except SyntaxError as e:
+            ok = False; err = str(e)
+        check("retrieve.py is valid Python", ok, err)
+        check("retrieve.py records its provenance (id8 + created_at)",
+              id8 in src and manifest["created_at"] in src)
+        imports = {n.split(".")[0] for node in ast.walk(ast.parse(src))
+                   if isinstance(node, (ast.Import, ast.ImportFrom))
+                   for n in ([a.name for a in node.names] if isinstance(node, ast.Import)
+                             else [node.module or ""])}
+        STDLIB = {"argparse","json","sys","urllib","os","re"}
+        check("retrieve.py imports stdlib only", imports <= STDLIB, str(sorted(imports)))
+    else:
+        check("retrieve.py absent when retrieve_script is false",
+              not (pkg / "retrieve.py").exists())
+
+print(f"\n{'PACKAGE VALID' if not fails else str(len(fails)) + ' CHECK(S) FAILED'}")
+sys.exit(1 if fails else 0)
+```
+
+### scripts/verify/01_infrastructure.sh
+
+```bash
+#!/usr/bin/env bash
+# SPECIFICATIONS.md §10.5 — Infrastructure
+#
+# The restart and first-run timing checks are disruptive, so they are opt-in.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+C="${PREFIX}Infra"
+
+section "§10.5 Infrastructure"
+
+# ── exactly one host-published port ──────────────────────────────────────────
+bindings=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Ports}}') \
+  | grep -o '0\.0\.0\.0:[0-9]*->[0-9]*/tcp' | sort -u)
+count=$(printf '%s\n' "$bindings" | grep -c . )
+check_eq "only one port is published to the host" "$count" "1"
+printf '%s' "$bindings" | grep -q -- '->80/tcp'
+check "that port maps to the proxy's port 80" $? "$bindings"
+
+for svc in api weaviate; do
+  published=$( (cd "$REPO_ROOT" && docker compose ps --format "{{.Service}}|{{.Ports}}") \
+    | grep "^$svc|" | grep -c '0\.0\.0\.0' || true)
+  check_eq "$svc publishes nothing to the host" "$published" "0"
+done
+
+# ── five services, all reporting healthy where a healthcheck exists ──────────
+running=$( (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) | grep -c .)
+check_eq "five services are running" "$running" "5"
+unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
+check_eq "no service reports unhealthy" "$unhealthy" "0"
+
+# ── health endpoint reports each dependency ──────────────────────────────────
+api_get "/health" > /tmp/vfy_health.json
+check_eq "health status is ok" "$(jfield "['status']" < /tmp/vfy_health.json)" "ok"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_health.json'))
+s=d['services']
+ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
+      and s['ollama']['embed']['status']=='ok'
+      and all(v['latency_ms'] >= 0 for v in (s['weaviate'], s['ollama']['llm'], s['ollama']['embed'])))
+sys.exit(0 if ok else 1)"
+check "per-service status and latency are reported" $?
+
+# ── ingest config defaults ───────────────────────────────────────────────────
+drop_collection "$C"; make_collection "$C"
+check_eq "a fresh collection reports is_default true" \
+  "$(api_get "/ingest/config/$C" | jfield "['is_default']")" "True"
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"semantic\",\"chunk_size\":800,\"chunk_overlap\":150,\"similarity_threshold\":0.9,\"min_chunk_size\":80}" >/dev/null
+api_get "/ingest/config/$C" > /tmp/vfy_cfg.json
+check_eq "after saving, is_default is false" "$(jfield "['is_default']" < /tmp/vfy_cfg.json)" "False"
+check_eq "the saved strategy is returned" "$(jfield "['chunking_strategy']" < /tmp/vfy_cfg.json)" "semantic"
+
+# ── deleting a collection must take its configs with it ──────────────────────
+# Spec §8 rule 1. This was not happening for the ingest config, so a recreated
+# collection silently inherited chunking settings the user never chose.
+drop_collection "$C"
+make_collection "$C"
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"semantic\",\"chunk_size\":900,\"chunk_overlap\":100,\"similarity_threshold\":0.9,\"min_chunk_size\":70}" >/dev/null
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":9,\"alpha\":0.4,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+drop_collection "$C"
+make_collection "$C"
+check_eq "a recreated collection does not inherit the ingest config" \
+  "$(api_get "/ingest/config/$C" | jfield "['is_default']")" "True"
+check_eq "a recreated collection does not inherit the retrieval config" \
+  "$(api_get "/retrieval/config/$C" | jfield "['is_default']")" "True"
+
+# ── persistence across a restart (opt-in: it stops the stack) ────────────────
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  api_get "/collections" > /tmp/vfy_before.json
+  started=$(python3 -c "import time;print(time.time())")
+  (cd "$REPO_ROOT" && docker compose down >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1)
+  for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+  elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
+  [ "$elapsed" -le 120 ]
+  check "restart reaches healthy within 120s" $? "took ${elapsed}s"
+  api_get "/collections" > /tmp/vfy_after.json
+  python3 -c "
+import json,sys
+b={c['name']:c for c in json.load(open('/tmp/vfy_before.json'))['collections']}
+a={c['name']:c for c in json.load(open('/tmp/vfy_after.json'))['collections']}
+ok = set(b)==set(a) and all(b[k]['object_count']==a[k]['object_count'] for k in b)
+sys.exit(0 if ok else 1)"
+  check "Weaviate data survives down/up" $?
+  python3 -c "
+import json,sys
+b={c['name']:c for c in json.load(open('/tmp/vfy_before.json'))['collections']}
+a={c['name']:c for c in json.load(open('/tmp/vfy_after.json'))['collections']}
+sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) else 1)"
+  check "created_at is preserved across restart" $?
+  check_eq "saved ingest config survives restart" \
+    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
+else
+  skip "restart, persistence and timing" "set RAG_ALLOW_RESTART=1 to include them"
+fi
+
+# ── startup sweeps leave a clean instance alone ──────────────────────────────
+leftover=$( (cd "$REPO_ROOT" && docker compose exec -T api sh -c \
+  'ls -d /app/uploads/import-* /app/uploads/rechunk-* 2>/dev/null | wc -l') | tr -d ' ')
+check_eq "no abandoned extraction directories" "${leftover:-0}" "0"
+staging=$(api_get "/collections" | python3 -c "
+import json,sys
+print(sum(1 for c in json.load(sys.stdin)['collections']
+          if '__importing_' in c['name'] or '__tuning_' in c['name']))")
+check_eq "no abandoned staging collections" "$staging" "0"
+
+drop_collection "$C"
+cleanup_prefixed
+summary
+```
+
+### scripts/verify/02_ingest.sh
+
+```bash
+#!/usr/bin/env bash
+# SPECIFICATIONS.md §10.1 — Ingest
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+
+require_stack
+C="${PREFIX}Ingest"
+
+# Uploads a set of files and echoes the finished job document to a file.
+ingest() {
+  local collection="$1" strategy="$2" size="$3" minsize="$4"; shift 4
+  local args=() f
+  for f in "$@"; do args+=(-F "files=@$f"); done
+  curl -s -m 600 -X POST "$API/ingest/upload" \
+    -F "collection=$collection" -F "strategy=$strategy" -F "chunk_size=$size" \
+    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}" > /tmp/vfy_job.json
+  local job; job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['job_id'])" 2>/dev/null)
+  [ -n "$job" ] || { printf '{}' > /tmp/vfy_job.json; return 1; }
+  wait_for_job "/ingest/job/$job" 900 >/dev/null
+  api_get "/ingest/job/$job" > /tmp/vfy_job.json
+}
+
+section "§10.1 Ingest"
+
+# ── all six supported types ──────────────────────────────────────────────────
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 200 40 \
+  "$FIX/policies.txt" "$FIX/policies.md" "$FIX/policies.csv" \
+  "$FIX/policies.json" "$FIX/policies.pdf" "$FIX/policies.docx"
+read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$completed" = 6 ] && [ "$chunks" -gt 0 ]
+check "all six file types ingest" $? "status=$status completed=$completed chunks=$chunks"
+
+# Confirm the chunks actually landed, not merely that the job reported success.
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$stored" -ge 6 ]
+check "every type produced at least one chunk" $? "collection holds $stored chunks"
+
+# ── ZIP batch, with unsupported members reported ─────────────────────────────
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 200 40 "$FIX/batch.zip" "$FIX/notes.xyz"
+read -r status completed skipped_n <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], len(d.get('skipped',[])))")"
+[ "$status" = completed ] && [ "$completed" = 3 ]
+check "ZIP extracts and processes supported members" $? "status=$status completed=$completed (want 3)"
+[ "$skipped_n" -ge 3 ]
+check "unsupported files are reported, not dropped silently" $? "$skipped_n skipped"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
+check "each skip names the unsupported extension" $?
+
+# ── every chunking strategy against a PDF ────────────────────────────────────
+for strategy in fixed overlap language context_aware semantic; do
+  if [ "$SKIP_SLOW" = "1" ] && [ "$strategy" = "semantic" ]; then
+    skip "strategy '$strategy' (loads a sentence-transformer)"; continue
+  fi
+  SC="${C}$(printf '%s' "$strategy" | tr -d '_')"
+  drop_collection "$SC"; make_collection "$SC"
+  ingest "$SC" "$strategy" 300 50 "$FIX/policies.pdf"
+  read -r status chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json')); print(d['status'], d['chunks_stored'])")"
+  [ "$status" = completed ] && [ "$chunks" -gt 0 ]
+  check "strategy '$strategy' produces chunks from a PDF" $? "status=$status chunks=$chunks"
+  drop_collection "$SC"
+done
+
+# ── min_chunk_size merging ───────────────────────────────────────────────────
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 60 100 "$FIX/tiny.txt"
+under=$(curl -s -m 60 -X POST "$API/query" -H 'Content-Type: application/json' \
+  -d "{\"question\":\"short\",\"collection\":\"$C\",\"retrieval_mode\":\"flat\",\"top_k\":20,\"include_citations\":true,\"response_format\":\"end_user\"}" \
+  2>/dev/null | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print('?'); raise SystemExit
+print(sum(1 for c in (d.get('citations') or []) if len(c['excerpt'].strip()) < 60))" 2>/dev/null)
+python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json')); import sys
+sys.exit(0 if d['chunks_stored'] == 1 else 1)"
+check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['chunks_stored'])") chunk(s), wanted 1"
+
+# ── one bad file must not fail the batch ─────────────────────────────────────
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 300 50 "$FIX/broken.pdf" "$FIX/policies.txt" "$FIX/tiny.txt"
+read -r status completed failed errs <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['files_failed'], len(d['errors']))")"
+[ "$status" = partial ] && [ "$completed" = 2 ] && [ "$failed" = 1 ] && [ "$errs" -ge 1 ]
+check "a parser failure does not stop the other files" $? \
+  "status=$status completed=$completed failed=$failed errors=$errs"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+sys.exit(0 if any('broken.pdf' in e for e in d['errors']) else 1)"
+check "the failure names the offending file" $?
+
+# ── job status transitions ───────────────────────────────────────────────────
+# `queued` is only observable when the executor is saturated, so this asserts
+# the terminal transition and that the POST reports the initial state.
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$FIX/policies.txt" > /tmp/vfy_start.json
+initial=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['status'])")
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['job_id'])")
+check_eq "a new job starts as 'queued'" "$initial" "queued"
+final=$(wait_for_job "/ingest/job/$job" 900)
+check_eq "job reaches 'completed'" "$final" "completed"
+
+drop_collection "$C"
+cleanup_prefixed
+summary
+```
+
+### scripts/verify/03_query.sh
+
+```bash
+#!/usr/bin/env bash
+# SPECIFICATIONS.md §10.2 — Query
+cd "$(dirname "$0")" && . ./lib.sh
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}Query"
+
+section "§10.2 Query"
+
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_q.json
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_q.json'))['job_id'])")
+wait_for_job "/ingest/job/$job" 900 >/dev/null
+
+ask() {  # ask <mode> <format> <citations> -> writes /tmp/vfy_ans.json
+  api_post "/query" "{\"question\":\"who approves overtime?\",\"collection\":\"$C\",\"retrieval_mode\":\"$1\",\"top_k\":3,\"alpha\":0.5,\"include_citations\":$3,\"response_format\":\"$2\"}" > /tmp/vfy_ans.json
+}
+
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "§10.2 entirely" "every check needs an LLM call"
+  summary; exit $?
+fi
+
+# ── a question returns an answer, with usable latencies ──────────────────────
+ask hnsw end_user true
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
+sys.exit(0 if d.get('answer','').strip() else 1)"
+check "a question returns a non-empty answer" $?
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
+sys.exit(0 if d.get('retrieval_latency_ms',0) > 0 and d.get('llm_latency_ms',0) > 0 else 1)"
+check "latency fields present and non-zero" $? \
+  "$(python3 -c "import json;d=json.load(open('/tmp/vfy_ans.json'));print(d.get('retrieval_latency_ms'),d.get('llm_latency_ms'))")"
+
+# ── citations are shaped correctly ───────────────────────────────────────────
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
+c = d.get('citations') or []
+ok = bool(c) and all(
+    isinstance(x.get('source_file'), str) and x['source_file']
+    and isinstance(x.get('score'), (int, float))
+    and isinstance(x.get('chunk_index'), int)
+    and isinstance(x.get('excerpt'), str) for x in c)
+sys.exit(0 if ok else 1)"
+check "citations carry source_file, chunk_index, score and excerpt" $?
+
+ask hnsw end_user false
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
+sys.exit(0 if not d.get('citations') else 1)"
+check "citations are withheld when not requested" $?
+
+# ── all four retrieval modes ─────────────────────────────────────────────────
+for mode in hnsw flat hybrid semantic; do
+  ask "$mode" end_user true
+  python3 -c "
+import json,sys
+try: d=json.load(open('/tmp/vfy_ans.json'))
+except Exception: sys.exit(1)
+sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('answer','').strip() else 1)"
+  check "retrieval mode '$mode' returns results" $?
+done
+
+# ── end_user is shorter than engineer ────────────────────────────────────────
+# The prompts instruct plain language but never brevity, so a single pair is
+# noise. Compare across trials and require a clear majority.
+trials="${RAG_FORMAT_TRIALS:-3}"
+eu_total=0; en_total=0; eu_wins=0
+for _ in $(seq 1 "$trials"); do
+  ask flat end_user false;  eu=$(python3 -c "import json;print(len(json.load(open('/tmp/vfy_ans.json'))['answer']))")
+  ask flat engineer false;  en=$(python3 -c "import json;print(len(json.load(open('/tmp/vfy_ans.json'))['answer']))")
+  eu_total=$((eu_total+eu)); en_total=$((en_total+en))
+  [ "$eu" -lt "$en" ] && eu_wins=$((eu_wins+1))
+done
+[ "$eu_total" -lt "$en_total" ]
+check "end_user answers are shorter than engineer on average" $? \
+  "mean end_user=$((eu_total/trials)) engineer=$((en_total/trials)); end_user shorter in $eu_wins/$trials trials"
+
+drop_collection "$C"
+cleanup_prefixed
+summary
+```
+
+### scripts/verify/04_goldstandard.sh
+
+```bash
+#!/usr/bin/env bash
+# SPECIFICATIONS.md §10.3 — Gold Standard
+#
+# Every check here corresponds to a defect that was live in the codebase:
+# lost pairs, counters that reported attempts as successes, a 500 where a 409
+# belonged, and a PATCH that silently rewrote approved content.
+cd "$(dirname "$0")" && . ./lib.sh
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}Gold"
+
+section "§10.3 Gold Standard"
+
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "§10.3 entirely" "every check needs LLM generation"
+  summary; exit $?
+fi
+
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_g.json
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_g.json'))['job_id'])")
+wait_for_job "/ingest/job/$job" 900 >/dev/null
+
+SAMPLE="${RAG_GS_SAMPLE:-3}"
+api_post "/goldstandard/generate" "{\"collection\":\"$C\",\"sample_size\":$SAMPLE}" > /tmp/vfy_gen.json
+SID=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen.json'))['session_id'])")
+
+# ── 409 while still generating ───────────────────────────────────────────────
+# Regenerating mid-flight raced with the generation loop and returned 500.
+overlapped=0
+for _ in $(seq 1 60); do
+  read -r st n <<<"$(api_get "/goldstandard/session/$SID" | python3 -c "
+import json,sys; d=json.load(sys.stdin); print(d['status'], len(d['pairs']))")"
+  if [ "$st" = generating ] && [ "$n" -ge 1 ]; then
+    pid=$(api_get "/goldstandard/session/$SID" | jfield "['pairs'][0]['pair_id']")
+    code=$(api_post_code "/goldstandard/regenerate" "{\"session_id\":\"$SID\",\"pair_id\":\"$pid\"}")
+    check_eq "regenerate during generation returns 409" "$code" "409"
+    overlapped=1; break
+  fi
+  [ "$st" != generating ] && break
+  sleep 1
+done
+[ "$overlapped" = 1 ] || skip "409-while-generating" "generation finished before a regenerate could overlap"
+
+wait_for_job "/goldstandard/session/$SID" 1800 >/dev/null
+api_get "/goldstandard/session/$SID" > /tmp/vfy_sess.json
+
+# ── every requested pair exists, and the counters agree ──────────────────────
+read -r total attempted completed failed actual <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_sess.json'))
+print(d['pairs_total'], d.get('pairs_attempted','?'), d['pairs_completed'],
+      d.get('pairs_failed','?'), len(d['pairs']))")"
+[ "$completed" = "$total" ] && [ "$actual" = "$total" ]
+check "generate returns sample_size pairs" $? \
+  "total=$total completed=$completed actual=$actual failed=$failed"
+[ "$completed" = "$actual" ]
+check "pairs_completed matches the pairs that exist" $? \
+  "completed=$completed actual=$actual (this counted attempts before)"
+[ "$attempted" = "$total" ]
+check "pairs_attempted reaches the total so progress can finish" $? "attempted=$attempted/$total"
+
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_sess.json'))
+need = ('question','answer','ground_truth','contexts')
+sys.exit(0 if d['pairs'] and all(all(p.get(f) for f in need) for p in d['pairs']) else 1)"
+check "every pair has question, answer, ground_truth and contexts" $?
+
+# ── the PATCH audit rule ─────────────────────────────────────────────────────
+PID=$(python3 -c "import json;print(json.load(open('/tmp/vfy_sess.json'))['pairs'][0]['pair_id'])")
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
+  -d '{"question":"rewritten without declaring an edit"}')
+check_eq "editing content without status='edited' is refused" "$code" "422"
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
+  -d '{"status":"edited","question":"a properly declared edit"}')
+check_eq "editing content with status='edited' is accepted" "$code" "200"
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "a status-only change is accepted" "$code" "200"
+
+# ── regenerate replaces exactly one pair ─────────────────────────────────────
+if [ "$actual" -ge 2 ]; then
+  TARGET=$(python3 -c "import json;print(json.load(open('/tmp/vfy_sess.json'))['pairs'][1]['pair_id'])")
+  api_post "/goldstandard/regenerate" "{\"session_id\":\"$SID\",\"pair_id\":\"$TARGET\"}" > /tmp/vfy_regen.json
+  api_get "/goldstandard/session/$SID" > /tmp/vfy_after.json
+  python3 - "$TARGET" <<'ENDPY'
+import json, sys
+target = sys.argv[1]
+before = {p['pair_id']: p for p in json.load(open('/tmp/vfy_sess.json'))['pairs']}
+after = {p['pair_id']: p for p in json.load(open('/tmp/vfy_after.json'))['pairs']}
+changed = [k for k in before if k in after and before[k] != after[k]]
+# The first pair was edited above, so it is expected to differ too.
+unexpected = [k for k in changed if k != target and k != list(before)[0]]
+sys.exit(0 if set(before) == set(after) and target in changed and not unexpected else 1)
+ENDPY
+  check "regenerate replaces only the targeted pair, ids stable" $?
+else
+  skip "regenerate-replaces-one" "needs at least two pairs"
+fi
+
+# ── export filtering, schema and filename ────────────────────────────────────
+python3 - "$SID" "$API" <<'ENDPY'
+import json, sys, urllib.request
+sid, api = sys.argv[1], sys.argv[2]
+pairs = json.load(urllib.request.urlopen(f"{api}/goldstandard/session/{sid}"))['pairs']
+plan = ["approved", "edited", "rejected", "pending", "approved"]
+for pair, status in zip(pairs, plan):
+    body = {"status": status}
+    if status == "edited":
+        body["question"] = "edited for export"
+    req = urllib.request.Request(
+        f"{api}/goldstandard/session/{sid}/pair/{pair['pair_id']}",
+        data=json.dumps(body).encode(), method="PATCH",
+        headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req)
+ENDPY
+api_post "/goldstandard/save" "{\"session_id\":\"$SID\"}" > /tmp/vfy_save.json
+SAVE_INFO=$(python3 - "$C" <<'ENDPY'
+import json, re, sys
+collection = sys.argv[1]
+d = json.load(open('/tmp/vfy_save.json'))
+kept = json.load(open('/tmp/vfy_sess.json'))['pairs']
+expected = sum(1 for p, s in zip(kept, ["approved","edited","rejected","pending","approved"])
+               if s in ("approved", "edited"))
+print(d['pairs_saved'], d['pairs_excluded'], expected, d['filename'],
+      1 if re.match(rf'^{collection}_\d{{8}}_\d{{6}}\.json$', d['filename']) else 0)
+ENDPY
+)
+read -r saved excluded expected fname name_ok <<<"$SAVE_INFO"
+[ "$saved" = "$expected" ]
+check "export keeps only approved and edited pairs" $? "saved=$saved expected=$expected excluded=$excluded"
+[ "$((saved + excluded))" = "$actual" ]
+check "saved + excluded accounts for every pair" $? "$saved + $excluded vs $actual"
+check_eq "default filename is {collection}_{YYYYMMDD_HHMMSS}.json" "$name_ok" "1"
+
+curl -s -m 120 "$API/goldstandard/download/$fname" -o /tmp/vfy_export.json
+python3 -c "
+import json,sys
+d = json.load(open('/tmp/vfy_export.json'))
+RAGAS = {'question','answer','contexts','ground_truth'}
+ok = isinstance(d, list) and d and all(
+    RAGAS <= set(r) and isinstance(r['contexts'], list) and r['contexts']
+    and all(isinstance(x,str) and x for x in r['contexts'])
+    and all(isinstance(r[k],str) and r[k].strip() for k in ('question','answer','ground_truth'))
+    for r in d)
+sys.exit(0 if ok else 1)"
+check "exported file is valid JSON in the RAGAS schema" $?
+
+code=$(api_code "$API/goldstandard/download/definitely_not_here.json")
+check_eq "download of an unknown filename returns 404" "$code" "404"
+
+# ── sessions survive a restart ───────────────────────────────────────────────
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  (cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ../..)" && docker compose restart api >/dev/null 2>&1)
+  for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
+  api_get "/goldstandard/session/$SID" > /tmp/vfy_post.json
+  python3 -c "
+import json,sys
+a=json.load(open('/tmp/vfy_after.json')); b=json.load(open('/tmp/vfy_post.json'))
+sys.exit(0 if [p['pair_id'] for p in a['pairs']] == [p['pair_id'] for p in b['pairs']] else 1)"
+  check "sessions survive an API restart" $?
+else
+  skip "session survives a restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
+drop_collection "$C"
+cleanup_prefixed
+summary
+```
+
+### scripts/verify/05_transfer.sh
+
+```bash
+#!/usr/bin/env bash
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20)
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}Transfer"
+EXPORTS="$REPO_ROOT/exports"
+
+section "Export, import and tuning"
+
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_t.json
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_t.json'))['job_id'])")
+wait_for_job "/ingest/job/$job" 900 >/dev/null
+chunks_before=$(api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+
+# Retrieval settings must exist for the package to carry retrieve.py.
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+
+# ── export ───────────────────────────────────────────────────────────────────
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_exp.json
+ejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp.json'))['job_id'])")
+estatus=$(wait_for_job "/export/job/$ejob" 1800)
+check_eq "export completes" "$estatus" "completed"
+api_get "/export/job/$ejob" > /tmp/vfy_expjob.json
+read -r PKG fidelity script <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_expjob.json'))
+print(d['filename'], d['fidelity'], d['retrieve_script'])")"
+check_eq "a collection with retained sources exports with-sources" "$fidelity" "with-sources"
+check_eq "a tuned collection ships retrieve.py" "$script" "True"
+
+python3 ./validate_package.py "$EXPORTS/$PKG" > /tmp/vfy_val.txt 2>&1
+check "package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_val.txt | head -1)"
+
+# ── corruption is detected ───────────────────────────────────────────────────
+python3 - "$EXPORTS/$PKG" <<'ENDPY'
+import pathlib, shutil, subprocess, sys, tarfile, tempfile
+src = pathlib.Path(sys.argv[1])
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work)
+    root = next(p for p in work.iterdir() if p.is_dir())
+    chunks = root / "chunks.jsonl"
+    chunks.write_bytes(chunks.read_bytes()[: len(chunks.read_bytes()) // 2])
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-corrupt.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+ENDPY
+CORRUPT=$(python3 - "$EXPORTS/$PKG" <<'ENDPY'
+import pathlib, sys
+src = pathlib.Path(sys.argv[1])
+print(src.name.replace(".tar.gz", "") + "-corrupt.tar.gz")
+ENDPY
+)
+api_post "/import" "{\"filename\":\"$CORRUPT\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+code=$(api_get "/import/job/$ijob" | jfield "['error_code']")
+check_eq "a truncated package is refused as PACKAGE_CORRUPT" "$code" "PACKAGE_CORRUPT"
+api_get "/import/job/$ijob" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
+check "the corruption error names the offending file" $?
+rm -f "$EXPORTS/$CORRUPT"
+
+# ── conflict handling ────────────────────────────────────────────────────────
+api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+code=$(api_get "/import/job/$ijob" | jfield "['error_code']")
+check_eq "abort refuses an existing collection" "$code" "COLLECTION_EXISTS"
+
+api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"rename\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+istatus=$(wait_for_job "/import/job/$ijob" 1800)
+api_get "/import/job/$ijob" > /tmp/vfy_impjob.json
+read -r istat iname irenamed iwritten <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_impjob.json'))
+print(d['status'], d['collection'], d['renamed'], d['chunks_written'])")"
+check_eq "rename imports alongside the original" "$istat" "completed"
+[ "$irenamed" = "True" ] && [ "$iname" != "$C" ]
+check "the renamed collection has a new name" $? "imported as $iname"
+check_eq "every chunk is imported" "$iwritten" "$chunks_before"
+
+# ── import is lossless ───────────────────────────────────────────────────────
+api_post "/export" "{\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
+ejob2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp2.json'))['job_id'])")
+wait_for_job "/export/job/$ejob2" 1800 >/dev/null
+PKG2=$(api_get "/export/job/$ejob2" | jfield "['filename']")
+python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" <<'ENDPY'
+import json, sys, tarfile, tempfile, pathlib
+def chunks(path):
+    with tempfile.TemporaryDirectory() as td:
+        with tarfile.open(path) as t:
+            t.extractall(td)
+        root = next(p for p in pathlib.Path(td).iterdir() if p.is_dir())
+        return {r["id"]: r for r in
+                (json.loads(l) for l in (root / "chunks.jsonl").read_text().splitlines() if l.strip())}
+a, b = chunks(sys.argv[1]), chunks(sys.argv[2])
+same = set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
+                                and a[k]["properties"] == b[k]["properties"] for k in a)
+sys.exit(0 if same else 1)
+ENDPY
+check "re-export after import is byte-identical (uuids, vectors, properties)" $?
+rm -f "$EXPORTS/$PKG2"
+drop_collection "$iname"
+
+# ── tuning ───────────────────────────────────────────────────────────────────
+api_get "/tune/$C" > /tmp/vfy_tune.json
+check_eq "tune options report with-sources" "$(jfield "['fidelity']" < /tmp/vfy_tune.json)" "with-sources"
+check_eq "re-chunking is offered" "$(jfield "['can_rechunk']" < /tmp/vfy_tune.json)" "True"
+
+api_post "/tune/reindex" "{\"collection\":\"$C\",\"index_type\":\"flat\",\"distance_metric\":\"cosine\"}" > /tmp/vfy_tj.json
+tjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_tj.json'))['job_id'])")
+tstatus=$(wait_for_job "/tune/job/$tjob" 1800)
+check_eq "re-index completes" "$tstatus" "completed"
+api_get "/tune/job/$tjob" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+sys.exit(0 if any('unchanged' in n for n in d['notes']) else 1)"
+check "re-index leaves gold-standard sessions alone" $?
+after_index=$(api_get "/collections" | python3 -c "
+import json,sys; print([c['index_type'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+check_eq "the index type actually changed" "$after_index" "flat"
+
+api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+tjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_tj.json'))['job_id'])")
+tstatus=$(wait_for_job "/tune/job/$tjob" 1800)
+check_eq "re-chunk completes" "$tstatus" "completed"
+after_chunks=$(api_get "/tune/job/$tjob" | jfield "['chunks_written']")
+[ "$after_chunks" -gt "$chunks_before" ]
+check "re-chunking with a smaller size yields more chunks" $? "$chunks_before -> $after_chunks"
+
+# ── chunks-only refuses re-chunking ──────────────────────────────────────────
+SRCLESS="${PREFIX}Chunksonly"
+drop_collection "$SRCLESS"; make_collection "$SRCLESS"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$SRCLESS" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_s.json
+sjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_s.json'))['job_id'])")
+wait_for_job "/ingest/job/$sjob" 900 >/dev/null
+(cd "$REPO_ROOT" && docker compose exec -T api sh -c "rm -rf /app/sources/$SRCLESS") >/dev/null 2>&1
+check_eq "a source-less collection reports chunks-only" \
+  "$(api_get "/tune/$SRCLESS" | jfield "['fidelity']")" "chunks-only"
+api_post "/tune/rechunk" "{\"collection\":\"$SRCLESS\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80}" > /tmp/vfy_tj.json
+tjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_tj.json'))['job_id'])")
+wait_for_job "/tune/job/$tjob" 900 >/dev/null
+check_eq "re-chunking a chunks-only collection is refused" \
+  "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
+api_post "/tune/reembed" "{\"collection\":\"$SRCLESS\",\"chunk_size\":80}" > /tmp/vfy_tj.json
+tjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_tj.json'))['job_id'])")
+wait_for_job "/tune/job/$tjob" 900 >/dev/null
+check_eq "re-embedding a chunks-only collection with new chunking is refused" \
+  "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
+drop_collection "$SRCLESS"
+
+# ── the help page and the package README share a source ──────────────────────
+api_get "/help/transfer" > /tmp/vfy_help.json
+python3 - "$EXPORTS/$PKG" <<'ENDPY'
+import json, pathlib, sys, tarfile, tempfile
+help_md = json.load(open('/tmp/vfy_help.json'))['markdown']
+partials = pathlib.Path('../../api/templates/partials')
+with tempfile.TemporaryDirectory() as td:
+    with tarfile.open(sys.argv[1]) as t:
+        t.extractall(td)
+    root = next(p for p in pathlib.Path(td).iterdir() if p.is_dir())
+    readme = (root / "README.md").read_text()
+missing = []
+for part in sorted(partials.glob("*.md")):
+    probe = max(part.read_text().split("\n"), key=len).strip()
+    if "@@" in probe:
+        probe = probe.split("@@")[0].strip()
+    if not probe:
+        continue
+    if probe not in help_md:
+        missing.append(f"{part.stem}: absent from help page")
+    # retrieve_usage only appears in a README when that package ships a script
+    elif probe not in readme and part.stem != "retrieve_usage":
+        missing.append(f"{part.stem}: absent from package README")
+sys.exit(0 if not missing else 1)
+ENDPY
+check "help page and package README render from the same partials" $?
+python3 -c "
+import json,re,sys
+m=json.load(open('/tmp/vfy_help.json'))['markdown']
+sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
+check "the help page has no unsubstituted placeholders" $?
+
+rm -f "$EXPORTS/$PKG"
+drop_collection "$C"
+cleanup_prefixed
+summary
+```
+
+### scripts/verify/06_ui.sh
+
+```bash
+#!/usr/bin/env bash
+# SPECIFICATIONS.md §10.4 — Web UI, driven by a real headless browser.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+
+IMAGE="rag-verify-browser:latest"
+NETWORK="${RAG_NETWORK:-}"
+if [ -z "$NETWORK" ]; then
+  NETWORK=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Name}}' | head -1) )
+  NETWORK=$(docker inspect "$NETWORK" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null)
+fi
+if [ -z "$NETWORK" ]; then
+  printf '    could not determine the compose network; set RAG_NETWORK\n'
+  exit 2
+fi
+
+# Build once; it is cached thereafter.
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  printf '    building the browser image (first run only)...\n'
+  docker build -q -t "$IMAGE" ./browser >/dev/null || { printf '    image build failed\n'; exit 2; }
+fi
+
+# A collection must exist for the delete-confirmation check to have a target.
+C="${PREFIX}Ui"
+drop_collection "$C"; make_collection "$C"
+
+docker run --rm --network "$NETWORK" \
+  -e RAG_UI_BASE="${RAG_UI_BASE:-http://proxy}" \
+  -e RAG_SKIP_SLOW="$SKIP_SLOW" \
+  -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js
+rc=$?
+
+drop_collection "$C"
+cleanup_prefixed
+exit $rc
+```
+
+### scripts/verify/browser/Dockerfile
+
+```dockerfile
+# Headless Chromium for the UI checks.
+#
+# jsdom cannot run this UI: Vite emits <script type="module">, which jsdom will
+# not execute, so the page renders as an empty root and every assertion passes
+# vacuously. A real browser is the only way these checks mean anything.
+FROM node:20-alpine
+RUN apk add --no-cache chromium
+# Baked in rather than bind-mounted: a scratch directory can be reaped between
+# runs, which has already broken this image's dependencies once.
+RUN npm install -g puppeteer-core@24
+ENV NODE_PATH=/usr/local/lib/node_modules
+WORKDIR /w
+```
+
+### scripts/verify/browser/lib.js
+
+```javascript
+// Shared browser-test helpers.
+const puppeteer = require('puppeteer-core');
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function makeReporter() {
+  let pass = 0, fail = 0, skip = 0;
+  const failed = [];
+  return {
+    check(name, ok, detail = '') {
+      if (ok) { pass++; console.log(`    PASS  ${name}`); }
+      else { fail++; failed.push(name); console.log(`    FAIL  ${name}${detail ? '  — ' + detail : ''}`); }
+    },
+    skip(name, why = '') { skip++; console.log(`    SKIP  ${name}${why ? '  — ' + why : ''}`); },
+    section(t) { console.log(`\n  ${t}`); },
+    summary() {
+      console.log(`\n  ${pass} passed, ${fail} failed, ${skip} skipped`);
+      if (fail) { console.log('  failed:'); failed.forEach(f => console.log(`    - ${f}`)); }
+      return fail === 0;
+    },
+  };
+}
+
+async function launch() {
+  return puppeteer.launch({
+    executablePath: '/usr/bin/chromium-browser', headless: 'new',
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+  });
+}
+
+// A fresh browser context per role, with console errors and API calls recorded.
+// Console errors matter: a React component that throws unmounts the whole app,
+// which once turned every page blank after visiting /health.
+async function session(browser, base, role) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [], api = [];
+  page.on('pageerror', e => errors.push('pageerror: ' + e.message));
+  page.on('console', m => { if (m.type() === 'error') errors.push('console.error: ' + m.text()); });
+  page.on('request', r => {
+    const u = r.url();
+    if (u.includes('/api/')) api.push({ method: r.method(), url: u.replace(/^https?:\/\/[^/]+/, ''), at: Date.now() });
+  });
+  await page.goto(base + '/', { waitUntil: 'networkidle2' });
+  if (role) await page.evaluate(r => sessionStorage.setItem('rag_role', JSON.stringify({ role: r })), role);
+  return { ctx, page, errors, api };
+}
+
+const bodyText = page => page.evaluate(
+  () => (document.querySelector('#root')?.innerText || '').replace(/\s+/g, ' ').trim());
+
+// React tracks input state internally, so assigning .value is ignored. Use the
+// native setter and dispatch the event React listens for.
+const setValue = (page, selectorFn, value) => page.evaluate((fn, v) => {
+  const el = eval(fn)();
+  const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype
+              : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+              : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+  el.dispatchEvent(new Event(el instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }));
+}, selectorFn, value);
+
+const clickByText = (page, text) => page.evaluate(t => {
+  const el = [...document.querySelectorAll('a,button')].find(e => (e.textContent || '').trim() === t);
+  if (!el) return false; el.click(); return true;
+}, text);
+
+module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, clickByText };
+```
+
+### scripts/verify/browser/ui_criteria.js
+
+```javascript
+// SPECIFICATIONS.md §10.4 — Web UI, plus the Transfer and help pages.
+//
+// Selectors here are deliberately precise. Loose ones have produced false
+// results in both directions: a collections dropdown once matched as the
+// chunking-strategy selector, `input[type=text]` missed an input with no type
+// attribute, and a row's delete link matched a class test meant for the modal's
+// confirm button.
+const { sleep, makeReporter, launch, session, bodyText, clickByText } = require('./lib');
+
+const BASE = process.env.RAG_UI_BASE || 'http://proxy';
+const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
+
+(async () => {
+  const browser = await launch();
+  const r = makeReporter();
+
+  // ── role persistence ───────────────────────────────────────────────────────
+  r.section('§10.4 role selection');
+  {
+    const s = await session(browser, BASE, null);
+    await s.page.goto(BASE + '/', { waitUntil: 'networkidle2' });
+    await sleep(1200);
+    const picked = await s.page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find(x => /Engineer/i.test(x.textContent));
+      if (!b) return false; b.click(); return true;
+    });
+    r.check('a role can be chosen on the landing page', picked);
+    const stored = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
+    r.check('the choice is persisted', !!stored, String(stored));
+    for (const p of ['/qa', '/collections', '/health', '/qa']) {
+      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(700);
+    }
+    const after = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
+    const navPresent = await s.page.evaluate(() => document.querySelectorAll('nav a').length > 0);
+    r.check('the role survives navigation', after === stored && navPresent);
+    await s.ctx.close();
+  }
+
+  // ── role gating ────────────────────────────────────────────────────────────
+  r.section('§10.4 role gating');
+  {
+    const s = await session(browser, BASE, 'end_user');
+    await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+    r.check('End User sees only Q&A in the nav', links.length === 1 && /Q&A/.test(links[0]), JSON.stringify(links));
+    await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1200);
+    const landed = await s.page.evaluate(() => location.pathname);
+    r.check('End User cannot reach a gated route directly', landed === '/qa', `landed on ${landed}`);
+    await s.ctx.close();
+  }
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health']) {
+      r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
+    }
+    await s.ctx.close();
+  }
+
+  // ── chunking explainer ─────────────────────────────────────────────────────
+  r.section('§10.4 chunking explainer');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.goto(BASE + '/chunking', { waitUntil: 'networkidle2' }); await sleep(2200);
+    let reloads = 0; s.page.on('framenavigated', () => reloads++);
+    const options = await s.page.evaluate(K => {
+      const sel = [...document.querySelectorAll('select')]
+        .find(x => { const v = [...x.options].map(o => o.value); return K.every(k => v.includes(k)); });
+      return sel ? [...sel.options].map(o => o.value) : [];
+    }, STRATEGIES);
+    r.check('the strategy selector offers every strategy', options.length === STRATEGIES.length, JSON.stringify(options));
+    const seen = [];
+    for (const v of options) {
+      await s.page.evaluate(val => {
+        const sel = [...document.querySelectorAll('select')].find(x => [...x.options].some(o => o.value === val));
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(sel, val);
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }, v);
+      await sleep(500);
+      seen.push(await bodyText(s.page));
+    }
+    r.check('each strategy renders a distinct explanation',
+            options.length > 1 && new Set(seen).size === options.length, `${new Set(seen).size} distinct`);
+    r.check('no page reload occurs', reloads === 0, `${reloads} navigations`);
+    await s.ctx.close();
+  }
+
+  // ── delete confirmation ────────────────────────────────────────────────────
+  r.section('§10.4 delete confirmation');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(2200);
+    const opened = await s.page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Delete');
+      if (!b) return false; b.click(); return true;
+    });
+    if (!opened) {
+      r.skip('delete confirmation', 'no collection present to delete');
+    } else {
+      await sleep(700);
+      const state = await s.page.evaluate(() => {
+        const inputs = [...document.querySelectorAll('input')].filter(i => !i.type || i.type === 'text');
+        // the modal's confirm button is the solid red one; the row link is not
+        const btn = [...document.querySelectorAll('button')]
+          .find(b => b.textContent.trim() === 'Delete' && b.className.includes('bg-red-600'));
+        return { inputs: inputs.length, disabled: btn ? btn.disabled : null };
+      });
+      r.check('the modal asks for the name to be typed', state.inputs > 0, JSON.stringify(state));
+      r.check('confirm is disabled until it matches', state.disabled === true, JSON.stringify(state));
+      const before = s.api.filter(x => x.method === 'DELETE').length;
+      await s.page.evaluate(() => {
+        const el = [...document.querySelectorAll('input')].find(i => !i.type || i.type === 'text');
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'not-the-name');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        const btn = [...document.querySelectorAll('button')]
+          .find(b => b.textContent.trim() === 'Delete' && b.className.includes('bg-red-600'));
+        if (btn && !btn.disabled) btn.click();
+      });
+      await sleep(900);
+      r.check('a wrong name sends no DELETE',
+              s.api.filter(x => x.method === 'DELETE').length === before);
+    }
+    await s.ctx.close();
+  }
+
+  // ── health dashboard ───────────────────────────────────────────────────────
+  r.section('§10.4 health dashboard');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.goto(BASE + '/health', { waitUntil: 'networkidle2' }); await sleep(2500);
+    const body = await bodyText(s.page);
+    const latencies = body.match(/\d+\s*ms/g) || [];
+    r.check('per-service latency is shown', latencies.length >= 3, latencies.slice(0, 5).join(' '));
+    // Services are labelled by role and model, not by the word "Ollama".
+    for (const want of ['Weaviate', 'LLM', 'Embed']) {
+      r.check(`the dashboard names ${want}`, new RegExp(want, 'i').test(body));
+    }
+    if (process.env.RAG_SKIP_SLOW === '1') {
+      r.skip('30s auto-refresh', 'needs a 70s observation window');
+    } else {
+      const t0 = Date.now(); s.api.length = 0;
+      await sleep(70000);
+      const hits = s.api.filter(x => x.url.includes('/health')).map(x => Math.round((x.at - t0) / 1000));
+      const gaps = hits.slice(1).map((v, i) => v - hits[i]);
+      r.check('the dashboard refreshes on its own', hits.length >= 2, `polled at t+${hits.join('s, t+')}s`);
+      r.check('the interval is about 30s', gaps.length > 0 && gaps.every(g => g >= 25 && g <= 35), `gaps: ${gaps.join(', ')}s`);
+    }
+    r.check('no console errors on the health page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    await s.ctx.close();
+  }
+
+  // ── transfer help page ─────────────────────────────────────────────────────
+  r.section('transfer help page');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.goto(BASE + '/help/transfer', { waitUntil: 'networkidle2' }); await sleep(2500);
+    const info = await s.page.evaluate(() => {
+      const h1 = document.querySelector('h1');
+      const p = document.querySelector('article p');
+      return {
+        chars: (document.querySelector('#root')?.innerText || '').length,
+        headings: [...document.querySelectorAll('h2')].map(e => e.textContent.trim()),
+        tables: document.querySelectorAll('table').length,
+        h1Size: h1 ? parseFloat(getComputedStyle(h1).fontSize) : 0,
+        pSize: p ? parseFloat(getComputedStyle(p).fontSize) : 0,
+      };
+    });
+    r.check('the help page renders substantive content', info.chars > 3000, `${info.chars} chars`);
+    r.check('markdown tables render', info.tables >= 3, `${info.tables} tables`);
+    r.check('headings are styled (typography plugin present)', info.h1Size > info.pSize,
+            `h1=${info.h1Size}px p=${info.pSize}px`);
+    for (const want of ['Where packages live', 'Naming', 'What a package contains',
+                        'Fidelity', 'embedding model rule', 'name collision', 'Tuning after import']) {
+      r.check(`§10 topic covered: ${want}`,
+              info.headings.some(h => h.toLowerCase().includes(want.toLowerCase())),
+              info.headings.join(' | ').slice(0, 80));
+    }
+    r.check('no console errors on the help page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    await s.ctx.close();
+  }
+
+  await browser.close();
+  process.exit(r.summary() ? 0 : 1);
+})().catch(e => { console.log('  HARNESS FAILURE: ' + e.message); process.exit(2); });
+```
+
+## 6. Packaging and Offline Distribution
 
 Specified in `SPECIFICATIONS.md` §11. The files below are the implementation.
 

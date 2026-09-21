@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from config import settings
+from services import ingest_config
 from services import model_bundle
 from services import retrieval_config
 from services import sources
@@ -176,15 +177,8 @@ def render_help(embed_dimensions: int | str) -> str:
 
 
 def _ingest_config(collection: str) -> dict | None:
-    safe = re.sub(r"[^a-zA-Z0-9_]", "_", collection)
-    p = Path(settings.upload_dir) / "ingest_configs" / f"{safe}.json"
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except (OSError, ValueError):
-        _log.warning("Unreadable ingest config for %r; omitting from package", collection)
-        return None
+    """The collection's saved chunking settings, or None."""
+    return ingest_config.load(collection)
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:

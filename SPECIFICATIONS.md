@@ -1718,8 +1718,18 @@ rag-docker/
 
 ## 10. Acceptance Criteria
 
-**All 32 verified 2026-09-21** against the running stack. Seven defects were
-found and fixed; each is noted against the criterion that exposed it.
+**All 32 verified 2026-09-21** against the running stack, and now automated in
+`scripts/verify/` so they can be re-run on demand. Eight defects were found and
+fixed; each is noted against the criterion that exposed it.
+
+The eighth was found by the test suite itself, on its second run: deleting a
+collection removed its sources and retrieval config but **not** its ingest
+config, so a collection recreated under the same name silently inherited
+chunking settings the user never chose (Section 8 rule 1 of
+`RAG_EXPORT_SPECIFICATIONS.md` requires both configs to go). The path convention
+had been written out three separate times — in the ingest router, in the
+exporter, and needed a fourth time here — which is how the omission survived. It
+now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 

@@ -8,14 +8,12 @@ from pydantic import BaseModel
 
 from config import settings
 from models.schemas import IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from utils import api_error
 
 router = APIRouter(prefix="/ingest")
-
-_CONFIGS_DIR: Path | None = None
-
 
 class SaveIngestConfigBody(BaseModel):
     collection: str
@@ -24,28 +22,6 @@ class SaveIngestConfigBody(BaseModel):
     chunk_overlap: int = 200
     similarity_threshold: float | None = None
     min_chunk_size: int = 100
-
-
-def _configs_dir() -> Path:
-    global _CONFIGS_DIR
-    if _CONFIGS_DIR is None:
-        _CONFIGS_DIR = Path(settings.upload_dir) / "ingest_configs"
-        _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
-    return _CONFIGS_DIR
-
-
-def _safe_name(name: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-
-def _load_config(collection: str) -> dict | None:
-    p = _configs_dir() / f"{_safe_name(collection)}.json"
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return None
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -92,27 +68,12 @@ async def job_status(job_id: str):
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
 async def get_ingest_config(collection: str):
-    cfg = await asyncio.to_thread(_load_config, collection)
-    is_default = cfg is None
-    if is_default:
-        cfg = {
-            "collection": collection,
-            "chunking_strategy": "overlap",
-            "chunk_size": 1000,
-            "chunk_overlap": 200,
-            "similarity_threshold": None,
-            "min_chunk_size": 100,
-        }
+    cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
-
-
-def _write_config(p: Path, data: str) -> None:
-    p.write_text(data)
 
 
 @router.post("/config", response_model=IngestConfigResponse, status_code=201)
 async def save_ingest_config(body: SaveIngestConfigBody):
     cfg = body.model_dump()
-    p = _configs_dir() / f"{_safe_name(body.collection)}.json"
-    await asyncio.to_thread(_write_config, p, json.dumps(cfg, indent=2))
+    await asyncio.to_thread(ingest_config.save, cfg)
     return IngestConfigResponse(is_default=False, **cfg)

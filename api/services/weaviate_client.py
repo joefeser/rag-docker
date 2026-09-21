@@ -8,6 +8,7 @@ from weaviate.classes.config import Configure, Property, DataType, VectorDistanc
 from weaviate.classes.query import MetadataQuery
 
 from config import settings
+from services import ingest_config
 from services import retrieval_config
 from services import sources
 
@@ -140,6 +141,7 @@ def _delete_collection_sync(name: str) -> int:
     # surfaced nowhere in the UI, so a leak here would be invisible.
     sources.delete(name)
     retrieval_config.delete(name)
+    ingest_config.delete(name)
     # Gold-standard sessions are kept and flagged, never deleted (spec §8 rule 4):
     # they are evaluation work the user may still want, and the pairs stay
     # readable even with the collection gone. Imported here rather than at module
