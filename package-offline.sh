@@ -28,7 +28,7 @@ OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 IMAGES=(
   rag-docker-api:latest
   rag-docker-ui:latest
-  semitechnologies/weaviate:1.39.4
+  semitechnologies/weaviate:1.39.6
   ollama/ollama:0.3.14
   nginx:1.29-alpine
 )
