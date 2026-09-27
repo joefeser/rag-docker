@@ -30,7 +30,7 @@ IMAGES=(
   rag-docker-ui:latest
   semitechnologies/weaviate:1.39.4
   ollama/ollama:0.3.14
-  nginx:1.27-alpine
+  nginx:1.29-alpine
 )
 
 echo "==> Checking prerequisites"
