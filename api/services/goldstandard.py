@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
+from models.schemas import SessionResponse
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 
@@ -38,6 +39,19 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
+_SESSION_ID = re.compile(r"gs_[0-9a-f]{8}")
+
+
+def validate_session_id(session_id: str) -> None:
+    """Imported identities use the same grammar as locally generated ones."""
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        raise ValueError("Invalid evaluation session ID.")
+
+
+def validate_session(session: dict) -> None:
+    """Validate without normalising or dropping historical validity metadata."""
+    SessionResponse.model_validate(session, strict=True)
+    validate_session_id(session["session_id"])
 
 
 def _sessions_dir() -> Path:
@@ -47,11 +61,25 @@ def _sessions_dir() -> Path:
 
 
 def _session_path(session_id: str) -> Path:
-    return _sessions_dir() / f"{session_id}.json"
+    validate_session_id(session_id)
+    # Preflight must be read-only; the writer creates the directory only after
+    # every imported session has been checked.
+    root = (Path(settings.upload_dir) / "goldstandard_sessions").resolve()
+    candidate = root / f"{session_id}.json"
+    if candidate.is_symlink():
+        raise ValueError("Evaluation session destination is a symlink.")
+    target = candidate.resolve()
+    # Grammar prevents metadata-derived paths; containment also refuses an
+    # existing file symlink which would redirect a valid identity's write.
+    if target.parent != root:
+        raise ValueError("Evaluation session destination is outside session storage.")
+    return target
 
 
 def _save_session_sync(session: dict) -> None:
-    _session_path(session["session_id"]).write_text(json.dumps(session, indent=2))
+    path = _session_path(session["session_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(session, indent=2))
 
 
 async def _save_session(session: dict) -> None:
@@ -91,8 +119,8 @@ def store_session(session: dict) -> None:
     flagging pass writes that back over the file. Import learned this the hard
     way — a restored session reverted to its pre-import orphaned state.
     """
-    _sessions[session["session_id"]] = session
     _save_session_sync(session)
+    _sessions[session["session_id"]] = session
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:

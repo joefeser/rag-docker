@@ -332,7 +332,43 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict,
     return written
 
 
-def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
+def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
+    """Preflight every evaluation sidecar before touching live state.
+
+    A valid archive and matching digests prove neither metadata validity nor
+    safe persistence destinations. Retain these parsed snapshots so restoration
+    cannot discover an invalid later session after a replacement has begun.
+    """
+    gold = pkg / "goldstandard"
+    if not gold.exists():
+        return []
+    if not gold.is_dir():
+        raise PackageError("PACKAGE_CORRUPT", "goldstandard must be a directory.",
+                           {"file": "goldstandard"})
+    sessions: list[dict] = []
+    identities: set[str] = set()
+    for path in sorted(gold.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+            goldstandard.validate_session(data)
+            if canonical(data["collection"]) != canonical(original):
+                raise ValueError("Evaluation session belongs to a different collection.")
+            if data["session_id"] in identities:
+                raise ValueError("Duplicate evaluation session identity.")
+            # Check the live write boundary too, before any collection/model
+            # mutation. This catches pre-existing redirected destinations.
+            goldstandard._session_path(data["session_id"])
+        except (OSError, ValueError) as exc:
+            raise PackageError(
+                "PACKAGE_CORRUPT", "Invalid evaluation session metadata.",
+                {"file": f"goldstandard/{path.name}"}) from exc
+        identities.add(data["session_id"])
+        sessions.append(data)
+    return sessions
+
+
+def _restore_sidecars(target: str, pkg: Path, original: str,
+                      validated_sessions: list[dict]) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -361,16 +397,10 @@ def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
         except Exception as exc:                      # noqa: BLE001
             notes.append(f"retrieval settings could not be restored: {exc}")
 
-    gold = pkg / "goldstandard"
-    if gold.is_dir():
-        (Path(settings.upload_dir) / "goldstandard_sessions").mkdir(parents=True, exist_ok=True)
+    if validated_sessions:
         restored = 0
-        for session_file in sorted(gold.glob("*.json")):
-            try:
-                data = json.loads(session_file.read_text())
-            except ValueError:
-                notes.append(f"gold-standard session {session_file.name} was unreadable")
-                continue
+        for session in validated_sessions:
+            data = dict(session)
             # The session points at the collection by name; after a rename that
             # name is different, and a session pointing at nothing is worse than
             # no session.
@@ -438,6 +468,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                f"'{original}' is not a usable collection name.",
                                {"name": original})
 
+        validated_sessions = _read_goldstandard_sessions(pkg, original)
+
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
         exists = wc._collection_exists_sync(target)                 # check 5
@@ -476,7 +508,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
         marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+        notes = model_notes + replace_notes + _restore_sidecars(
+            target, pkg, original, validated_sessions)
 
         if staged and temp_collection:
             try:

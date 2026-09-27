@@ -322,7 +322,18 @@ Checks run in this order and stop at the first failure:
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
+| 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; its resolved storage destination is contained | `PACKAGE_CORRUPT`, naming the sidecar |
 | 5 | Collection name collision | resolved per `on_conflict` |
+
+Check 4a runs before bundled-model installation, collection creation/deletion,
+or restoring any sidecar. All sessions MUST be preflighted together, including
+later files, and the validated snapshots used for restoration. Invalid JSON or
+metadata is a refusal, not a skipped session. Session IDs use the locally
+generated `gs_[0-9a-f]{8}` grammar; malformed IDs are never rewritten. The
+persistence boundary also enforces resolved-path containment and refuses
+symlink destinations. Existing review work remains unchanged on validation
+failure, including `replace`. Optional legacy progress fields retain their
+existing defaults, and historical validity metadata is preserved.
 
 Check 4 is a refusal, not a warning. Vectors from a different model are
 meaningless rather than merely different, and a collection built from them
@@ -623,6 +634,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
+| E23 | A digest-valid package with malformed evaluation metadata fails `PACKAGE_CORRUPT` before model installation, collection mutation or sidecar restoration; existing review work remains unchanged |
 
 ---
 
