@@ -1,0 +1,123 @@
+"""Retention of original uploaded documents.
+
+Ingest previously parsed uploads and deleted them, so only chunked text survived.
+Export, re-chunking and re-embedding all need the originals, so accepted files
+are copied here instead.
+
+Files are content-addressed: the SHA-256 of the raw bytes is the storage key, so
+re-ingesting the same document stores one copy and records the extra logical
+name. Storage is proportional to the corpus rather than to upload count.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+from config import settings
+
+log = logging.getLogger(__name__)
+
+INDEX_NAME = "index.json"
+INDEX_VERSION = 1
+
+
+def _root() -> Path:
+    return Path(settings.sources_dir)
+
+
+def collection_dir(collection: str) -> Path:
+    return _root() / collection
+
+
+def _index_path(collection: str) -> Path:
+    return collection_dir(collection) / INDEX_NAME
+
+
+def load_index(collection: str) -> dict:
+    p = _index_path(collection)
+    if not p.exists():
+        return {"version": INDEX_VERSION, "documents": {}}
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        log.warning("Unreadable source index for %r; treating as empty", collection)
+        return {"version": INDEX_VERSION, "documents": {}}
+    data.setdefault("version", INDEX_VERSION)
+    data.setdefault("documents", {})
+    return data
+
+
+def _save_index(collection: str, index: dict) -> None:
+    p = _index_path(collection)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # Write via a temp file in the same directory so a crash cannot truncate an
+    # existing index.
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(index, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
+    """Retain one accepted upload. Returns its sha256."""
+    digest = hashlib.sha256(data).hexdigest()
+    target = collection_dir(collection) / digest
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if not target.exists():
+        tmp = target.with_name(digest + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(target)
+
+    now = datetime.now(timezone.utc).isoformat()
+    index = load_index(collection)
+    entry = index["documents"].get(digest)
+    if entry is None:
+        index["documents"][digest] = {
+            "filenames": [filename],
+            "size": len(data),
+            "media_type": media_type,
+            "first_seen": now,
+            "last_seen": now,
+        }
+    else:
+        if filename not in entry["filenames"]:
+            entry["filenames"].append(filename)
+        entry["last_seen"] = now
+    _save_index(collection, index)
+    return digest
+
+
+def digests_for_filename(collection: str, filename: str) -> list[str]:
+    """All digests ever stored under this logical filename.
+
+    Returns more than one when the same name was ingested with different
+    content. Callers must decide what that means rather than assume one.
+    """
+    index = load_index(collection)
+    return [d for d, e in index["documents"].items() if filename in e.get("filenames", [])]
+
+
+def has_sources(collection: str) -> bool:
+    """True when the collection has retained originals (export fidelity)."""
+    return bool(load_index(collection)["documents"])
+
+
+def stats(collection: str) -> dict:
+    docs = load_index(collection)["documents"]
+    return {
+        "document_count": len(docs),
+        "total_bytes": sum(e.get("size", 0) for e in docs.values()),
+    }
+
+
+def delete(collection: str) -> None:
+    """Remove every retained source for a collection.
+
+    Called when the collection is deleted. Without this the volume leaks
+    silently: it is surfaced nowhere in the UI.
+    """
+    shutil.rmtree(collection_dir(collection), ignore_errors=True)

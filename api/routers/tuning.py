@@ -1,0 +1,92 @@
+"""Tuning a collection after import: re-chunk, re-embed, re-index.
+
+Spec §7. Each operation rebuilds the collection and is long-running, so all
+three follow the job-and-poll pattern.
+"""
+from __future__ import annotations
+
+import asyncio
+
+from fastapi import APIRouter
+
+from models.schemas import (
+    ReembedRequest,
+    ReindexRequest,
+    RechunkRequest,
+    TuneJobStatusResponse,
+    TuneOptionsResponse,
+    TuneStartResponse,
+)
+from services import sources, tuning
+from services import weaviate_client as wc
+from utils import api_error
+
+router = APIRouter(prefix="/tune")
+
+
+async def _start(collection: str, operation: str, params: dict):
+    if not await wc.collection_exists(collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
+    try:
+        job_id = await tuning.start_tune_job(collection, operation, params)
+    except RuntimeError as exc:
+        return api_error(409, "TUNE_IN_PROGRESS",
+                         f"'{exc}' is already being tuned.",
+                         detail={"collection": str(exc)})
+    return TuneStartResponse(job_id=job_id, status="queued",
+                             collection=collection, operation=operation)
+
+
+@router.post("/rechunk", response_model=TuneStartResponse, status_code=202)
+async def rechunk(body: RechunkRequest):
+    """Re-split the retained originals and rebuild. Needs `with-sources`."""
+    return await _start(body.collection, "rechunk", {"chunking": body.chunking()})
+
+
+@router.post("/reembed", response_model=TuneStartResponse, status_code=202)
+async def reembed(body: ReembedRequest):
+    """Regenerate vectors.
+
+    With no chunking parameters this re-embeds what is stored, leaving chunk
+    boundaries alone. With them, it is a re-chunk as well, which a chunks-only
+    collection refuses rather than half-honouring (spec §7.2).
+    """
+    return await _start(body.collection, "reembed",
+                        {"chunking": body.chunking() if body.has_chunking() else None})
+
+
+@router.post("/reindex", response_model=TuneStartResponse, status_code=202)
+async def reindex(body: ReindexRequest):
+    """Change index type or distance metric, reusing the existing vectors."""
+    return await _start(body.collection, "reindex",
+                        {"index_type": body.index_type,
+                         "distance_metric": body.distance_metric})
+
+
+@router.get("/job/{job_id}", response_model=TuneJobStatusResponse)
+async def tune_job_status(job_id: str):
+    job = tuning.get_job(job_id)
+    if job is None:
+        return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
+    return TuneJobStatusResponse(**job)
+
+
+@router.get("/{collection}", response_model=TuneOptionsResponse)
+async def tune_options(collection: str):
+    """What this collection can be tuned with, given its fidelity."""
+    if not await wc.collection_exists(collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
+    has_sources = await asyncio.to_thread(sources.has_sources, collection)
+    stats = await asyncio.to_thread(sources.stats, collection)
+    return TuneOptionsResponse(
+        collection=collection,
+        fidelity="with-sources" if has_sources else "chunks-only",
+        source_document_count=stats["document_count"],
+        can_rechunk=has_sources,
+        can_reembed=True,
+        can_reindex=True,
+        note=("Every tuning operation is available." if has_sources else
+              "No original documents were retained, so this collection cannot be "
+              "re-chunked. Re-embedding works from the stored chunk text, which "
+              "leaves chunk boundaries unchanged."),
+    )

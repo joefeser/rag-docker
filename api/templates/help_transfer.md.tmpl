@@ -1,0 +1,101 @@
+# Moving a RAG between machines
+
+A collection can be exported as a single `.tar.gz` and imported somewhere else —
+another laptop, a customer's machine, an air-gapped network. The package carries
+the chunks and their vectors, the settings the collection was tuned with, a
+standalone query script and, when the originals were retained, the source
+documents themselves.
+
+Everything below is rendered from the same templates that generate the
+`README.md` inside each package, so the two cannot disagree.
+
+## Where packages live
+
+Both directions use `./exports/` in the project directory, which is a bind mount
+rather than a Docker volume so you can pick files up and drop them in directly.
+
+- **Exporting** writes the `.tar.gz` there.
+- **Importing** reads from there: copy a package in first, then import by filename.
+
+`GET /api/packages` lists what is currently in that directory, including files it
+cannot read — those are shown rather than hidden, so nothing disappears silently.
+
+Packages are never deleted automatically, and importing never modifies the file.
+
+## Naming
+
+@@INCLUDE:naming@@
+
+## What a package contains
+
+@@INCLUDE:contents@@
+
+## Fidelity: with-sources or chunks-only
+
+@@INCLUDE:fidelity_table@@
+
+**Why some collections are `chunks-only`.** Retaining original documents was
+added after the first version of this platform. A collection ingested before that
+has its chunks and vectors but not the files they came from, so it exports as
+`chunks-only`. Nothing is wrong with it — it imports and answers questions
+normally. It simply cannot be re-split, because the text to re-split is gone.
+
+Re-ingesting the original documents into a new collection is the way to get full
+fidelity for an older corpus.
+
+## The embedding model rule
+
+@@INCLUDE:embedding_rule@@
+
+If the target machine has no embedding model at all, export with
+`include_models: true`. That bundles `@@EMBED_MODEL@@` and `@@LLM_MODEL@@` as
+Ollama's own manifest and blob files, taking the package from kilobytes to
+roughly 2.3 GB. On import a model already present is left alone; a missing one is
+installed from the package and checked before the collection is built.
+
+Without bundled models, importing into a machine that lacks the embedding model
+fails with `EMBEDDING_MODEL_MISSING` — a different error from a mismatch, because
+the remedy is different.
+
+## Handling a name collision
+
+`on_conflict` is required when importing and has no default, because the wrong
+choice can delete a collection.
+
+| Value | Behaviour |
+|---|---|
+| `abort` | Fail if a collection of that name already exists. |
+| `rename` | Import alongside it as `<name>_imported_<id8>`. |
+| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly, so a failed replace leaves the original intact. |
+
+Replacing a collection keeps its gold-standard sessions and marks them orphaned,
+and the import result reports how many. They are never deleted silently.
+
+## Tuning after import
+
+| Goal | Requires | How |
+|---|---|---|
+| Change mode, `top_k` or `alpha` | nothing | Retrieval page, or per request on `POST /query` |
+| Change index type or distance metric | nothing | `POST /tune/reindex` — reuses the existing vectors |
+| Change chunk size, overlap or strategy | `with-sources` | `POST /tune/rechunk` |
+| Change the embedding model | `with-sources` preferred | `POST /tune/reembed` |
+| Add documents | matching embedding model | normal ingest |
+
+`GET /api/tune/<collection>` reports which of these a given collection can do.
+
+Every rebuild is staged into a temporary collection and swapped in only once it
+succeeds, so a failed tune leaves the collection as it was.
+
+**Gold-standard sessions are flagged, never deleted or remapped.** Re-chunking or
+re-embedding changes which chunks exist, so evaluation pairs built against the
+old ones no longer describe what is stored; those sessions are marked `stale`
+with a reason and a timestamp. Guessing which new chunk replaces an old one would
+corrupt a baseline silently, which is worse than an honest flag. Changing only
+the index or distance metric does not touch chunk identity, and leaves sessions
+alone.
+
+## Running a package's query script
+
+@@INCLUDE:retrieve_usage@@
+
+@@INCLUDE:encryption@@

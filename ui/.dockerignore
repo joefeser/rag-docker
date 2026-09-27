@@ -1,0 +1,41 @@
+# Build context exclusions for the ui image.
+#
+# The Dockerfile runs `COPY package*.json ./` -> `npm ci` -> `COPY . .`, so the
+# second COPY lands on top of an already-installed tree. Without this file, a
+# host node_modules/ would overwrite the container's freshly installed packages
+# with ones built for the host platform (darwin/arm64 binaries inside a linux
+# image), producing a broken or silently wrong build.
+
+# Host install and build output
+node_modules
+dist
+.vite
+.cache
+
+# OS and editor noise. These bust the `COPY . .` layer cache on every Finder
+# or editor touch, forcing a needless rebuild of `npm run build`.
+.DS_Store
+**/.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Local environment files are never baked into an image.
+# (Nothing in ui/src reads import.meta.env today, so the build does not need them.)
+.env
+.env.*
+
+# Logs and caches
+*.log
+npm-debug.log*
+yarn-error.log*
+.npm
+.eslintcache
+
+# Version control
+.git
+.gitignore
+
+# Read directly by the builder; no need to ship them inside the image.
+Dockerfile
+.dockerignore

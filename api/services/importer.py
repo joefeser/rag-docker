@@ -1,0 +1,543 @@
+"""The import job: validate a package, then build a collection from it.
+
+Reads the package through `packager.py` so the format has exactly one
+implementation. Validation order is spec §6.2 and stops at the first failure.
+
+**Atomicity, and where it departs from the plan.** The plan said to build into a
+temporary collection and rename it on success. Weaviate has no rename:
+`client.collections` offers create/delete/exists/get/list_all and nothing else,
+confirmed against 4.23.1. So the guarantee in spec §6.5 — a failed import leaves
+no partial collection and never destroys the target — is met differently
+depending on whether there is anything to protect:
+
+* `abort` and `rename` produce a collection name that does not yet exist, so the
+  build goes straight into it and is deleted on failure. Nothing pre-existing is
+  at risk, and there is no second pass.
+* `replace` builds into a temporary collection first, to prove the package
+  inserts cleanly, and only then deletes the existing collection and builds the
+  real one. That costs a second insert pass, which is the price of a
+  non-destructive replace in a database that cannot rename. If the second pass
+  fails, the temporary collection is *kept* and named in the error, so the data
+  is recoverable rather than lost.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import shutil
+import tempfile
+import threading
+import uuid
+from pathlib import Path
+
+from config import settings
+from services import goldstandard
+from services import model_bundle
+from services import packager
+from services import retrieval_config
+from services import sources
+from services import weaviate_client as wc
+from services.packager import PackageError
+
+_log = logging.getLogger(__name__)
+
+ON_CONFLICT = ("abort", "rename", "replace")
+
+_jobs: dict[str, dict] = {}
+_active: set[str] = set()
+_lock = threading.Lock()
+
+# Weaviate capitalises the first character of a collection name and rejects
+# anything outside [A-Za-z0-9_]. Both were confirmed against the live server.
+_NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def get_job(job_id: str) -> dict | None:
+    return _jobs.get(job_id)
+
+
+# ── Surviving a hard kill ─────────────────────────────────────────────────────
+#
+# `abort` and `rename` build straight into the target collection, so there is no
+# staging name for the startup sweep to recognise. A SIGKILL during the insert
+# would leave a half-filled collection that looks like a real one. A marker
+# written before the build, and removed after it, lets the next start tell the
+# two apart.
+
+def _markers_dir() -> Path:
+    d = Path(settings.upload_dir) / "imports_in_progress"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _marker_path(collection: str) -> Path:
+    return _markers_dir() / f"{_safe_file(collection)}.json"
+
+
+def _mark_started(collection: str, expected_chunks: int, job_id: str) -> None:
+    _marker_path(collection).write_text(json.dumps({
+        "collection": collection,
+        "expected_chunks": expected_chunks,
+        "job_id": job_id,
+    }, indent=2))
+
+
+def _mark_finished(collection: str) -> None:
+    _marker_path(collection).unlink(missing_ok=True)
+
+
+# Extraction workspaces created by an import or a re-chunk. Both remove their
+# own directory in a `finally`, which a hard kill skips -- twelve of these were
+# found holding 152 MB after the kill tests, and a with-models package would
+# leave 2.3 GB behind each time.
+_WORKDIR_PREFIXES = ("import-", "rechunk-")
+
+
+def sweep_stale_workdirs() -> list[str]:
+    """Remove extraction directories abandoned by a killed job."""
+    root = Path(settings.upload_dir)
+    removed: list[str] = []
+    if not root.is_dir():
+        return removed
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or not entry.name.startswith(_WORKDIR_PREFIXES):
+            continue
+        try:
+            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+            shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            _log.exception("Could not remove stale work directory %s", entry)
+            continue
+        removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+    return removed
+
+
+def sweep_interrupted_imports() -> list[str]:
+    """Remove collections left half-built by a killed import.
+
+    The expected chunk count is compared rather than trusting the marker alone:
+    a marker that outlived a *successful* import — a failed unlink, a disk
+    error — must not cost the user a complete collection.
+    """
+    removed: list[str] = []
+    for marker in sorted(_markers_dir().glob("*.json")):
+        try:
+            data = json.loads(marker.read_text())
+            collection = data["collection"]
+            expected = int(data.get("expected_chunks", -1))
+        except (OSError, ValueError, KeyError):
+            marker.unlink(missing_ok=True)
+            continue
+        try:
+            if wc._collection_exists_sync(collection):
+                col = wc.get_client().collections.get(collection)
+                actual = col.aggregate.over_all(total_count=True).total_count or 0
+                if expected < 0 or actual != expected:
+                    wc.get_client().collections.delete(collection)
+                    removed.append(f"{collection} ({actual} of {expected} chunks)")
+        except Exception:                             # noqa: BLE001
+            _log.exception("Could not resolve interrupted import of %r", collection)
+            continue
+        marker.unlink(missing_ok=True)
+    return removed
+
+
+def canonical(name: str) -> str:
+    """The name Weaviate will actually store, so collision checks are honest."""
+    return name[:1].upper() + name[1:] if name else name
+
+
+def _safe_file(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+
+def _rename_target(name: str, id8: str) -> str:
+    """Spec §6.4's `rename`, adjusted to a name Weaviate accepts.
+
+    The spec says `<name>-imported-<id8>`; Weaviate rejects hyphens with a 422,
+    so the separator is an underscore. A numeric suffix is added only if that
+    name is taken too, which happens when the same package is imported twice.
+    """
+    base = f"{canonical(name)}_imported_{id8}"
+    if not wc._collection_exists_sync(base):
+        return base
+    for n in range(2, 100):
+        candidate = f"{base}_{n}"
+        if not wc._collection_exists_sync(candidate):
+            return candidate
+    raise PackageError("COLLECTION_EXISTS",
+                       f"Could not find a free name based on '{base}'.")
+
+
+# ── Validation (spec §6.2) ────────────────────────────────────────────────────
+
+def _check_embedding(manifest: dict) -> None:
+    """Check 4. A refusal, not a warning — see spec §6.2."""
+    embedding = manifest.get("embedding") or {}
+    pkg_model = embedding.get("model")
+    pkg_dims = embedding.get("dimensions")
+    our_model = settings.embed_model
+
+    if pkg_model != our_model:
+        fidelity = manifest.get("fidelity")
+        remedy = ("This package is `with-sources`, so it can be re-embedded after "
+                  "import once that is supported."
+                  if fidelity == "with-sources" else
+                  "This package is `chunks-only`, so it cannot be re-embedded from "
+                  "the original documents. Use an instance running "
+                  f"'{pkg_model}', or re-export from one.")
+        raise PackageError(
+            "EMBEDDING_MISMATCH",
+            f"The package was embedded with '{pkg_model}' ({pkg_dims} dimensions) "
+            f"but this instance uses '{our_model}'. Vectors from a different model "
+            f"are meaningless here, not merely different, so the import is refused. "
+            + remedy,
+            {"package_model": pkg_model, "package_dimensions": pkg_dims,
+             "instance_model": our_model})
+
+    # Same model name but a different width means one side is not what it claims.
+    if pkg_dims is not None:
+        actual = _probe_dimensions()
+        if actual is not None and actual != pkg_dims:
+            raise PackageError(
+                "EMBEDDING_MISMATCH",
+                f"The package reports {pkg_dims}-dimension vectors from "
+                f"'{pkg_model}', but this instance's '{our_model}' produces "
+                f"{actual}. The models share a name but not a vector space.",
+                {"package_model": pkg_model, "package_dimensions": pkg_dims,
+                 "instance_model": our_model, "instance_dimensions": actual})
+
+
+_probed_dimensions: int | None = None
+
+
+def _probe_dimensions() -> int | None:
+    """Embed a token once to learn this instance's real vector width."""
+    global _probed_dimensions
+    if _probed_dimensions is None:
+        try:
+            from services import ollama_client
+            vector = asyncio.run(ollama_client.embed("dimension probe"))
+            _probed_dimensions = len(vector)
+        except Exception as exc:                      # noqa: BLE001
+            _log.warning("Could not probe embedding dimensions: %s", exc)
+            return None
+    return _probed_dimensions
+
+
+def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
+    """Spec §6.3. The embedding model is the one that decides the import.
+
+    Present by name  -> skip; an existing model is assumed deliberate.
+    Absent, bundled  -> install, then verify Ollama actually reports it.
+    Absent, unbundled-> EMBEDDING_MODEL_MISSING.
+    """
+    notes: list[str] = []
+    if not model_bundle.store_available():
+        # Nothing can be installed or checked; say so rather than guess.
+        notes.append("the Ollama model store is not mounted, so models were not checked")
+        return notes
+
+    embed_model = settings.embed_model
+    llm_model = settings.llm_model
+    bundled = model_bundle.bundled_models(pkg)
+
+    for model, required in ((embed_model, True), (llm_model, False)):
+        name = model_bundle.split_ref(model)[0]
+        if model_bundle.is_installed(model):
+            notes.append(f"model '{name}' already present; left untouched")
+            continue
+        if name not in bundled:
+            if not required:
+                notes.append(f"model '{name}' is absent and not bundled; "
+                             "queries will fail until it is pulled")
+                continue
+            pkg_model = (manifest.get("embedding") or {}).get("model")
+            raise PackageError(
+                "EMBEDDING_MODEL_MISSING",
+                f"This instance does not have the embedding model '{name}' and the "
+                f"package does not bundle it. The vectors in this package were "
+                f"produced by '{pkg_model}', so nothing can embed a query against "
+                f"them. Pull it with `docker compose exec ollama ollama pull {name}`, "
+                f"or import a package exported with include_models=true.",
+                {"model": name, "package_model": pkg_model, "bundled": bundled})
+        try:
+            model_bundle.install_model(pkg, model)
+        except (OSError, ValueError) as exc:
+            raise PackageError(
+                "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
+                f"Could not install bundled model '{name}': {exc}",
+                {"model": name}) from exc
+        if not model_bundle.is_installed(model):
+            raise PackageError(
+                "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
+                f"Installed '{name}' from the package but Ollama does not report it.",
+                {"model": name})
+        notes.append(f"model '{name}' installed from the package")
+    return notes
+
+
+# ── Building ──────────────────────────────────────────────────────────────────
+
+def _create_from_package(name: str, pkg: Path) -> None:
+    cfg_path = pkg / "collection.json"
+    cfg = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
+    wc._create_collection_sync(
+        name,
+        cfg.get("index_type", "hnsw"),
+        cfg.get("distance_metric", "cosine"),
+        cfg.get("hnsw_config") or {},
+    )
+
+
+def _insert_chunks(name: str, pkg: Path, manifest: dict,
+                   progress) -> int:
+    """Insert every chunk with its original uuid and vector.
+
+    The uuid is preserved deliberately: gold-standard sessions reference chunks
+    by id, and that is the reason sessions are exportable at all.
+    """
+    client = wc.get_client()
+    col = client.collections.get(name)
+    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
+    written = 0
+    with col.batch.dynamic() as batch:
+        for record in packager.iter_chunks_file(pkg):
+            vector = record.get("vector")
+            if not isinstance(vector, list) or not vector:
+                raise PackageError("PACKAGE_CORRUPT",
+                                   f"Chunk {record.get('id')} has no vector.",
+                                   {"file": "chunks.jsonl", "id": record.get("id")})
+            if expected_dims and len(vector) != expected_dims:
+                raise PackageError(
+                    "PACKAGE_CORRUPT",
+                    f"Chunk {record.get('id')} has {len(vector)} dimensions but the "
+                    f"manifest declares {expected_dims}.",
+                    {"file": "chunks.jsonl", "id": record.get("id")})
+            batch.add_object(properties=record["properties"],
+                             uuid=record["id"],
+                             vector=vector)
+            written += 1
+            if progress and written % 500 == 0:
+                progress(written)
+        if batch.number_errors > 0:
+            raise PackageError(
+                "PACKAGE_CORRUPT",
+                f"Weaviate rejected {batch.number_errors} object(s) while importing.",
+                {"errors": batch.number_errors})
+    if progress:
+        progress(written)
+    return written
+
+
+def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
+    """Sources, configs and gold-standard sessions. Returns notes for the job."""
+    notes: list[str] = []
+
+    src = pkg / "sources"
+    if src.is_dir():
+        dest = sources.collection_dir(target)
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            if item.is_file():
+                shutil.copyfile(item, dest / item.name)
+
+    ingest_cfg = pkg / "ingest_config.json"
+    if ingest_cfg.is_file():
+        data = json.loads(ingest_cfg.read_text())
+        data["collection"] = target
+        out = Path(settings.upload_dir) / "ingest_configs"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
+
+    retrieval_cfg = pkg / "retrieval_config.json"
+    if retrieval_cfg.is_file():
+        data = json.loads(retrieval_cfg.read_text())
+        data["collection"] = target
+        try:
+            retrieval_config.save(data)
+        except Exception as exc:                      # noqa: BLE001
+            notes.append(f"retrieval settings could not be restored: {exc}")
+
+    gold = pkg / "goldstandard"
+    if gold.is_dir():
+        (Path(settings.upload_dir) / "goldstandard_sessions").mkdir(parents=True, exist_ok=True)
+        restored = 0
+        for session_file in sorted(gold.glob("*.json")):
+            try:
+                data = json.loads(session_file.read_text())
+            except ValueError:
+                notes.append(f"gold-standard session {session_file.name} was unreadable")
+                continue
+            # The session points at the collection by name; after a rename that
+            # name is different, and a session pointing at nothing is worse than
+            # no session.
+            data["collection"] = target
+            # A restored session is valid again for this collection, so any
+            # orphan flag from the collection it replaced no longer applies.
+            data.pop("orphaned", None)
+            data.pop("orphaned_reason", None)
+            data.pop("orphaned_at", None)
+            # Write through the service: a direct file write leaves the
+            # in-memory cache holding the old version, which the next flagging
+            # pass would write straight back over this one.
+            goldstandard.store_session(data)
+            restored += 1
+        if restored:
+            notes.append(f"{restored} gold-standard session(s) restored")
+            if target != original:
+                notes.append(f"their collection was rewritten from '{original}' to '{target}'")
+    return notes
+
+
+def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
+    """Create and fill `target`. Removes it again if anything fails."""
+    _create_from_package(target, pkg)
+    try:
+        return _insert_chunks(target, pkg, manifest, progress)
+    except Exception:
+        # Spec §6.5: a failure part-way leaves no partial collection.
+        try:
+            wc.get_client().collections.delete(target)
+        except Exception:                             # noqa: BLE001
+            _log.exception("Could not remove partial collection %r", target)
+        raise
+
+
+def _run(job_id: str, filename: str, on_conflict: str) -> None:
+    job = _jobs[job_id]
+    job["status"] = "running"
+    work = Path(tempfile.mkdtemp(prefix="import-", dir=settings.upload_dir))
+    temp_collection: str | None = None
+    marked: str | None = None
+    # True only while a *successfully built* staging collection is on disk.
+    # _build deletes its own collection on failure, so temp_collection being
+    # set is not by itself evidence that anything survived to recover.
+    staged = False
+
+    def progress(n: int) -> None:
+        job["chunks_written"] = n
+
+    try:
+        archive = packager.exports_dir() / Path(filename).name
+        pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
+        packager.verify_digests(pkg, manifest)                      # check 3
+        _check_embedding(manifest)                                  # check 4
+
+        original = manifest["collection"]["name"]
+        id8 = packager.sha256_file(pkg / "manifest.json")[:8]
+        job["collection"] = original
+        job["fidelity"] = manifest.get("fidelity")
+
+        replace_notes: list[str] = []
+        target = canonical(original)
+        if not _NAME_OK.match(target):
+            raise PackageError("PACKAGE_FORMAT_UNSUPPORTED",
+                               f"'{original}' is not a usable collection name.",
+                               {"name": original})
+
+        model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
+
+        exists = wc._collection_exists_sync(target)                 # check 5
+        if exists and on_conflict == "abort":
+            raise PackageError(
+                "COLLECTION_EXISTS",
+                f"A collection named '{target}' already exists. Import with "
+                "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
+                {"collection": target})
+
+        if exists and on_conflict == "rename":
+            target = _rename_target(original, id8)
+
+        if exists and on_conflict == "replace":
+            # Prove the package inserts cleanly before destroying anything.
+            temp_collection = f"{canonical(original)}__importing_{id8}"
+            if wc._collection_exists_sync(temp_collection):
+                wc.get_client().collections.delete(temp_collection)
+            _build(temp_collection, pkg, manifest, progress)
+            staged = True
+            job["chunks_written"] = 0
+            # Counted before the delete, because the delete is what orphans them.
+            orphaned = len(goldstandard.sessions_for(target))
+            wc._delete_collection_sync(target)   # also drops its sources + config
+            if orphaned:
+                # Spec §8 rule 4: silently destroying evaluation work is worse
+                # than reporting it, and refusing the import would block a
+                # legitimate operation over data the user may not care about.
+                replace_notes.append(
+                    f"{orphaned} gold-standard session(s) from the replaced "
+                    "collection were kept and marked orphaned")
+
+        expected = manifest.get("collection", {}).get("chunk_count", -1)
+        _mark_started(target, expected, job_id)
+        marked = target
+        written = _build(target, pkg, manifest, progress)
+        _mark_finished(target)
+        marked = None
+        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+
+        if staged and temp_collection:
+            try:
+                wc.get_client().collections.delete(temp_collection)
+            except Exception:                         # noqa: BLE001
+                _log.exception("Could not remove staging collection %r", temp_collection)
+            staged = False
+
+        job.update(status="completed", collection=target, original_collection=original,
+                   chunks_written=written, renamed=(target != canonical(original)),
+                   notes=notes)
+
+    except PackageError as exc:
+        job.update(status="failed", error_code=exc.code, error=exc.message,
+                   error_detail=exc.detail)
+        if staged and temp_collection:
+            # The real build failed after the target was deleted. Keeping the
+            # staging collection means the data is recoverable, not lost.
+            job["error"] = (exc.message + f" The imported data is available as "
+                            f"'{temp_collection}'.")
+            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection}
+    except Exception as exc:                          # noqa: BLE001
+        _log.exception("Import of %r failed", filename)
+        job.update(status="failed", error_code="IMPORT_FAILED",
+                   error=f"{type(exc).__name__}: {exc}")
+        if staged and temp_collection:
+            job["error"] = (job["error"] + f" The imported data is available as "
+                            f"'{temp_collection}'.")
+            job["error_detail"] = {"recovered_as": temp_collection}
+    finally:
+        # A handled failure already removed the partial collection, so the
+        # marker has nothing left to describe. Only a hard kill leaves one
+        # behind, which is the case the startup sweep exists for.
+        if marked:
+            _mark_finished(marked)
+        shutil.rmtree(work, ignore_errors=True)
+        with _lock:
+            _active.discard(filename)
+
+
+async def start_import_job(filename: str, on_conflict: str) -> str:
+    job_id = str(uuid.uuid4())[:8]
+    with _lock:
+        if filename in _active:
+            raise RuntimeError(filename)
+        _active.add(filename)
+
+    _jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "filename": filename,
+        "on_conflict": on_conflict,
+        "collection": None,
+        "original_collection": None,
+        "chunks_written": 0,
+        "fidelity": None,
+        "renamed": False,
+        "notes": [],
+        "error": None,
+        "error_code": None,
+        "error_detail": None,
+    }
+    asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
+    return job_id

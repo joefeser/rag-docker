@@ -1,0 +1,91 @@
+from __future__ import annotations
+import time
+
+from services import ollama_client as ollama
+from services import weaviate_client as wc
+
+REFORMULATE_SYSTEM = (
+    "You are a search query optimizer. Given a user's question, rewrite it as a concise "
+    "search query that maximizes retrieval of relevant text chunks from a vector database. "
+    "Return only the rewritten query with no explanation."
+)
+
+SYNTHESIS_END_USER_SYSTEM = (
+    "You are a helpful assistant. Answer the user's question using only the provided context. "
+    "If the context does not contain enough information to answer the question, say so clearly. "
+    "Do not use any knowledge outside the provided context. "
+    "Write in plain, clear language for a non-technical reader."
+)
+
+SYNTHESIS_ENGINEER_SYSTEM = (
+    "You are a precise technical assistant. Answer the user's question using only the provided context. "
+    "Include relevant technical details. Indicate the confidence level of your answer (high/medium/low) "
+    "based on how directly the context addresses the question. "
+    "If the context is insufficient, state this explicitly."
+)
+
+
+def _build_context_end_user(chunks: list[dict]) -> str:
+    lines = []
+    for i, c in enumerate(chunks, 1):
+        lines.append(f"[{i}] {c['content']}")
+    return "\n\n".join(lines)
+
+
+def _build_context_engineer(chunks: list[dict]) -> str:
+    lines = []
+    for i, c in enumerate(chunks, 1):
+        lines.append(f"[{i}] (source: {c['source_file']}, chunk {c['chunk_index']}) {c['content']}")
+    return "\n\n".join(lines)
+
+
+async def run_query(
+    question: str,
+    collection: str,
+    retrieval_mode: str,
+    top_k: int,
+    alpha: float,
+    include_citations: bool,
+    response_format: str,
+) -> dict:
+    reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
+    reformulated = reformulated.strip()
+
+    t0 = time.monotonic()
+    if retrieval_mode in ("hnsw", "flat"):
+        vector = await ollama.embed(reformulated)
+        chunks = await wc.near_vector_query(collection, vector, top_k)
+    elif retrieval_mode == "hybrid":
+        chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
+    else:
+        chunks = await wc.near_text_query(collection, reformulated, top_k)
+    retrieval_ms = int((time.monotonic() - t0) * 1000)
+
+    t1 = time.monotonic()
+    if response_format == "engineer":
+        context = _build_context_engineer(chunks)
+        answer = await ollama.chat(SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+    else:
+        context = _build_context_end_user(chunks)
+        answer = await ollama.chat(SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+    llm_ms = int((time.monotonic() - t1) * 1000)
+
+    citations = None
+    if include_citations:
+        citations = [
+            {
+                "source_file": c["source_file"],
+                "chunk_index": c["chunk_index"],
+                "score": round(c["score"], 4),
+                "excerpt": c["content"][:200],
+            }
+            for c in chunks
+        ]
+
+    return {
+        "answer": answer.strip(),
+        "citations": citations,
+        "retrieval_latency_ms": retrieval_ms,
+        "llm_latency_ms": llm_ms,
+        "chunks_retrieved": len(chunks),
+    }

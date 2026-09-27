@@ -1,0 +1,20 @@
+# Build context exclusions for the mcp image.
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.DS_Store
+**/.DS_Store
+*.swp
+*~
+.env
+.env.*
+.git
+.gitignore
+Dockerfile
+.dockerignore

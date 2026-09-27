@@ -1,0 +1,62 @@
+name: Bug report
+description: Something in the RAG platform isn't working as documented.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please don't include secrets or private documents.
+        For security issues, use the Security tab instead of this form.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. docker compose up -d
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - API
+        - UI
+        - Ingest
+        - Query / retrieval
+        - Gold standard
+        - Export / import
+        - Offline packaging
+        - Docker / infrastructure
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: health
+    attributes:
+      label: Output of /api/health
+      description: "Output of `curl -s http://localhost:8080/api/health`, if the stack is up."
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: "For example `docker compose logs api --tail 100`."
+      render: shell
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, CPU architecture, Docker version, and memory allocated to Docker.
+      placeholder: macOS 15, Apple Silicon, Docker Desktop 4.x, 12 GB
+    validations:
+      required: true

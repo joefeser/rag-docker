@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# SPECIFICATIONS.md §10.1 — Ingest
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+
+require_stack
+C="${PREFIX}Ingest"
+
+# Uploads a set of files and echoes the finished job document to a file.
+ingest() {
+  local collection="$1" strategy="$2" size="$3" minsize="$4"; shift 4
+  local args=() f
+  for f in "$@"; do args+=(-F "files=@$f"); done
+  curl -s -m 600 -X POST "$API/ingest/upload" \
+    -F "collection=$collection" -F "strategy=$strategy" -F "chunk_size=$size" \
+    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}" > /tmp/vfy_job.json
+  local job; job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['job_id'])" 2>/dev/null)
+  [ -n "$job" ] || { printf '{}' > /tmp/vfy_job.json; return 1; }
+  wait_for_job "/ingest/job/$job" 900 >/dev/null
+  api_get "/ingest/job/$job" > /tmp/vfy_job.json
+}
+
+section "§10.1 Ingest"
+
+# ── all six supported types ──────────────────────────────────────────────────
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 200 40 \
+  "$FIX/policies.txt" "$FIX/policies.md" "$FIX/policies.csv" \
+  "$FIX/policies.json" "$FIX/policies.pdf" "$FIX/policies.docx"
+read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$completed" = 6 ] && [ "$chunks" -gt 0 ]
+check "all six file types ingest" $? "status=$status completed=$completed chunks=$chunks"
+
+# Confirm the chunks actually landed, not merely that the job reported success.
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$stored" -ge 6 ]
+check "every type produced at least one chunk" $? "collection holds $stored chunks"
+
+# ── ZIP batch, with unsupported members reported ─────────────────────────────
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 200 40 "$FIX/batch.zip" "$FIX/notes.xyz"
+read -r status completed skipped_n <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], len(d.get('skipped',[])))")"
+[ "$status" = completed ] && [ "$completed" = 3 ]
+check "ZIP extracts and processes supported members" $? "status=$status completed=$completed (want 3)"
+[ "$skipped_n" -ge 3 ]
+check "unsupported files are reported, not dropped silently" $? "$skipped_n skipped"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
+check "each skip names the unsupported extension" $?
+
+# ── every chunking strategy against a PDF ────────────────────────────────────
+for strategy in fixed overlap language context_aware semantic; do
+  if [ "$SKIP_SLOW" = "1" ] && [ "$strategy" = "semantic" ]; then
+    skip "strategy '$strategy' (loads a sentence-transformer)"; continue
+  fi
+  SC="${C}$(printf '%s' "$strategy" | tr -d '_')"
+  drop_collection "$SC"; make_collection "$SC"
+  ingest "$SC" "$strategy" 300 50 "$FIX/policies.pdf"
+  read -r status chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json')); print(d['status'], d['chunks_stored'])")"
+  [ "$status" = completed ] && [ "$chunks" -gt 0 ]
+  check "strategy '$strategy' produces chunks from a PDF" $? "status=$status chunks=$chunks"
+  drop_collection "$SC"
+done
+
+# ── min_chunk_size merging ───────────────────────────────────────────────────
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 60 100 "$FIX/tiny.txt"
+under=$(curl -s -m 60 -X POST "$API/query" -H 'Content-Type: application/json' \
+  -d "{\"question\":\"short\",\"collection\":\"$C\",\"retrieval_mode\":\"flat\",\"top_k\":20,\"include_citations\":true,\"response_format\":\"end_user\"}" \
+  2>/dev/null | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print('?'); raise SystemExit
+print(sum(1 for c in (d.get('citations') or []) if len(c['excerpt'].strip()) < 60))" 2>/dev/null)
+python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json')); import sys
+sys.exit(0 if d['chunks_stored'] == 1 else 1)"
+check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['chunks_stored'])") chunk(s), wanted 1"
+
+# ── one bad file must not fail the batch ─────────────────────────────────────
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 300 50 "$FIX/broken.pdf" "$FIX/policies.txt" "$FIX/tiny.txt"
+read -r status completed failed errs <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['files_failed'], len(d['errors']))")"
+[ "$status" = partial ] && [ "$completed" = 2 ] && [ "$failed" = 1 ] && [ "$errs" -ge 1 ]
+check "a parser failure does not stop the other files" $? \
+  "status=$status completed=$completed failed=$failed errors=$errs"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+sys.exit(0 if any('broken.pdf' in e for e in d['errors']) else 1)"
+check "the failure names the offending file" $?
+
+# ── job status transitions ───────────────────────────────────────────────────
+# `queued` is only observable when the executor is saturated, so this asserts
+# the terminal transition and that the POST reports the initial state.
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$FIX/policies.txt" > /tmp/vfy_start.json
+initial=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['status'])")
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['job_id'])")
+check_eq "a new job starts as 'queued'" "$initial" "queued"
+final=$(wait_for_job "/ingest/job/$job" 900)
+check_eq "job reaches 'completed'" "$final" "completed"
+
+drop_collection "$C"
+cleanup_prefixed
+summary
