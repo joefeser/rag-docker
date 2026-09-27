@@ -13,6 +13,11 @@ updates:
     groups:
       ui-minor-and-patch:
         update-types: ["minor", "patch"]
+    ignore:
+      # vite 8 needs a newer @vitejs/plugin-react; upgrade both together
+      # by hand (see closed PRs #3, #5, #17).
+      - dependency-name: "vite"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "docker"
     directories: ["/api", "/ui"]
@@ -23,3 +28,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # ollama 0.34.4 timed out on /api/chat with phi3.5 (5 of 15 calls hit
+      # the 5-minute limit; 0.3.14 answers in 3-33s). Upgrade by hand and run
+      # the full scripts/verify/all.sh. See closed PR #15.
+      - dependency-name: "ollama/ollama"
