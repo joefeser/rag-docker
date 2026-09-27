@@ -331,9 +331,16 @@ later files, and the validated snapshots used for restoration. Invalid JSON or
 metadata is a refusal, not a skipped session. Session IDs use the locally
 generated `gs_[0-9a-f]{8}` grammar; malformed IDs are never rewritten. The
 persistence boundary also enforces resolved-path containment and refuses
-symlink destinations. Existing review work remains unchanged on validation
+redirected storage directories and non-regular destinations. Archive extraction
+accepts only regular files and directories, so special members cannot block a
+later metadata read. Existing review work remains unchanged on validation
 failure, including `replace`. Optional legacy progress fields retain their
 existing defaults, and historical validity metadata is preserved.
+
+Startup loading, collection flagging and export use the same session-record
+validation. Invalid legacy files (including filename/identity mismatch) remain
+untouched on disk with diagnostics and are excluded from the active cache and
+exports. They MUST NOT abort flagging after a collection has been deleted.
 
 Check 4 is a refusal, not a warning. Vectors from a different model are
 meaningless rather than merely different, and a collection built from them

@@ -349,6 +349,8 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     identities: set[str] = set()
     for path in sorted(gold.glob("*.json")):
         try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(path.read_text())
             goldstandard.validate_session(data)
             if canonical(data["collection"]) != canonical(original):
@@ -358,7 +360,7 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
             # Check the live write boundary too, before any collection/model
             # mutation. This catches pre-existing redirected destinations.
             goldstandard._session_path(data["session_id"])
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             raise PackageError(
                 "PACKAGE_CORRUPT", "Invalid evaluation session metadata.",
                 {"file": f"goldstandard/{path.name}"}) from exc

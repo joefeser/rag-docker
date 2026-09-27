@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from config import settings
+from services import goldstandard
 from services import ingest_config
 from services import model_bundle
 from services import retrieval_config
@@ -182,19 +183,9 @@ def _ingest_config(collection: str) -> dict | None:
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:
-    out = []
-    d = Path(settings.upload_dir) / "goldstandard_sessions"
-    if not d.is_dir():
-        return out
-    for p in sorted(d.glob("*.json")):
-        try:
-            data = json.loads(p.read_text())
-        except (OSError, ValueError):
-            _log.warning("Skipping unreadable gold-standard session %s", p.name)
-            continue
-        if data.get("collection") == collection:
-            out.append(data)
-    return out
+    # Export shares the disk-load validation boundary; legacy invalid metadata
+    # must not be repackaged as an apparently usable evaluation session.
+    return goldstandard.sessions_for(collection)
 
 
 def _fidelity_note(fidelity: str) -> str:
@@ -484,6 +475,11 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
             raise PackageError(
                 "PACKAGE_UNREADABLE",
                 f"Package contains a link ('{member.name}'), which is not allowed.",
+                {"member": member.name})
+        if not (member.isfile() or member.isdir()):
+            raise PackageError(
+                "PACKAGE_UNREADABLE",
+                "Package contains a non-regular archive member.",
                 {"member": member.name})
         target = (dest / member.name).resolve()
         if target != root and root not in target.parents:

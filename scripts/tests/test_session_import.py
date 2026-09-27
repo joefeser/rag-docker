@@ -186,6 +186,90 @@ class SessionImportTests(unittest.TestCase):
         self.assertEqual(json.loads(gs._session_path(self.original['session_id']).read_text()),
                          self.original)
 
+    def test_redirected_storage_root_is_refused_by_import_store_and_load(self):
+        outside = self.root / 'existing-storage'
+        outside.mkdir()
+        directory = self.root / 'uploads' / 'goldstandard_sessions'
+        directory.symlink_to(outside, target_is_directory=True)
+        self.sidecar('session.json', self.original)
+        with self.assertRaises(packager.PackageError):
+            importer._read_goldstandard_sessions(self.pkg, 'Corpus')
+        with self.assertRaises(ValueError):
+            gs.store_session(self.original)
+        with self.assertLogs(gs.log, level='WARNING'):
+            gs.load_sessions_from_disk()
+        self.assertFalse(gs._sessions)
+        self.assertFalse(list(outside.iterdir()))
+        self.assertTrue(directory.is_symlink())
+
+    def test_storage_root_must_be_a_directory(self):
+        directory = self.root / 'uploads' / 'goldstandard_sessions'
+        directory.write_text('existing')
+        with self.assertRaises(ValueError):
+            gs._session_path(self.original['session_id'])
+        self.assertEqual(directory.read_text(), 'existing')
+
+    def test_nonregular_sidecar_is_refused_before_reading(self):
+        path = self.pkg / 'goldstandard' / 'session.json'
+        os.mkfifo(path)
+        with patch.object(Path, 'read_text', side_effect=AssertionError('Special file read')):
+            with self.assertRaises(packager.PackageError):
+                importer._read_goldstandard_sessions(self.pkg, 'Corpus')
+
+    def test_special_archive_member_is_refused_before_extraction(self):
+        archive = self.root / 'special.tar.gz'
+        with tarfile.open(archive, 'w:gz') as tar:
+            member = tarfile.TarInfo('package/goldstandard/session.json')
+            member.type = tarfile.FIFOTYPE
+            tar.addfile(member)
+        dest = self.root / 'extracted'
+        dest.mkdir()
+        with self.assertRaises(packager.PackageError) as error:
+            packager.open_package(archive, dest)
+        self.assertEqual(error.exception.code, 'PACKAGE_UNREADABLE')
+        self.assertFalse(list(dest.iterdir()))
+
+    def test_disk_readers_report_preserve_and_exclude_invalid_legacy_files(self):
+        gs.store_session(self.original)
+        directory = self.root / 'uploads' / 'goldstandard_sessions'
+        legacy = directory / 'legacy.json'
+        legacy.write_text(json.dumps(session('legacy-id')))
+        malformed = directory / 'gs_11111111.json'
+        malformed.write_text('{')
+        alias = directory / 'alias.json'
+        alias.write_text(json.dumps(self.original))
+        outside = self.root / 'outside.json'
+        outside.write_text(json.dumps(session('gs_22222222')))
+        (directory / 'gs_22222222.json').symlink_to(outside)
+        fifo = directory / 'gs_33333333.json'
+        os.mkfifo(fifo)
+        originals = {p: p.read_bytes() for p in (legacy, malformed, alias, outside)}
+        gs._sessions.clear()
+        with self.assertLogs(gs.log, level='WARNING'):
+            gs.load_sessions_from_disk()
+            self.assertEqual(gs.sessions_for('Corpus'), [self.original])
+            self.assertEqual(packager._goldstandard_sessions('Corpus'), [self.original])
+            self.assertEqual(gs.mark_orphaned('Corpus', 'deleted'), 1)
+        self.assertEqual(set(gs._sessions), {self.original['session_id']})
+        for path, data in originals.items():
+            self.assertEqual(path.read_bytes(), data)
+        self.assertTrue(fifo.exists())
+
+    def test_legacy_cached_identity_cannot_abort_post_delete_flagging(self):
+        gs._sessions['legacy-id'] = session('legacy-id')
+        with self.assertLogs(gs.log, level='WARNING'):
+            self.assertEqual(gs.mark_orphaned('Corpus', 'deleted'), 0)
+        self.assertFalse((self.root / 'uploads' / 'goldstandard_sessions').exists())
+
+    def test_regular_destination_is_required_at_write_time(self):
+        directory = self.root / 'uploads' / 'goldstandard_sessions'
+        directory.mkdir()
+        dest = directory / (self.original['session_id'] + '.json')
+        os.mkfifo(dest)
+        with self.assertRaises(ValueError):
+            gs.store_session(self.original)
+        self.assertFalse(gs._sessions)
+
 
 if __name__ == '__main__':
     unittest.main()

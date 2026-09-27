@@ -54,8 +54,19 @@ def validate_session(session: dict) -> None:
     validate_session_id(session["session_id"])
 
 
+def _session_storage_root() -> Path:
+    upload = Path(settings.upload_dir).resolve()
+    p = upload / "goldstandard_sessions"
+    if p.is_symlink() or (p.exists() and not p.is_dir()):
+        raise ValueError("Evaluation session storage is not a regular directory.")
+    root = p.resolve()
+    if root.parent != upload:
+        raise ValueError("Evaluation session storage is outside the upload directory.")
+    return root
+
+
 def _sessions_dir() -> Path:
-    p = Path(settings.upload_dir) / "goldstandard_sessions"
+    p = _session_storage_root()
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -64,10 +75,10 @@ def _session_path(session_id: str) -> Path:
     validate_session_id(session_id)
     # Preflight must be read-only; the writer creates the directory only after
     # every imported session has been checked.
-    root = (Path(settings.upload_dir) / "goldstandard_sessions").resolve()
+    root = _session_storage_root()
     candidate = root / f"{session_id}.json"
-    if candidate.is_symlink():
-        raise ValueError("Evaluation session destination is a symlink.")
+    if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+        raise ValueError("Evaluation session destination is not a regular file.")
     target = candidate.resolve()
     # Grammar prevents metadata-derived paths; containment also refuses an
     # existing file symlink which would redirect a valid identity's write.
@@ -86,25 +97,56 @@ async def _save_session(session: dict) -> None:
     await asyncio.to_thread(_save_session_sync, session)
 
 
-def load_sessions_from_disk() -> None:
-    for p in _sessions_dir().glob("*.json"):
+def _sessions_on_disk() -> list[dict]:
+    """Leave invalid legacy files untouched and reported, outside the cache.
+
+    A previously accepted ID must not make post-deletion flagging raise after
+    the collection has already gone. Every disk reader uses this same boundary.
+    """
+    try:
+        paths = sorted(_session_storage_root().glob("*.json"))
+    except (OSError, ValueError, RuntimeError):
+        log.exception("Cannot read evaluation session storage; existing files are unchanged")
+        return []
+    sessions = []
+    for p in paths:
         try:
+            if p.is_symlink() or not p.is_file():
+                raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(p.read_text())
-            _sessions[data["session_id"]] = data
-        except Exception:
-            pass
+            validate_session(data)
+            if p != _session_path(data["session_id"]):
+                raise ValueError("Evaluation session filename does not match its identity.")
+        except (OSError, ValueError, RuntimeError):
+            log.warning("Skipping invalid evaluation session %s; file is unchanged", p,
+                        exc_info=True)
+            continue
+        sessions.append(data)
+    return sessions
+
+
+def load_sessions_from_disk() -> None:
+    for data in _sessions_on_disk():
+        _sessions[data["session_id"]] = data
 
 
 def sessions_for(collection: str) -> list[dict]:
     """Every session generated against a collection, in-memory and on disk."""
-    found = {sid: sess for sid, sess in _sessions.items()
-             if sess.get("collection") == collection}
-    # A session written by an import may not be in memory yet.
-    for path in _sessions_dir().glob("*.json"):
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
+    found = {}
+    for sid, sess in list(_sessions.items()):
+        if sess.get("collection") != collection:
             continue
+        try:
+            validate_session(sess)
+            if sid != sess["session_id"]:
+                raise ValueError("Cached evaluation identity does not match its key.")
+            _session_path(sid)
+        except (OSError, ValueError, RuntimeError):
+            log.warning("Skipping invalid cached evaluation session %s", sid, exc_info=True)
+            continue
+        found[sid] = sess
+    # A session written by an import may not be in memory yet.
+    for data in _sessions_on_disk():
         if data.get("collection") == collection and data["session_id"] not in found:
             found[data["session_id"]] = data
             _sessions[data["session_id"]] = data
@@ -119,6 +161,7 @@ def store_session(session: dict) -> None:
     flagging pass writes that back over the file. Import learned this the hard
     way — a restored session reverted to its pre-import orphaned state.
     """
+    validate_session(session)
     _save_session_sync(session)
     _sessions[session["session_id"]] = session
 
@@ -138,7 +181,7 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
         session[f"{flag}_at"] = now
         try:
             _save_session_sync(session)
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
             log.exception("Could not flag gold-standard session %s", session["session_id"])
             continue
         marked += 1
