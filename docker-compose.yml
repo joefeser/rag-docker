@@ -107,7 +107,7 @@ services:
       api: { condition: service_healthy }
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.29-alpine
     ports:
       - "8080:80"
     volumes:
