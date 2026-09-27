@@ -1,0 +1,25 @@
+# Dependabot version updates. They target the repository's default branch
+# (develop); security updates always do, whatever this file says.
+#
+# api/ (pip) is deliberately absent. api/requirements.txt is a pip-freeze
+# lock that must be regenerated from requirements.in, never bumped one pin at
+# a time. See "Dependency management" in README.md. mcp/ is parked.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/ui"
+    schedule:
+      interval: "weekly"
+    groups:
+      ui-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "docker"
+    directories: ["/api", "/ui"]
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
