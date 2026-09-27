@@ -1,0 +1,5 @@
+# The maintainer reviews every change. Code owners must have write access.
+# Later lines take precedence, so the .github/ rule stays in force even if the
+# catch-all above is changed.
+*                   @mikesilvers
+/.github/           @mikesilvers
