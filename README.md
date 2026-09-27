@@ -6,11 +6,11 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 
 | Component | Technology | Purpose |
 |---|---|---|
-| Vector store | Weaviate 1.39.4 | Stores and retrieves document chunks |
+| Vector store | Weaviate 1.39.6 | Stores and retrieves document chunks |
 | LLM + embeddings | Ollama 0.3.14 | Runs phi3.5 (chat) and nomic-embed-text (embeddings) locally |
 | API | FastAPI + Python 3.11 | RAG pipeline, ingest, gold standard generation |
 | UI | React 18 + Vite + Tailwind | Three-role web interface |
-| Proxy | nginx 1.27 | Routes traffic; listens on port 80 in-container, published on host port 8080 |
+| Proxy | nginx 1.29 | Routes traffic; listens on port 80 in-container, published on host port 8080 |
 
 ## Prerequisites
 
@@ -594,8 +594,8 @@ The fix is to pull each base image individually first, which shows real layer-by
 
 ```bash
 docker compose down
-docker pull semitechnologies/weaviate:1.39.4
-docker pull nginx:1.27-alpine
+docker pull semitechnologies/weaviate:1.39.6
+docker pull nginx:1.29-alpine
 docker pull ollama/ollama:0.3.14
 ```
 
