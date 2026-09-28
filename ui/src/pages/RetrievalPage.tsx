@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, CollectionInfo } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
@@ -20,12 +20,17 @@ export default function RetrievalPage() {
   const [indexLoading, setIndexLoading] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const indexRequest = useRef(0)
 
   useEffect(() => {
+    const ticket = ++indexRequest.current
     api.getCollections().then(r => {
+      if (ticket !== indexRequest.current) return
+      setIndexError('')
       setCollections(r.collections)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => { setIndexError('Could not read the current physical index.') })
+    }).catch(() => { if (ticket === indexRequest.current) setIndexError('Could not read the current physical index.') })
+    return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -68,10 +73,16 @@ export default function RetrievalPage() {
   const physicalIndex = collections.find(c => c.name === collection)
 
   async function refreshIndex() {
+    const ticket = ++indexRequest.current
     setIndexLoading(true); setIndexError('')
-    try { setCollections((await api.getCollections()).collections) }
-    catch { setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
-    finally { setIndexLoading(false) }
+    try {
+      const result = await api.getCollections()
+      if (ticket !== indexRequest.current) return
+      setCollections(result.collections)
+      if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
+    }
+    catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
+    finally { if (ticket === indexRequest.current) setIndexLoading(false) }
   }
 
   return (

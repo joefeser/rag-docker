@@ -1773,7 +1773,7 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
-      *Six controlled runtime groups plus one ten-source documentation group pass. Suite11 (called by03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows72/160/32 backend settings, labels saved ef96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
+      *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K1/50 save payloads, initial/refresh failures and late initial responses. Suite11 (called by03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows72/160/32 backend settings, labels saved ef96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
 
 ### 10.3 Gold Standard
 

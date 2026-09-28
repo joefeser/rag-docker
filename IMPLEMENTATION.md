@@ -7149,7 +7149,7 @@ export default function ChunkingPage() {
 ### ui/src/pages/RetrievalPage.tsx
 
 ```typescript
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, CollectionInfo } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
@@ -7171,12 +7171,17 @@ export default function RetrievalPage() {
   const [indexLoading, setIndexLoading] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const indexRequest = useRef(0)
 
   useEffect(() => {
+    const ticket = ++indexRequest.current
     api.getCollections().then(r => {
+      if (ticket !== indexRequest.current) return
+      setIndexError('')
       setCollections(r.collections)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => { setIndexError('Could not read the current physical index.') })
+    }).catch(() => { if (ticket === indexRequest.current) setIndexError('Could not read the current physical index.') })
+    return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -7219,10 +7224,16 @@ export default function RetrievalPage() {
   const physicalIndex = collections.find(c => c.name === collection)
 
   async function refreshIndex() {
+    const ticket = ++indexRequest.current
     setIndexLoading(true); setIndexError('')
-    try { setCollections((await api.getCollections()).collections) }
-    catch { setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
-    finally { setIndexLoading(false) }
+    try {
+      const result = await api.getCollections()
+      if (ticket !== indexRequest.current) return
+      setCollections(result.collections)
+      if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
+    }
+    catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
+    finally { if (ticket === indexRequest.current) setIndexLoading(false) }
   }
 
   return (
@@ -8178,6 +8189,8 @@ curl -s localhost:8080/api/collections | python3 -c \
   "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
+
+The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
 ````
 
 ### scripts/verify/all.sh
@@ -8923,6 +8936,8 @@ summary
 # Observe physical config and execute top-K on real backend, controlling models.
 set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
+proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
 require_stack
 section "Physical index and effective query controls"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
@@ -8939,7 +8954,7 @@ Inside disposable API: python - < scripts/verify/retrieval_controls.py
 Actual SDK/backend storage and vector queries; only Ollama reformulation,
 embedding and answer calls are controlled. No startup sweep/model calls.
 """
-import os,tempfile,uuid
+import importlib.util,json,os,tempfile,uuid
 from unittest.mock import AsyncMock,patch
 from fastapi.testclient import TestClient
 from config import settings
@@ -8948,24 +8963,40 @@ from services import weaviate_client as wc,rag_pipeline as rag
 
 prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
 collections=[]
+owners=[]
+persistent_upload=settings.upload_dir
+if importlib.util.find_spec('services.collection_recovery'):
+    from services import collection_recovery as recovery
+else:
+    recovery=None  # The pre-recovery baseline sweeps legacy staging markers.
+
 client=TestClient(app)
 with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
     try:
         for index in ('hnsw','flat'):
-            name=prefix+index;assert not wc._collection_exists_sync(name);collections.append(name)
+            if recovery:
+                with patch.object(settings,'upload_dir',persistent_upload):
+                    owner=recovery.begin(prefix+index,'tune',wc.get_client())
+                owners.append(owner);name=owner['staging']
+            else:
+                name=prefix+index+'__tuning_'+uuid.uuid4().hex
+            assert not wc._collection_exists_sync(name);collections.append(name)
             response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
             assert response.status_code==201,response.text
+            if os.environ.get('RAG_VERIFY_INTERRUPT_AFTER_CREATE')=='1':
+                print('OWNED_INTERRUPTED_FIXTURE '+json.dumps({'name':name,'owner':owners[-1] if owners else None}),flush=True)
+                os._exit(86)  # Acceptance injection: skips finally like a hard kill.
             coll=wc.get_client().collections.get(name)
             for i in range(1,11):coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
             row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert row['index_type']==index and row['distance_metric']=='cosine'
             assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
             print('PASS real '+index+' physical settings are observed, not query labels',flush=True)
-            for mode,limit in (('hnsw',2),('flat',5)):
+            for mode,limit in (('hnsw',1),('flat',50)):
                 with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
                     response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
                 assert response.status_code==200,response.text
-                body=response.json();assert body['chunks_retrieved']==limit and len(body['citations'])==limit,body
+                body=response.json();assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
             after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
             print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
@@ -8976,11 +9007,21 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
             config['ef']=None
             assert client.post('/retrieval/config',json=config).status_code==201
             assert client.get('/retrieval/config/'+name).json()['ef'] is None
-            print('PASS saved method/topK/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
+            for limit in (1,50):
+                config['top_k']=limit
+                saved=client.post('/retrieval/config',json=config)
+                assert saved.status_code==201 and client.get('/retrieval/config/'+name).json()['top_k']==limit,saved.text
+            for limit in (0,51):
+                invalid=client.post('/retrieval/config',json={**config,'top_k':limit})
+                assert invalid.status_code==422,invalid.text
+            print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
     finally:
         for name in collections:
             if wc._collection_exists_sync(name):
                 response=client.delete('/collections/'+name+'?confirm=true');assert response.status_code==200,response.text
+        if recovery:
+            with patch.object(settings,'upload_dir',persistent_upload):
+                for owner in owners:recovery.discard(owner,wc.get_client())
         wc.close_client()
 assert all(not wc._collection_exists_sync(name) for name in collections)
 wc.close_client()
@@ -9677,6 +9718,74 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── owned retrieval HTTP fixtures; no backend writes/model calls ───────────
+  r.section('effective retrieval UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedRetrievalBrowserFixture';
+    const row = { name, object_count: 10, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 72, efConstruction: 160, maxConnections: 32 } };
+    let lists = 0, failRefresh = false;
+    const saves = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        lists++;
+        return request.respond({ status: lists === 1 || failRefresh ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lists === 1 || failRefresh ? { error: { message: 'Synthetic index read failure.' } } : { collections: [row] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.25, ef: 96, response_format: 'engineer', is_default: false }) });
+      }
+      if (path === '/api/retrieval/config' && request.method() === 'POST') {
+        const body = JSON.parse(request.postData()); saves.push(body);
+        return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ ...body, is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
+      r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      await clickByText(s.page, 'Refresh index details'); await sleep(500);
+      const refreshed = await bodyText(s.page);
+      r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
+      r.check('three query methods replace inactive build controls and show legacy ef warning', await s.page.evaluate(() => document.querySelectorAll('input[name=mode]').length === 3 && document.querySelectorAll('input[type=range]').length === 1 && document.querySelector('input[value=hnsw]').checked && document.body.innerText.includes('legacy saved ef override (96) is inactive')));
+      for (const limit of [1, 50]) {
+        await s.page.evaluate(value => { const input = document.querySelector('input[type=range]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(value)); input.dispatchEvent(new Event('input', { bubbles: true })); }, limit);
+        await sleep(100); await clickByText(s.page, 'Save for this collection'); await sleep(300);
+        r.check('Top-K ' + limit + ' is selected and sent when saving', saves.at(-1)?.top_k === limit && (await bodyText(s.page)).includes('Top-K Results: ' + limit));
+      }
+      r.check('saving normalizes legacy vector alias and clears inactive ef without changing observed index', saves.length === 2 && saves.every(save => save.retrieval_mode === 'hnsw' && save.ef === null) && /ef: 72/.test(await bodyText(s.page)));
+      failRefresh = true;
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      r.check('failed refresh keeps prior physical details with an explicit warning', /displayed details are from the prior read/.test(await bodyText(s.page)) && /ef: 72/.test(await bodyText(s.page)));
+      r.check('retrieval fixture causes no React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+  for (const lateFailure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    let initial, count = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/collections') {
+        count++;
+        if (count === 1) { initial = request; return; }
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 191, efConstruction: 170, maxConnections: 40 } }] }) });
+      }
+      if (new URL(request.url()).pathname.startsWith('/api/retrieval/config/')) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: 'OwnedLatestIndexFixture', retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
+      if (!initial) throw new Error('Initial metadata request was not observed');
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      const freshVisible = /ef: 191/.test(await bodyText(s.page));
+      await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
+      await sleep(300);
+      const after = await bodyText(s.page);
+      r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── delete confirmation ────────────────────────────────────────────────────
   r.section('§10.4 delete confirmation');
   {
@@ -9712,6 +9821,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       r.check('a wrong name sends no DELETE',
               s.api.filter(x => x.method === 'DELETE').length === before);
     }
+    await s.ctx.close();
+  }
+
+  // ── upload size limit ──────────────────────────────────────────────────────
+  // The Import page refuses a selection over the proxy's limit before sending.
+  // The file is sparse: it reports 513 MB but occupies no disk, and the check
+  // must stop it before the browser ever reads it. See issue #21.
+  r.section('upload size limit');
+  {
+    const fs = require('fs');
+    const big = '/tmp/vfy-oversize-upload.txt';
+    fs.closeSync(fs.openSync(big, 'w'));
+    fs.truncateSync(big, 513 * 1024 * 1024);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const hint = await bodyText(s.page);
+    r.check('the drop zone states the upload limit', hint.includes('up to 512 MB per upload'));
+    const input = await s.page.$('#file-input');
+    await input.uploadFile(big);
+    await sleep(500);
+    const posts = () => s.api.filter(x => x.method === 'POST' && x.url.includes('/ingest/upload')).length;
+    const before = posts();
+    const clicked = await clickByText(s.page, 'Start Ingest');
+    await sleep(900);
+    const text = await bodyText(s.page);
+    r.check('an oversize selection is refused with the limit named',
+            clicked && text.includes('one upload can be at most 512 MB'),
+            clicked ? text.slice(0, 160) : 'Start Ingest button not found');
+    r.check('an oversize selection sends no upload', posts() === before);
+    r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    fs.unlinkSync(big);
     await s.ctx.close();
   }
 
@@ -10120,4 +10260,32 @@ echo
 echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
+```
+
+### scripts/verify/compose_target.py
+
+```python
+"""Refuse an in-container verifier when RAG_API selects another deployment."""
+import sys
+from urllib.parse import urlsplit
+
+def matches_local_proxy(api, bindings):
+    try:
+        url=urlsplit(api)
+        if url.scheme!='http' or url.hostname not in ('localhost','127.0.0.1','::1') or url.username or url.password or url.path.rstrip('/')!='/api' or url.query or url.fragment:
+            return False
+        port=url.port or 80
+        for binding in bindings.splitlines():
+            host, published=binding.rsplit(':',1)
+            host=host.strip('[]')
+            if int(published)!=port:continue
+            if host in ('0.0.0.0','::') or host==url.hostname or (host=='127.0.0.1' and url.hostname=='localhost'):
+                return True
+        return False
+    except (ValueError,TypeError):return False
+
+if __name__=='__main__':
+    if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
+        print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
+        sys.exit(2)
 ```

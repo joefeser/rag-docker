@@ -4,7 +4,7 @@ Inside disposable API: python - < scripts/verify/retrieval_controls.py
 Actual SDK/backend storage and vector queries; only Ollama reformulation,
 embedding and answer calls are controlled. No startup sweep/model calls.
 """
-import os,tempfile,uuid
+import importlib.util,json,os,tempfile,uuid
 from unittest.mock import AsyncMock,patch
 from fastapi.testclient import TestClient
 from config import settings
@@ -13,24 +13,40 @@ from services import weaviate_client as wc,rag_pipeline as rag
 
 prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
 collections=[]
+owners=[]
+persistent_upload=settings.upload_dir
+if importlib.util.find_spec('services.collection_recovery'):
+    from services import collection_recovery as recovery
+else:
+    recovery=None  # The pre-recovery baseline sweeps legacy staging markers.
+
 client=TestClient(app)
 with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
     try:
         for index in ('hnsw','flat'):
-            name=prefix+index;assert not wc._collection_exists_sync(name);collections.append(name)
+            if recovery:
+                with patch.object(settings,'upload_dir',persistent_upload):
+                    owner=recovery.begin(prefix+index,'tune',wc.get_client())
+                owners.append(owner);name=owner['staging']
+            else:
+                name=prefix+index+'__tuning_'+uuid.uuid4().hex
+            assert not wc._collection_exists_sync(name);collections.append(name)
             response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
             assert response.status_code==201,response.text
+            if os.environ.get('RAG_VERIFY_INTERRUPT_AFTER_CREATE')=='1':
+                print('OWNED_INTERRUPTED_FIXTURE '+json.dumps({'name':name,'owner':owners[-1] if owners else None}),flush=True)
+                os._exit(86)  # Acceptance injection: skips finally like a hard kill.
             coll=wc.get_client().collections.get(name)
             for i in range(1,11):coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
             row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert row['index_type']==index and row['distance_metric']=='cosine'
             assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
             print('PASS real '+index+' physical settings are observed, not query labels',flush=True)
-            for mode,limit in (('hnsw',2),('flat',5)):
+            for mode,limit in (('hnsw',1),('flat',50)):
                 with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
                     response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
                 assert response.status_code==200,response.text
-                body=response.json();assert body['chunks_retrieved']==limit and len(body['citations'])==limit,body
+                body=response.json();assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
             after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
             print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
@@ -41,11 +57,21 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
             config['ef']=None
             assert client.post('/retrieval/config',json=config).status_code==201
             assert client.get('/retrieval/config/'+name).json()['ef'] is None
-            print('PASS saved method/topK/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
+            for limit in (1,50):
+                config['top_k']=limit
+                saved=client.post('/retrieval/config',json=config)
+                assert saved.status_code==201 and client.get('/retrieval/config/'+name).json()['top_k']==limit,saved.text
+            for limit in (0,51):
+                invalid=client.post('/retrieval/config',json={**config,'top_k':limit})
+                assert invalid.status_code==422,invalid.text
+            print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
     finally:
         for name in collections:
             if wc._collection_exists_sync(name):
                 response=client.delete('/collections/'+name+'?confirm=true');assert response.status_code==200,response.text
+        if recovery:
+            with patch.object(settings,'upload_dir',persistent_upload):
+                for owner in owners:recovery.discard(owner,wc.get_client())
         wc.close_client()
 assert all(not wc._collection_exists_sync(name) for name in collections)
 wc.close_client()

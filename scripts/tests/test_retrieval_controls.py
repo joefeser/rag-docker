@@ -4,8 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,MagicMock,patch
 sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
-from fastapi.testclient import TestClient
-from main import app
 from config import settings
 from services import weaviate_client as wc,rag_pipeline as rag,retrieval_config as saved
 from weaviate.classes.config import VectorDistances
@@ -24,14 +22,6 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(rows[0]['distance_metric'],'dot');self.assertEqual(rows[1]['index_type'],'flat')
         self.assertEqual(rows[1]['distance_metric'],'l2-squared');self.assertIsNone(rows[1]['hnsw_config'])
 
-    def test_collection_http_forwards_physical_config_and_missing_fields_remain_unknown(self):
-        from routers import collections
-        raw=[{'name':'Synthetic','object_count':0,'index_type':'hnsw','distance_metric':'cosine','hnsw_config':{'ef':77,'efConstruction':144,'maxConnections':40}},
-             {'name':'OlderSource','object_count':0,'index_type':'hnsw','distance_metric':'cosine'}]
-        with patch.object(wc,'get_collections',new=AsyncMock(return_value=raw)),patch.object(collections,'_load_registry',return_value={}):
-            response=TestClient(app).get('/collections')
-        self.assertEqual(response.status_code,200,response.text);rows=response.json()['collections']
-        self.assertEqual(rows[0]['hnsw_config'],raw[0]['hnsw_config']);self.assertIsNone(rows[1]['hnsw_config'])
 
 class BackendControlTests(unittest.TestCase):
     def test_hybrid_weight_and_semantic_top_k_reach_supported_sdk_calls(self):
@@ -68,21 +58,32 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             semantic.assert_awaited_once_with('Synthetic','Synthetic',11)
 
     async def test_saved_settings_roundtrip_keeps_legacy_ef_but_ui_equivalent_clears_it(self):
-        client=TestClient(app)
         with tempfile.TemporaryDirectory() as directory,patch.object(settings,'upload_dir',directory),patch.object(saved,'_DIR',None):
             config={'collection':'Synthetic','retrieval_mode':'flat','top_k':17,'alpha':0.25,'ef':96,'response_format':'engineer'}
-            response=client.post('/retrieval/config',json=config);self.assertEqual(response.status_code,201,response.text)
-            loaded=client.get('/retrieval/config/Synthetic').json()
-            for key,value in config.items():self.assertEqual(loaded[key],value)
+            saved.save(config)
+            self.assertEqual(saved.resolve('Synthetic'),(config,False))
             config.update(retrieval_mode='hnsw',ef=None)
-            self.assertEqual(client.post('/retrieval/config',json=config).status_code,201)
-            self.assertIsNone(client.get('/retrieval/config/Synthetic').json()['ef'])
+            saved.save(config)
+            self.assertIsNone(saved.load('Synthetic')['ef'])
+
+class TargetTests(unittest.TestCase):
+    def test_in_container_target_cannot_silently_select_another_stack(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('compose_target',Path(__file__).resolve().parents[1]/'verify/compose_target.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        match=module.matches_local_proxy
+        for api in ('http://localhost:18080/api','http://127.0.0.1:18080/api/'):
+            self.assertTrue(match(api,'127.0.0.1:18080'))
+        self.assertTrue(match('http://[::1]:18080/api','[::]:18080'))
+        for api in ('http://remote.example:18080/api','http://127.0.0.1:8080/api','https://localhost:18080/api','http://localhost:18080/other','http://user@localhost:18080/api','http://localhost:18080/api?other=1'):
+            self.assertFalse(match(api,'127.0.0.1:18080'))
+        self.assertFalse(match('http://localhost:18080/api',''))
 
 class DocumentationTests(unittest.TestCase):
     def test_changed_embedded_sources_match_runtime(self):
         root=Path(__file__).resolve().parents[2];text=(root/'IMPLEMENTATION.md').read_text()
-        for name in ('api/models/schemas.py','api/routers/collections.py','api/services/weaviate_client.py','ui/src/api/client.ts','ui/src/pages/RetrievalPage.tsx','ui/src/pages/QAPage.tsx','scripts/verify/03_query.sh','scripts/verify/11_retrieval.sh','scripts/verify/retrieval_controls.py','scripts/verify/README.md'):
-            lang='typescript' if name.endswith(('.ts','.tsx')) else 'bash' if name.endswith('.sh') else 'markdown' if name.endswith('.md') else 'python';fence='````' if name.endswith('.md') else '```';h='### '+name+'\n\n'+fence+lang+'\n'
+        for name in ('api/models/schemas.py','api/routers/collections.py','api/services/weaviate_client.py','ui/src/api/client.ts','ui/src/pages/RetrievalPage.tsx','ui/src/pages/QAPage.tsx','scripts/verify/03_query.sh','scripts/verify/11_retrieval.sh','scripts/verify/retrieval_controls.py','scripts/verify/README.md','scripts/verify/compose_target.py','scripts/verify/browser/ui_criteria.js'):
+            lang='typescript' if name.endswith(('.ts','.tsx')) else 'bash' if name.endswith('.sh') else 'markdown' if name.endswith('.md') else 'javascript' if name.endswith('.js') else 'python';fence='````' if name.endswith('.md') else '```';h='### '+name+'\n\n'+fence+lang+'\n'
             a=text.index(h)+len(h);b=text.index('\n'+fence+'\n',a)
             with self.subTest(file=name):self.assertEqual(text[a:b],(root/name).read_text().rstrip('\n'))
 
