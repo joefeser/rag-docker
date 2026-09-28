@@ -183,10 +183,11 @@ class ImplementationTests(unittest.TestCase):
         text=(root/'IMPLEMENTATION.md').read_text()
         names=('api/main.py','api/models/schemas.py','api/services/weaviate_client.py',
                'api/services/goldstandard.py','api/services/chunk_sampling.py',
-               'scripts/verify/chunk_sampling.py','scripts/verify/README.md')
+               'scripts/verify/chunk_sampling.py','scripts/verify/README.md',
+               'scripts/verify/04_goldstandard.sh','scripts/verify/09_sampling.sh')
         for name in names:
             fence='````' if name.endswith('README.md') else '```'
-            language='markdown' if name.endswith('README.md') else 'python'
+            language='markdown' if name.endswith('README.md') else 'bash' if name.endswith('.sh') else 'python'
             header='### '+name+'\n\n'+fence+language+'\n'
             start=text.index(header)+len(header); end=text.index('\n'+fence+'\n',start)
             with self.subTest(file=name):

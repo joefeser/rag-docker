@@ -8183,6 +8183,7 @@ drive the UI in a real browser.
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
+| `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
 | `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 
 ## Environment
@@ -9052,6 +9053,20 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/09_sampling.sh
+
+```bash
+#!/usr/bin/env bash
+# UUID selection through the real SDK; owned fixtures and supplied vectors.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Evaluation sampling across iterator pages"
+(cd ../.. && docker compose exec -T api python - < scripts/verify/chunk_sampling.py)
+check "seeded selection, iterator paging, bounds and owned-fixture cleanup" $?
+summary
+```
+
 ### scripts/verify/chunk_sampling.py
 
 ```python
@@ -9122,8 +9137,12 @@ C="${PREFIX}Gold"
 
 section "§10.3 Gold Standard"
 
+# Selection needs the backend but no LLM work; include it even in slow-skip runs.
+bash ./09_sampling.sh
+check "UUID sampling acceptance" $?
+
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.3 entirely" "every check needs LLM generation"
+  skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
 fi
 
