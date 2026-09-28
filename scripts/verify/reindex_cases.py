@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 from services import tuning
+validate_vectorizer = tuning.wc._validate_reindex_vectorizer_sync
 
 
 def records():
@@ -55,11 +56,19 @@ class ReindexTests(unittest.TestCase):
         patches = [patch.object(tuning.wc,'get_client',return_value=SimpleNamespace(collections=self.backend)),
                    patch.object(tuning.wc,'_create_collection_sync',side_effect=self.backend.create),
                    patch.object(tuning.wc,'_collection_config_sync',return_value=self.config),
+                   patch.object(tuning.wc,'_validate_reindex_vectorizer_sync'),
                    patch.object(tuning.wc,'_insert_chunks_sync',self.embedding),
                    patch.object(tuning.sources,'has_sources',return_value=False),
                    patch.object(tuning.goldstandard,'mark_stale',self.stale),
                    patch.object(tuning,'_jobs',{}),patch.object(tuning,'_active',{'OwnedReindex'})]
         for change in patches: change.start(); self.addCleanup(change.stop)
+        import tempfile
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        def begin(collection,operation,client):return {'staging':collection+'__tuning_owned','state':'scratch','operation_id':'owned'}
+        def retain(owner):owner['state']='recovery'
+        def discard(owner,client):client.collections.delete(owner['staging'])
+        for change in [patch.object(tuning.collection_recovery,'begin',side_effect=begin),patch.object(tuning.collection_recovery,'retain',side_effect=retain),patch.object(tuning.collection_recovery,'discard',side_effect=discard),patch.object(tuning.collection_recovery,'_root',return_value=Path(self.temp.name))]:
+            change.start();self.addCleanup(change.stop)
     def run_job(self, operation='reindex'):
         tuning._jobs['owned'] = {'status':'queued','chunks_written':0,'notes':[]}
         tuning._run('owned','OwnedReindex',operation,{'index_type':'flat','distance_metric':'dot'})
@@ -105,6 +114,84 @@ class ReindexTests(unittest.TestCase):
     def test_empty_collection_reindexes_without_embedding(self):
         self.backend.data['OwnedReindex']=[]; job=self.run_job()
         self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_written'],0); self.embedding.assert_not_called(); self.stale.assert_not_called()
+    def test_ingest_started_after_source_check_waits_for_final_reindex_copy(self):
+        import tempfile,threading,uuid
+        from concurrent.futures import ThreadPoolExecutor
+        from services import ingest_pipeline as ingest
+        entered=threading.Event();release=threading.Event();parsed=threading.Event();attempted=threading.Event()
+        verify=tuning._verify_records;paused=False
+        def paused_verify(name,records):
+            nonlocal paused
+            verify(name,records)
+            if name=='OwnedReindex' and not paused:
+                paused=True;entered.set();assert release.wait(3)
+        def parse(path):parsed.set();return 'Owned later upload',[]
+        def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
+        job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+            path=Path(temp)/'owned.txt';path.write_text('Owned later upload')
+            reindex=pool.submit(self.run_job);self.assertTrue(entered.wait(2))
+            def start_ingest():
+                attempted.set();ingest._process_job_sync('owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
+            upload=pool.submit(start_ingest);self.assertTrue(attempted.wait(2));self.assertFalse(parsed.wait(.05));release.set()
+            result=reindex.result(timeout=3);upload.result(timeout=3)
+        self.assertEqual(result['status'],'completed');self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.backend.data['OwnedReindex'][:2],self.original);self.assertEqual(len(self.backend.data['OwnedReindex']),3)
+    def test_reindex_snapshot_waits_for_already_running_ingest(self):
+        import tempfile,threading,uuid
+        from concurrent.futures import ThreadPoolExecutor
+        from services import ingest_pipeline as ingest
+        parsed=threading.Event();release=threading.Event();snapshot=threading.Event();attempted=threading.Event()
+        original_read=tuning._existing_records
+        def read(name):snapshot.set();return original_read(name)
+        def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
+        def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
+        job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+            path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
+            upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
+            self.assertTrue(parsed.wait(2))
+            def start_reindex():attempted.set();return self.run_job()
+            reindex=pool.submit(start_reindex);self.assertTrue(attempted.wait(2));self.assertFalse(snapshot.wait(.05));release.set()
+            upload.result(timeout=3);result=reindex.result(timeout=3)
+        self.assertEqual(result['status'],'completed');self.assertEqual(result['chunks_written'],3)
+        self.assertEqual(self.backend.data['OwnedReindex'][:2],self.original);self.assertEqual(len(self.backend.data['OwnedReindex']),3)
+    def test_foreign_vectorizer_refuses_before_staging_or_delete(self):
+        tuning.wc._validate_reindex_vectorizer_sync.side_effect=ValueError('Owned incompatible model')
+        job=self.run_job();self.assertEqual(job['status'],'failed')
+        self.assertEqual(self.backend.created,[]);self.assertEqual(self.backend.deleted,[])
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original);self.stale.assert_not_called()
+    def test_vectorizer_validation_checks_model_endpoint_type_and_named_vectors(self):
+        from config import settings
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None)
+        client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
+        with patch.object(tuning.wc,'get_client',return_value=client):
+            validate_vectorizer('Owned')
+            for attribute,value in [('model','foreign'),('apiEndpoint','http://foreign:1')]:
+                original=cfg.vectorizer_config.model[attribute];cfg.vectorizer_config.model[attribute]=value
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                cfg.vectorizer_config.model[attribute]=original
+            cfg.vectorizer_config.vectorizer='unsupported'
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+            cfg.vectorizer_config.vectorizer='text2vec-ollama';cfg.vector_config={'foreign':object()}
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+    def test_delete_refusal_with_intact_original_preserves_evaluation_validity(self):
+        delete=self.backend.delete
+        def refuse(name):
+            if name=='OwnedReindex':raise RuntimeError('Owned delete refusal')
+            delete(name)
+        with patch.object(self.backend,'delete',side_effect=refuse):job=self.run_job()
+        self.assertEqual(job['status'],'failed');self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        self.stale.assert_not_called();self.assertEqual(set(self.backend.data),{'OwnedReindex'})
+    def test_uncertain_delete_retains_recovery_and_marks_historical(self):
+        delete=self.backend.delete
+        def uncertain(name):
+            delete(name)
+            if name=='OwnedReindex':raise RuntimeError('Owned lost delete acknowledgement')
+        with patch.object(self.backend,'delete',side_effect=uncertain):job=self.run_job()
+        self.assertEqual(job['status'],'failed');self.stale.assert_called_once()
+        retained=job['error_detail']['recovered_as'];self.assertEqual(self.backend.data[retained],self.original)
+        self.assertEqual(job['chunks_written'],0)
     def test_reembed_retains_its_explicit_regeneration_path(self):
         def embed(name,props):
             self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},

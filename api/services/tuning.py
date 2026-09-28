@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from services import collection_writes, collection_recovery
 from config import settings
 from services import goldstandard
 from services import sources
@@ -177,6 +178,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
+@collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None) -> int:
     """Stage the new chunks, then swap them into place.
@@ -184,27 +186,34 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     Re-chunk/re-embed use the embedding insert path. Reindex supplies original
     records and verifies them before replacement and after the final copy.
     """
+    if records is not None:
+        wc._validate_reindex_vectorizer_sync(collection)
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
 
-    staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
+    ownership = collection_recovery.begin(collection, "tune", client) if records is not None else None
+    staging = ownership["staging"] if ownership else f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     wc._create_collection_sync(staging, new_index, new_distance, hnsw)
     cutover_started = False
+    completed = False
+    original_intact = False
     try:
         if records is not None:
             _write_records(staging, records)
-            # Refuse a source change observed during staging; this is not a
-            # collection-wide lock against independent writers.
+            # Application writers share the held guard. Also refuse a source
+            # change from an independently connected backend writer.
             _verify_records(collection, records)
+            collection_recovery.retain(ownership)
             cutover_started = True
             client.collections.delete(collection)
             wc._create_collection_sync(collection, new_index, new_distance, hnsw)
             _write_records(collection, records)
             if progress:
                 progress(len(records))
+            completed = True
             return len(records)
         wc._insert_chunks_sync(staging, properties)
         staged = [
@@ -232,17 +241,34 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 raise RuntimeError(
                     f"{batch.number_errors} error(s) writing the rebuilt collection")
         return len(staged)
-    except Exception:
+    except Exception as exc:
         if records is not None and cutover_started:
-            goldstandard.mark_stale(collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+            try:
+                _verify_records(collection, records)
+                original_intact = wc._collection_config_sync(collection) == config
+            except Exception:
+                original_intact = False
+            if not original_intact:
+                try:
+                    goldstandard.mark_stale(collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+                except Exception:
+                    _log.exception("Could not mark evaluation historical after failed reindex")
+                if ownership["state"] == "recovery":
+                    raise PackageError("TUNE_FAILED", str(exc) + f" Verified data retained as '{staging}'.",
+                                       {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
         raise
     finally:
         try:
-            client.collections.delete(staging)
+            if ownership:
+                if completed or original_intact or ownership["state"] == "scratch":
+                    collection_recovery.discard(ownership, client)
+            else:
+                client.collections.delete(staging)
         except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove staging collection %r", staging)
+            _log.exception("Could not remove owned staging collection %r", staging)
 
 
+@collection_writes.serialized("collection")
 def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
     job = _jobs[job_id]
     job["status"] = "running"

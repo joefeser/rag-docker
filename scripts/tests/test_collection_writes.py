@@ -1,0 +1,64 @@
+"""Writer barriers cover complete workers, nesting and independent collections."""
+import os,sys,threading,unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+from services import collection_writes as writes
+
+class WriterTests(unittest.TestCase):
+    def test_same_collection_waits_until_complete_guard_releases(self):
+        attempted=threading.Event();entered=threading.Event()
+        def worker():
+            attempted.set()
+            with writes.guard('Owned'):entered.set()
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                task=pool.submit(worker);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05))
+            task.result(timeout=2);self.assertTrue(entered.is_set())
+        self.assertNotIn('Owned',writes._registry)
+    def test_reentrant_worker_and_primitive_share_one_guard(self):
+        @writes.serialized('collection')
+        def primitive(collection):
+            with writes.guard(collection):return writes._registry[collection][1]
+        with writes.guard('Owned'):self.assertEqual(primitive(collection='Owned'),3)
+        self.assertNotIn('Owned',writes._registry)
+    def test_other_collections_do_not_wait(self):
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                def independent():
+                    with writes.guard('Other'):return True
+                self.assertTrue(pool.submit(independent).result(timeout=2))
+    def test_failed_worker_releases_guard(self):
+        with self.assertRaises(RuntimeError):
+            with writes.guard('Owned'):raise RuntimeError('Owned failure')
+        self.assertNotIn('Owned',writes._registry)
+    def test_backend_case_aliases_share_the_same_guard(self):
+        entered=threading.Event()
+        def worker():
+            with writes.guard('owned'):entered.set()
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                task=pool.submit(worker);self.assertFalse(entered.wait(.05))
+            task.result(timeout=2);self.assertTrue(entered.is_set())
+    def test_actual_import_and_backend_mutators_wait_before_entering_their_body(self):
+        from unittest.mock import patch
+        from services import importer,weaviate_client as wc
+        operations=[(wc._create_collection_sync,('owned','hnsw','cosine',{}),wc,'get_client'),
+                    (wc._insert_chunks_sync,('owned',[]),wc,'get_client'),
+                    (wc._delete_collection_sync,('owned',),wc,'get_client'),
+                    (importer._build,('owned',Path('/inert'),{},None),importer,'_create_from_package')]
+        for operation,args,module,boundary in operations:
+            with self.subTest(operation=operation.__name__):
+                attempted=threading.Event();entered=threading.Event()
+                def boundary_call(*args,**kwargs):
+                    entered.set();raise RuntimeError('Owned stopped backend boundary')
+                def worker():attempted.set();return operation(*args)
+                with patch.object(module,boundary,side_effect=boundary_call),ThreadPoolExecutor() as pool:
+                    with writes.guard('Owned'):
+                        task=pool.submit(worker);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05))
+                    with self.assertRaisesRegex(RuntimeError,'Owned stopped'):task.result(timeout=2)
+                    self.assertTrue(entered.is_set())
+                self.assertNotIn('Owned',writes._registry)
+
+
+if __name__=='__main__':unittest.main()

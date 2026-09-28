@@ -455,8 +455,9 @@ first request, which is what makes this safe.
 
 | Left behind by | Detected at startup by | Action |
 |---|---|---|
-| `replace` staging (`<name>__importing_<id8>`) | the name marker | delete; it is internal and would otherwise appear in the collection list as if it were real |
-| a tuning rebuild (`<name>__tuning_<id8>`) | the name marker | delete |
+| a durably owned reindex scratch (`<name>__tuning_<id32>`) | a valid ownership record in `UPLOAD_DIR/collection_operations` | remove only that exact owned scratch; resume owned cleanup intent |
+| verified reindex recovery and sidecars | the valid record's `recovery` state | preserve; report the retained collection and sidecar snapshot path |
+| legacy/unowned import or tuning marker-like names | a name alone supplies no ownership proof | preserve for operator inspection; the complete import/recovery migration is the separate #42–#44 repair |
 | `abort`/`rename` partial target | an in-progress marker file recording the expected chunk count | delete **only if** the collection's actual count differs from the expected one |
 | an extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete; twelve of these were found holding 152 MB after kill testing, and a `with-models` package leaves 2.3 GB behind each time |
 
@@ -498,9 +499,14 @@ remapped: a wrong remap corrupts an evaluation baseline silently, which is worse
 than an honest stale flag.
 
 A successfully verified index/distance change preserves exact UUIDs, properties
-and vectors, and MUST NOT mark sessions stale. An observed source change during
-staging must be refused before replacement. Failure after reindex cutover
-marks retained sessions stale, because exact preservation was not verified.
+and vectors, and MUST NOT mark sessions stale. Single-process application writers
+share the collection guard through snapshot, replacement and final verification;
+external backend writers remain outside it and an observed change is refused.
+A stored vectorizer mismatch with the recreation configuration is refused before
+staging. Verified staging and pre-cutover sidecars must survive an uncertain
+cutover under durable recovery ownership. A failed delete that leaves exact
+original records/configuration intact preserves evaluation validity; an uncertain
+or changed state marks sessions historical and reports the retained recovery.
 
 **Sessions are cached in memory as well as on disk.** Anything that writes a
 session file directly, without going through the gold-standard service, will be
@@ -625,7 +631,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
-| E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged |
+| E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 
 ---
 

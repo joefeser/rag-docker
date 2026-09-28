@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from services import collection_writes
 from config import settings
 from services.chunker import chunk as do_chunk
 from services import sources
@@ -58,6 +59,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+@collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
     file_paths: list[Path],

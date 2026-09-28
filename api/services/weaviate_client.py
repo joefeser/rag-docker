@@ -7,6 +7,7 @@ import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
 from weaviate.classes.query import MetadataQuery
 
+from services import collection_writes, collection_recovery
 from config import settings
 from services import ingest_config
 from services import retrieval_config
@@ -80,6 +81,7 @@ async def check_health() -> bool:
     return await asyncio.to_thread(_check_health_sync)
 
 
+@collection_writes.serialized("name")
 def _create_collection_sync(
     name: str,
     index_type: str,
@@ -132,6 +134,7 @@ async def collection_exists(name: str) -> bool:
     return await asyncio.to_thread(_collection_exists_sync, name)
 
 
+@collection_writes.serialized("name")
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
@@ -198,21 +201,11 @@ STAGING_MARKERS = ("__importing_", "__tuning_")
 
 
 def _sweep_staging_sync() -> list[str]:
-    client = get_client()
-    removed = []
-    for name in list(client.collections.list_all()):
-        if any(marker in name for marker in STAGING_MARKERS):
-            try:
-                client.collections.delete(name)
-            except Exception:                         # noqa: BLE001
-                log.exception("Could not remove abandoned staging collection %r", name)
-                continue
-            removed.append(name)
-    return removed
+    return collection_recovery.sweep(get_client())
 
 
 async def sweep_staging() -> list[str]:
-    """Remove staging collections abandoned by a previous process."""
+    """Remove positively owned scratch; preserve recovery and unowned names."""
     return await asyncio.to_thread(_sweep_staging_sync)
 
 
@@ -272,6 +265,23 @@ async def get_collection_config(name: str) -> dict:
     return await asyncio.to_thread(_collection_config_sync, name)
 
 
+def _validate_reindex_vectorizer_sync(name: str) -> None:
+    """Fail before staging if recreation would change the stored vector space."""
+    cfg = get_client().collections.get(name).config.get()
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model = getattr(vectorizer, "model", None)
+    if (getattr(kind, "value", kind) != "text2vec-ollama"
+            or not isinstance(model, dict)
+            or model.get("model") != settings.embed_model
+            or model.get("apiEndpoint") != f"http://{settings.ollama_host}:{settings.ollama_port}"
+            or getattr(vectorizer, "vectorize_collection_name", None) is not False
+            or getattr(cfg, "vector_config", None)):
+        raise ValueError("Reindex would change the collection's vectorizer configuration; "
+                         "re-embed with the configured model first")
+
+
+@collection_writes.serialized("collection_name")
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)

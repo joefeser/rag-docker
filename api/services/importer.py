@@ -32,6 +32,7 @@ import threading
 import uuid
 from pathlib import Path
 
+from services import collection_writes
 from config import settings
 from services import goldstandard
 from services import model_bundle
@@ -392,6 +393,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
     return notes
 
 
+@collection_writes.serialized("target")
 def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
     _create_from_package(target, pkg)

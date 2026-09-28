@@ -45,7 +45,7 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
-    image: semitechnologies/weaviate:1.39.4
+    image: semitechnologies/weaviate:1.39.6
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
@@ -150,7 +150,7 @@ services:
       api: { condition: service_healthy }
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.29-alpine
     ports:
       - "8080:80"
     volumes:
@@ -250,6 +250,19 @@ http {
         listen 80;
 
         location /api/ {
+            # nginx's default request-body limit is 1 MB, which rejected most
+            # real PDFs with a 413 before the API saw them (issue #21). 512 MB
+            # covers a ZIP of a firm's documents in one upload. It is the limit
+            # for the whole request, so a multi-file upload counts every file.
+            # ui/src/api/client.ts holds the same number to warn before sending;
+            # change both together.
+            client_max_body_size 512m;
+            # Stream uploads straight to the API instead of spooling each one to
+            # nginx's temp directory first. Buffering would write up to 512 MB
+            # into the container's writable layer, on Docker's often-small
+            # virtual disk, before the API even starts reading. The limit above
+            # still applies: nginx checks Content-Length up front.
+            proxy_request_buffering off;
             proxy_pass http://api/;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
@@ -609,6 +622,7 @@ settings = Settings()
 ### api/models/__init__.py
 
 ```python
+
 ```
 
 ### api/models/schemas.py
@@ -1093,6 +1107,7 @@ class ErrorResponse(BaseModel):
 ### api/services/__init__.py
 
 ```python
+
 ```
 
 ### api/services/sources.py
@@ -1422,6 +1437,7 @@ import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
 from weaviate.classes.query import MetadataQuery
 
+from services import collection_writes, collection_recovery
 from config import settings
 from services import ingest_config
 from services import retrieval_config
@@ -1495,6 +1511,7 @@ async def check_health() -> bool:
     return await asyncio.to_thread(_check_health_sync)
 
 
+@collection_writes.serialized("name")
 def _create_collection_sync(
     name: str,
     index_type: str,
@@ -1547,6 +1564,7 @@ async def collection_exists(name: str) -> bool:
     return await asyncio.to_thread(_collection_exists_sync, name)
 
 
+@collection_writes.serialized("name")
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
@@ -1613,21 +1631,11 @@ STAGING_MARKERS = ("__importing_", "__tuning_")
 
 
 def _sweep_staging_sync() -> list[str]:
-    client = get_client()
-    removed = []
-    for name in list(client.collections.list_all()):
-        if any(marker in name for marker in STAGING_MARKERS):
-            try:
-                client.collections.delete(name)
-            except Exception:                         # noqa: BLE001
-                log.exception("Could not remove abandoned staging collection %r", name)
-                continue
-            removed.append(name)
-    return removed
+    return collection_recovery.sweep(get_client())
 
 
 async def sweep_staging() -> list[str]:
-    """Remove staging collections abandoned by a previous process."""
+    """Remove positively owned scratch; preserve recovery and unowned names."""
     return await asyncio.to_thread(_sweep_staging_sync)
 
 
@@ -1687,6 +1695,23 @@ async def get_collection_config(name: str) -> dict:
     return await asyncio.to_thread(_collection_config_sync, name)
 
 
+def _validate_reindex_vectorizer_sync(name: str) -> None:
+    """Fail before staging if recreation would change the stored vector space."""
+    cfg = get_client().collections.get(name).config.get()
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model = getattr(vectorizer, "model", None)
+    if (getattr(kind, "value", kind) != "text2vec-ollama"
+            or not isinstance(model, dict)
+            or model.get("model") != settings.embed_model
+            or model.get("apiEndpoint") != f"http://{settings.ollama_host}:{settings.ollama_port}"
+            or getattr(vectorizer, "vectorize_collection_name", None) is not False
+            or getattr(cfg, "vector_config", None)):
+        raise ValueError("Reindex would change the collection's vectorizer configuration; "
+                         "re-embed with the configured model first")
+
+
+@collection_writes.serialized("collection_name")
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
@@ -2035,6 +2060,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from services import collection_writes
 from config import settings
 from services.chunker import chunk as do_chunk
 from services import sources
@@ -2048,6 +2074,11 @@ _log = logging.getLogger(__name__)
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def _save_upload(src, dest: Path) -> None:
+    with dest.open("wb") as fh:
+        shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
@@ -2077,6 +2108,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+@collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
     file_paths: list[Path],
@@ -2182,8 +2214,11 @@ async def start_ingest_job(
             if not safe_name:
                 continue
             dest = tmp_dir / safe_name
-            content = await upload.read()
-            dest.write_bytes(content)
+            # Copy in blocks rather than `await upload.read()`, which held the
+            # whole file in memory. Uploads can now reach 512 MB (issue #21),
+            # and this container already runs close to its memory budget. The
+            # copy blocks, so it runs off the event loop.
+            await asyncio.to_thread(_save_upload, upload.file, dest)
 
             if safe_name.lower().endswith(".zip"):
                 resolved_tmp = tmp_dir.resolve()
@@ -3482,6 +3517,7 @@ import threading
 import uuid
 from pathlib import Path
 
+from services import collection_writes
 from config import settings
 from services import goldstandard
 from services import model_bundle
@@ -3842,6 +3878,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
     return notes
 
 
+@collection_writes.serialized("target")
 def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
     _create_from_package(target, pkg)
@@ -4178,6 +4215,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from services import collection_writes, collection_recovery
 from config import settings
 from services import goldstandard
 from services import sources
@@ -4327,6 +4365,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
+@collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None) -> int:
     """Stage the new chunks, then swap them into place.
@@ -4334,27 +4373,34 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     Re-chunk/re-embed use the embedding insert path. Reindex supplies original
     records and verifies them before replacement and after the final copy.
     """
+    if records is not None:
+        wc._validate_reindex_vectorizer_sync(collection)
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
 
-    staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
+    ownership = collection_recovery.begin(collection, "tune", client) if records is not None else None
+    staging = ownership["staging"] if ownership else f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     wc._create_collection_sync(staging, new_index, new_distance, hnsw)
     cutover_started = False
+    completed = False
+    original_intact = False
     try:
         if records is not None:
             _write_records(staging, records)
-            # Refuse a source change observed during staging; this is not a
-            # collection-wide lock against independent writers.
+            # Application writers share the held guard. Also refuse a source
+            # change from an independently connected backend writer.
             _verify_records(collection, records)
+            collection_recovery.retain(ownership)
             cutover_started = True
             client.collections.delete(collection)
             wc._create_collection_sync(collection, new_index, new_distance, hnsw)
             _write_records(collection, records)
             if progress:
                 progress(len(records))
+            completed = True
             return len(records)
         wc._insert_chunks_sync(staging, properties)
         staged = [
@@ -4382,17 +4428,34 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 raise RuntimeError(
                     f"{batch.number_errors} error(s) writing the rebuilt collection")
         return len(staged)
-    except Exception:
+    except Exception as exc:
         if records is not None and cutover_started:
-            goldstandard.mark_stale(collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+            try:
+                _verify_records(collection, records)
+                original_intact = wc._collection_config_sync(collection) == config
+            except Exception:
+                original_intact = False
+            if not original_intact:
+                try:
+                    goldstandard.mark_stale(collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+                except Exception:
+                    _log.exception("Could not mark evaluation historical after failed reindex")
+                if ownership["state"] == "recovery":
+                    raise PackageError("TUNE_FAILED", str(exc) + f" Verified data retained as '{staging}'.",
+                                       {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
         raise
     finally:
         try:
-            client.collections.delete(staging)
+            if ownership:
+                if completed or original_intact or ownership["state"] == "scratch":
+                    collection_recovery.discard(ownership, client)
+            else:
+                client.collections.delete(staging)
         except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove staging collection %r", staging)
+            _log.exception("Could not remove owned staging collection %r", staging)
 
 
+@collection_writes.serialized("collection")
 def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -4500,6 +4563,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
 ### api/routers/__init__.py
 
 ```python
+
 ```
 
 ### api/services/system_info.py
@@ -5880,9 +5944,7 @@ async def lifespan(app: FastAPI):
     from services import weaviate_client as wc
     goldstandard.load_sessions_from_disk()
     metrics.load_from_disk()
-    # An import or tune killed part-way cannot run its own cleanup, so its
-    # staging collection would survive forever. Nothing can be using one before
-    # the app starts serving, so clearing them here is safe.
+    # Only durable ownership permits scratch cleanup; retain verified recovery.
     log = logging.getLogger(__name__)
     try:
         abandoned = await wc.sweep_staging()
@@ -5941,14 +6003,14 @@ app.include_router(tuning.router)
 ### ui/Dockerfile
 
 ```dockerfile
-FROM node:20-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM node:20-alpine
+FROM node:26-alpine
 WORKDIR /app
 RUN npm install -g serve
 COPY --from=builder /app/dist ./dist
@@ -5969,12 +6031,12 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "preview": "vite preview"
   },
   "dependencies": {
-    "lucide-react": "^0.441.0",
+    "lucide-react": "^1.48.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
-    "react-router-dom": "^6.26.0",
-    "recharts": "^2.12.7",
+    "react-router-dom": "^7.18.4",
+    "recharts": "^3.10.1",
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
@@ -5982,11 +6044,11 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "autoprefixer": "^10.4.20",
+    "autoprefixer": "^10.6.1",
     "postcss": "^8.4.45",
     "tailwindcss": "^3.4.11",
-    "typescript": "^5.5.4",
-    "vite": "^5.4.2"
+    "typescript": "^7.0.2",
+    "vite": "^6.4.3"
   }
 }
 ```
@@ -6365,6 +6427,21 @@ export function useQueryConfig() {
 ```typescript
 const BASE = '/api'
 
+// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// It covers a whole request, so a multi-file upload counts every file. Kept
+// here only so the Import page can warn before sending; nginx enforces it.
+// Change both together.
+export const MAX_UPLOAD_MB = 512
+export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+// Errors the proxy answers itself, before the API sees the request. Those
+// arrive as nginx's HTML error pages, not the API's JSON error shape.
+const PROXY_ERRORS: Record<number, string> = {
+  413: `The upload is larger than the ${MAX_UPLOAD_MB} MB limit. Split it into smaller batches.`,
+  502: 'The API is not responding. It may still be starting; try again in a minute.',
+  504: 'The API took too long to respond.',
+}
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -6372,8 +6449,15 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
     headers,
     body: isFormData ? (body as FormData) : body !== undefined ? JSON.stringify(body) : undefined,
   })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data?.error?.message ?? `HTTP ${res.status}`)
+  // Read as text first: calling res.json() on an nginx error page threw a
+  // JSON syntax error, which is what the user saw instead of the real problem.
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
 }
 
@@ -6899,7 +6983,7 @@ export default function QAPage() {
 
 ```typescript
 import { useState, useEffect } from 'react'
-import { api, CollectionInfo, JobStatus } from '../api/client'
+import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
@@ -6972,6 +7056,14 @@ export default function ImportPage() {
   async function startIngest() {
     if (!files.length || !collection) return
     setError('')
+    // Refuse before sending: the proxy would reject it anyway, but only after
+    // the browser had started pushing hundreds of MB, and a connection the
+    // proxy closes mid-upload can surface as a bare network error.
+    const total = files.reduce((n, f) => n + f.size, 0)
+    if (total > MAX_UPLOAD_BYTES) {
+      setError(`These files total ${(total / 1024 / 1024).toFixed(0)} MB; one upload can be at most ${MAX_UPLOAD_MB} MB. Split them into smaller batches.`)
+      return
+    }
     const form = new FormData()
     files.forEach(f => form.append('files', f))
     form.append('collection', collection)
@@ -7001,7 +7093,7 @@ export default function ImportPage() {
         onClick={() => document.getElementById('file-input')?.click()}
       >
         <p className="text-gray-500">Drop files here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP</p>
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
         <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
@@ -8179,8 +8271,8 @@ drive the UI in a real browser.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
-| `14_reindex.sh` | exact-record reindex: twelve controlled failure/preservation cases, two polling-deadline cases and nine real Weaviate/handler checks with a refused embedding endpoint; run by `05_transfer.sh` |
-| `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves its exact fixture names/directory before standalone exit |
+| `14_reindex.sh` | exact-record reindex: 18 record/cutover/vectorizer/concurrency cases, six writer-guard cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 28 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 
@@ -8224,6 +8316,10 @@ curl -s localhost:8080/api/collections | python3 -c \
   "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
+
+`reindex_verifier_cases.py` checks actual async failure cleanup and the parent shell cleanup predicate without a backend/model call. The registered suite transports its helper, the actual `lib.sh`, and these controlled tests into an owned temporary API directory. `test_collection_writes.py` checks waiting writers, case aliases, reentrancy, failures, independent collections and actual import/backend entry points.
+
+The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
 ````
 
 ### scripts/verify/all.sh
@@ -8435,6 +8531,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import random
 import sys
 import zipfile
 
@@ -8455,8 +8552,13 @@ PARAGRAPHS = [
 ONE_LINER = PARAGRAPHS[0]
 
 
-def _pdf(paragraphs: list[str]) -> bytes:
-    """A minimal single-page PDF. Hand-built to avoid a writer dependency."""
+def _pdf(paragraphs: list[str], padding: int = 0) -> bytes:
+    """A minimal single-page PDF. Hand-built to avoid a writer dependency.
+
+    `padding` adds an unreferenced stream object of that many bytes. No page
+    points at it, so parsers skip it: the file is large on the wire but carries
+    only the text above, which keeps an upload-size test fast to ingest.
+    """
     lines: list[str] = []
     for para in paragraphs:
         cur = ""
@@ -8483,6 +8585,12 @@ def _pdf(paragraphs: list[str]) -> bytes:
         b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
+    if padding:
+        # Seeded so the fixture is byte-identical on every run. Random bytes
+        # rather than zeros so nothing on the path can compress it away.
+        filler = random.Random(21).randbytes(padding)
+        objects.append(b"<< /Length " + str(padding).encode() + b" >>\nstream\n"
+                       + filler + b"\nendstream")
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, body in enumerate(objects, 1):
@@ -8543,6 +8651,9 @@ def write(target: pathlib.Path) -> None:
     (target / "tiny.txt").write_text("Short.\n\nAlso short.\n\n" + ONE_LINER + "\n")
     # Right extension, unparseable content — one bad file must not fail a batch.
     (target / "broken.pdf").write_bytes(b"%PDF-1.4\nnot a real pdf body\n%%EOF\n")
+    # Over nginx's 1 MB default request-body limit, which once rejected every
+    # real-world PDF with a 413 before the API saw it. See issue #21.
+    (target / "large.pdf").write_bytes(_pdf(PARAGRAPHS, padding=3 * 1024 * 1024))
     # Unsupported types, which must be reported rather than dropped in silence.
     (target / "notes.xyz").write_text("unsupported\n")
     (target / "notes.rtf").write_text("also unsupported\n")
@@ -8847,7 +8958,9 @@ summary
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
-[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+# Regenerate when the newest fixture is missing, so a directory left by an
+# older run does not hide a check behind a missing file.
+[ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 C="${PREFIX}Ingest"
@@ -8900,6 +9013,36 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
 check "each skip names the unsupported extension" $?
+
+# ── upload size limit at the proxy ───────────────────────────────────────────
+# nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
+# a 413 before the API sees them, so every real-world PDF failed through the
+# UI while the few-KB fixtures here all passed. These go through $API, which is
+# the proxy, on purpose. See issue #21.
+size=$(python3 -c "import os;print(os.path.getsize('$FIX/large.pdf'))")
+[ "$size" -gt 1048576 ]
+check "the large fixture is over nginx's 1 MB default" $? "$size bytes"
+
+drop_collection "$C"; make_collection "$C"
+if ingest "$C" fixed 300 50 "$FIX/large.pdf"; then
+  read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+else
+  status="rejected"; completed=0; chunks=0
+fi
+[ "$status" = completed ] && [ "$completed" = 1 ] && [ "$chunks" -gt 0 ]
+check "an upload over 1 MB is accepted through the proxy and ingests" $? \
+  "status=$status completed=$completed chunks=$chunks"
+
+# Just over the 512 MB limit. A sparse file, so nothing is written to disk, and
+# nginx answers from the Content-Length header without reading the body.
+big_dir=$(mktemp -d)
+python3 -c "open('$big_dir/oversize.txt','wb').truncate(513*1024*1024)"
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "strategy=fixed" -F "files=@$big_dir/oversize.txt")
+rm -rf "$big_dir"
+check_eq "an upload over the 512 MB limit is refused with 413" "$code" "413"
 
 # ── every chunking strategy against a PDF ────────────────────────────────────
 for strategy in fixed overlap language context_aware semantic; do
@@ -9690,6 +9833,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── upload size limit ──────────────────────────────────────────────────────
+  // The Import page refuses a selection over the proxy's limit before sending.
+  // The file is sparse: it reports 513 MB but occupies no disk, and the check
+  // must stop it before the browser ever reads it. See issue #21.
+  r.section('upload size limit');
+  {
+    const fs = require('fs');
+    const big = '/tmp/vfy-oversize-upload.txt';
+    fs.closeSync(fs.openSync(big, 'w'));
+    fs.truncateSync(big, 513 * 1024 * 1024);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const hint = await bodyText(s.page);
+    r.check('the drop zone states the upload limit', hint.includes('up to 512 MB per upload'));
+    const input = await s.page.$('#file-input');
+    await input.uploadFile(big);
+    await sleep(500);
+    const posts = () => s.api.filter(x => x.method === 'POST' && x.url.includes('/ingest/upload')).length;
+    const before = posts();
+    const clicked = await clickByText(s.page, 'Start Ingest');
+    await sleep(900);
+    const text = await bodyText(s.page);
+    r.check('an oversize selection is refused with the limit named',
+            clicked && text.includes('one upload can be at most 512 MB'),
+            clicked ? text.slice(0, 160) : 'Start Ingest button not found');
+    r.check('an oversize selection sends no upload', posts() === before);
+    r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    fs.unlinkSync(big);
+    await s.ctx.close();
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {
@@ -10108,6 +10282,12 @@ bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$bindings" || exit 2
 require_stack
 section "Exact-record reindex"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_collection_writes.py)
+check "collection writer barrier regressions" $?
+# Transport only these three controlled sources into a temporary API directory.
+# The tests exercise the actual helper and parent cleanup function with mocks.
+(cd ../.. && python3 -c 'import sys,tarfile; t=tarfile.open(fileobj=sys.stdout.buffer,mode="w|"); [t.add("scripts/verify/"+name,arcname=name) for name in ("reindex.py","lib.sh","reindex_verifier_cases.py")]; t.close()' | docker compose exec -T api python -c 'import os,sys,tarfile,tempfile,subprocess; task=tempfile.TemporaryDirectory(prefix="owned-reindex-tests-"); tarfile.open(fileobj=sys.stdin.buffer,mode="r|*").extractall(task.name,filter="data"); result=subprocess.run([sys.executable,task.name+"/reindex_verifier_cases.py"],env={**os.environ,"RAG_TEST_API_DIR":"/app","RAG_REINDEX_VERIFIER_SOURCE":task.name+"/reindex.py","RAG_VERIFIER_LIB":task.name+"/lib.sh"}); task.cleanup(); sys.exit(result.returncode)')
+check "verifier async ownership and parent cleanup regressions" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/reindex_cases.py)
 check "owned reindex preservation and failure regressions" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/reindex.py)
@@ -10125,6 +10305,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 from services import tuning
+validate_vectorizer = tuning.wc._validate_reindex_vectorizer_sync
 
 
 def records():
@@ -10175,11 +10356,19 @@ class ReindexTests(unittest.TestCase):
         patches = [patch.object(tuning.wc,'get_client',return_value=SimpleNamespace(collections=self.backend)),
                    patch.object(tuning.wc,'_create_collection_sync',side_effect=self.backend.create),
                    patch.object(tuning.wc,'_collection_config_sync',return_value=self.config),
+                   patch.object(tuning.wc,'_validate_reindex_vectorizer_sync'),
                    patch.object(tuning.wc,'_insert_chunks_sync',self.embedding),
                    patch.object(tuning.sources,'has_sources',return_value=False),
                    patch.object(tuning.goldstandard,'mark_stale',self.stale),
                    patch.object(tuning,'_jobs',{}),patch.object(tuning,'_active',{'OwnedReindex'})]
         for change in patches: change.start(); self.addCleanup(change.stop)
+        import tempfile
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        def begin(collection,operation,client):return {'staging':collection+'__tuning_owned','state':'scratch','operation_id':'owned'}
+        def retain(owner):owner['state']='recovery'
+        def discard(owner,client):client.collections.delete(owner['staging'])
+        for change in [patch.object(tuning.collection_recovery,'begin',side_effect=begin),patch.object(tuning.collection_recovery,'retain',side_effect=retain),patch.object(tuning.collection_recovery,'discard',side_effect=discard),patch.object(tuning.collection_recovery,'_root',return_value=Path(self.temp.name))]:
+            change.start();self.addCleanup(change.stop)
     def run_job(self, operation='reindex'):
         tuning._jobs['owned'] = {'status':'queued','chunks_written':0,'notes':[]}
         tuning._run('owned','OwnedReindex',operation,{'index_type':'flat','distance_metric':'dot'})
@@ -10225,6 +10414,84 @@ class ReindexTests(unittest.TestCase):
     def test_empty_collection_reindexes_without_embedding(self):
         self.backend.data['OwnedReindex']=[]; job=self.run_job()
         self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_written'],0); self.embedding.assert_not_called(); self.stale.assert_not_called()
+    def test_ingest_started_after_source_check_waits_for_final_reindex_copy(self):
+        import tempfile,threading,uuid
+        from concurrent.futures import ThreadPoolExecutor
+        from services import ingest_pipeline as ingest
+        entered=threading.Event();release=threading.Event();parsed=threading.Event();attempted=threading.Event()
+        verify=tuning._verify_records;paused=False
+        def paused_verify(name,records):
+            nonlocal paused
+            verify(name,records)
+            if name=='OwnedReindex' and not paused:
+                paused=True;entered.set();assert release.wait(3)
+        def parse(path):parsed.set();return 'Owned later upload',[]
+        def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
+        job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+            path=Path(temp)/'owned.txt';path.write_text('Owned later upload')
+            reindex=pool.submit(self.run_job);self.assertTrue(entered.wait(2))
+            def start_ingest():
+                attempted.set();ingest._process_job_sync('owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
+            upload=pool.submit(start_ingest);self.assertTrue(attempted.wait(2));self.assertFalse(parsed.wait(.05));release.set()
+            result=reindex.result(timeout=3);upload.result(timeout=3)
+        self.assertEqual(result['status'],'completed');self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.backend.data['OwnedReindex'][:2],self.original);self.assertEqual(len(self.backend.data['OwnedReindex']),3)
+    def test_reindex_snapshot_waits_for_already_running_ingest(self):
+        import tempfile,threading,uuid
+        from concurrent.futures import ThreadPoolExecutor
+        from services import ingest_pipeline as ingest
+        parsed=threading.Event();release=threading.Event();snapshot=threading.Event();attempted=threading.Event()
+        original_read=tuning._existing_records
+        def read(name):snapshot.set();return original_read(name)
+        def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
+        def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
+        job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+            path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
+            upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
+            self.assertTrue(parsed.wait(2))
+            def start_reindex():attempted.set();return self.run_job()
+            reindex=pool.submit(start_reindex);self.assertTrue(attempted.wait(2));self.assertFalse(snapshot.wait(.05));release.set()
+            upload.result(timeout=3);result=reindex.result(timeout=3)
+        self.assertEqual(result['status'],'completed');self.assertEqual(result['chunks_written'],3)
+        self.assertEqual(self.backend.data['OwnedReindex'][:2],self.original);self.assertEqual(len(self.backend.data['OwnedReindex']),3)
+    def test_foreign_vectorizer_refuses_before_staging_or_delete(self):
+        tuning.wc._validate_reindex_vectorizer_sync.side_effect=ValueError('Owned incompatible model')
+        job=self.run_job();self.assertEqual(job['status'],'failed')
+        self.assertEqual(self.backend.created,[]);self.assertEqual(self.backend.deleted,[])
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original);self.stale.assert_not_called()
+    def test_vectorizer_validation_checks_model_endpoint_type_and_named_vectors(self):
+        from config import settings
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None)
+        client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
+        with patch.object(tuning.wc,'get_client',return_value=client):
+            validate_vectorizer('Owned')
+            for attribute,value in [('model','foreign'),('apiEndpoint','http://foreign:1')]:
+                original=cfg.vectorizer_config.model[attribute];cfg.vectorizer_config.model[attribute]=value
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                cfg.vectorizer_config.model[attribute]=original
+            cfg.vectorizer_config.vectorizer='unsupported'
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+            cfg.vectorizer_config.vectorizer='text2vec-ollama';cfg.vector_config={'foreign':object()}
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+    def test_delete_refusal_with_intact_original_preserves_evaluation_validity(self):
+        delete=self.backend.delete
+        def refuse(name):
+            if name=='OwnedReindex':raise RuntimeError('Owned delete refusal')
+            delete(name)
+        with patch.object(self.backend,'delete',side_effect=refuse):job=self.run_job()
+        self.assertEqual(job['status'],'failed');self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        self.stale.assert_not_called();self.assertEqual(set(self.backend.data),{'OwnedReindex'})
+    def test_uncertain_delete_retains_recovery_and_marks_historical(self):
+        delete=self.backend.delete
+        def uncertain(name):
+            delete(name)
+            if name=='OwnedReindex':raise RuntimeError('Owned lost delete acknowledgement')
+        with patch.object(self.backend,'delete',side_effect=uncertain):job=self.run_job()
+        self.assertEqual(job['status'],'failed');self.stale.assert_called_once()
+        retained=job['error_detail']['recovered_as'];self.assertEqual(self.backend.data[retained],self.original)
+        self.assertEqual(job['chunks_written'],0)
     def test_reembed_retains_its_explicit_regeneration_path(self):
         def embed(name,props):
             self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},
@@ -10240,17 +10507,17 @@ if __name__=='__main__': unittest.main()
 
 ```python
 """Real Weaviate reindex with an unreachable embedding endpoint; owned fixtures only."""
-import asyncio, os, tempfile, uuid
+import asyncio, json, os, subprocess, sys, tempfile, threading, uuid
 from pathlib import Path
 from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
-from services import goldstandard as gs, tuning
+from services import goldstandard as gs, tuning, ingest_pipeline as ingest
 from services import weaviate_client as wc
 
 
-async def completed(client,path,timeout=300):
+async def completed(client,path,timeout=300,expected_status="completed"):
     deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
     while True:
         remaining=deadline-asyncio.get_running_loop().time()
@@ -10260,7 +10527,7 @@ async def completed(client,path,timeout=300):
         assert response.status_code==200,response.text
         job=response.json();last=job.get('status','missing')
         if last not in ('queued','running'):
-            assert last=='completed',job
+            assert last==expected_status,job
             return job
         await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
 
@@ -10282,60 +10549,182 @@ async def bounded_poll_cases():
     assert pending==[('owned','owned-cleanup-job','queued')]
     print('PASS two controlled job-poll and cleanup deadline cases',flush=True)
 
+def owned_name(prefix,token):
+    # Parent suites may sweep their prefix. This standalone owner must remain
+    # outside that namespace when preserving a failed or interrupted fixture.
+    if not prefix:raise ValueError('A nonempty parent fixture prefix is required')
+    first = 'A' if not prefix.startswith('A') else 'B'
+    return first+'OwnedReindex'+token
+
+def preserve_receipt(directory,created,pending):
+    path=Path(directory)/'owned-fixtures.json'
+    with path.open('w') as output:
+        json.dump({'created_collections':list(created),'pending_jobs':pending,'fixture_directory':directory,'cleanup':'Inspect terminal writer state and delete only these exact owned names; do not prefix-sweep.'},output,indent=2)
+        output.flush();os.fsync(output.fileno())
+    return str(path)
+
+
+async def queued_ingest_checks(api,client,collection,jobs,check):
+    before=await asyncio.to_thread(tuning._existing_records,collection)
+    paused=threading.Event();release=threading.Event();original_verify=tuning._verify_records;once=False
+    def verify(target,records):
+        nonlocal once
+        original_verify(target,records)
+        if target==collection and not once:
+            once=True;paused.set()
+            if not release.wait(30):raise TimeoutError('Owned source-check pause expired')
+    # Only the embedding fixture is replaced; the HTTP upload, parser, chunker,
+    # ingest worker, source retention and actual backend writes remain real.
+    def supplied_vectors(target,chunks):
+        col=client.collections.get(target)
+        for chunk in chunks:col.data.insert(properties=chunk,uuid=str(uuid.uuid4()),vector=[.25]*len(before[0]['vector']))
+    with patch.object(tuning,'_verify_records',side_effect=verify),patch.object(wc,'_insert_chunks_sync',side_effect=supplied_vectors):
+        try:
+            response=await api.post('/tune/reindex',json={'collection':collection,'index_type':'hnsw','distance_metric':'cosine'})
+            assert response.status_code==202,response.text;reindex=response.json()['job_id'];jobs.append((tuning,reindex))
+            check(await asyncio.to_thread(paused.wait,10),'real reindex reaches protected source check before cutover')
+            uploaded=await api.post('/ingest/upload',data={'collection':collection,'strategy':'fixed','chunk_size':'150','chunk_overlap':'0','min_chunk_size':'100'},files={'files':('owned-concurrent.txt',b'Owned concurrency upload with inert public text. '*40,'text/plain')})
+            assert uploaded.status_code==202,uploaded.text;upload=uploaded.json()['job_id'];jobs.append((ingest,upload))
+            status=await api.get('/ingest/job/'+upload)
+            check(status.status_code==200 and status.json()['status']=='queued','actual ingest HTTP job remains queued while reindex holds the source guard')
+            release.set()
+            reindexed=await completed(api,'/tune/job/'+reindex)
+            ingested=await completed(api,'/ingest/job/'+upload)
+            check(reindexed['chunks_written']==len(before) and ingested['chunks_stored']>0,'reindex verifies its copy before the waiting real ingest completes')
+        finally:release.set()
+    after=await asyncio.to_thread(tuning._existing_records,collection);observed={record['id']:record for record in after}
+    check(all(observed.get(record['id'])==record for record in before) and len(after)==len(before)+ingested['chunks_stored'],'real backend retains original exact records and the post-cutover upload')
+
+
+async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check):
+    collection=name+'CutoverFail';sid='gs_'+uuid.uuid4().hex[:8]
+    await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+    col=client.collections.get(collection)
+    await asyncio.to_thread(col.data.insert,properties={'content':'Owned inert recovery','source_file':'owned.txt','chunk_index':0},uuid=str(uuid.uuid4()),vector=[.125]*768)
+    before=await asyncio.to_thread(tuning._existing_records,collection)
+    session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
+    await asyncio.to_thread(gs.store_session,session);session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
+    def create(target,*args,**kwargs):
+        if target==collection:raise RuntimeError('Owned injected final-create failure after cutover')
+        record_create(target,*args,**kwargs)
+    with patch.object(wc,'_create_collection_sync',side_effect=create):
+        response=await api.post('/tune/reindex',json={'collection':collection,'index_type':'flat','distance_metric':'dot'})
+        assert response.status_code==202,response.text;job=response.json()['job_id'];jobs.append((tuning,job))
+        result=await completed(api,'/tune/job/'+job,expected_status='failed')
+    check(result['chunks_written']==0,'post-cutover failure is not published as completion')
+    stage=result['error_detail']['recovered_as'];check(stage.startswith(collection+'__tuning_'),'failure identifies the exact operation-owned retained copy')
+    check(await asyncio.to_thread(tuning._existing_records,stage)==before,'retained backend copy preserves exact UUID/properties/vector after final create fails')
+    paths=await asyncio.to_thread(lambda:list(tuning.collection_recovery._root().glob('*.json')));assert len(paths)==1
+    owner=await asyncio.to_thread(lambda:json.loads(paths[0].read_text()))
+    check(owner['state']=='recovery' and owner['target']==collection and owner['staging']==stage,'durable recovery ownership binds the original and retained copy')
+    snapshot=Path(result['error_detail']['sidecar_snapshots'])/'goldstandard'/(sid+'.json')
+    check(await asyncio.to_thread(snapshot.read_bytes)==session_bytes,'pre-cutover evaluation snapshot is retained byte-identically')
+    check(await asyncio.to_thread(lambda:gs.get_session(sid).get('stale')),'failed cutover marks its retained evaluation historical')
+    await asyncio.to_thread(wc._sweep_staging_sync)
+    check(await asyncio.to_thread(client.collections.exists,stage) and await asyncio.to_thread(paths[0].is_file),'actual startup sweep preserves retained recovery and its durable record')
+    child="""import asyncio,json,sys
+from services import weaviate_client as wc,goldstandard as gs,tuning
+from main import app,lifespan
+expected=json.load(sys.stdin)
+async def proof():
+    async with lifespan(app):
+        assert wc.get_client().collections.exists(sys.argv[1])
+        assert tuning._existing_records(sys.argv[1])==expected
+        assert gs.get_session(sys.argv[2])['stale']
+asyncio.run(proof())
+print('PASS independent API lifespan restores recovery, exact records and historical session')
+"""
+    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')}
+    restarted=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child,stage,sid],input=json.dumps(before),text=True,capture_output=True,env=env,timeout=30)
+    if restarted.returncode:print(restarted.stderr,flush=True)
+    check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
+
+
 async def main():
-    token=uuid.uuid4().hex[:8]; name=os.environ.get('RAG_TEST_PREFIX','Vfy49')+'Reindex'+token
-    probe=name+'Probe'; sid='gs_'+token; job=None; checks=0
+    token=uuid.uuid4().hex[:8]; name=owned_name(os.environ.get('RAG_TEST_PREFIX','Vfy49'),token)
+    probe=name+'Probe'; sid='gs_'+token; job=None; jobs=[]; checks=0
     await bounded_poll_cases()
-    client=await asyncio.to_thread(wc.get_client); created=[]
-    with tempfile.TemporaryDirectory(prefix='owned-reindex-') as temp, \
-         patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
-         patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1):
-        def check(condition,label):
-            nonlocal checks
-            assert condition,label; checks+=1; print('PASS '+label,flush=True)
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned') as api:
-            try:
-                await asyncio.to_thread(wc._create_collection_sync,probe,'hnsw','cosine',{}); created.append(probe)
+    for prefix in ('Vfy49','A','B'):
+        if prefix:assert not owned_name(prefix,'owned').startswith(prefix)
+    print('PASS parent cleanup namespace excludes verifier-owned names',flush=True)
+    client=None;created=[]
+    original_create=wc._create_collection_sync
+    def record_create(collection,*args,**kwargs):
+        original_create(collection,*args,**kwargs);created.append(collection)
+    temporary=await asyncio.to_thread(tempfile.TemporaryDirectory,prefix='owned-reindex-')
+    temp=temporary.name
+    try:
+        client=await asyncio.to_thread(wc.get_client)
+        with patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
+             patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1), \
+             patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
+            def check(condition,label):
+                nonlocal checks
+                assert condition,label; checks+=1; print('PASS '+label,flush=True)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned') as api:
                 try:
-                    await asyncio.to_thread(client.collections.get(probe).data.insert,properties={'content':'Owned endpoint refusal probe'})
-                except Exception as exc:
-                    message=str(exc).lower()
-                    check('connect' in message and ('127.0.0.1:1' in message or 'connection refused' in message),'actual vectorization fails against the closed embedding endpoint')
-                else: raise AssertionError('Owned embedding endpoint unexpectedly served a vector')
-                check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
-                await asyncio.to_thread(wc._create_collection_sync,name,'hnsw','cosine',{}); created.append(name)
-                col=client.collections.get(name)
-                source=[]
-                for i in range(2):
-                    identity=str(uuid.uuid4()); vector=[(i+1)/8.0]*768
-                    props={'content':'Owned inert reindex '+str(i),'source_file':'owned-inert.txt','source_type':'txt','chunk_index':i,'chunk_strategy':'fixed','chunk_size':150,'chunk_overlap':0,'created_at':'2026-09-28T00:00:00Z'}
-                    await asyncio.to_thread(col.data.insert,properties=props,uuid=identity,vector=vector)
-                    source.append(identity)
-                before=await asyncio.to_thread(tuning._existing_records,name)
-                check({r['id'] for r in before}==set(source),'stored explicit vectors and original UUIDs are readable with embeddings unavailable')
-                session={'session_id':sid,'collection':name,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_'+token,'question':'Owned question','answer':'Owned answer','ground_truth':'Owned truth','contexts':['Owned inert reindex'],'source_file':'owned-inert.txt','chunk_index':0,'status':'approved'}]}
-                await asyncio.to_thread(gs.store_session,session); session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
-                request=await api.post('/tune/reindex',json={'collection':name,'index_type':'flat','distance_metric':'dot'})
-                check(request.status_code==202,'real reindex HTTP handler queues the job with closed embedding configuration'); job=request.json()['job_id']
-                result=await completed(api,'/tune/job/'+job)
-                check(result['status']=='completed' and result['chunks_written']==len(before), 'job completes only after final backend verification: '+str(result))
-                after=await asyncio.to_thread(tuning._existing_records,name)
-                check({r['id']:r for r in after}=={r['id']:r for r in before},'UUIDs, every property and all stored vector values match exactly after reindex')
-                config=await asyncio.to_thread(wc._collection_config_sync,name)
-                check(config['index_type']=='flat' and config['distance_metric']=='dot','physical index and distance change to flat/dot')
-                check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes and not gs.get_session(sid).get('stale')),'retained evaluation identity/content/validity are unchanged')
-                check(any('verified unchanged' in note for note in result['notes']),'completion notes truthfully report verified identity and vector preservation')
-            finally:
-                if job:
-                    pending=await settle_owned_jobs([(tuning,job)])
-                    if pending:
-                        print(f'FAIL owned jobs still active: {pending}; preserving fixtures {created} and {temp}',flush=True)
-                        # Standalone verifier: preserve active fixtures and avoid executor join.
-                        os._exit(2)
-                for owned in reversed(created):
-                    if await asyncio.to_thread(client.collections.exists,owned): await asyncio.to_thread(client.collections.delete,owned)
-                gs._sessions.pop(sid,None)
-    await asyncio.to_thread(client.close); print(str(checks)+' real reindex checks passed',flush=True)
+                    await asyncio.to_thread(wc._create_collection_sync,probe,'hnsw','cosine',{})
+                    try:
+                        await asyncio.to_thread(client.collections.get(probe).data.insert,properties={'content':'Owned endpoint refusal probe'})
+                    except Exception as exc:
+                        message=str(exc).lower()
+                        check('connect' in message and ('127.0.0.1:1' in message or 'connection refused' in message),'actual vectorization fails against the closed embedding endpoint')
+                    else: raise AssertionError('Owned embedding endpoint unexpectedly served a vector')
+                    check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
+                    await asyncio.to_thread(wc._create_collection_sync,name,'hnsw','cosine',{})
+                    col=client.collections.get(name)
+                    source=[]
+                    for i in range(2):
+                        identity=str(uuid.uuid4()); vector=[(i+1)/8.0]*768
+                        props={'content':'Owned inert reindex '+str(i),'source_file':'owned-inert.txt','source_type':'txt','chunk_index':i,'chunk_strategy':'fixed','chunk_size':150,'chunk_overlap':0,'created_at':'2026-09-28T00:00:00Z'}
+                        await asyncio.to_thread(col.data.insert,properties=props,uuid=identity,vector=vector)
+                        source.append(identity)
+                    before=await asyncio.to_thread(tuning._existing_records,name)
+                    check({r['id'] for r in before}==set(source),'stored explicit vectors and original UUIDs are readable with embeddings unavailable')
+                    session={'session_id':sid,'collection':name,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_'+token,'question':'Owned question','answer':'Owned answer','ground_truth':'Owned truth','contexts':['Owned inert reindex'],'source_file':'owned-inert.txt','chunk_index':0,'status':'approved'}]}
+                    await asyncio.to_thread(gs.store_session,session); session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
+                    request=await api.post('/tune/reindex',json={'collection':name,'index_type':'flat','distance_metric':'dot'})
+                    check(request.status_code==202,'real reindex HTTP handler queues the job with closed embedding configuration'); job=request.json()['job_id'];jobs.append((tuning,job))
+                    result=await completed(api,'/tune/job/'+job)
+                    check(result['status']=='completed' and result['chunks_written']==len(before), 'job completes only after final backend verification: '+str(result))
+                    after=await asyncio.to_thread(tuning._existing_records,name)
+                    check({r['id']:r for r in after}=={r['id']:r for r in before},'UUIDs, every property and all stored vector values match exactly after reindex')
+                    config=await asyncio.to_thread(wc._collection_config_sync,name)
+                    check(config['index_type']=='flat' and config['distance_metric']=='dot','physical index and distance change to flat/dot')
+                    check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes and not gs.get_session(sid).get('stale')),'retained evaluation identity/content/validity are unchanged')
+                    check(any('verified unchanged' in note for note in result['notes']),'completion notes truthfully report verified identity and vector preservation')
+                    with patch.object(settings,'embed_model','owned-incompatible-model'):
+                        request=await api.post('/tune/reindex',json={'collection':name,'index_type':'hnsw','distance_metric':'cosine'})
+                        assert request.status_code==202,request.text;job=request.json()['job_id'];jobs.append((tuning,job))
+                        refused=await completed(api,'/tune/job/'+job,expected_status='failed')
+                    check('vectorizer configuration' in refused['error'] and refused['chunks_written']==0,'foreign deployed embedding model is refused before replacement')
+                    unchanged=await asyncio.to_thread(tuning._existing_records,name)
+                    config_after_refusal=await asyncio.to_thread(wc._collection_config_sync,name)
+                    check(unchanged==after and config_after_refusal==config,'refused model mismatch leaves real records and physical index unchanged')
+                    check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'refused model mismatch preserves evaluation bytes')
+                    check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'successful reindex removes its exact durable ownership; refusal creates none')
+                    check(all(not item.startswith(os.environ.get('RAG_TEST_PREFIX','Vfy49')) for item in created),'all real verifier-created names remain outside the parent prefix sweep')
+                    await queued_ingest_checks(api,client,name,jobs,check)
+                    await retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
+                    check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'failed secondary cutover leaves the unrelated primary evaluation unchanged')
+                finally:
+                    if jobs:
+                        pending=await settle_owned_jobs(jobs)
+                        if pending:
+                            receipt=await asyncio.to_thread(preserve_receipt,temp,created,pending)
+                            print(f'FAIL owned jobs still active: {pending}; preserving fixtures {created} and {receipt}',flush=True)
+                            # Standalone verifier: preserve active fixtures and avoid executor join.
+                            os._exit(2)
+                    for owned in reversed(created):
+                        if await asyncio.to_thread(client.collections.exists,owned): await asyncio.to_thread(client.collections.delete,owned)
+                    check(not any([await asyncio.to_thread(client.collections.exists,item) for item in created]),'cleanup removes all exact recorded verifier-owned collections')
+                    gs._sessions.pop(sid,None)
+    finally:
+        try:
+            await asyncio.to_thread(temporary.cleanup)
+        finally:
+            if client is not None:await asyncio.to_thread(client.close)
+    print(str(checks)+' real reindex checks passed',flush=True)
 
 asyncio.run(main())
 ```
@@ -10366,4 +10755,364 @@ if __name__=='__main__':
     if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
         print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
         sys.exit(2)
+```
+
+### api/services/collection_writes.py
+
+```python
+"""Serialize collection mutations within one API process.
+
+The registry counts both owners and waiting writers. A guard spans synchronous
+worker work; callers must enter it in their executor, never across an async wait.
+"""
+from contextlib import contextmanager
+from functools import wraps
+from inspect import signature
+import threading
+
+_registry_lock = threading.Lock()
+_registry = {}
+
+
+@contextmanager
+def guard(collection):
+    # Weaviate canonicalizes the first character, including get()/insert().
+    collection = collection[:1].upper() + collection[1:]
+    with _registry_lock:
+        entry = _registry.setdefault(collection, [threading.RLock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _registry_lock:
+            entry[1] -= 1
+            if not entry[1]:
+                del _registry[collection]
+
+
+def serialized(argument):
+    def decorate(function):
+        parameters = signature(function)
+        @wraps(function)
+        def run(*args, **kwargs):
+            collection = parameters.bind(*args, **kwargs).arguments[argument]
+            with guard(collection):
+                return function(*args, **kwargs)
+        return run
+    return decorate
+```
+
+### api/services/collection_recovery.py
+
+```python
+"""Durable ownership of scratch collections and retained recovery copies.
+
+Names are never cleanup authority. Only a valid record created by this service
+allows startup to remove scratch; recovery records survive until explicit
+collection deletion or successful completion of their owning operation.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import uuid
+from pathlib import Path
+
+from config import settings
+from services import sources
+
+log = logging.getLogger(__name__)
+_NAME = re.compile(r"[A-Z][A-Za-z0-9_]*")
+
+
+def _root() -> Path:
+    root = Path(settings.upload_dir) / "collection_operations"
+    created = not root.exists()
+    root.mkdir(parents=True, exist_ok=True)
+    if created:
+        _sync_dir(root.parent)
+    return root
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_json(path: Path, record: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w") as output:
+        json.dump(record, output, indent=2, sort_keys=True)
+        output.flush()
+        os.fsync(output.fileno())
+    tmp.replace(path)
+    _sync_dir(path.parent)
+
+
+def _write(record: dict) -> None:
+    atomic_json(_root() / f"{record['operation_id']}.json", record)
+
+
+def begin(target: str, operation: str, client) -> dict:
+    if not _NAME.fullmatch(target) or operation not in ("import", "tune"):
+        raise ValueError("Invalid collection operation")
+    token = uuid.uuid4().hex
+    marker = "__importing_" if operation == "import" else "__tuning_"
+    staging = f"{target}{marker}{token}"
+    if client.collections.exists(staging):
+        raise RuntimeError(f"Recovery name '{staging}' is already in use")
+    record = dict(version=1, operation_id=token, operation=operation,
+                  target=target, staging=staging, state="scratch")
+    _write(record)  # Ownership is persisted before collection creation.
+    return record
+
+
+def _copy(source: Path, destination: Path) -> None:
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    elif source.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
+def retain(record: dict, *, package: Path | None = None) -> None:
+    """Snapshot sidecars and mark recovery durably BEFORE deleting the target."""
+    metadata = _root() / record["operation_id"]
+    metadata.mkdir()
+    target, staging = record["target"], record["staging"]
+    upload = Path(settings.upload_dir)
+    _copy(package / "sources" if package else sources.collection_dir(target),
+          sources.collection_dir(staging))
+    for kind in ("ingest", "retrieval"):
+        origin = package / f"{kind}_config.json" if package else upload / f"{kind}_configs" / f"{target}.json"
+        _copy(origin, metadata / f"{kind}_config.json")
+        if origin.is_file():
+            config = json.loads(origin.read_text())
+            config["collection"] = staging
+            out = upload / f"{kind}_configs" / f"{staging}.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(config, indent=2, sort_keys=True))
+    if package:
+        _copy(package / "goldstandard", metadata / "goldstandard")
+        _copy(package / "collection.json", metadata / "collection.json")
+        _copy(package / "manifest.json", metadata / "manifest.json")
+    else:
+        sessions = upload / "goldstandard_sessions"
+        for path in sessions.glob("*.json"):
+            # Preserve unreadable state rather than guessing that it is unrelated.
+            try:
+                belongs = json.loads(path.read_text()).get("collection") == target
+            except (ValueError, OSError, AttributeError):
+                belongs = True
+            if belongs:
+                _copy(path, metadata / "goldstandard" / path.name)
+    # Sources live on a separate named volume. Flush both snapshots before the
+    # state transition; a crash before the transition leaves the original safe.
+    paths = [metadata, sources.collection_dir(staging)]
+    paths += [upload / f"{kind}_configs" / f"{staging}.json" for kind in ("ingest", "retrieval")]
+    for path in paths:
+        files = list(path.rglob("*")) if path.is_dir() else [path]
+        for item in files:
+            if item.is_file():
+                with item.open("rb") as data:
+                    os.fsync(data.fileno())
+        if path.is_dir():
+            for directory in sorted((p for p in path.rglob("*") if p.is_dir()), reverse=True):
+                _sync_dir(directory)
+            _sync_dir(path)
+        if path.exists():
+            _sync_dir(path.parent)
+    _sync_dir(upload)
+    updated = {**record, "state": "recovery"}
+    _write(updated)
+    record.update(updated)
+
+
+def discard(record: dict, client) -> None:
+    """Delete an owned copy after success, or scratch while the target is safe."""
+    # Persist intent before the first deletion. Startup can finish this exact
+    # authorized cleanup even if backend or filesystem cleanup is interrupted.
+    if record["state"] != "cleanup":
+        updated = {**record, "state": "cleanup"}
+        _write(updated)
+        record.update(updated)
+    name = record["staging"]
+    if client.collections.exists(name):
+        client.collections.delete(name)
+    sources.delete(name)
+    if sources.collection_dir(name).exists():
+        raise OSError(f"Could not remove recovery sources for {name}")
+    for kind in ("ingest", "retrieval"):
+        (Path(settings.upload_dir) / f"{kind}_configs" / f"{name}.json").unlink(missing_ok=True)
+    metadata = _root() / record["operation_id"]
+    if metadata.exists():
+        shutil.rmtree(metadata)
+    (_root() / f"{record['operation_id']}.json").unlink(missing_ok=True)
+    _sync_dir(_root())
+
+
+def sweep(client) -> list[str]:
+    removed = []
+    for path in sorted(_root().glob("*.json")):
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+                raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
+            record = json.loads(path.read_text())
+            token = record["operation_id"]
+            operation = record["operation"]
+            marker = "__importing_" if operation == "import" else "__tuning_"
+            if (type(record.get("version")) is not int or record["version"] != 1 or operation not in ("import", "tune")
+                    or not re.fullmatch(r"[0-9a-f]{32}", token)
+                    or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
+                    or record["staging"] != f"{record['target']}{marker}{token}"
+                    or record["state"] not in ("scratch", "recovery", "cleanup")):
+                raise ValueError("Invalid collection ownership record")
+            if record["state"] == "recovery":
+                log.warning("Retained recovery collection %r; sidecar snapshots: %s",
+                            record["staging"], _root() / token)
+                continue
+            discard(record, client)
+            removed.append(record["staging"])
+        except Exception:  # Unreadable ownership never grants deletion authority.
+            log.exception("Could not resolve collection ownership %s; preserved", path)
+    return removed
+```
+
+### scripts/tests/test_collection_writes.py
+
+```python
+"""Writer barriers cover complete workers, nesting and independent collections."""
+import os,sys,threading,unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+from services import collection_writes as writes
+
+class WriterTests(unittest.TestCase):
+    def test_same_collection_waits_until_complete_guard_releases(self):
+        attempted=threading.Event();entered=threading.Event()
+        def worker():
+            attempted.set()
+            with writes.guard('Owned'):entered.set()
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                task=pool.submit(worker);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05))
+            task.result(timeout=2);self.assertTrue(entered.is_set())
+        self.assertNotIn('Owned',writes._registry)
+    def test_reentrant_worker_and_primitive_share_one_guard(self):
+        @writes.serialized('collection')
+        def primitive(collection):
+            with writes.guard(collection):return writes._registry[collection][1]
+        with writes.guard('Owned'):self.assertEqual(primitive(collection='Owned'),3)
+        self.assertNotIn('Owned',writes._registry)
+    def test_other_collections_do_not_wait(self):
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                def independent():
+                    with writes.guard('Other'):return True
+                self.assertTrue(pool.submit(independent).result(timeout=2))
+    def test_failed_worker_releases_guard(self):
+        with self.assertRaises(RuntimeError):
+            with writes.guard('Owned'):raise RuntimeError('Owned failure')
+        self.assertNotIn('Owned',writes._registry)
+    def test_backend_case_aliases_share_the_same_guard(self):
+        entered=threading.Event()
+        def worker():
+            with writes.guard('owned'):entered.set()
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                task=pool.submit(worker);self.assertFalse(entered.wait(.05))
+            task.result(timeout=2);self.assertTrue(entered.is_set())
+    def test_actual_import_and_backend_mutators_wait_before_entering_their_body(self):
+        from unittest.mock import patch
+        from services import importer,weaviate_client as wc
+        operations=[(wc._create_collection_sync,('owned','hnsw','cosine',{}),wc,'get_client'),
+                    (wc._insert_chunks_sync,('owned',[]),wc,'get_client'),
+                    (wc._delete_collection_sync,('owned',),wc,'get_client'),
+                    (importer._build,('owned',Path('/inert'),{},None),importer,'_create_from_package')]
+        for operation,args,module,boundary in operations:
+            with self.subTest(operation=operation.__name__):
+                attempted=threading.Event();entered=threading.Event()
+                def boundary_call(*args,**kwargs):
+                    entered.set();raise RuntimeError('Owned stopped backend boundary')
+                def worker():attempted.set();return operation(*args)
+                with patch.object(module,boundary,side_effect=boundary_call),ThreadPoolExecutor() as pool:
+                    with writes.guard('Owned'):
+                        task=pool.submit(worker);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05))
+                    with self.assertRaisesRegex(RuntimeError,'Owned stopped'):task.result(timeout=2)
+                    self.assertTrue(entered.is_set())
+                self.assertNotIn('Owned',writes._registry)
+
+
+if __name__=='__main__':unittest.main()
+```
+
+### scripts/verify/reindex_verifier_cases.py
+
+```python
+"""Owned async lifecycle and parent-cleanup regressions; no backend/model calls."""
+import ast,asyncio,json,os,subprocess,sys,tempfile,threading,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
+# Loaded from the host script on stdin with its helper passed alongside it.
+source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE',str(Path(__file__).with_name('reindex.py'))))
+tree=ast.parse(source.read_text());assert isinstance(tree.body[-1],ast.Expr);tree.body.pop()
+ns={'__file__':str(source),'__name__':'owned_verifier'};exec(compile(tree,str(source),'exec'),ns)
+
+class LifecycleTests(unittest.TestCase):
+    def test_failure_cleans_exact_collections_and_temp_off_loop_and_restores_cache(self):
+        loop_thread=threading.get_ident();calls=[];created={};closed=[];temps=[]
+        original_temp=tempfile.TemporaryDirectory
+        class OwnedTemp(original_temp):
+            def __init__(self,*args,**kwargs):calls.append(('temp_create',threading.get_ident()));super().__init__(*args,**kwargs);temps.append(self.name)
+            def cleanup(self):calls.append(('temp_cleanup',threading.get_ident()));super().cleanup()
+        def create(name,*args,**kwargs):calls.append(('create',threading.get_ident()));created[name]=[]
+        def delete(name):calls.append(('delete',threading.get_ident()));del created[name]
+        def collection(name):
+            def insert(properties,uuid=None,vector=None):
+                if uuid is None:raise RuntimeError('connection refused 127.0.0.1:1')
+                created[name].append(dict(id=uuid,properties=properties,vector=vector))
+            return SimpleNamespace(data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
+        client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:name in created,delete=delete),close=lambda:closed.append(threading.get_ident()))
+        protected={'protected':{'session_id':'gs_11111111'}}
+        with patch.object(ns['tempfile'],'TemporaryDirectory',OwnedTemp),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create),patch.object(ns['tuning'],'_existing_records',side_effect=lambda name:list(created[name])),patch.object(ns['gs'],'_sessions',protected),patch.object(ns['gs'],'store_session',side_effect=OSError('Owned session failure')):
+            with self.assertRaisesRegex(OSError,'Owned session failure'):asyncio.run(ns['main']())
+            self.assertIs(ns['gs']._sessions,protected)
+        self.assertFalse(created);self.assertEqual(len(closed),1);self.assertTrue(all(identity!=loop_thread for _,identity in calls));self.assertNotEqual(closed[0],loop_thread)
+        self.assertTrue(all(not Path(directory).exists() for directory in temps))
+    def test_client_failure_still_cleans_temporary_directory(self):
+        original_temp=tempfile.TemporaryDirectory;temps=[]
+        def create(*args,**kwargs):result=original_temp(*args,**kwargs);temps.append(result.name);return result
+        with patch.object(ns['tempfile'],'TemporaryDirectory',side_effect=create),patch.object(ns['wc'],'get_client',side_effect=OSError('Owned client failure')):
+            with self.assertRaisesRegex(OSError,'Owned client failure'):asyncio.run(ns['main']())
+        self.assertTrue(temps);self.assertTrue(all(not Path(directory).exists() for directory in temps))
+    def test_temp_creation_failure_does_not_open_client(self):
+        with patch.object(ns['tempfile'],'TemporaryDirectory',side_effect=OSError('Owned temp failure')),patch.object(ns['wc'],'get_client') as client:
+            with self.assertRaisesRegex(OSError,'Owned temp failure'):asyncio.run(ns['main']())
+            client.assert_not_called()
+    def test_parent_cleanup_preserves_exact_owned_namespace_and_receipt(self):
+        prefix='VfyParent';owned=ns['owned_name'](prefix,'49000000');probe=owned+'Probe';parent=prefix+'Transfer'
+        with tempfile.TemporaryDirectory(prefix='owned-parent-cleanup-') as directory:
+            root=Path(directory);fixture=root/'collections.json';fixture.write_text(json.dumps({'collections':[{'name':name} for name in [owned,probe,parent]]}))
+            receipt=ns['preserve_receipt'](directory,[owned,probe],[('tuning','owned-job','running')]);data=json.loads(Path(receipt).read_text())
+            self.assertEqual(data['created_collections'],[owned,probe]);self.assertEqual(data['pending_jobs'],[['tuning','owned-job','running']])
+            lib=Path(os.environ.get('RAG_VERIFIER_LIB',str(source.with_name('lib.sh'))))
+            code='source "$1"; PREFIX="$2"; REPO_ROOT="$3"; api_get(){ cat "$4"; }; drop_collection(){ printf "%s\\n" "$1"; }; cleanup_prefixed'
+            # api_get's function arguments differ from the script's, so retain
+            # the controlled input path in a distinct variable before defining it.
+            code=code.replace('api_get(){ cat "$4"; }','owned_fixture="$4"; api_get(){ cat "$owned_fixture"; }')
+            run=subprocess.run(['bash','-c',code,'owned',str(lib),prefix,directory,str(fixture)],text=True,capture_output=True,cwd=directory)
+            self.assertEqual(run.returncode,0,run.stderr);self.assertEqual(run.stdout.splitlines(),[parent]);self.assertTrue(Path(receipt).exists())
+        with self.assertRaises(ValueError):ns['owned_name']('','owned')
+
+if __name__=='__main__':unittest.main()
 ```
