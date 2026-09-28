@@ -1757,9 +1757,6 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
-- [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
-      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
-
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the
@@ -1787,6 +1784,9 @@ now lives once, in `api/services/ingest_config.py`.
       the fix returned 202 and stored 3,048 chunks before the run was stopped;
       ingest embeds about one chunk per second, so that file takes over an hour.
       A 513 MB sparse file gets 413.*
+
+- [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
+      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
 ### 10.2 Query
 
