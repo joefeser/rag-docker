@@ -180,12 +180,13 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress, *, records: list[dict] | None = None) -> int:
+             distance_metric: str | None, progress, *, records: list[dict] | None = None, source_collection: str | None = None) -> int:
     """Stage the new chunks, then swap them into place.
 
     Re-chunk/re-embed use the embedding insert path. Reindex supplies original
     records and verifies them before replacement and after the final copy.
     """
+    source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     if records is not None:
         wc._validate_reindex_vectorizer_sync(collection)
@@ -195,8 +196,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     hnsw = config.get("hnsw_config") or {}
 
     client = wc.get_client()
-    ownership = collection_recovery.begin(collection, "tune", client) if records is not None else None
-    staging = ownership["staging"] if ownership else f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
+    ownership = collection_recovery.begin(collection_writes.canonical(collection), "tune", client)
+    staging = ownership["staging"]
     cutover_started = False
     completed = False
     original_intact = False
@@ -207,7 +208,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             # Application writers share the held guard. Also refuse a source
             # change from an independently connected backend writer.
             _verify_records(collection, records)
-            collection_recovery.retain(ownership)
+            collection_recovery.retain(ownership, source_collection=source_collection)
             cutover_started = True
             client.collections.delete(collection)
             wc._create_collection_sync(collection, new_index, new_distance, hnsw)
@@ -229,6 +230,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         if progress:
             progress(len(staged))
 
+        collection_recovery.retain(ownership, source_collection=source_collection)
+        cutover_started = True
         # Past this point the original is replaced. Everything that could fail
         # has already run against the staging collection.
         client.collections.delete(collection)
@@ -241,6 +244,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             if batch.number_errors > 0:
                 raise RuntimeError(
                     f"{batch.number_errors} error(s) writing the rebuilt collection")
+        completed = True
         return len(staged)
     except Exception as exc:
         if records is not None and cutover_started:
@@ -251,12 +255,15 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 original_intact = False
             if not original_intact:
                 try:
-                    goldstandard.mark_stale(collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+                    goldstandard.mark_stale(source_collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
                 except Exception:
                     _log.exception("Could not mark evaluation historical after failed reindex")
                 if ownership["state"] == "recovery":
                     raise PackageError("TUNE_FAILED", str(exc) + f" Verified data retained as '{staging}'.",
                                        {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
+        elif cutover_started and ownership["state"] == "recovery":
+            raise PackageError("TUNE_FAILED", str(exc) + f" Verified data retained as '{staging}'.",
+                               {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
         raise
     finally:
         try:
@@ -270,7 +277,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
 
 
 @collection_writes.serialized("collection")
-def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
+def _run(job_id: str, collection: str, operation: str, params: dict, *, source_collection: str | None = None) -> None:
+    source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
     job["collection"] = collection
@@ -280,7 +288,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
         job["chunks_written"] = n
 
     try:
-        has_sources = sources.has_sources(collection)
+        has_sources = sources.has_sources(source_collection)
         records = None
 
         if operation == "rechunk":
@@ -292,7 +300,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                     "Re-embedding from the stored chunk text is available, but "
                     "chunk boundaries cannot change.",
                     {"collection": collection})
-            properties = _chunks_from_sources(collection, **params["chunking"])
+            properties = _chunks_from_sources(source_collection, **params["chunking"])
             reason = "the collection was re-chunked, so its chunks no longer match these pairs"
 
         elif operation == "reembed":
@@ -307,7 +315,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                         "boundaries cannot change; this request also asked for new "
                         "chunking parameters. Send one or the other.",
                         {"collection": collection})
-                properties = _chunks_from_sources(collection, **params["chunking"])
+                properties = _chunks_from_sources(source_collection, **params["chunking"])
                 reason = "the collection was re-chunked and re-embedded"
             elif has_sources:
                 properties = _existing_chunks(collection)
@@ -327,12 +335,12 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
         job["chunks_total"] = len(properties)
         rebuild_args = (collection, properties, params.get("index_type"),
                         params.get("distance_metric"), progress)
-        written = (_rebuild(*rebuild_args, records=records) if records is not None
-                   else _rebuild(*rebuild_args))
+        written = (_rebuild(*rebuild_args, records=records, source_collection=source_collection) if records is not None
+                   else _rebuild(*rebuild_args, source_collection=source_collection))
 
         notes = []
         if reason:
-            stale = goldstandard.mark_stale(collection, reason)
+            stale = goldstandard.mark_stale(source_collection, reason)
             if stale:
                 notes.append(f"{stale} gold-standard session(s) marked stale")
         else:
@@ -354,6 +362,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
 
 
 async def start_tune_job(collection: str, operation: str, params: dict) -> str:
+    source_collection = collection
     collection = collection_writes.canonical(collection)
     job_id = str(uuid.uuid4())[:8]
     with _lock:
@@ -373,5 +382,5 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params))
+    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
     return job_id

@@ -94,13 +94,13 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     col=client.collections.get(collection)
     await asyncio.to_thread(col.data.insert,properties={'content':'Owned inert recovery','source_file':'owned.txt','chunk_index':0},uuid=str(uuid.uuid4()),vector=[.125]*768)
     before=await asyncio.to_thread(tuning._existing_records,collection)
-    session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
+    session={'session_id':sid,'collection':collection[:1].lower()+collection[1:],'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
     await asyncio.to_thread(gs.store_session,session);session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
     def create(target,*args,**kwargs):
         if target==collection:raise RuntimeError('Owned injected final-create failure after cutover')
         record_create(target,*args,**kwargs)
     with patch.object(wc,'_create_collection_sync',side_effect=create):
-        response=await api.post('/tune/reindex',json={'collection':collection,'index_type':'flat','distance_metric':'dot'})
+        response=await api.post('/tune/reindex',json={'collection':collection[:1].lower()+collection[1:],'index_type':'flat','distance_metric':'dot'})
         assert response.status_code==202,response.text;job=response.json()['job_id'];jobs.append((tuning,job))
         result=await completed(api,'/tune/job/'+job,expected_status='failed')
     check(result['chunks_written']==0,'post-cutover failure is not published as completion')
@@ -165,6 +165,28 @@ async def additional_vectorizer_and_import_checks(api,client,name,temp,created,j
     removed=await asyncio.to_thread(wc._sweep_staging_sync)
     check(staging in removed and not await asyncio.to_thread(client.collections.exists,staging),'startup removes the exact positively owned interrupted import scratch')
     check(await asyncio.to_thread(lambda:not records()),'startup completes and removes the owned import scratch journal')
+
+async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+    from services import sources,ingest_config,retrieval_config
+    caller=(name+'CallerDelete');caller=caller[:1].lower()+caller[1:];sid='gs_'+uuid.uuid4().hex[:8]
+    await asyncio.to_thread(wc._create_collection_sync,caller,'hnsw','cosine',{})
+    await asyncio.to_thread(client.collections.get(caller).data.insert,properties={'content':'Owned alias deletion'},vector=[.125]*768)
+    await asyncio.to_thread(sources.store,caller,'owned.txt',b'Owned caller original')
+    await asyncio.to_thread(ingest_config.save,{'collection':caller});await asyncio.to_thread(retrieval_config.save,{'collection':caller})
+    await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+    check(await asyncio.to_thread(lambda:sources.collection_dir(caller).is_dir() and (Path(temp)/'ingest_configs'/(caller+'.json')).is_file()),'actual caller-spelled source/config sidecars exist before deletion')
+    response=await api.delete('/collections/'+caller)
+    check(response.status_code==200 and not await asyncio.to_thread(client.collections.exists,caller),'caller-spelled HTTP deletion removes the canonical backend collection')
+    check(await asyncio.to_thread(lambda:not sources.collection_dir(caller).exists() and not (Path(temp)/'ingest_configs'/(caller+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(caller+'.json')).exists() and gs.get_session(sid)['orphaned']),'caller source/config paths are cleaned and matching evaluation is orphaned')
+    before=await asyncio.to_thread(tuning._existing_records,name)
+    child="from services import tuning,weaviate_client as w; import os; original=w._create_collection_sync; w._create_collection_sync=lambda *a,**k:(original(*a,**k),os._exit(17)); tuning._jobs['owned']={'status':'queued','chunks_written':0}; tuning._run('owned',"+repr(name)+",'reembed',{'index_type':'hnsw','distance_metric':'cosine'})"
+    result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child],env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')},text=True,capture_output=True,timeout=30)
+    def owners():return [json.loads(p.read_text()) for p in tuning.collection_recovery._root().glob('*.json') if json.loads(p.read_text()).get('target')==name]
+    ownership=await asyncio.to_thread(owners);created.extend(o['staging'] for o in ownership)
+    check(result.returncode==17 and len(ownership)==1 and ownership[0]['state']=='scratch','actual reembed worker hard-exits with positive staging ownership')
+    stage=ownership[0]['staging'];check(await asyncio.to_thread(client.collections.exists,stage),'hard exit leaves exact positively owned legacy tuning staging')
+    removed=await asyncio.to_thread(wc._sweep_staging_sync)
+    check(stage in removed and not await asyncio.to_thread(client.collections.exists,stage) and await asyncio.to_thread(tuning._existing_records,name)==before and not await asyncio.to_thread(owners),'startup removes exact legacy tuning scratch while preserving original records')
 
 async def main():
     token=uuid.uuid4().hex[:8]; name=owned_name(os.environ.get('RAG_TEST_PREFIX','Vfy49'),token)
@@ -233,6 +255,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'successful reindex removes its exact durable ownership; refusal creates none')
                     check(all(not item.startswith(os.environ.get('RAG_TEST_PREFIX','Vfy49')) for item in created),'all real verifier-created names remain outside the parent prefix sweep')
                     await additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check)
+                    await caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check)
                     await queued_ingest_checks(api,client,name,jobs,check)
                     await retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
                     check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'failed secondary cutover leaves the unrelated primary evaluation unchanged')

@@ -65,13 +65,13 @@ class ReindexTests(unittest.TestCase):
         import tempfile
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         def begin(collection,operation,client):return {'staging':collection+'__tuning_owned','state':'scratch','operation_id':'owned'}
-        def retain(owner):owner['state']='recovery'
+        def retain(owner, **kwargs):owner['state']='recovery'
         def discard(owner,client):client.collections.delete(owner['staging'])
         for change in [patch.object(tuning.collection_recovery,'begin',side_effect=begin),patch.object(tuning.collection_recovery,'retain',side_effect=retain),patch.object(tuning.collection_recovery,'discard',side_effect=discard),patch.object(tuning.collection_recovery,'_root',return_value=Path(self.temp.name))]:
             change.start();self.addCleanup(change.stop)
     def run_job(self, operation='reindex'):
         tuning._jobs['owned'] = {'status':'queued','chunks_written':0,'notes':[]}
-        tuning._run('owned','OwnedReindex',operation,{'index_type':'flat','distance_metric':'dot'})
+        tuning._run('owned','OwnedReindex',operation,{'index_type':'flat','distance_metric':'dot',**({'chunking':{}} if operation=='rechunk' else {})})
         return tuning._jobs['owned']
     def test_reindex_changes_physical_config_and_preserves_every_record_without_embedding(self):
         job=self.run_job(); self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_written'],2)
@@ -242,6 +242,22 @@ class ReindexTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):await tuning.start_tune_job('OwnedReindex','reindex',{})
                 await asyncio.sleep(0)
         asyncio.run(check())
+    def test_rechunk_and_reembed_preserve_caller_spelled_source_identity(self):
+        for operation in ('rechunk','reembed'):
+            with self.subTest(operation=operation),patch.object(tuning.sources,'has_sources',return_value=True) as has_sources,patch.object(tuning,'_chunks_from_sources',return_value=[{'content':'Owned caller sources'}]) as read_sources,patch.object(tuning,'_existing_chunks',return_value=[{'content':'Owned caller chunks'}]),patch.object(tuning,'_rebuild',return_value=1):
+                tuning._jobs['owned']={'status':'queued','chunks_written':0,'notes':[]}
+                params={'chunking':{'strategy':'fixed','chunk_size':150,'chunk_overlap':0,'similarity_threshold':.5,'min_chunk_size':40}}
+                tuning._run('owned','ownedReindex',operation,params)
+                self.assertEqual(tuning._jobs['owned']['status'],'completed');has_sources.assert_called_once_with('ownedReindex');self.assertEqual(read_sources.call_args.args[0],'ownedReindex')
+    def test_every_tuning_operation_registers_owned_staging(self):
+        for operation in ('reindex','reembed','rechunk'):
+            with self.subTest(operation=operation),patch.object(tuning.collection_recovery,'begin',wraps=tuning.collection_recovery.begin) as begin:
+                # Existing controlled rebuild fixture executes the real rebuild;
+                # rechunk uses inert parsed properties without changing traversal.
+                with patch.object(tuning.sources,'has_sources',return_value=True),patch.object(tuning,'_chunks_from_sources',return_value=[r['properties'] for r in self.original]),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=lambda name,props:self.backend.data.__setitem__(name,__import__('copy').deepcopy(self.original))):
+                    job=self.run_job(operation)
+                begin.assert_called_once();self.assertEqual(begin.call_args.args[:2],('OwnedReindex','tune'))
+                self.assertEqual(set(self.backend.data),{'OwnedReindex'})
     def test_reembed_retains_its_explicit_regeneration_path(self):
         def embed(name,props):
             self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},

@@ -74,11 +74,11 @@ def _copy(source: Path, destination: Path) -> None:
         shutil.copyfile(source, destination)
 
 
-def retain(record: dict, *, package: Path | None = None) -> None:
+def retain(record: dict, *, package: Path | None = None, source_collection: str | None = None) -> None:
     """Snapshot sidecars and mark recovery durably BEFORE deleting the target."""
     metadata = _root() / record["operation_id"]
     metadata.mkdir()
-    target, staging = record["target"], record["staging"]
+    target, staging = source_collection or record["target"], record["staging"]
     upload = Path(settings.upload_dir)
     _copy(package / "sources" if package else sources.collection_dir(target),
           sources.collection_dir(staging))

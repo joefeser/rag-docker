@@ -1566,12 +1566,11 @@ async def collection_exists(name: str) -> bool:
 
 @collection_writes.serialized("name")
 def _delete_collection_sync(name: str) -> int:
-    name = collection_writes.canonical(name)
     client = get_client()
     coll = client.collections.get(name)
     count = coll.aggregate.over_all(total_count=True).total_count
     client.collections.delete(name)
-    collection_recovery.retire_deleted(name, client)
+    collection_recovery.retire_deleted(collection_writes.canonical(name), client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
     sources.delete(name)
@@ -4399,12 +4398,13 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress, *, records: list[dict] | None = None) -> int:
+             distance_metric: str | None, progress, *, records: list[dict] | None = None, source_collection: str | None = None) -> int:
     """Stage the new chunks, then swap them into place.
 
     Re-chunk/re-embed use the embedding insert path. Reindex supplies original
     records and verifies them before replacement and after the final copy.
     """
+    source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     if records is not None:
         wc._validate_reindex_vectorizer_sync(collection)
@@ -4414,8 +4414,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     hnsw = config.get("hnsw_config") or {}
 
     client = wc.get_client()
-    ownership = collection_recovery.begin(collection, "tune", client) if records is not None else None
-    staging = ownership["staging"] if ownership else f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
+    ownership = collection_recovery.begin(collection_writes.canonical(collection), "tune", client)
+    staging = ownership["staging"]
     cutover_started = False
     completed = False
     original_intact = False
@@ -4426,7 +4426,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             # Application writers share the held guard. Also refuse a source
             # change from an independently connected backend writer.
             _verify_records(collection, records)
-            collection_recovery.retain(ownership)
+            collection_recovery.retain(ownership, source_collection=source_collection)
             cutover_started = True
             client.collections.delete(collection)
             wc._create_collection_sync(collection, new_index, new_distance, hnsw)
@@ -4448,6 +4448,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         if progress:
             progress(len(staged))
 
+        collection_recovery.retain(ownership, source_collection=source_collection)
+        cutover_started = True
         # Past this point the original is replaced. Everything that could fail
         # has already run against the staging collection.
         client.collections.delete(collection)
@@ -4460,6 +4462,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             if batch.number_errors > 0:
                 raise RuntimeError(
                     f"{batch.number_errors} error(s) writing the rebuilt collection")
+        completed = True
         return len(staged)
     except Exception as exc:
         if records is not None and cutover_started:
@@ -4470,12 +4473,15 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 original_intact = False
             if not original_intact:
                 try:
-                    goldstandard.mark_stale(collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+                    goldstandard.mark_stale(source_collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
                 except Exception:
                     _log.exception("Could not mark evaluation historical after failed reindex")
                 if ownership["state"] == "recovery":
                     raise PackageError("TUNE_FAILED", str(exc) + f" Verified data retained as '{staging}'.",
                                        {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
+        elif cutover_started and ownership["state"] == "recovery":
+            raise PackageError("TUNE_FAILED", str(exc) + f" Verified data retained as '{staging}'.",
+                               {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
         raise
     finally:
         try:
@@ -4489,7 +4495,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
 
 
 @collection_writes.serialized("collection")
-def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
+def _run(job_id: str, collection: str, operation: str, params: dict, *, source_collection: str | None = None) -> None:
+    source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
     job["collection"] = collection
@@ -4499,7 +4506,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
         job["chunks_written"] = n
 
     try:
-        has_sources = sources.has_sources(collection)
+        has_sources = sources.has_sources(source_collection)
         records = None
 
         if operation == "rechunk":
@@ -4511,7 +4518,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                     "Re-embedding from the stored chunk text is available, but "
                     "chunk boundaries cannot change.",
                     {"collection": collection})
-            properties = _chunks_from_sources(collection, **params["chunking"])
+            properties = _chunks_from_sources(source_collection, **params["chunking"])
             reason = "the collection was re-chunked, so its chunks no longer match these pairs"
 
         elif operation == "reembed":
@@ -4526,7 +4533,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                         "boundaries cannot change; this request also asked for new "
                         "chunking parameters. Send one or the other.",
                         {"collection": collection})
-                properties = _chunks_from_sources(collection, **params["chunking"])
+                properties = _chunks_from_sources(source_collection, **params["chunking"])
                 reason = "the collection was re-chunked and re-embedded"
             elif has_sources:
                 properties = _existing_chunks(collection)
@@ -4546,12 +4553,12 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
         job["chunks_total"] = len(properties)
         rebuild_args = (collection, properties, params.get("index_type"),
                         params.get("distance_metric"), progress)
-        written = (_rebuild(*rebuild_args, records=records) if records is not None
-                   else _rebuild(*rebuild_args))
+        written = (_rebuild(*rebuild_args, records=records, source_collection=source_collection) if records is not None
+                   else _rebuild(*rebuild_args, source_collection=source_collection))
 
         notes = []
         if reason:
-            stale = goldstandard.mark_stale(collection, reason)
+            stale = goldstandard.mark_stale(source_collection, reason)
             if stale:
                 notes.append(f"{stale} gold-standard session(s) marked stale")
         else:
@@ -4573,6 +4580,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
 
 
 async def start_tune_job(collection: str, operation: str, params: dict) -> str:
+    source_collection = collection
     collection = collection_writes.canonical(collection)
     job_id = str(uuid.uuid4())[:8]
     with _lock:
@@ -4592,7 +4600,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params))
+    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
     return job_id
 ```
 
@@ -8307,7 +8315,7 @@ drive the UI in a real browser.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
-| `14_reindex.sh` | exact-record reindex: 22 record/cutover/vectorizer/concurrency cases, thirteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 38 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
@@ -8357,7 +8365,7 @@ curl -s localhost:8080/api/collections | python3 -c \
 
 The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
 
-Tuning normalizes the backend first-character alias before active-job admission, journaling and sidecar access. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
+Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
 ````
 
 ### scripts/verify/all.sh
@@ -10403,13 +10411,13 @@ class ReindexTests(unittest.TestCase):
         import tempfile
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         def begin(collection,operation,client):return {'staging':collection+'__tuning_owned','state':'scratch','operation_id':'owned'}
-        def retain(owner):owner['state']='recovery'
+        def retain(owner, **kwargs):owner['state']='recovery'
         def discard(owner,client):client.collections.delete(owner['staging'])
         for change in [patch.object(tuning.collection_recovery,'begin',side_effect=begin),patch.object(tuning.collection_recovery,'retain',side_effect=retain),patch.object(tuning.collection_recovery,'discard',side_effect=discard),patch.object(tuning.collection_recovery,'_root',return_value=Path(self.temp.name))]:
             change.start();self.addCleanup(change.stop)
     def run_job(self, operation='reindex'):
         tuning._jobs['owned'] = {'status':'queued','chunks_written':0,'notes':[]}
-        tuning._run('owned','OwnedReindex',operation,{'index_type':'flat','distance_metric':'dot'})
+        tuning._run('owned','OwnedReindex',operation,{'index_type':'flat','distance_metric':'dot',**({'chunking':{}} if operation=='rechunk' else {})})
         return tuning._jobs['owned']
     def test_reindex_changes_physical_config_and_preserves_every_record_without_embedding(self):
         job=self.run_job(); self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_written'],2)
@@ -10580,6 +10588,22 @@ class ReindexTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):await tuning.start_tune_job('OwnedReindex','reindex',{})
                 await asyncio.sleep(0)
         asyncio.run(check())
+    def test_rechunk_and_reembed_preserve_caller_spelled_source_identity(self):
+        for operation in ('rechunk','reembed'):
+            with self.subTest(operation=operation),patch.object(tuning.sources,'has_sources',return_value=True) as has_sources,patch.object(tuning,'_chunks_from_sources',return_value=[{'content':'Owned caller sources'}]) as read_sources,patch.object(tuning,'_existing_chunks',return_value=[{'content':'Owned caller chunks'}]),patch.object(tuning,'_rebuild',return_value=1):
+                tuning._jobs['owned']={'status':'queued','chunks_written':0,'notes':[]}
+                params={'chunking':{'strategy':'fixed','chunk_size':150,'chunk_overlap':0,'similarity_threshold':.5,'min_chunk_size':40}}
+                tuning._run('owned','ownedReindex',operation,params)
+                self.assertEqual(tuning._jobs['owned']['status'],'completed');has_sources.assert_called_once_with('ownedReindex');self.assertEqual(read_sources.call_args.args[0],'ownedReindex')
+    def test_every_tuning_operation_registers_owned_staging(self):
+        for operation in ('reindex','reembed','rechunk'):
+            with self.subTest(operation=operation),patch.object(tuning.collection_recovery,'begin',wraps=tuning.collection_recovery.begin) as begin:
+                # Existing controlled rebuild fixture executes the real rebuild;
+                # rechunk uses inert parsed properties without changing traversal.
+                with patch.object(tuning.sources,'has_sources',return_value=True),patch.object(tuning,'_chunks_from_sources',return_value=[r['properties'] for r in self.original]),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=lambda name,props:self.backend.data.__setitem__(name,__import__('copy').deepcopy(self.original))):
+                    job=self.run_job(operation)
+                begin.assert_called_once();self.assertEqual(begin.call_args.args[:2],('OwnedReindex','tune'))
+                self.assertEqual(set(self.backend.data),{'OwnedReindex'})
     def test_reembed_retains_its_explicit_regeneration_path(self):
         def embed(name,props):
             self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},
@@ -10690,13 +10714,13 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     col=client.collections.get(collection)
     await asyncio.to_thread(col.data.insert,properties={'content':'Owned inert recovery','source_file':'owned.txt','chunk_index':0},uuid=str(uuid.uuid4()),vector=[.125]*768)
     before=await asyncio.to_thread(tuning._existing_records,collection)
-    session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
+    session={'session_id':sid,'collection':collection[:1].lower()+collection[1:],'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
     await asyncio.to_thread(gs.store_session,session);session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
     def create(target,*args,**kwargs):
         if target==collection:raise RuntimeError('Owned injected final-create failure after cutover')
         record_create(target,*args,**kwargs)
     with patch.object(wc,'_create_collection_sync',side_effect=create):
-        response=await api.post('/tune/reindex',json={'collection':collection,'index_type':'flat','distance_metric':'dot'})
+        response=await api.post('/tune/reindex',json={'collection':collection[:1].lower()+collection[1:],'index_type':'flat','distance_metric':'dot'})
         assert response.status_code==202,response.text;job=response.json()['job_id'];jobs.append((tuning,job))
         result=await completed(api,'/tune/job/'+job,expected_status='failed')
     check(result['chunks_written']==0,'post-cutover failure is not published as completion')
@@ -10761,6 +10785,28 @@ async def additional_vectorizer_and_import_checks(api,client,name,temp,created,j
     removed=await asyncio.to_thread(wc._sweep_staging_sync)
     check(staging in removed and not await asyncio.to_thread(client.collections.exists,staging),'startup removes the exact positively owned interrupted import scratch')
     check(await asyncio.to_thread(lambda:not records()),'startup completes and removes the owned import scratch journal')
+
+async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+    from services import sources,ingest_config,retrieval_config
+    caller=(name+'CallerDelete');caller=caller[:1].lower()+caller[1:];sid='gs_'+uuid.uuid4().hex[:8]
+    await asyncio.to_thread(wc._create_collection_sync,caller,'hnsw','cosine',{})
+    await asyncio.to_thread(client.collections.get(caller).data.insert,properties={'content':'Owned alias deletion'},vector=[.125]*768)
+    await asyncio.to_thread(sources.store,caller,'owned.txt',b'Owned caller original')
+    await asyncio.to_thread(ingest_config.save,{'collection':caller});await asyncio.to_thread(retrieval_config.save,{'collection':caller})
+    await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+    check(await asyncio.to_thread(lambda:sources.collection_dir(caller).is_dir() and (Path(temp)/'ingest_configs'/(caller+'.json')).is_file()),'actual caller-spelled source/config sidecars exist before deletion')
+    response=await api.delete('/collections/'+caller)
+    check(response.status_code==200 and not await asyncio.to_thread(client.collections.exists,caller),'caller-spelled HTTP deletion removes the canonical backend collection')
+    check(await asyncio.to_thread(lambda:not sources.collection_dir(caller).exists() and not (Path(temp)/'ingest_configs'/(caller+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(caller+'.json')).exists() and gs.get_session(sid)['orphaned']),'caller source/config paths are cleaned and matching evaluation is orphaned')
+    before=await asyncio.to_thread(tuning._existing_records,name)
+    child="from services import tuning,weaviate_client as w; import os; original=w._create_collection_sync; w._create_collection_sync=lambda *a,**k:(original(*a,**k),os._exit(17)); tuning._jobs['owned']={'status':'queued','chunks_written':0}; tuning._run('owned',"+repr(name)+",'reembed',{'index_type':'hnsw','distance_metric':'cosine'})"
+    result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child],env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')},text=True,capture_output=True,timeout=30)
+    def owners():return [json.loads(p.read_text()) for p in tuning.collection_recovery._root().glob('*.json') if json.loads(p.read_text()).get('target')==name]
+    ownership=await asyncio.to_thread(owners);created.extend(o['staging'] for o in ownership)
+    check(result.returncode==17 and len(ownership)==1 and ownership[0]['state']=='scratch','actual reembed worker hard-exits with positive staging ownership')
+    stage=ownership[0]['staging'];check(await asyncio.to_thread(client.collections.exists,stage),'hard exit leaves exact positively owned legacy tuning staging')
+    removed=await asyncio.to_thread(wc._sweep_staging_sync)
+    check(stage in removed and not await asyncio.to_thread(client.collections.exists,stage) and await asyncio.to_thread(tuning._existing_records,name)==before and not await asyncio.to_thread(owners),'startup removes exact legacy tuning scratch while preserving original records')
 
 async def main():
     token=uuid.uuid4().hex[:8]; name=owned_name(os.environ.get('RAG_TEST_PREFIX','Vfy49'),token)
@@ -10829,6 +10875,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'successful reindex removes its exact durable ownership; refusal creates none')
                     check(all(not item.startswith(os.environ.get('RAG_TEST_PREFIX','Vfy49')) for item in created),'all real verifier-created names remain outside the parent prefix sweep')
                     await additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check)
+                    await caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check)
                     await queued_ingest_checks(api,client,name,jobs,check)
                     await retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
                     check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'failed secondary cutover leaves the unrelated primary evaluation unchanged')
@@ -11011,11 +11058,11 @@ def _copy(source: Path, destination: Path) -> None:
         shutil.copyfile(source, destination)
 
 
-def retain(record: dict, *, package: Path | None = None) -> None:
+def retain(record: dict, *, package: Path | None = None, source_collection: str | None = None) -> None:
     """Snapshot sidecars and mark recovery durably BEFORE deleting the target."""
     metadata = _root() / record["operation_id"]
     metadata.mkdir()
-    target, staging = record["target"], record["staging"]
+    target, staging = source_collection or record["target"], record["staging"]
     upload = Path(settings.upload_dir)
     _copy(package / "sources" if package else sources.collection_dir(target),
           sources.collection_dir(staging))
@@ -11274,8 +11321,8 @@ class DeletedRecoveryTests(unittest.TestCase):
         for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{})]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
-            def exists(inner,name):return name in self.backend
-            def delete(inner,name):self.backend.remove(name)
+            def exists(inner,name):return writes.canonical(name) in self.backend
+            def delete(inner,name):self.backend.remove(writes.canonical(name))
             def get(inner,name):return SimpleNamespace(aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
         self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
         self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
@@ -11286,6 +11333,14 @@ class DeletedRecoveryTests(unittest.TestCase):
         name=self.owner['staging'];self.assertEqual(self.wc._delete_collection_sync(name[:1].lower()+name[1:]),3)
         self.assertNotIn(name,self.backend);self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists());self.assertFalse((self.recovery._root()/(self.owner['operation_id']+'.json')).exists())
         self.assertIn(other['staging'],self.backend);self.assertTrue((self.recovery._root()/other['operation_id']).is_dir());self.assertTrue(corrupt.is_file())
+    def test_caller_spelled_sidecars_and_sessions_are_cleaned_on_normal_delete(self):
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        caller='ownedRecovery';sources.store(caller,'inert.txt',b'Owned inert original')
+        ingest_config.save({'collection':caller});retrieval_config.save({'collection':caller})
+        session={'session_id':'gs_490abcde','collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]};gs.store_session(session)
+        self.wc._delete_collection_sync(caller)
+        self.assertFalse(sources.collection_dir(caller).exists());self.assertFalse((self.root/'ingest_configs'/(caller+'.json')).exists());self.assertFalse((self.root/'retrieval_configs'/(caller+'.json')).exists())
+        self.assertTrue(gs.get_session(session['session_id'])['orphaned']);self.assertIn(self.owner['staging'],self.backend)
     def test_deleting_original_preserves_distinct_retained_recovery(self):
         self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
         self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())

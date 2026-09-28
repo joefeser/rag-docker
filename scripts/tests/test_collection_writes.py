@@ -133,8 +133,8 @@ class DeletedRecoveryTests(unittest.TestCase):
         for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{})]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
-            def exists(inner,name):return name in self.backend
-            def delete(inner,name):self.backend.remove(name)
+            def exists(inner,name):return writes.canonical(name) in self.backend
+            def delete(inner,name):self.backend.remove(writes.canonical(name))
             def get(inner,name):return SimpleNamespace(aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
         self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
         self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
@@ -145,6 +145,14 @@ class DeletedRecoveryTests(unittest.TestCase):
         name=self.owner['staging'];self.assertEqual(self.wc._delete_collection_sync(name[:1].lower()+name[1:]),3)
         self.assertNotIn(name,self.backend);self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists());self.assertFalse((self.recovery._root()/(self.owner['operation_id']+'.json')).exists())
         self.assertIn(other['staging'],self.backend);self.assertTrue((self.recovery._root()/other['operation_id']).is_dir());self.assertTrue(corrupt.is_file())
+    def test_caller_spelled_sidecars_and_sessions_are_cleaned_on_normal_delete(self):
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        caller='ownedRecovery';sources.store(caller,'inert.txt',b'Owned inert original')
+        ingest_config.save({'collection':caller});retrieval_config.save({'collection':caller})
+        session={'session_id':'gs_490abcde','collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]};gs.store_session(session)
+        self.wc._delete_collection_sync(caller)
+        self.assertFalse(sources.collection_dir(caller).exists());self.assertFalse((self.root/'ingest_configs'/(caller+'.json')).exists());self.assertFalse((self.root/'retrieval_configs'/(caller+'.json')).exists())
+        self.assertTrue(gs.get_session(session['session_id'])['orphaned']);self.assertIn(self.owner['staging'],self.backend)
     def test_deleting_original_preserves_distinct_retained_recovery(self):
         self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
         self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())

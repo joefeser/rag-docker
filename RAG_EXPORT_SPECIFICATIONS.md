@@ -455,7 +455,7 @@ first request, which is what makes this safe.
 
 | Left behind by | Detected at startup by | Action |
 |---|---|---|
-| a durably owned reindex or replace-import scratch (`<name>__tuning_<id32>` / `<name>__importing_<id32>`) | a valid ownership record in `UPLOAD_DIR/collection_operations` | remove only that exact owned scratch; resume owned cleanup intent |
+| a durably owned tuning or replace-import scratch (`<name>__tuning_<id32>` / `<name>__importing_<id32>`) | a valid ownership record in `UPLOAD_DIR/collection_operations` | remove only that exact owned scratch; resume owned cleanup intent |
 | verified reindex recovery and sidecars | the valid record's `recovery` state | preserve; report the retained collection and sidecar snapshot path |
 | legacy/unowned import or tuning marker-like names | a name alone supplies no ownership proof | preserve for operator inspection; legacy cleanup migration and final batch completion remain in the separate #42–#44 repair |
 | `abort`/`rename` partial target | an in-progress marker file recording the expected chunk count | delete **only if** the collection's actual count differs from the expected one |
@@ -644,4 +644,4 @@ Incremental export, encryption and signing, corpus merging, cross-vector-store
 migration, gold-standard remapping after re-chunk, and HTTP transport as an
 alternative to the mounted directory.
 
-Tuning normalizes the backend first-character alias before active-job admission, journaling and sidecar access. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
+Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
