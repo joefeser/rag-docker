@@ -74,6 +74,7 @@ export const api = {
 // Types
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
+  hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }

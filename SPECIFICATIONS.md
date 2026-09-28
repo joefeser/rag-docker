@@ -549,6 +549,8 @@ special-case a new collection.
 system defaults (`hnsw`, `top_k: 5`, `alpha: 0.75`, `ef: null`,
 `response_format: "end_user"`).
 
+Saved `ef` is a legacy inactive field, not a query override. `GET /collections` reports actual HNSW settings as `hnsw_config` (ef, efConstruction, maxConnections), or null for a Flat index. Both hnsw/flat query-mode names use the existing physical index.
+
 ---
 
 ```
@@ -1452,18 +1454,13 @@ is shared by every browser, and travels with a RAG export. It is not held in
 
 | Mode | Explanation text |
 |---|---|
-| HNSW — Approximate (default) | The fastest option. Uses a smart graph to find the closest matches quickly. May very rarely miss the single best result, but works well for almost all use cases. |
-| Flat — Exact | Checks every stored chunk to find the mathematically perfect match. More accurate but slower as your collection grows. Best for collections under 10,000 chunks. |
+| Vector — existing index | Finds similar chunks using the collection's existing physical index. Selecting this query method does not switch HNSW/Flat. |
 | Hybrid | Combines keyword search with meaning-based search. Best when your questions include specific terms, names, or codes. Adjust the slider to balance between the two modes. |
 | Semantic | Pure meaning-based search. Best for conceptual questions where the exact words are less important than the idea. |
 
-- Top-K slider (1–20, default 5).
+- Top-K slider (1–50, default 5).
 - Hybrid alpha slider (visible only when Hybrid selected, range 0.0–1.0, default 0.75, labeled "Keyword ← Balance → Meaning").
-- HNSW advanced parameters accordion (Engineer role only, collapsed by default):
-  - `ef` slider (16–512)
-  - `efConstruction` slider (64–512)
-  - `maxConnections` slider (16–128)
-  - Each parameter has an explanation tooltip.
+- Read-only physical index panel shows observed index type, distance metric and actual HNSW ef/efConstruction/maxConnections. A refresh button reads current backend settings; details are labeled as last refreshed. Missing details and refresh failures are explicit. No build/query-ef sliders appear.
 - "Save for this collection" button — `POST /retrieval/config` with the full
   configuration. Disabled while no collection is selected or while settings are
   loading. On success the button shows a transient "Saved!" confirmation.
@@ -1477,15 +1474,13 @@ is shared by every browser, and travels with a RAG export. It is not held in
   "response_format": "engineer"
 }
 ```
-`ef` is sent as `null` unless `retrieval_mode` is `"hnsw"`. `alpha` is always
+`ef` is always sent as `null` from this form; a prior saved override is shown as inactive and cleared on save. `alpha` is always
 sent and is only applied by the server for `"hybrid"`. `response_format` records
 the active role at the time of saving (End User → `end_user`, Engineer and
 Developer → `engineer`) so an exported retrieval script reproduces the same
 answer style.
 
-`efConstruction` and `maxConnections` are collection build-time properties set
-when the collection is created; the sliders shown here are informational and are
-not part of the saved retrieval configuration.
+`efConstruction` and `maxConnections` are physical build settings; `ef` belongs to the physical HNSW index as well. The pinned query API does not accept a per-request ef override. Query settings do not alter the physical index. The legacy API modes `hnsw` and `flat` both use near_vector against the existing index; the UI displays a single Vector method and normalizes a saved flat alias when saving. Exact search depends on the observed physical Flat index, not a query-mode name.
 
 ### 7.7 Gold Standard Page
 
@@ -1590,9 +1585,9 @@ page renders as one undifferentiated block.
 | `chunk_overlap` | 200 | 0 | 2000 | In characters; must be < `chunk_size` |
 | `similarity_threshold` | 0.85 | 0.0 | 1.0 | Semantic chunking only |
 | `min_chunk_size` | 100 | 40 | 2000 | In characters; must be < `chunk_size` |
-| `top_k` | 5 | 1 | 20 | |
+| `top_k` | 5 | 1 | 50 | API bounds |
 | `alpha` | 0.75 | 0.0 | 1.0 | Hybrid mode only |
-| `ef` | 64 | 16 | 512 | HNSW query param |
+| `ef` | 64 | 16 | 512 | Physical HNSW setting; saved query override inactive |
 | `efConstruction` | 128 | 64 | 512 | HNSW build param |
 | `maxConnections` | 64 | 16 | 128 | HNSW build param |
 | Gold standard `sample_size` | 20 | 1 | 100 | |
@@ -1776,6 +1771,9 @@ now lives once, in `api/services/ingest_config.py`.
       engineer being told to add technical detail and a confidence level, so the
       margin is a tendency rather than a guarantee.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
+
+- [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
+      *Six controlled runtime groups plus one ten-source documentation group pass. Suite11 (called by03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows72/160/32 backend settings, labels saved ef96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
 
 ### 10.3 Gold Standard
 

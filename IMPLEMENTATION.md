@@ -640,6 +640,7 @@ class CollectionInfo(BaseModel):
     index_type: str
     distance_metric: str
     created_at: Optional[str]
+    hnsw_config: Optional[dict[str, int]] = None
 
 
 class CollectionsResponse(BaseModel):
@@ -1597,6 +1598,10 @@ def _get_collections_sync() -> list[dict]:
             "object_count": count,
             "index_type": index_type,
             "distance_metric": distance_str,
+            "hnsw_config": ({"ef": vector_config.ef,
+                             "efConstruction": vector_config.ef_construction,
+                             "maxConnections": vector_config.max_connections}
+                            if index_type == "hnsw" else None),
         })
     return result
 
@@ -4661,6 +4666,7 @@ async def list_collections():
             index_type=c["index_type"],
             distance_metric=c["distance_metric"],
             created_at=registry.get(c["name"]),
+            hnsw_config=c.get("hnsw_config"),
         )
         for c in raw
     ]
@@ -6293,6 +6299,21 @@ export function useQueryConfig() {
 ```typescript
 const BASE = '/api'
 
+// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// It covers a whole request, so a multi-file upload counts every file. Kept
+// here only so the Import page can warn before sending; nginx enforces it.
+// Change both together.
+export const MAX_UPLOAD_MB = 512
+export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+// Errors the proxy answers itself, before the API sees the request. Those
+// arrive as nginx's HTML error pages, not the API's JSON error shape.
+const PROXY_ERRORS: Record<number, string> = {
+  413: `The upload is larger than the ${MAX_UPLOAD_MB} MB limit. Split it into smaller batches.`,
+  502: 'The API is not responding. It may still be starting; try again in a minute.',
+  504: 'The API took too long to respond.',
+}
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -6300,8 +6321,15 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
     headers,
     body: isFormData ? (body as FormData) : body !== undefined ? JSON.stringify(body) : undefined,
   })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data?.error?.message ?? `HTTP ${res.status}`)
+  // Read as text first: calling res.json() on an nginx error page threw a
+  // JSON syntax error, which is what the user saw instead of the real problem.
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
 }
 
@@ -6345,6 +6373,7 @@ export const api = {
 // Types
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
+  hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
@@ -6779,7 +6808,7 @@ export default function QAPage() {
         </select>
         {role !== 'end_user' && (
           <select value={config.retrieval_mode} disabled className="border rounded px-3 py-2 text-sm bg-gray-50 text-gray-500">
-            <option value={config.retrieval_mode}>{config.retrieval_mode}</option>
+            <option value={config.retrieval_mode}>{["hnsw", "flat"].includes(config.retrieval_mode) ? "Vector — existing index" : config.retrieval_mode}</option>
           </select>
         )}
       </div>
@@ -7126,8 +7155,7 @@ import { useRole } from '../context/RoleContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
 
 const MODES = [
-  { id: 'hnsw', label: 'HNSW — Approximate (default)', description: 'The fastest option. Uses a smart graph to find the closest matches quickly. May very rarely miss the single best result, but works well for almost all use cases.' },
-  { id: 'flat', label: 'Flat — Exact', description: 'Checks every stored chunk to find the mathematically perfect match. More accurate but slower as your collection grows. Best for collections under 10,000 chunks.' },
+  { id: 'hnsw', label: 'Vector — existing index', description: 'Finds similar chunks using the physical index already configured for this collection. Choosing this method does not switch between HNSW and Flat.' },
   { id: 'hybrid', label: 'Hybrid', description: 'Combines keyword search with meaning-based search. Best when your questions include specific terms, names, or codes. Adjust the slider to balance between the two modes.' },
   { id: 'semantic', label: 'Semantic', description: 'Pure meaning-based search. Best for conceptual questions where the exact words are less important than the idea.' },
 ]
@@ -7136,12 +7164,11 @@ export default function RetrievalPage() {
   const { role } = useRole()
   const { collection, setCollection, config, isDefault, loading, error, saveConfig } = useQueryConfig()
   const [collections, setCollections] = useState<CollectionInfo[]>([])
-  const [mode, setMode] = useState(config.retrieval_mode)
+  const [mode, setMode] = useState(config.retrieval_mode === 'flat' ? 'hnsw' : config.retrieval_mode)
   const [topK, setTopK] = useState(config.top_k)
   const [alpha, setAlpha] = useState(config.alpha)
-  const [ef, setEf] = useState(config.ef ?? 64)
-  const [efConstruction, setEfConstruction] = useState(128)
-  const [maxConnections, setMaxConnections] = useState(64)
+  const [indexError, setIndexError] = useState('')
+  const [indexLoading, setIndexLoading] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
 
@@ -7149,7 +7176,7 @@ export default function RetrievalPage() {
     api.getCollections().then(r => {
       setCollections(r.collections)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch(() => { setIndexError('Could not read the current physical index.') })
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -7159,10 +7186,9 @@ export default function RetrievalPage() {
   // the values. `applied` is deliberately not reset here: a save replaces
   // `config`, which would otherwise clear the confirmation immediately.
   useEffect(() => {
-    setMode(config.retrieval_mode)
+    setMode(config.retrieval_mode === 'flat' ? 'hnsw' : config.retrieval_mode)
     setTopK(config.top_k)
     setAlpha(config.alpha)
-    setEf(config.ef ?? 64)
   }, [config])
 
   useEffect(() => {
@@ -7175,7 +7201,7 @@ export default function RetrievalPage() {
       retrieval_mode: mode,
       top_k: topK,
       alpha,
-      ef: mode === 'hnsw' ? ef : null,
+      ef: null, // Legacy overrides were saved but never applied to query execution.
       // The role toggle drives the answer style live; persisting it here is
       // what makes the stored config usable by an exported retrieval script.
       response_format: role === 'end_user' ? 'end_user' : 'engineer',
@@ -7188,6 +7214,15 @@ export default function RetrievalPage() {
     } catch (e: unknown) {
       setSaveError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  const physicalIndex = collections.find(c => c.name === collection)
+
+  async function refreshIndex() {
+    setIndexLoading(true); setIndexError('')
+    try { setCollections((await api.getCollections()).collections) }
+    catch { setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
+    finally { setIndexLoading(false) }
   }
 
   return (
@@ -7238,7 +7273,7 @@ export default function RetrievalPage() {
 
       <div className="mb-4">
         <label className="block text-xs text-gray-600 mb-1">Top-K Results: {topK}</label>
-        <input type="range" min={1} max={20} value={topK} onChange={e => setTopK(+e.target.value)} className="w-full" />
+        <input type="range" min={1} max={50} value={topK} onChange={e => setTopK(+e.target.value)} className="w-full" />
       </div>
 
       {mode === 'hybrid' && (
@@ -7250,25 +7285,17 @@ export default function RetrievalPage() {
         </div>
       )}
 
-      {mode === 'hnsw' && role === 'engineer' && (
-        <details className="mb-4 border rounded">
-          <summary className="px-3 py-2 text-sm cursor-pointer font-medium">Advanced HNSW Parameters</summary>
-          <div className="p-3 space-y-3">
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">ef (query accuracy): {ef}</label>
-              <input type="range" min={16} max={512} step={8} value={ef} onChange={e => setEf(+e.target.value)} className="w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">efConstruction (build accuracy): {efConstruction}</label>
-              <input type="range" min={64} max={512} step={8} value={efConstruction} onChange={e => setEfConstruction(+e.target.value)} className="w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">maxConnections (graph density): {maxConnections}</label>
-              <input type="range" min={16} max={128} step={4} value={maxConnections} onChange={e => setMaxConnections(+e.target.value)} className="w-full" />
-            </div>
-          </div>
-        </details>
-      )}
+      <div className="mb-4 border rounded p-3 text-sm">
+        <h2 className="font-semibold mb-2">Physical index (read only)</h2>
+        {indexError && <p className="text-amber-700">{indexError}</p>}
+        {physicalIndex ? <>
+          <p>Type: {physicalIndex.index_type} · Distance: {physicalIndex.distance_metric}</p>
+          {physicalIndex.hnsw_config && <p className="mt-1">ef: {physicalIndex.hnsw_config.ef} · efConstruction: {physicalIndex.hnsw_config.efConstruction} · maxConnections: {physicalIndex.hnsw_config.maxConnections}</p>}
+          <p className="text-xs text-gray-500 mt-1">Observed when index details were last refreshed. Saved query methods do not rebuild the index.</p>
+        </> : <p>Index details are unavailable for this collection.</p>}
+        {config.ef !== null && <p className="text-xs text-amber-700 mt-2">The legacy saved ef override ({config.ef}) is inactive. Queries use the physical index settings; saving here clears that override.</p>}
+        <button onClick={refreshIndex} disabled={indexLoading} className="mt-2 border rounded px-2 py-1 text-xs disabled:opacity-50">Refresh index details</button>
+      </div>
 
       <button
         onClick={apply}
@@ -8104,6 +8131,7 @@ drive the UI in a real browser.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
+| `11_retrieval.sh` + `retrieval_controls.py` | called by03/all.sh; owned real physical config/vector-query checks with controlled model responses; no startup sweeps |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
@@ -8887,6 +8915,77 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/11_retrieval.sh
+
+```bash
+#!/usr/bin/env bash
+# Observe physical config and execute top-K on real backend, controlling models.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Physical index and effective query controls"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
+check "physical index, legacy vector aliases, executed topK and config lifecycle" $?
+summary
+```
+
+### scripts/verify/retrieval_controls.py
+
+```python
+"""Real physical config and executed query limits on owned synthetic collections.
+
+Inside disposable API: python - < scripts/verify/retrieval_controls.py
+Actual SDK/backend storage and vector queries; only Ollama reformulation,
+embedding and answer calls are controlled. No startup sweep/model calls.
+"""
+import os,tempfile,uuid
+from unittest.mock import AsyncMock,patch
+from fastapi.testclient import TestClient
+from config import settings
+from main import app
+from services import weaviate_client as wc,rag_pipeline as rag
+
+prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
+collections=[]
+client=TestClient(app)
+with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
+    try:
+        for index in ('hnsw','flat'):
+            name=prefix+index;assert not wc._collection_exists_sync(name);collections.append(name)
+            response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
+            assert response.status_code==201,response.text
+            coll=wc.get_client().collections.get(name)
+            for i in range(1,11):coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
+            assert row['index_type']==index and row['distance_metric']=='cosine'
+            assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
+            print('PASS real '+index+' physical settings are observed, not query labels',flush=True)
+            for mode,limit in (('hnsw',2),('flat',5)):
+                with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
+                    response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
+                assert response.status_code==200,response.text
+                body=response.json();assert body['chunks_retrieved']==limit and len(body['citations'])==limit,body
+            after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
+            assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
+            print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
+            config={'collection':name,'retrieval_mode':'hybrid','top_k':7,'alpha':0.25,'ef':96,'response_format':'engineer'}
+            assert client.post('/retrieval/config',json=config).status_code==201
+            loaded=client.get('/retrieval/config/'+name).json()
+            assert all(loaded[key]==value for key,value in config.items()),loaded
+            config['ef']=None
+            assert client.post('/retrieval/config',json=config).status_code==201
+            assert client.get('/retrieval/config/'+name).json()['ef'] is None
+            print('PASS saved method/topK/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
+    finally:
+        for name in collections:
+            if wc._collection_exists_sync(name):
+                response=client.delete('/collections/'+name+'?confirm=true');assert response.status_code==200,response.text
+        wc.close_client()
+assert all(not wc._collection_exists_sync(name) for name in collections)
+wc.close_client()
+print('PASS owned synthetic collections/config/files removed',flush=True)
+```
+
 ### scripts/verify/03_query.sh
 
 ```bash
@@ -8896,6 +8995,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./11_retrieval.sh
+check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
@@ -8911,7 +9012,7 @@ ask() {  # ask <mode> <format> <citations> -> writes /tmp/vfy_ans.json
 }
 
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.2 entirely" "every check needs an LLM call"
+  skip "LLM query assertions" "set RAG_SKIP_SLOW=0 to include model calls"
   summary; exit $?
 fi
 

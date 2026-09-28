@@ -24,6 +24,7 @@ class CollectionInfo(BaseModel):
     index_type: str
     distance_metric: str
     created_at: Optional[str]
+    hnsw_config: Optional[dict[str, int]] = None
 
 
 class CollectionsResponse(BaseModel):

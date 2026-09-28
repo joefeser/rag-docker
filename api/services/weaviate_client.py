@@ -182,6 +182,10 @@ def _get_collections_sync() -> list[dict]:
             "object_count": count,
             "index_type": index_type,
             "distance_metric": distance_str,
+            "hnsw_config": ({"ef": vector_config.ef,
+                             "efConstruction": vector_config.ef_construction,
+                             "maxConnections": vector_config.max_connections}
+                            if index_type == "hnsw" else None),
         })
     return result
 
