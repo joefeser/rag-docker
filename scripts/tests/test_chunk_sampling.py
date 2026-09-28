@@ -172,7 +172,8 @@ class RequestTests(unittest.TestCase):
                         '{"collection":"Inert","'+field+'":'+number+'}',
                         headers={'Content-Type':'application/json'})
                     self.assertEqual(response.status_code,422,response.text)
-                    self.assertIn('detail',response.json())
+                    self.assertEqual(response.json()['error']['code'],'INVALID_PARAMETER')
+                    self.assertTrue(response.json()['error']['detail'])
             lookup.assert_not_awaited(); generation.assert_not_awaited()
 
 
