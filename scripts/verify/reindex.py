@@ -132,6 +132,37 @@ print('PASS independent API lifespan restores recovery, exact records and histor
     check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
 
 
+async def additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check):
+    custom=name+'Custom'
+    def create_custom():
+        properties=[wc.Property(name=p.name,data_type=p.dataType,skip_vectorization=(p.name=='content')) for p in wc.COLLECTION_PROPERTIES]
+        client.collections.create(name=custom,vectorizer_config=wc.Configure.Vectorizer.text2vec_ollama(api_endpoint='http://127.0.0.1:1',model=settings.embed_model,vectorize_collection_name=False),properties=properties)
+        created.append(custom)
+        client.collections.get(custom).data.insert(properties={'content':'Owned custom vectorizer input'},vector=[.125]*768)
+    await asyncio.to_thread(create_custom)
+    before=await asyncio.to_thread(tuning._existing_records,custom)
+    request=await api.post('/tune/reindex',json={'collection':custom,'index_type':'flat','distance_metric':'dot'})
+    assert request.status_code==202,request.text;identity=request.json()['job_id'];jobs.append((tuning,identity))
+    refusal=await completed(api,'/tune/job/'+identity,expected_status='failed')
+    check('vectorizer configuration' in refusal['error'] and refusal['chunks_written']==0,'actual custom property vectorization is refused before staging')
+    check(await asyncio.to_thread(tuning._existing_records,custom)==before,'custom property refusal preserves real UUID/property/vector data')
+    check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'custom property refusal creates no ownership or staging')
+    # A distinct process registers actual import scratch, creates it, then exits
+    # without Python finally. Startup ownership sweep must remove exactly it.
+    parent=name+'ImportParent'
+    code="from services import collection_recovery as r,weaviate_client as w; import os; o=r.begin("+repr(parent)+",'import',w.get_client()); w._create_collection_sync(o['staging'],'hnsw','cosine',{}); print(o['staging'],flush=True); os._exit(17)"
+    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')}
+    result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code],env=env,text=True,capture_output=True,timeout=30)
+    def records():return [json.loads(p.read_text()) for p in tuning.collection_recovery._root().glob('*.json') if json.loads(p.read_text()).get('target')==parent]
+    ownership=await asyncio.to_thread(records)
+    created.extend(o['staging'] for o in ownership)
+    check(result.returncode==17 and len(ownership)==1 and ownership[0]['state']=='scratch','independent import scratch writer hard-exits with durable positive ownership')
+    staging=ownership[0]['staging']
+    check(await asyncio.to_thread(client.collections.exists,staging),'hard exit leaves the exact owned import staging collection')
+    removed=await asyncio.to_thread(wc._sweep_staging_sync)
+    check(staging in removed and not await asyncio.to_thread(client.collections.exists,staging),'startup removes the exact positively owned interrupted import scratch')
+    check(await asyncio.to_thread(lambda:not records()),'startup completes and removes the owned import scratch journal')
+
 async def main():
     token=uuid.uuid4().hex[:8]; name=owned_name(os.environ.get('RAG_TEST_PREFIX','Vfy49'),token)
     probe=name+'Probe'; sid='gs_'+token; job=None; jobs=[]; checks=0
@@ -196,6 +227,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'refused model mismatch preserves evaluation bytes')
                     check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'successful reindex removes its exact durable ownership; refusal creates none')
                     check(all(not item.startswith(os.environ.get('RAG_TEST_PREFIX','Vfy49')) for item in created),'all real verifier-created names remain outside the parent prefix sweep')
+                    await additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check)
                     await queued_ingest_checks(api,client,name,jobs,check)
                     await retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
                     check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'failed secondary cutover leaves the unrelated primary evaluation unchanged')

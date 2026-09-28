@@ -23,6 +23,7 @@ depending on whether there is anything to protect:
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import json
 import logging
 import re
@@ -32,7 +33,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from services import collection_writes
+from services import collection_writes, collection_recovery
 from config import settings
 from services import goldstandard
 from services import model_bundle
@@ -418,6 +419,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     # _build deletes its own collection on failure, so temp_collection being
     # set is not by itself evidence that anything survived to recover.
     staged = False
+    ownership: dict | None = None
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -442,54 +444,57 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
-        exists = wc._collection_exists_sync(target)                 # check 5
-        if exists and on_conflict == "abort":
-            raise PackageError(
-                "COLLECTION_EXISTS",
-                f"A collection named '{target}' already exists. Import with "
-                "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
-                {"collection": target})
+        # The synchronous executor holds one target guard through conflict
+        # check, both build passes, cutover and sidecar restoration.
+        with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
+            exists = wc._collection_exists_sync(target)                 # check 5
+            if exists and on_conflict == "abort":
+                raise PackageError(
+                    "COLLECTION_EXISTS",
+                    f"A collection named '{target}' already exists. Import with "
+                    "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
+                    {"collection": target})
 
-        if exists and on_conflict == "rename":
-            target = _rename_target(original, id8)
+            if exists and on_conflict == "rename":
+                target = _rename_target(original, id8)
 
-        if exists and on_conflict == "replace":
-            # Prove the package inserts cleanly before destroying anything.
-            temp_collection = f"{canonical(original)}__importing_{id8}"
-            if wc._collection_exists_sync(temp_collection):
-                wc.get_client().collections.delete(temp_collection)
-            _build(temp_collection, pkg, manifest, progress)
-            staged = True
-            job["chunks_written"] = 0
-            # Counted before the delete, because the delete is what orphans them.
-            orphaned = len(goldstandard.sessions_for(target))
-            wc._delete_collection_sync(target)   # also drops its sources + config
-            if orphaned:
-                # Spec §8 rule 4: silently destroying evaluation work is worse
-                # than reporting it, and refusing the import would block a
-                # legitimate operation over data the user may not care about.
-                replace_notes.append(
-                    f"{orphaned} gold-standard session(s) from the replaced "
-                    "collection were kept and marked orphaned")
+            if exists and on_conflict == "replace":
+                # Prove the package inserts cleanly before destroying anything.
+                ownership = collection_recovery.begin(target, "import", wc.get_client())
+                temp_collection = ownership["staging"]
+                _build(temp_collection, pkg, manifest, progress)
+                job["chunks_written"] = 0
+                collection_recovery.retain(ownership, package=pkg)
+                staged = True
+                # Counted before the delete, because the delete is what orphans them.
+                orphaned = len(goldstandard.sessions_for(target))
+                wc._delete_collection_sync(target)   # also drops its sources + config
+                if orphaned:
+                    # Spec §8 rule 4: silently destroying evaluation work is worse
+                    # than reporting it, and refusing the import would block a
+                    # legitimate operation over data the user may not care about.
+                    replace_notes.append(
+                        f"{orphaned} gold-standard session(s) from the replaced "
+                        "collection were kept and marked orphaned")
 
-        expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id)
-        marked = target
-        written = _build(target, pkg, manifest, progress)
-        _mark_finished(target)
-        marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+            expected = manifest.get("collection", {}).get("chunk_count", -1)
+            _mark_started(target, expected, job_id)
+            marked = target
+            written = _build(target, pkg, manifest, progress)
+            _mark_finished(target)
+            marked = None
+            notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
 
-        if staged and temp_collection:
-            try:
-                wc.get_client().collections.delete(temp_collection)
-            except Exception:                         # noqa: BLE001
-                _log.exception("Could not remove staging collection %r", temp_collection)
-            staged = False
+            if staged and temp_collection:
+                try:
+                    collection_recovery.discard(ownership, wc.get_client())
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not remove staging collection %r", temp_collection)
+                staged = False
 
-        job.update(status="completed", collection=target, original_collection=original,
-                   chunks_written=written, renamed=(target != canonical(original)),
-                   notes=notes)
+            job.update(status="completed", collection=target, original_collection=original,
+                       chunks_written=written, renamed=(target != canonical(original)),
+                       notes=notes)
 
     except PackageError as exc:
         job.update(status="failed", error_code=exc.code, error=exc.message,
@@ -499,7 +504,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # staging collection means the data is recoverable, not lost.
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection}
+            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -507,13 +513,19 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {"recovered_as": temp_collection}
+            job["error_detail"] = {"recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
         # behind, which is the case the startup sweep exists for.
         if marked:
             _mark_finished(marked)
+        if ownership and ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, wc.get_client())
+            except Exception:
+                _log.exception("Could not remove owned import scratch %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
         with _lock:
             _active.discard(filename)

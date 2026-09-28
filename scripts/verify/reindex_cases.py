@@ -163,7 +163,7 @@ class ReindexTests(unittest.TestCase):
         self.assertEqual(self.backend.data['OwnedReindex'],self.original);self.stale.assert_not_called()
     def test_vectorizer_validation_checks_model_endpoint_type_and_named_vectors(self):
         from config import settings
-        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None)
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=False,vectorize_property_name=True),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES])
         client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
         with patch.object(tuning.wc,'get_client',return_value=client):
             validate_vectorizer('Owned')
@@ -175,6 +175,40 @@ class ReindexTests(unittest.TestCase):
             with self.assertRaises(ValueError):validate_vectorizer('Owned')
             cfg.vectorizer_config.vectorizer='text2vec-ollama';cfg.vector_config={'foreign':object()}
             with self.assertRaises(ValueError):validate_vectorizer('Owned')
+    def test_vectorizer_refuses_extra_module_options_and_changed_property_inputs(self):
+        from config import settings
+        props=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=False,vectorize_property_name=True),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES]
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=props)
+        client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
+        with patch.object(tuning.wc,'get_client',return_value=client):
+            validate_vectorizer('Owned')
+            cfg.vectorizer_config.model['source_properties']=['content']
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+            cfg.vectorizer_config.model.pop('source_properties')
+            for field,value in [('skip',True),('vectorize_property_name',False)]:
+                rules=props[0].vectorizer_config;old=getattr(rules,field);setattr(rules,field,value)
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                setattr(rules,field,old)
+            for field,value in [('name','custom_text'),('data_type','int'),('vectorizer','foreign'),('vectorizer_configs',{'default':object()})]:
+                old=getattr(props[0],field);setattr(props[0],field,value)
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                setattr(props[0],field,old)
+            props[1]=props[0]
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+    def test_staging_creation_failures_cleanup_owned_scratch_without_touching_original(self):
+        create=self.backend.create
+        for created_before_error in (False,True):
+            with self.subTest(created_before_error=created_before_error):
+                def fail(name,*args):
+                    if created_before_error:create(name,*args)
+                    raise RuntimeError('Owned staging create acknowledgement failure')
+                def discard(owner,client):
+                    if owner['staging'] in client.collections.data:client.collections.delete(owner['staging'])
+                with patch.object(tuning.wc,'_create_collection_sync',side_effect=fail),patch.object(tuning.collection_recovery,'discard',side_effect=discard) as cleanup:
+                    job=self.run_job()
+                self.assertEqual(job['status'],'failed');cleanup.assert_called_once()
+                self.assertEqual(set(self.backend.data),{'OwnedReindex'});self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+                self.stale.assert_not_called()
     def test_delete_refusal_with_intact_original_preserves_evaluation_validity(self):
         delete=self.backend.delete
         def refuse(name):

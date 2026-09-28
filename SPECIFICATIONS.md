@@ -1063,11 +1063,11 @@ Re-chunk/re-embed generate vectors during preparation. Reindex reads the origina
 UUIDs, properties and finite default vectors, supplies them during both writes,
 and verifies exact backend equality after staging and final copying. It also
 holds a collection writer guard from the source snapshot through final verification.
-Ingestion workers, import builds and create/insert/delete primitives in the same
+Ingestion workers, complete replace-import conflict/cutover/sidecar restoration and create/insert/delete primitives in the same
 API process share that guard; waiting happens in their executor threads. Backend
 clients outside this process are not covered, so an observed source change is
 also refused before cutover. Stored vectorizer type/model/endpoint/settings must
-match the supported recreation configuration; a mismatch fails before staging
+match the complete supported recreation configuration, including every module option and property name/type/vectorization flag; a mismatch fails before staging
 and requires re-embedding first. Reindex needs no embedding response and fails
 instead of guessing if a stored vector is unavailable or unsupported.
 
@@ -1079,7 +1079,7 @@ configuration are confirmed intact after a refused delete, evaluation validity
 is retained. Otherwise sessions become historical and verified staging plus
 pre-cutover sidecars remain under durable recovery ownership, named in the job
 error. Startup preserves recovery and deletes only positively owned scratch;
-a name marker alone is insufficient cleanup authority.
+a name marker alone is insufficient cleanup authority. Replace-import staging is registered before creation and retained before cutover through the same ownership service. Ordinary staging-creation failures immediately clean exact owned scratch, including a lost creation acknowledgement.
 
 ---
 
@@ -1844,7 +1844,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 `''`; the type name is now always included.
 
 - [x] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
-      *Registered `14_reindex.sh`: 18 runtime cases, six writer-guard cases, four async lifecycle/parent-cleanup cases, two polling cases and 28 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*
+      *Registered `14_reindex.sh`: 20 runtime cases, nine writer/import-boundary cases, four async lifecycle/parent-cleanup cases, two polling cases and 35 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*
 
 ### 10.4 Web UI
 

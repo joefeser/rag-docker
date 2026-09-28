@@ -1623,10 +1623,9 @@ async def get_collections() -> list[dict]:
     return await asyncio.to_thread(_get_collections_sync)
 
 
-# Collections created mid-operation and normally removed by the operation's own
-# cleanup. A hard kill (SIGKILL, OOM, `docker compose kill`) skips that cleanup,
-# so they are swept at startup instead — nothing can legitimately be using one
-# before the application has begun serving.
+# Startup only removes scratch with a durable positive ownership record.
+# Legacy/unowned marker names are preserved; names alone cannot distinguish
+# abandoned scratch from deliberately retained recovery.
 STAGING_MARKERS = ("__importing_", "__tuning_")
 
 
@@ -1701,12 +1700,31 @@ def _validate_reindex_vectorizer_sync(name: str) -> None:
     vectorizer = getattr(cfg, "vectorizer_config", None)
     kind = getattr(vectorizer, "vectorizer", None)
     model = getattr(vectorizer, "model", None)
-    if (getattr(kind, "value", kind) != "text2vec-ollama"
-            or not isinstance(model, dict)
-            or model.get("model") != settings.embed_model
-            or model.get("apiEndpoint") != f"http://{settings.ollama_host}:{settings.ollama_port}"
-            or getattr(vectorizer, "vectorize_collection_name", None) is not False
-            or getattr(cfg, "vector_config", None)):
+    expected_model = {"model": settings.embed_model,
+                      "apiEndpoint": f"http://{settings.ollama_host}:{settings.ollama_port}"}
+    compatible = (getattr(kind, "value", kind) == "text2vec-ollama"
+                  and model == expected_model
+                  and getattr(vectorizer, "vectorize_collection_name", None) is False
+                  and not getattr(cfg, "vector_config", None))
+    # Property names/types and skip/name flags also determine provider input.
+    # Refuse unknown module options and custom properties instead of copying
+    # old vectors into the fixed schema with different future insert rules.
+    expected_properties = {p.name: p._to_dict() for p in COLLECTION_PROPERTIES}
+    properties = list(getattr(cfg, "properties", None) or [])
+    compatible = compatible and len(properties) == len(expected_properties) and {p.name for p in properties} == set(expected_properties)
+    for prop in properties:
+        expected = expected_properties.get(prop.name)
+        rules = getattr(prop, "vectorizer_config", None)
+        compatible = compatible and bool(
+            expected
+            and getattr(prop.data_type, "value", prop.data_type) == expected["dataType"][0]
+            and getattr(prop, "vectorizer", None) == "text2vec-ollama"
+            and not getattr(prop, "vectorizer_configs", None)
+            and rules is not None
+            and rules.skip == expected["skip_vectorization"]
+            and rules.vectorize_property_name == expected["vectorize_property_name"]
+            and not getattr(prop, "nested_properties", None))
+    if not compatible:
         raise ValueError("Reindex would change the collection's vectorizer configuration; "
                          "re-embed with the configured model first")
 
@@ -3508,6 +3526,7 @@ depending on whether there is anything to protect:
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import json
 import logging
 import re
@@ -3517,7 +3536,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from services import collection_writes
+from services import collection_writes, collection_recovery
 from config import settings
 from services import goldstandard
 from services import model_bundle
@@ -3903,6 +3922,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     # _build deletes its own collection on failure, so temp_collection being
     # set is not by itself evidence that anything survived to recover.
     staged = False
+    ownership: dict | None = None
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -3927,54 +3947,57 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
-        exists = wc._collection_exists_sync(target)                 # check 5
-        if exists and on_conflict == "abort":
-            raise PackageError(
-                "COLLECTION_EXISTS",
-                f"A collection named '{target}' already exists. Import with "
-                "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
-                {"collection": target})
+        # The synchronous executor holds one target guard through conflict
+        # check, both build passes, cutover and sidecar restoration.
+        with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
+            exists = wc._collection_exists_sync(target)                 # check 5
+            if exists and on_conflict == "abort":
+                raise PackageError(
+                    "COLLECTION_EXISTS",
+                    f"A collection named '{target}' already exists. Import with "
+                    "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
+                    {"collection": target})
 
-        if exists and on_conflict == "rename":
-            target = _rename_target(original, id8)
+            if exists and on_conflict == "rename":
+                target = _rename_target(original, id8)
 
-        if exists and on_conflict == "replace":
-            # Prove the package inserts cleanly before destroying anything.
-            temp_collection = f"{canonical(original)}__importing_{id8}"
-            if wc._collection_exists_sync(temp_collection):
-                wc.get_client().collections.delete(temp_collection)
-            _build(temp_collection, pkg, manifest, progress)
-            staged = True
-            job["chunks_written"] = 0
-            # Counted before the delete, because the delete is what orphans them.
-            orphaned = len(goldstandard.sessions_for(target))
-            wc._delete_collection_sync(target)   # also drops its sources + config
-            if orphaned:
-                # Spec §8 rule 4: silently destroying evaluation work is worse
-                # than reporting it, and refusing the import would block a
-                # legitimate operation over data the user may not care about.
-                replace_notes.append(
-                    f"{orphaned} gold-standard session(s) from the replaced "
-                    "collection were kept and marked orphaned")
+            if exists and on_conflict == "replace":
+                # Prove the package inserts cleanly before destroying anything.
+                ownership = collection_recovery.begin(target, "import", wc.get_client())
+                temp_collection = ownership["staging"]
+                _build(temp_collection, pkg, manifest, progress)
+                job["chunks_written"] = 0
+                collection_recovery.retain(ownership, package=pkg)
+                staged = True
+                # Counted before the delete, because the delete is what orphans them.
+                orphaned = len(goldstandard.sessions_for(target))
+                wc._delete_collection_sync(target)   # also drops its sources + config
+                if orphaned:
+                    # Spec §8 rule 4: silently destroying evaluation work is worse
+                    # than reporting it, and refusing the import would block a
+                    # legitimate operation over data the user may not care about.
+                    replace_notes.append(
+                        f"{orphaned} gold-standard session(s) from the replaced "
+                        "collection were kept and marked orphaned")
 
-        expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id)
-        marked = target
-        written = _build(target, pkg, manifest, progress)
-        _mark_finished(target)
-        marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+            expected = manifest.get("collection", {}).get("chunk_count", -1)
+            _mark_started(target, expected, job_id)
+            marked = target
+            written = _build(target, pkg, manifest, progress)
+            _mark_finished(target)
+            marked = None
+            notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
 
-        if staged and temp_collection:
-            try:
-                wc.get_client().collections.delete(temp_collection)
-            except Exception:                         # noqa: BLE001
-                _log.exception("Could not remove staging collection %r", temp_collection)
-            staged = False
+            if staged and temp_collection:
+                try:
+                    collection_recovery.discard(ownership, wc.get_client())
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not remove staging collection %r", temp_collection)
+                staged = False
 
-        job.update(status="completed", collection=target, original_collection=original,
-                   chunks_written=written, renamed=(target != canonical(original)),
-                   notes=notes)
+            job.update(status="completed", collection=target, original_collection=original,
+                       chunks_written=written, renamed=(target != canonical(original)),
+                       notes=notes)
 
     except PackageError as exc:
         job.update(status="failed", error_code=exc.code, error=exc.message,
@@ -3984,7 +4007,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # staging collection means the data is recoverable, not lost.
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection}
+            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -3992,13 +4016,19 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {"recovered_as": temp_collection}
+            job["error_detail"] = {"recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
         # behind, which is the case the startup sweep exists for.
         if marked:
             _mark_finished(marked)
+        if ownership and ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, wc.get_client())
+            except Exception:
+                _log.exception("Could not remove owned import scratch %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
         with _lock:
             _active.discard(filename)
@@ -4383,11 +4413,11 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     client = wc.get_client()
     ownership = collection_recovery.begin(collection, "tune", client) if records is not None else None
     staging = ownership["staging"] if ownership else f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw)
     cutover_started = False
     completed = False
     original_intact = False
     try:
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw)
         if records is not None:
             _write_records(staging, records)
             # Application writers share the held guard. Also refuse a source
@@ -8271,7 +8301,7 @@ drive the UI in a real browser.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
-| `14_reindex.sh` | exact-record reindex: 18 record/cutover/vectorizer/concurrency cases, six writer-guard cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 28 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `14_reindex.sh` | exact-record reindex: 20 record/cutover/vectorizer/concurrency cases, nine writer/import-boundary cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 35 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
@@ -8317,7 +8347,7 @@ curl -s localhost:8080/api/collections | python3 -c \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
 
-`reindex_verifier_cases.py` checks actual async failure cleanup and the parent shell cleanup predicate without a backend/model call. The registered suite transports its helper, the actual `lib.sh`, and these controlled tests into an owned temporary API directory. `test_collection_writes.py` checks waiting writers, case aliases, reentrancy, failures, independent collections and actual import/backend entry points.
+`reindex_verifier_cases.py` checks actual async failure cleanup and the parent shell cleanup predicate without a backend/model call. The registered suite transports its helper, the actual `lib.sh`, and these controlled tests into an owned temporary API directory. `test_collection_writes.py` checks waiting writers, case aliases, reentrancy, failures, independent collections and actual import/backend entry points, a paused complete replace-import cutover and sidecar restoration, positive ownership before import staging, and ordinary staging failure/recovery cleanup. The live suite refuses altered property vectorization and removes exact durably owned import scratch after an independent process exits without finally.
 
 The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
 ````
@@ -10463,7 +10493,7 @@ class ReindexTests(unittest.TestCase):
         self.assertEqual(self.backend.data['OwnedReindex'],self.original);self.stale.assert_not_called()
     def test_vectorizer_validation_checks_model_endpoint_type_and_named_vectors(self):
         from config import settings
-        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None)
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=False,vectorize_property_name=True),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES])
         client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
         with patch.object(tuning.wc,'get_client',return_value=client):
             validate_vectorizer('Owned')
@@ -10475,6 +10505,40 @@ class ReindexTests(unittest.TestCase):
             with self.assertRaises(ValueError):validate_vectorizer('Owned')
             cfg.vectorizer_config.vectorizer='text2vec-ollama';cfg.vector_config={'foreign':object()}
             with self.assertRaises(ValueError):validate_vectorizer('Owned')
+    def test_vectorizer_refuses_extra_module_options_and_changed_property_inputs(self):
+        from config import settings
+        props=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=False,vectorize_property_name=True),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES]
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=props)
+        client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
+        with patch.object(tuning.wc,'get_client',return_value=client):
+            validate_vectorizer('Owned')
+            cfg.vectorizer_config.model['source_properties']=['content']
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+            cfg.vectorizer_config.model.pop('source_properties')
+            for field,value in [('skip',True),('vectorize_property_name',False)]:
+                rules=props[0].vectorizer_config;old=getattr(rules,field);setattr(rules,field,value)
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                setattr(rules,field,old)
+            for field,value in [('name','custom_text'),('data_type','int'),('vectorizer','foreign'),('vectorizer_configs',{'default':object()})]:
+                old=getattr(props[0],field);setattr(props[0],field,value)
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                setattr(props[0],field,old)
+            props[1]=props[0]
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+    def test_staging_creation_failures_cleanup_owned_scratch_without_touching_original(self):
+        create=self.backend.create
+        for created_before_error in (False,True):
+            with self.subTest(created_before_error=created_before_error):
+                def fail(name,*args):
+                    if created_before_error:create(name,*args)
+                    raise RuntimeError('Owned staging create acknowledgement failure')
+                def discard(owner,client):
+                    if owner['staging'] in client.collections.data:client.collections.delete(owner['staging'])
+                with patch.object(tuning.wc,'_create_collection_sync',side_effect=fail),patch.object(tuning.collection_recovery,'discard',side_effect=discard) as cleanup:
+                    job=self.run_job()
+                self.assertEqual(job['status'],'failed');cleanup.assert_called_once()
+                self.assertEqual(set(self.backend.data),{'OwnedReindex'});self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+                self.stale.assert_not_called()
     def test_delete_refusal_with_intact_original_preserves_evaluation_validity(self):
         delete=self.backend.delete
         def refuse(name):
@@ -10640,6 +10704,37 @@ print('PASS independent API lifespan restores recovery, exact records and histor
     check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
 
 
+async def additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check):
+    custom=name+'Custom'
+    def create_custom():
+        properties=[wc.Property(name=p.name,data_type=p.dataType,skip_vectorization=(p.name=='content')) for p in wc.COLLECTION_PROPERTIES]
+        client.collections.create(name=custom,vectorizer_config=wc.Configure.Vectorizer.text2vec_ollama(api_endpoint='http://127.0.0.1:1',model=settings.embed_model,vectorize_collection_name=False),properties=properties)
+        created.append(custom)
+        client.collections.get(custom).data.insert(properties={'content':'Owned custom vectorizer input'},vector=[.125]*768)
+    await asyncio.to_thread(create_custom)
+    before=await asyncio.to_thread(tuning._existing_records,custom)
+    request=await api.post('/tune/reindex',json={'collection':custom,'index_type':'flat','distance_metric':'dot'})
+    assert request.status_code==202,request.text;identity=request.json()['job_id'];jobs.append((tuning,identity))
+    refusal=await completed(api,'/tune/job/'+identity,expected_status='failed')
+    check('vectorizer configuration' in refusal['error'] and refusal['chunks_written']==0,'actual custom property vectorization is refused before staging')
+    check(await asyncio.to_thread(tuning._existing_records,custom)==before,'custom property refusal preserves real UUID/property/vector data')
+    check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'custom property refusal creates no ownership or staging')
+    # A distinct process registers actual import scratch, creates it, then exits
+    # without Python finally. Startup ownership sweep must remove exactly it.
+    parent=name+'ImportParent'
+    code="from services import collection_recovery as r,weaviate_client as w; import os; o=r.begin("+repr(parent)+",'import',w.get_client()); w._create_collection_sync(o['staging'],'hnsw','cosine',{}); print(o['staging'],flush=True); os._exit(17)"
+    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')}
+    result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code],env=env,text=True,capture_output=True,timeout=30)
+    def records():return [json.loads(p.read_text()) for p in tuning.collection_recovery._root().glob('*.json') if json.loads(p.read_text()).get('target')==parent]
+    ownership=await asyncio.to_thread(records)
+    created.extend(o['staging'] for o in ownership)
+    check(result.returncode==17 and len(ownership)==1 and ownership[0]['state']=='scratch','independent import scratch writer hard-exits with durable positive ownership')
+    staging=ownership[0]['staging']
+    check(await asyncio.to_thread(client.collections.exists,staging),'hard exit leaves the exact owned import staging collection')
+    removed=await asyncio.to_thread(wc._sweep_staging_sync)
+    check(staging in removed and not await asyncio.to_thread(client.collections.exists,staging),'startup removes the exact positively owned interrupted import scratch')
+    check(await asyncio.to_thread(lambda:not records()),'startup completes and removes the owned import scratch journal')
+
 async def main():
     token=uuid.uuid4().hex[:8]; name=owned_name(os.environ.get('RAG_TEST_PREFIX','Vfy49'),token)
     probe=name+'Probe'; sid='gs_'+token; job=None; jobs=[]; checks=0
@@ -10704,6 +10799,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'refused model mismatch preserves evaluation bytes')
                     check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'successful reindex removes its exact durable ownership; refusal creates none')
                     check(all(not item.startswith(os.environ.get('RAG_TEST_PREFIX','Vfy49')) for item in created),'all real verifier-created names remain outside the parent prefix sweep')
+                    await additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check)
                     await queued_ingest_checks(api,client,name,jobs,check)
                     await retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
                     check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'failed secondary cutover leaves the unrelated primary evaluation unchanged')
@@ -11049,6 +11145,66 @@ class WriterTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError,'Owned stopped'):task.result(timeout=2)
                     self.assertTrue(entered.is_set())
                 self.assertNotIn('Owned',writes._registry)
+
+class ImportCutoverTests(unittest.TestCase):
+    def execute(self,build_hook=None,restore_hook=None,delete_hook=None):
+        import tempfile,json
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from services import importer,collection_recovery as recovery
+        from config import settings
+        task=tempfile.TemporaryDirectory();self.addCleanup(task.cleanup);root=Path(task.name)
+        pkg=root/'pkg';pkg.mkdir();(pkg/'manifest.json').write_text('{}')
+        backend={'OwnedImport'};deleted=[];observed=[]
+        class Collections:
+            def exists(self,name):return name in backend
+            def delete(self,name):deleted.append(name);backend.discard(name)
+        client=SimpleNamespace(collections=Collections())
+        job={'status':'queued','chunks_written':0};manifest={'collection':{'name':'OwnedImport','chunk_count':1}}
+        def build(name,*args):
+            backend.add(name)
+            if name!='OwnedImport':
+                records=[json.loads(p.read_text()) for p in recovery._root().glob('*.json')]
+                self.assertEqual(len(records),1);self.assertEqual(records[0]['staging'],name);self.assertEqual(records[0]['state'],'scratch');observed.append(name)
+            if build_hook:build_hook(name,backend)
+            return 1
+        def delete(name):
+            client.collections.delete(name)
+            if delete_hook:delete_hook(name)
+        stack=ExitStack();self.addCleanup(stack.close)
+        for change in [patch.object(settings,'upload_dir',str(root)),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(importer,'_jobs',{'owned':job}),patch.object(importer,'_active',{'owned.zip'}),patch.object(importer.packager,'exports_dir',return_value=root),patch.object(importer.packager,'open_package',return_value=(pkg,manifest)),patch.object(importer.packager,'verify_digests'),patch.object(importer,'_check_embedding'),patch.object(importer,'_ensure_models',return_value=[]),patch.object(importer.wc,'get_client',return_value=client),patch.object(importer.wc,'_collection_exists_sync',side_effect=lambda name:name in backend),patch.object(importer.wc,'_delete_collection_sync',side_effect=delete),patch.object(importer,'_build',side_effect=build),patch.object(importer.goldstandard,'sessions_for',return_value=[]),patch.object(importer,'_restore_sidecars',side_effect=restore_hook or (lambda *args:[]))]:stack.enter_context(change)
+        return importer,job,backend,deleted,observed,root
+    def test_replace_guard_spans_deleted_target_and_sidecar_restoration(self):
+        from concurrent.futures import ThreadPoolExecutor
+        deleted_event=threading.Event();restore_event=threading.Event();resume_delete=threading.Event();resume_restore=threading.Event();entered=threading.Event();attempted=threading.Event()
+        def delete(name):deleted_event.set();assert resume_delete.wait(3)
+        def restore(*args):restore_event.set();assert resume_restore.wait(3);return []
+        module,job,backend,deleted,observed,root=self.execute(delete_hook=delete,restore_hook=restore)
+        def writer():
+            attempted.set()
+            with writes.guard('ownedImport'):entered.set();self.assertIn('OwnedImport',backend)
+        with ThreadPoolExecutor() as pool:
+            task=pool.submit(module._run,'owned','owned.zip','replace');self.assertTrue(deleted_event.wait(2))
+            waiting=pool.submit(writer);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05));resume_delete.set()
+            self.assertTrue(restore_event.wait(2));self.assertFalse(entered.wait(.05));resume_restore.set();task.result(timeout=3);waiting.result(timeout=3)
+        self.assertEqual(job['status'],'completed');self.assertEqual(backend,{'OwnedImport'});self.assertEqual(len(observed),1)
+        self.assertEqual(list((root/'collection_operations').glob('*.json')),[])
+    def test_import_staging_failure_cleans_owned_journal_and_collection(self):
+        def fail(name,backend):
+            if name!='OwnedImport':raise RuntimeError('Owned staging insertion failed')
+        module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
+        module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');self.assertEqual(backend,{'OwnedImport'})
+        self.assertNotIn('OwnedImport',deleted);self.assertEqual(list((root/'collection_operations').glob('*.json')),[])
+    def test_replace_failure_retains_positive_recovery_and_startup_preserves_it(self):
+        from services import collection_recovery as recovery
+        def fail(name,backend):
+            if name=='OwnedImport':backend.remove(name);raise RuntimeError('Owned final insertion failed')
+        module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
+        module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');retained=job['error_detail']['recovered_as']
+        self.assertIn(retained,backend);self.assertTrue(Path(job['error_detail']['sidecar_snapshots']).is_dir())
+        self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
+
 
 
 if __name__=='__main__':unittest.main()

@@ -196,11 +196,11 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     client = wc.get_client()
     ownership = collection_recovery.begin(collection, "tune", client) if records is not None else None
     staging = ownership["staging"] if ownership else f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw)
     cutover_started = False
     completed = False
     original_intact = False
     try:
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw)
         if records is not None:
             _write_records(staging, records)
             # Application writers share the held guard. Also refuse a source

@@ -193,10 +193,9 @@ async def get_collections() -> list[dict]:
     return await asyncio.to_thread(_get_collections_sync)
 
 
-# Collections created mid-operation and normally removed by the operation's own
-# cleanup. A hard kill (SIGKILL, OOM, `docker compose kill`) skips that cleanup,
-# so they are swept at startup instead — nothing can legitimately be using one
-# before the application has begun serving.
+# Startup only removes scratch with a durable positive ownership record.
+# Legacy/unowned marker names are preserved; names alone cannot distinguish
+# abandoned scratch from deliberately retained recovery.
 STAGING_MARKERS = ("__importing_", "__tuning_")
 
 
@@ -271,12 +270,31 @@ def _validate_reindex_vectorizer_sync(name: str) -> None:
     vectorizer = getattr(cfg, "vectorizer_config", None)
     kind = getattr(vectorizer, "vectorizer", None)
     model = getattr(vectorizer, "model", None)
-    if (getattr(kind, "value", kind) != "text2vec-ollama"
-            or not isinstance(model, dict)
-            or model.get("model") != settings.embed_model
-            or model.get("apiEndpoint") != f"http://{settings.ollama_host}:{settings.ollama_port}"
-            or getattr(vectorizer, "vectorize_collection_name", None) is not False
-            or getattr(cfg, "vector_config", None)):
+    expected_model = {"model": settings.embed_model,
+                      "apiEndpoint": f"http://{settings.ollama_host}:{settings.ollama_port}"}
+    compatible = (getattr(kind, "value", kind) == "text2vec-ollama"
+                  and model == expected_model
+                  and getattr(vectorizer, "vectorize_collection_name", None) is False
+                  and not getattr(cfg, "vector_config", None))
+    # Property names/types and skip/name flags also determine provider input.
+    # Refuse unknown module options and custom properties instead of copying
+    # old vectors into the fixed schema with different future insert rules.
+    expected_properties = {p.name: p._to_dict() for p in COLLECTION_PROPERTIES}
+    properties = list(getattr(cfg, "properties", None) or [])
+    compatible = compatible and len(properties) == len(expected_properties) and {p.name for p in properties} == set(expected_properties)
+    for prop in properties:
+        expected = expected_properties.get(prop.name)
+        rules = getattr(prop, "vectorizer_config", None)
+        compatible = compatible and bool(
+            expected
+            and getattr(prop.data_type, "value", prop.data_type) == expected["dataType"][0]
+            and getattr(prop, "vectorizer", None) == "text2vec-ollama"
+            and not getattr(prop, "vectorizer_configs", None)
+            and rules is not None
+            and rules.skip == expected["skip_vectorization"]
+            and rules.vectorize_property_name == expected["vectorize_property_name"]
+            and not getattr(prop, "nested_properties", None))
+    if not compatible:
         raise ValueError("Reindex would change the collection's vectorizer configuration; "
                          "re-embed with the configured model first")
 
