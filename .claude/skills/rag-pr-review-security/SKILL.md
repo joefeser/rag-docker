@@ -45,7 +45,7 @@ Also check the **issue's own security requirements**, for example a cap value or
 - **Medium:** defence in depth missing, where a failure would be safe or need an unlikely precondition.
 - **Low:** hardening with little practical effect.
 
-## Your extra summary section
+## Your extra recap section
 
 ```markdown
 ### Security notes
@@ -56,4 +56,4 @@ Also check the **issue's own security requirements**, for example a cap value or
 
 `Safe to execute locally` is `no` whenever you have a High, or the PR adds anything that runs automatically on build or start (install scripts, entrypoints, compose commands) that you couldn't fully verify.
 
-Apply `Passed: Security` or `FAILED: Security` per `reference.md`, then return the result block. Put the `Safe to execute locally` answer in `notes`.
+Write `findings-security.json` per `reference.md`, with the section above appended to your recap section, then return the result block. Put the `Safe to execute locally` answer in `notes`. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.

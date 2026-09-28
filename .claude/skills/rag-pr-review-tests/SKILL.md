@@ -41,7 +41,7 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
 
 ## Delivering the tests you wrote
 
-Don't push to the PR branch or create branches. Put the tests in your review summary as a patch that the author or maintainer can apply:
+Don't push to the PR branch or create branches. Put the tests in your recap section as a patch that the author or maintainer can apply:
 
 ````markdown
 ### Tests written by the reviewer
@@ -53,7 +53,7 @@ Don't push to the PR branch or create branches. Put the tests in your review sum
 </details>
 ````
 
-## Your extra summary section
+## Your extra recap section
 
 ```markdown
 ### Test coverage
@@ -69,4 +69,4 @@ Don't push to the PR branch or create branches. Put the tests in your review sum
 Stack restored to `develop`: yes (all services healthy)
 ```
 
-Apply `Passed: Tests` or `FAILED: Tests` per `reference.md`, then return the result block. If you weren't allowed to run code, return `verdict: NOT RUN`, apply no label, and still post the coverage mapping as a review.
+Write `findings-tests.json` per `reference.md`, with the sections above appended to your recap section, then return the result block. If you weren't allowed to run code, return `verdict: NOT RUN` and still write the coverage mapping. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.
