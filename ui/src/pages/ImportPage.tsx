@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { api, CollectionInfo, JobStatus } from '../api/client'
+import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
@@ -72,6 +72,14 @@ export default function ImportPage() {
   async function startIngest() {
     if (!files.length || !collection) return
     setError('')
+    // Refuse before sending: the proxy would reject it anyway, but only after
+    // the browser had started pushing hundreds of MB, and a connection the
+    // proxy closes mid-upload can surface as a bare network error.
+    const total = files.reduce((n, f) => n + f.size, 0)
+    if (total > MAX_UPLOAD_BYTES) {
+      setError(`These files total ${(total / 1024 / 1024).toFixed(0)} MB; one upload can be at most ${MAX_UPLOAD_MB} MB. Split them into smaller batches.`)
+      return
+    }
     const form = new FormData()
     files.forEach(f => form.append('files', f))
     form.append('collection', collection)
@@ -101,7 +109,7 @@ export default function ImportPage() {
         onClick={() => document.getElementById('file-input')?.click()}
       >
         <p className="text-gray-500">Drop files here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP</p>
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
         <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
