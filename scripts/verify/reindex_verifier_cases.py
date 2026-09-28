@@ -16,16 +16,17 @@ class LifecycleTests(unittest.TestCase):
         class OwnedTemp(original_temp):
             def __init__(self,*args,**kwargs):calls.append(('temp_create',threading.get_ident()));super().__init__(*args,**kwargs);temps.append(self.name)
             def cleanup(self):calls.append(('temp_cleanup',threading.get_ident()));super().cleanup()
-        def create(name,*args,**kwargs):calls.append(('create',threading.get_ident()));created[name]=[]
-        def delete(name):calls.append(('delete',threading.get_ident()));del created[name]
+        def create(name,*args,**kwargs):name=ns['wc'].collection_writes.canonical(name);calls.append(('create',threading.get_ident()));created[name]=[]
+        def delete(name):name=ns['wc'].collection_writes.canonical(name);calls.append(('delete',threading.get_ident()));del created[name]
         def collection(name):
+            name=ns['wc'].collection_writes.canonical(name)
             def insert(properties,uuid=None,vector=None):
                 if uuid is None:raise RuntimeError('connection refused 127.0.0.1:1')
                 created[name].append(dict(id=uuid,properties=properties,vector=vector))
             return SimpleNamespace(data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
-        client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:name in created,delete=delete),close=lambda:closed.append(threading.get_ident()))
+        client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:ns["wc"].collection_writes.canonical(name) in created,delete=delete),close=lambda:closed.append(threading.get_ident()))
         protected={'protected':{'session_id':'gs_11111111'}}
-        with patch.object(ns['tempfile'],'TemporaryDirectory',OwnedTemp),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create),patch.object(ns['tuning'],'_existing_records',side_effect=lambda name:list(created[name])),patch.object(ns['gs'],'_sessions',protected),patch.object(ns['gs'],'store_session',side_effect=OSError('Owned session failure')):
+        with patch.object(ns['tempfile'],'TemporaryDirectory',OwnedTemp),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create),patch.object(ns['tuning'],'_existing_records',side_effect=lambda name:list(created[ns["wc"].collection_writes.canonical(name)])),patch.object(ns['gs'],'_sessions',protected),patch.object(ns['gs'],'store_session',side_effect=OSError('Owned session failure')):
             with self.assertRaisesRegex(OSError,'Owned session failure'):asyncio.run(ns['main']())
             self.assertIs(ns['gs']._sessions,protected)
         self.assertFalse(created);self.assertEqual(len(closed),1);self.assertTrue(all(identity!=loop_thread for _,identity in calls));self.assertNotEqual(closed[0],loop_thread)
