@@ -3,7 +3,7 @@ import asyncio,json,os,sys,tempfile,threading,unittest,subprocess,time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import AsyncMock,patch
+from unittest.mock import AsyncMock,MagicMock,patch
 sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 from config import settings
 from services import goldstandard as gs
@@ -15,7 +15,7 @@ def fixture():
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
-        for obj,key,value in [(settings,'upload_dir',self.tmp.name),(gs,'_sessions',{}),(gs,'_diagnostics',{})]:
+        for obj,key,value in [(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{}),(gs,'_diagnostics',{})]:
             change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
         self.data=fixture();gs.store_session(self.data)
 
@@ -252,6 +252,11 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         from services import importer
         job={'status':'queued'};jobid='owned-import-marker-job';pkg=Path(self.tmp.name)
         manifest={'collection':{'name':'OwnedPersistence','chunk_count':1}}
+        client=MagicMock();client.collections.exists.side_effect=lambda name:name=='OwnedPersistence'
+        original_replace=gs.os.replace
+        def failed_marker(src,dst):
+            if Path(dst).stem==self.data['session_id']:raise OSError('Owned marker failure')
+            return original_replace(src,dst)
         def deleted(name):
             gs.mark_orphaned(name,'Owned completed primary replacement')
             return 1
@@ -269,8 +274,8 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 (importer,'_mark_finished',{'return_value':None}),
                 (importer.wc,'_collection_exists_sync',{'side_effect':lambda name:name=='OwnedPersistence'}),
                 (importer.wc,'_delete_collection_sync',{'side_effect':deleted}),
-                (importer.wc,'get_client',{}),
-                (gs.os,'replace',{'side_effect':OSError('Owned marker failure')})]:
+                (importer.wc,'get_client',{'return_value':client}),
+                (gs.os,'replace',{'side_effect':failed_marker})]:
                 stack.enter_context(patch.object(obj,name,**kwargs))
             build=stack.enter_context(patch.object(importer,'_build',return_value=1))
             importer._run(jobid,'owned-package.tar.gz','replace')
