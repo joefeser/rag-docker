@@ -1205,9 +1205,20 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 - Behavior: splits on character count with no intentional overlap. Sentence boundaries not respected.
 
 #### Fixed Size with Overlap (`overlap`)
-- Splitter: `CharacterTextSplitter`
+- Splitter: explicit character windows, independent of paragraph/word separators
 - Parameters: `chunk_size`, `chunk_overlap`, `min_chunk_size`
-- Behavior: each chunk shares `chunk_overlap` characters with the next chunk.
+- Behavior: consecutive windows share exactly `chunk_overlap` characters. Nonblank
+  text is covered in order, including internal and boundary whitespace; blank-only
+  input yields no chunks. Python character counts, rather than encoded byte counts,
+  determine window sizes. Long tokens and single-newline parser text remain bounded.
+- Window size must be positive, `0 <= chunk_overlap < chunk_size`, and
+  `0 <= min_chunk_size <= chunk_size`; impossible values are rejected.
+- The final undersized window is merged by appending only its new suffix, removing
+  duplicated overlap without adding a separator. All other windows are at most
+  `chunk_size`; the final output is at most
+  `chunk_size + max(0, min_chunk_size - chunk_overlap - 1)` characters. With defaults
+  (size 1000, overlap 200, minimum 100), every chunk is at most 1000 characters. A whole
+  document shorter than the minimum remains one short chunk; no text is fabricated.
 
 #### Language-Based (`language`)
 - Splitter: `RecursiveCharacterTextSplitter`
@@ -1227,7 +1238,13 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 
 ### 5.3 Minimum Chunk Enforcement
 
-After splitting, any chunk with character count below `min_chunk_size` is merged into the preceding chunk. If it is the first chunk, it is merged into the following chunk. All size parameters throughout the pipeline are in characters.
+Overlap uses the final-window policy and size bound in §5.2. Other strategies
+use a shared merge pass: a chunk below `min_chunk_size` is appended to its
+predecessor with a space when a predecessor exists. A short initial chunk can
+remain short. That shared pass can extend a preceding chunk beyond `chunk_size`;
+context-aware tables and semantic chunks also have no hard size cap. Those
+algorithms are outside the overlap size guarantee. All size parameters throughout
+the pipeline are in characters.
 
 ### 5.4 Embedding and Storage
 

@@ -37,9 +37,36 @@ def chunk_fixed(text: str, chunk_size: int, min_chunk_size: int) -> list[str]:
 
 
 def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size: int) -> list[str]:
-    splitter = CharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = splitter.split_text(text)
-    return _enforce_min_chunk_size(chunks, min_chunk_size)
+    # This strategy promises character overlap, independently of paragraph or
+    # word boundaries. A separator-only splitter cannot bound a long paragraph.
+    for name, value in (("chunk_size", chunk_size), ("chunk_overlap", chunk_overlap),
+                        ("min_chunk_size", min_chunk_size)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+    if chunk_size <= 0 or not 0 <= chunk_overlap < chunk_size:
+        raise ValueError("chunk_size must be positive and 0 <= chunk_overlap < chunk_size")
+    if not 0 <= min_chunk_size <= chunk_size:
+        raise ValueError("min_chunk_size must be between zero and chunk_size")
+    if not text.strip():
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = end - chunk_overlap
+
+    # The tail repeats the preceding window's overlap. Append only its new
+    # suffix, preserving coverage without duplicating those repeated bytes.
+    # Only this last window can be undersized. A short whole document stays
+    # one short chunk; minimum size is a preference, not fabricated content.
+    if len(chunks) > 1 and len(chunks[-1]) < min_chunk_size:
+        tail = chunks.pop()
+        chunks[-1] += tail[chunk_overlap:]
+    return chunks
 
 
 def chunk_language(
