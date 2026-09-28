@@ -1846,7 +1846,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
       weaviate publish nothing; ollama and ui expose container ports only.*
-- [ ] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback.
+- [x] Docker Engine is 28.0.0 or newer; older engines are outside the supported localhost-isolation profile. The infrastructure suite checks the daemon version.
+- [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
 
 ---
 
@@ -1861,7 +1862,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 | Requirement | Value | Why |
 |---|---|---|
 | Hardware | Apple Silicon (arm64) | All images resolve arm64 natively; torch is installed from the CPU index, which publishes linux/aarch64 wheels |
-| Docker Desktop | installed and running | The only host dependency. No Python, Node or compiler is required |
+| Docker Desktop | installed and running, Engine 28.0.0+ | The only host dependency. No Python, Node or compiler is required |
 | **Docker memory** | **10 GB minimum** | phi3.5 is ~6 GB resident. Below this it is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout` |
 | Docker disk | 20 GB minimum, 32 GB recommended | ~6.5 GB images + ~2.5 GB model weights + build cache |
 | Free host port | 8080 | `proxy` publishes `127.0.0.1:8080:80` |

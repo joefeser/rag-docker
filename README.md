@@ -14,10 +14,12 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 
 ## Prerequisites
 
-- **Docker Desktop** (or Docker Engine + Compose v2) — [install](https://docs.docker.com/get-docker/)
+- **Docker Desktop with Engine 28.0.0 or newer** (or Docker Engine 28.0.0+ with Compose v2) — [install](https://docs.docker.com/get-docker/)
 - **10 GB RAM allocated to Docker** (Docker Desktop → Settings → Resources → Memory). phi3.5 alone is ~6 GB resident; below 10 GB it is repeatedly evicted and reloaded and queries time out. Allocate more if you have it — `/health` reports what Docker actually has against this recommendation
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
-- Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, reachable from the host itself
+- Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
+
+Check the daemon version with `docker version --format '{{.Server.Version}}'`. Docker documents that engines older than 28.0.0 allow same-network hosts to reach localhost-published ports; upgrade the engine before using this unauthenticated workbench. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/#publishing-ports). This default assumes Docker's standard bridge/NAT configuration; custom direct-routing settings are outside this local profile.
 
 No API keys, no cloud accounts, no Python or Node installs required on your machine.
 
@@ -508,7 +510,7 @@ so it does not depend on its own executable bit.
 | Requirement | Value |
 |---|---|
 | Hardware | Apple Silicon (arm64) |
-| Docker Desktop | installed and running |
+| Docker Desktop | installed and running, Engine 28.0.0+ |
 | Docker disk | 20 GB minimum, 32 GB recommended |
 | Docker memory | 10 GB minimum (phi3.5 is ~6 GB resident) |
 | Free host port | 8080 |
@@ -563,9 +565,9 @@ bash install-offline.sh
 
 `install-offline.sh` loads the images, restores the model weights into the
 project's volume, and runs `docker compose up -d --no-build`. Nothing is pulled
-and nothing is compiled. The target needs only Docker Desktop, running.
+and nothing is compiled. The target needs only Docker Desktop, running with Engine 28.0.0 or newer.
 
-**Requirements on the target:** Apple Silicon, Docker Desktop, ~12 GB of Docker
+**Requirements on the target:** Apple Silicon, Docker Desktop with Engine 28.0.0+, ~12 GB of Docker
 disk, ~10 GB of free space on the host filesystem for the archive plus its
 extraction, and port 8080 free. No Python, Node, compiler or network needed.
 
