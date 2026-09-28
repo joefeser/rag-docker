@@ -8180,10 +8180,10 @@ drive the UI in a real browser.
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
+| `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 
 ## Environment
 
