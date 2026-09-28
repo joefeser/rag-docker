@@ -4207,7 +4207,10 @@ def _existing_chunks(collection: str) -> list[dict]:
 
 def _existing_records(collection: str) -> list[dict]:
     """Read the supported single-vector corpus without regenerating identity."""
-    records = []
+    return list(_iter_existing_records(collection))
+
+
+def _iter_existing_records(collection: str):
     seen = set()
     col = wc.get_client().collections.get(collection)
     for obj in col.iterator(include_vector=True):
@@ -4224,9 +4227,8 @@ def _existing_records(collection: str) -> list[dict]:
         if identity in seen:
             raise RuntimeError(f"Reindex received duplicate stored UUID {identity}")
         seen.add(identity)
-        records.append({"id": identity, "vector": copy.deepcopy(vector),
-                        "properties": copy.deepcopy(dict(obj.properties or {}))})
-    return records
+        yield {"id": identity, "vector": copy.deepcopy(vector),
+               "properties": copy.deepcopy(dict(obj.properties or {}))}
 
 
 def _write_records(collection: str, records: list[dict]) -> None:
@@ -4242,9 +4244,13 @@ def _write_records(collection: str, records: list[dict]) -> None:
 
 
 def _verify_records(collection: str, records: list[dict]) -> None:
-    actual = {record["id"]: record for record in _existing_records(collection)}
     expected = {record["id"]: record for record in records}
-    if actual != expected:
+    seen = set()
+    for record in _iter_existing_records(collection):
+        if record != expected.get(record["id"]):
+            raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
+        seen.add(record["id"])
+    if seen != expected.keys():
         raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
 
 

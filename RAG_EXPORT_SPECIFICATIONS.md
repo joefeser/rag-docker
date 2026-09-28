@@ -625,7 +625,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
-| E23 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged |
+| E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged |
 
 ---
 
@@ -634,4 +634,3 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 Incremental export, encryption and signing, corpus merging, cross-vector-store
 migration, gold-standard remapping after re-chunk, and HTTP transport as an
 alternative to the mounted directory.
-
