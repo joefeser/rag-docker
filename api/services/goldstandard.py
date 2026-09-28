@@ -433,12 +433,14 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     return None
 
 
+# Published cache snapshots are immutable. Export captures one stable reference
+# and never mutates or exposes it; later commits publish a different object.
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     out_path.write_text(json.dumps(ragas, indent=2))
 
 
 async def save_session(session_id: str, filename: str | None) -> dict | None:
-    session = get_session(session_id)
+    session = _sessions.get(session_id)
     if session is None:
         return None
 
