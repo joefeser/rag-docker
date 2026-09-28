@@ -9801,7 +9801,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
         selector.dispatchEvent(new Event('change', { bubbles: true }));
         document.querySelector('input[name="conflict"][value="rename"]').click();
       }, filename);
-      await clickByText(s.page, 'Import'); await sleep(600);
+      await s.page.evaluate(() => [...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Import').click()); await sleep(600);
       const text = await bodyText(s.page);
       r.check('rename import submits selected package and explicit policy', submissions.length === 1 && submissions[0].filename === filename && submissions[0].on_conflict === 'rename');
       r.check('completed import displays original and allocated session IDs for lookup', text.includes(sourceId) && text.includes(localId) && text.includes('OwnedImported'));

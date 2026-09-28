@@ -1809,8 +1809,8 @@ now lives once, in `api/services/ingest_config.py`.
       under a status saying otherwise. **Fixed**: a model validator requires
       `status="edited"` whenever content fields are present.*
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`).
-- [ ] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
-      *Registered `13_identity.sh` runs ten owned identity/preservation cases plus actual package/HTTP/backend/fresh-process acceptance; checked after the live run. The Transfer browser fixture exercises visible source/local lookup IDs.*
+- [x] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
+      *Registered `13_identity.sh` runs ten owned identity/preservation cases plus actual package/HTTP/backend/fresh-process acceptance; The actual roundtrip passed10 controlled cases and eight live package/backend/HTTP/reload checks. The Transfer browser fixture exercises visible source/local lookup IDs.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.
       *2 approved + 1 edited saved; 1 rejected + 1 pending excluded.*
 - [x] Exported file is valid JSON and each pair matches the RAGAS schema.
