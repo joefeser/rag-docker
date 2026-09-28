@@ -60,7 +60,7 @@ node --check <each changed .js>
 (cd ui && npm ci --no-audit --no-fund && npm run build)   # when ui/ changed
 ```
 
-Only when the PR is same-repository, or the coordinator has confirmed the user's go-ahead, may you run `npm ci`. It executes install scripts.
+**Only for a same-repository PR** may you run the UI line. `npm ci` runs install scripts, and `npm run build` runs the `build` script from `ui/package.json` (plus any `prebuild` hook) and `ui/vite.config.ts`, all of which the PR controls. You're dispatched alongside security, before any go-ahead exists, so for a cross-repository PR never run it, nor any other command that executes the PR's code: the coordinator's build check (step 8) builds the UI image after the go-ahead. `py_compile`, `bash -n` and `node --check` only parse, so they're always allowed.
 
 A failing build is a **High**.
 

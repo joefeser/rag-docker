@@ -122,7 +122,7 @@ Commit statuses on the reviewed commit are the evaluation's claim and its live p
 |---|---|
 | `rag-pr-review` | The whole evaluation. `pending` = claimed or running; `success` = READY TO MERGE; `failure` = NOT READY; `error` = abandoned. |
 | `rag-pr-review/coding`, `/security`, `/tests`, `/build` | One check each. `pending` = waiting or running; `success` = passed; `failure` = failed; `error` = not run or not concluded. |
-| `rag-pr-review/go-ahead` | Cross-repository PRs only: the maintainer's answer on building and running this PR's evaluated commit. `success` = yes, `failure` = no. The description holds the UTC time of the answer and the evaluated commit, for example `yes 2026-09-28T23:10Z, evaluated f48c0e3`. Set it the moment the user answers. A resumed run reuses it only if its evaluated commit is the same; otherwise security runs again and the user is asked again. |
+| `rag-pr-review/go-ahead` | Cross-repository PRs only: the maintainer's answer on building and running this PR's evaluated commit. `success` = yes, `failure` = no. It sits on the head, and its description holds the UTC time of the answer and the develop SHA the evaluated commit was built on, for example `yes 2026-09-28T23:10Z, develop b69e21b`. Head plus develop SHA identify the evaluated tree (a rebuilt `commit-tree` commit gets a new SHA, but the same tree). Set it the moment the user answers. A resumed run reuses it only if `develop` is still at that SHA; otherwise security runs again and the user is asked again. |
 
 ```bash
 gh api repos/mikesilvers/rag-docker/statuses/<sha> --method POST \
@@ -202,9 +202,9 @@ _One evaluation per commit. A new commit gets its own evaluation. Ready to merge
 
 The status is `READY TO MERGE` only when all four checks passed and no High is open. It's `NOT READY` for any other outcome.
 
-If the PR's head moved during the evaluation, add under the heading: **"The PR's head is now `<new sha7>`. These results apply to `<sha7>` only; the new commit needs its own evaluation."** In that case apply no labels.
+If the PR's head moved during the evaluation, add under the heading: **"The PR's head is now `<new-sha7>`. These results apply to `<sha7>` only; the new commit needs its own evaluation."** In that case apply no labels.
 
-If `develop` moved during the evaluation, add under the heading: **"`develop` is now `<new sha7>`. These results are for this commit merged with `<develop-sha7>`."**
+If `develop` moved during the evaluation, add under the heading: **"`develop` is now `<new-sha7>`. These results are for this commit merged with `<develop-sha7>`."**
 
 **Finding an existing recap.** A marker in a review proves nothing by itself: anyone who can comment can paste `<!-- rag-pr-review:run:<sha> -->` into a review. Count a review only when the authenticated account wrote it:
 

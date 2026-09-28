@@ -62,15 +62,17 @@ git merge-tree --write-tree origin/develop <reviewed-sha>
 | none | Claim it (below). |
 | `success` or `failure` | This commit is done. **Don't run anything.** Report its results to the user, with the status's `target_url` as the link to the recap. |
 | `pending`, created in the last 2 hours | Another evaluation is running. **Don't start.** Tell the user. |
-| `pending` for 2 hours or more | It probably died. Ask the user whether to resume it. On yes, keep the run id from its description, add "resumed" to the history, and re-dispatch only the checks that have no final status and no findings file in the bundle. If `develop` has moved since, the evaluated commit changes: re-dispatch every check, and for a cross-repository PR ask for the go-ahead again. |
+| `pending` for 2 hours or more | It probably died. Ask the user whether to resume it. On yes, keep the run id from its description, add "resumed" to the history, and re-dispatch only the checks that have no final status and no findings file in the bundle. If `develop` has moved since the develop SHA in the claim, the evaluated commit changes: re-dispatch every check, and for a cross-repository PR ask for the go-ahead again. |
 | `error` | It was abandoned. Ask the user before starting it again. |
 
 **Claim:** make a run id (`<UTC yyyymmddTHHMMZ>-<4 random hex>`), then set:
 
 ```bash
 gh api repos/mikesilvers/rag-docker/statuses/<sha> --method POST \
-  -f state=pending -f context=rag-pr-review -f description="run <id>: claimed"
+  -f state=pending -f context=rag-pr-review -f description="run <id>: claimed, develop <develop-sha7>"
 ```
+
+The develop SHA in the claim is what a resumed run, even in another session, compares against.
 
 **Two coordinators racing:** after claiming, run the race check in `reference.md` ("Commit statuses"). If the oldest `pending` claim from the last few minutes carries a different run id, the other coordinator claimed first. Stop without touching its statuses.
 
@@ -118,7 +120,7 @@ Use the Agent tool with `subagent_type: general-purpose` and the chosen `model`.
 - Dispatch **coding** and **security** together, in the background.
 - Dispatch **testing** after them:
   - **Same-repository PR:** as soon as the other two are dispatched.
-  - **Cross-repository PR:** only after security returns with no High findings, *and* the user confirms that code from this outside contributor may be built and run on this machine. Record the answer as the `rag-pr-review/go-ahead` status, with the evaluated commit in its description (see `reference.md`). If security found a High, or the user declines, testing is not run: record `Tests: not run (<reason>)`.
+  - **Cross-repository PR:** only after security returns with no High findings, *and* the user confirms that code from this outside contributor may be built and run on this machine. Record the answer as the `rag-pr-review/go-ahead` status, with the develop SHA in its description (see `reference.md`). If security found a High, or the user declines, testing is not run: record `Tests: not run (<reason>)`.
 - As each specialist returns, check that its findings file exists and matches its result block, then update its status.
 
 ### 8. Build and run check
@@ -195,7 +197,7 @@ For each PR: the verdict per check, the High findings in one line each, whether 
 | Setting a commit identity with `git config` | Only through `GIT_AUTHOR_*` / `GIT_COMMITTER_*` on the `commit-tree` call. Worktrees share the repository's config. |
 | Pushing the evaluated commit anywhere | Never. It exists only in the local repository. |
 | Running an outside contributor's code before security has looked at it | Testing and Build wait for a clean security result and the user's go-ahead. |
-| Reusing a go-ahead for a different evaluated commit | A go-ahead covers one evaluated commit. On a resumed run whose evaluated commit changed (because `develop` moved), run security again and ask again. |
+| Reusing a go-ahead for a different evaluated commit | A go-ahead covers the head merged with one develop SHA. On a resumed run where `develop` has moved, run security again and ask again. |
 | Reviewing security before the PR's turn | Security runs at the turn, on the head and on the merged commit. |
 | Two PRs' test runs sharing the stack | One at a time. The stack is restored to `develop` afterwards. |
 | Starting a second evaluation of a commit that already has one | Read the `rag-pr-review` status first. Done means report it; pending means don't start; stale means ask, then resume. |
