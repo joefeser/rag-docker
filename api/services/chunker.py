@@ -45,8 +45,8 @@ def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size
             raise ValueError(f"{name} must be an integer")
     if chunk_size <= 0 or not 0 <= chunk_overlap < chunk_size:
         raise ValueError("chunk_size must be positive and 0 <= chunk_overlap < chunk_size")
-    if not 0 <= min_chunk_size <= chunk_size:
-        raise ValueError("min_chunk_size must be between zero and chunk_size")
+    if min_chunk_size < 0:
+        raise ValueError("min_chunk_size must be nonnegative")
     if not text.strip():
         return []
 

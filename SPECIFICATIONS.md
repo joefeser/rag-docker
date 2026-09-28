@@ -1212,13 +1212,17 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
   input yields no chunks. Python character counts, rather than encoded byte counts,
   determine window sizes. Long tokens and single-newline parser text remain bounded.
 - Window size must be positive, `0 <= chunk_overlap < chunk_size`, and
-  `0 <= min_chunk_size <= chunk_size`; impossible values are rejected.
+  `min_chunk_size >= 0`; impossible size/overlap values are rejected.
 - The final undersized window is merged by appending only its new suffix, removing
   duplicated overlap without adding a separator. All other windows are at most
   `chunk_size`; the final output is at most
-  `chunk_size + max(0, min_chunk_size - chunk_overlap - 1)` characters. With defaults
+  `chunk_size + max(0, min(chunk_size, min_chunk_size - 1) - chunk_overlap)`
+  characters. With defaults
   (size 1000, overlap 200, minimum 100), every chunk is at most 1000 characters. A whole
   document shorter than the minimum remains one short chunk; no text is fabricated.
+  Minimum size applies to the final-window merge preference. A minimum above the
+  target does not combine every full window; the final output is still bounded by
+  at most two windows minus their overlap.
 
 #### Language-Based (`language`)
 - Splitter: `RecursiveCharacterTextSplitter`

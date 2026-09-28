@@ -45,7 +45,7 @@ try:
                     restored = chunks[0] + ''.join(c[overlap:] for c in chunks[1:]) if chunks else ''
                     assert restored == parsed, label
                     assert all(len(c) <= 1000 for c in chunks[:-1])
-                    assert all(len(c) <= 1000 + max(0,minimum-overlap-1) for c in chunks)
+                    assert all(len(c) <= 1000 + max(0,min(1000,minimum-1)-overlap) for c in chunks)
                     assert all(a[-overlap:] == b[:overlap] for a,b in zip(chunks,chunks[1:]))
                     print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
                 finally:

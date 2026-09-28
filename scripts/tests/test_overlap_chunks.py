@@ -23,7 +23,7 @@ class OverlapTests(unittest.TestCase):
                 self.assertEqual(left[-overlap:], right[:overlap])
         self.assertTrue(all(len(c) <= size for c in chunks[:-1]))
         # One short final window can extend its predecessor by its new suffix.
-        bound = size + max(0, minimum - overlap - 1)
+        bound = size + max(0, min(size, minimum - 1) - overlap)
         self.assertTrue(all(len(c) <= bound for c in chunks))
         return chunks
 
@@ -46,6 +46,11 @@ class OverlapTests(unittest.TestCase):
     def test_zero_overlap_tail_preserves_exact_text_without_added_separator(self):
         self.assertEqual(len(self.check_windows('x' * 1040, overlap=0)[0]), 1040)
 
+    def test_minimum_larger_than_split_target_keeps_the_tail_policy_bounded(self):
+        chunks = self.check_windows('x'*10000,minimum=2000)
+        self.assertEqual(len(chunks[-1]),1200)
+        self.assertEqual(len(chunks),12)
+
     def test_tail_at_minimum_remains_separate(self):
         chunks = self.check_windows('x' * 1080, overlap=20)
         self.assertEqual([len(c) for c in chunks], [1000, 100])
@@ -66,7 +71,7 @@ class OverlapTests(unittest.TestCase):
 
     def test_invalid_sizes_fail_before_splitting(self):
         for size, overlap, minimum in ((0,0,0),(-1,0,0),(10,-1,0),(10,10,0),
-                                      (10,11,0),(10,0,-1),(10,0,11),(True,0,0),
+                                      (10,11,0),(10,0,-1),(True,0,0),
                                       (10,False,0),(10,0,True),(10.5,0,0)):
             with self.subTest(values=(size,overlap,minimum)), self.assertRaises(ValueError):
                 chunker.chunk_overlap('inert',size,overlap,minimum)
@@ -78,7 +83,7 @@ class OverlapTests(unittest.TestCase):
     def test_small_parameter_matrix_preserves_coverage_and_stated_bound(self):
         for size in range(1, 16):
             for overlap in range(size):
-                for minimum in (0, 1, size):
+                for minimum in (0, 1, size, size+1, 2*size+1):
                     for length in (1, size, size+1, 2*size-1, 2*size+3):
                         text = ''.join(chr(65 + i % 26) for i in range(length))
                         with self.subTest(size=size, overlap=overlap, minimum=minimum, length=length):
