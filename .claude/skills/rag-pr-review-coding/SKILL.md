@@ -64,7 +64,7 @@ Only when the PR is same-repository, or the coordinator has confirmed the user's
 
 A failing build is a **High**.
 
-## Your extra summary section
+## Your extra recap section
 
 ```markdown
 ### Coding notes
@@ -72,4 +72,4 @@ A failing build is a **High**.
 - Static checks: <command> → <result>, one line each
 ```
 
-Apply `Passed: Coding` or `FAILED: Coding` per `reference.md`, then return the result block.
+Write `findings-coding.json` per `reference.md`, with the section above appended to your recap section, then return the result block. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.
