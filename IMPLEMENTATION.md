@@ -2483,7 +2483,7 @@ def _identity_available(session_id: str) -> bool:
     if session_id in _sessions:
         return False
     try:
-        _session_path(session_id).lstat()
+        (_sessions_dir() / f"{session_id}.json").lstat()
     except FileNotFoundError:
         return True
     # Any existing bytes, including unreadable JSON or a dangling symlink,
@@ -8255,7 +8255,7 @@ curl -s localhost:8080/api/collections | python3 -c \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
 
-`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes twelve owned cache/disk/collision/historical-ID/concurrent-insertion cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes thirteen owned cache/disk/collision/redirected-slot/historical-ID/concurrent-insertion cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 ````
 
 ### scripts/verify/all.sh
@@ -10278,6 +10278,13 @@ class IdentityTests(unittest.TestCase):
         with patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcde'+'0'*24)) as ids:
             with self.assertRaisesRegex(RuntimeError,'unoccupied session'):gs.store_imported_session(fixture(),'OwnedOriginal')
         self.assertEqual(ids.call_count,128);self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(gs._sessions),1)
+
+    def test_redirected_existing_identity_is_reserved_without_following_it(self):
+        foreign=Path(self.tmp.name)/'owned-retained-neighbor';foreign.write_bytes(b'owned retained bytes')
+        self.path.unlink();self.path.symlink_to(foreign);gs._sessions={}
+        saved=gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertNotEqual(saved['session_id'],self.original['session_id']);self.assertTrue(self.path.is_symlink())
+        self.assertEqual(foreign.read_bytes(),b'owned retained bytes')
 
     def test_free_valid_source_identity_is_retained_with_provenance(self):
         data=fixture();data['session_id']='gs_460abcdf';data['collection']='OwnedNew'

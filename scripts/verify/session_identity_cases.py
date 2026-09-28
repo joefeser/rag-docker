@@ -61,6 +61,13 @@ class IdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'unoccupied session'):gs.store_imported_session(fixture(),'OwnedOriginal')
         self.assertEqual(ids.call_count,128);self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(gs._sessions),1)
 
+    def test_redirected_existing_identity_is_reserved_without_following_it(self):
+        foreign=Path(self.tmp.name)/'owned-retained-neighbor';foreign.write_bytes(b'owned retained bytes')
+        self.path.unlink();self.path.symlink_to(foreign);gs._sessions={}
+        saved=gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertNotEqual(saved['session_id'],self.original['session_id']);self.assertTrue(self.path.is_symlink())
+        self.assertEqual(foreign.read_bytes(),b'owned retained bytes')
+
     def test_free_valid_source_identity_is_retained_with_provenance(self):
         data=fixture();data['session_id']='gs_460abcdf';data['collection']='OwnedNew'
         result=gs.store_imported_session(data,'ExternalOriginal')

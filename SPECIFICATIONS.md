@@ -1810,7 +1810,7 @@ now lives once, in `api/services/ingest_config.py`.
       `status="edited"` whenever content fields are present.*
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`).
 - [x] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
-      *Registered `13_identity.sh` runs twelve owned identity/preservation cases, two controlled poll/cleanup deadline cases and actual package/HTTP/backend/fresh-process acceptance. The repaired API image passed twelve controlled cases, two bounded-poll/cleanup cases and eleven actual package/backend/handler/restart/cleanup checks, including a digest-valid historical-ID archive and a protected neighboring collection. The initial full-run FAILED result remains disclosed separately. The Transfer browser fixture exercises visible source/local lookup IDs.*
+      *Registered `13_identity.sh` runs thirteen owned identity/preservation cases, two controlled poll/cleanup deadline cases and actual package/HTTP/backend/fresh-process acceptance. The repaired API image passed thirteen controlled cases, two bounded-poll/cleanup cases and eleven actual package/backend/handler/restart/cleanup checks, including a digest-valid historical-ID archive and a protected neighboring collection. The initial full-run FAILED result remains disclosed separately. The Transfer browser fixture exercises visible source/local lookup IDs.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.
       *2 approved + 1 edited saved; 1 rejected + 1 pending excluded.*
 - [x] Exported file is valid JSON and each pair matches the RAGAS schema.

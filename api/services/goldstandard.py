@@ -109,7 +109,7 @@ def _identity_available(session_id: str) -> bool:
     if session_id in _sessions:
         return False
     try:
-        _session_path(session_id).lstat()
+        (_sessions_dir() / f"{session_id}.json").lstat()
     except FileNotFoundError:
         return True
     # Any existing bytes, including unreadable JSON or a dangling symlink,
