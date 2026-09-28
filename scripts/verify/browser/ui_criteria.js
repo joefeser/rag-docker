@@ -124,6 +124,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── upload size limit ──────────────────────────────────────────────────────
+  // The Import page refuses a selection over the proxy's limit before sending.
+  // The file is sparse: it reports 513 MB but occupies no disk, and the check
+  // must stop it before the browser ever reads it. See issue #21.
+  r.section('upload size limit');
+  {
+    const fs = require('fs');
+    const big = '/tmp/vfy-oversize-upload.txt';
+    fs.closeSync(fs.openSync(big, 'w'));
+    fs.truncateSync(big, 513 * 1024 * 1024);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const hint = await bodyText(s.page);
+    r.check('the drop zone states the upload limit', hint.includes('up to 512 MB per upload'));
+    const input = await s.page.$('#file-input');
+    await input.uploadFile(big);
+    await sleep(500);
+    const posts = () => s.api.filter(x => x.method === 'POST' && x.url.includes('/ingest/upload')).length;
+    const before = posts();
+    const clicked = await clickByText(s.page, 'Start Ingest');
+    await sleep(900);
+    const text = await bodyText(s.page);
+    r.check('an oversize selection is refused with the limit named',
+            clicked && text.includes('one upload can be at most 512 MB'),
+            clicked ? text.slice(0, 160) : 'Start Ingest button not found');
+    r.check('an oversize selection sends no upload', posts() === before);
+    r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    fs.unlinkSync(big);
+    await s.ctx.close();
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {
