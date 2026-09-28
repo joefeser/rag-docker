@@ -44,6 +44,9 @@ drive the UI in a real browser.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `14_reindex.sh` | exact-record reindex: twelve controlled failure/preservation cases and nine real Weaviate/handler checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures |
+| `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 
 ## Environment

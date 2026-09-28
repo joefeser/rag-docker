@@ -1057,12 +1057,19 @@ ingest default.
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured.
 
-Each rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failure leaves the original untouched. Vectors are copied out of
-the staging collection rather than regenerated, so the corpus is embedded once.
+Each rebuild prepares a temporary collection before replacement. A preparation
+failure leaves the original untouched; failures after cutover can affect it.
+Re-chunk/re-embed generate vectors during preparation. Reindex reads the original
+UUIDs, properties and finite default vectors, supplies them during both writes,
+and verifies exact backend equality after staging and final copying. It also
+refuses a source change observed during staging. There is no collection-wide
+lock against independent writers. Reindex needs no embedding response; it fails
+instead of guessing if a stored vector is unavailable or unsupported.
 
 Any operation that changes chunk identity marks the collection's gold-standard
-sessions `stale`. `/tune/reindex` does not, because chunk identity is unchanged.
+sessions `stale`. A completed `/tune/reindex` leaves them unchanged because exact
+UUID/vector/property preservation was verified. A failed reindex after cutover
+marks retained pairs stale and reports a failed job instead of completion.
 
 ---
 
@@ -1825,6 +1832,9 @@ holding 2. There are now three counters: `pairs_attempted` (drives the UI
 progress bar, always reaches the total), `pairs_completed` (pairs that exist) and
 `pairs_failed`. Failures whose exception carried an empty string were recorded as
 `''`; the type name is now always included.
+
+- [ ] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
+      *Registered `14_reindex.sh` controls deferred batch errors, readback mismatches, observed source changes and post-cutover validity; live backend acceptance pending.*
 
 ### 10.4 Web UI
 

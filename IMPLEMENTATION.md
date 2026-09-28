@@ -4157,7 +4157,8 @@ or vector width changes and Weaviate cannot alter either in place.
 collection first, and the live one is replaced only once that succeeds. Weaviate
 has no rename (see `importer.py`), so the final step copies vectors out of the
 staging collection rather than re-embedding — one embedding pass, not two. A
-failure at any point leaves the original collection untouched.
+preparation failure leaves the original collection untouched. Replacement can
+still fail after cutover; reindex then marks retained evaluation pairs stale.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -4166,7 +4167,9 @@ deleted and never remapped (spec §7.3).
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+import math
 import mimetypes
 import shutil
 import tempfile
@@ -4200,6 +4203,49 @@ def _existing_chunks(collection: str) -> list[dict]:
     """Stored properties, without vectors. Used when re-embedding chunk text."""
     col = wc.get_client().collections.get(collection)
     return [dict(o.properties or {}) for o in col.iterator()]
+
+
+def _existing_records(collection: str) -> list[dict]:
+    """Read the supported single-vector corpus without regenerating identity."""
+    records = []
+    seen = set()
+    col = wc.get_client().collections.get(collection)
+    for obj in col.iterator(include_vector=True):
+        identity = str(obj.uuid)
+        vector = obj.vector
+        if isinstance(vector, dict):
+            if set(vector) != {"default"}:
+                raise RuntimeError("Reindex requires the collection's single default vector")
+            vector = vector["default"]
+        if (not isinstance(vector, list) or not vector
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) for value in vector)):
+            raise RuntimeError(f"Reindex cannot preserve the stored vector for {identity}")
+        if identity in seen:
+            raise RuntimeError(f"Reindex received duplicate stored UUID {identity}")
+        seen.add(identity)
+        records.append({"id": identity, "vector": copy.deepcopy(vector),
+                        "properties": copy.deepcopy(dict(obj.properties or {}))})
+    return records
+
+
+def _write_records(collection: str, records: list[dict]) -> None:
+    """Supply exact records, drain the batch, then compare backend readback."""
+    col = wc.get_client().collections.get(collection)
+    with col.batch.dynamic() as batch:
+        for record in records:
+            batch.add_object(properties=copy.deepcopy(record["properties"]),
+                             uuid=record["id"], vector=copy.deepcopy(record["vector"]))
+    if batch.number_errors:
+        raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
+    _verify_records(collection, records)
+
+
+def _verify_records(collection: str, records: list[dict]) -> None:
+    actual = {record["id"]: record for record in _existing_records(collection)}
+    expected = {record["id"]: record for record in records}
+    if actual != expected:
+        raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
 
 
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
@@ -4276,11 +4322,11 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress) -> int:
+             distance_metric: str | None, progress, *, records: list[dict] | None = None) -> int:
     """Stage the new chunks, then swap them into place.
 
-    Weaviate embeds during the staging insert. The final insert reuses those
-    vectors verbatim, so the corpus is embedded once rather than twice.
+    Re-chunk/re-embed use the embedding insert path. Reindex supplies original
+    records and verifies them before replacement and after the final copy.
     """
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
@@ -4290,7 +4336,20 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
     wc._create_collection_sync(staging, new_index, new_distance, hnsw)
+    cutover_started = False
     try:
+        if records is not None:
+            _write_records(staging, records)
+            # Refuse a source change observed during staging; this is not a
+            # collection-wide lock against independent writers.
+            _verify_records(collection, records)
+            cutover_started = True
+            client.collections.delete(collection)
+            wc._create_collection_sync(collection, new_index, new_distance, hnsw)
+            _write_records(collection, records)
+            if progress:
+                progress(len(records))
+            return len(records)
         wc._insert_chunks_sync(staging, properties)
         staged = [
             {"id": str(o.uuid),
@@ -4317,6 +4376,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 raise RuntimeError(
                     f"{batch.number_errors} error(s) writing the rebuilt collection")
         return len(staged)
+    except Exception:
+        if records is not None and cutover_started:
+            goldstandard.mark_stale(collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+        raise
     finally:
         try:
             client.collections.delete(staging)
@@ -4333,6 +4396,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
 
     try:
         has_sources = sources.has_sources(collection)
+        records = None
 
         if operation == "rechunk":
             if not has_sources:
@@ -4369,15 +4433,17 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                           "so its vectors changed")
 
         elif operation == "reindex":
-            properties = _existing_chunks(collection)
-            reason = None            # chunk identity is unchanged
+            records = _existing_records(collection)
+            properties = [record["properties"] for record in records]
+            reason = None            # exact UUID/vector/property copy is verified
         else:
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
 
         job["chunks_total"] = len(properties)
-        written = _rebuild(collection, properties,
-                           params.get("index_type"), params.get("distance_metric"),
-                           progress)
+        rebuild_args = (collection, properties, params.get("index_type"),
+                        params.get("distance_metric"), progress)
+        written = (_rebuild(*rebuild_args, records=records) if records is not None
+                   else _rebuild(*rebuild_args))
 
         notes = []
         if reason:
@@ -4385,8 +4451,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
             if stale:
                 notes.append(f"{stale} gold-standard session(s) marked stale")
         else:
-            notes.append("chunk identity unchanged, so gold-standard sessions "
-                         "were left alone")
+            notes.append("UUIDs, properties and vectors verified unchanged after reindex; "
+                         "gold-standard sessions were left alone")
 
         job.update(status="completed", chunks_written=written, notes=notes)
 
@@ -8107,6 +8173,9 @@ drive the UI in a real browser.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `14_reindex.sh` | exact-record reindex: twelve controlled failure/preservation cases and nine real Weaviate/handler checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures |
+| `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 
 ## Environment
@@ -9163,6 +9232,8 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./14_reindex.sh
+check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
 EXPORTS="$REPO_ROOT/exports"
 
@@ -10018,4 +10089,241 @@ echo
 echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
+```
+
+### scripts/verify/14_reindex.sh
+
+```bash
+#!/usr/bin/env bash
+# Exact-record reindex and unavailable-embedding acceptance.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$bindings" || exit 2
+require_stack
+section "Exact-record reindex"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/reindex_cases.py)
+check "owned reindex preservation and failure regressions" $?
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/reindex.py)
+check "real reindex with embedding endpoint unavailable" $?
+summary
+```
+
+### scripts/verify/reindex_cases.py
+
+```python
+"""Controlled reindex preservation/failure cases; registered by14_reindex.sh."""
+import copy, math, os, sys, unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+from services import tuning
+
+
+def records():
+    return [{'id': '49000000-0000-4000-8000-00000000000'+str(i),
+             'vector': [0.125, float(i), -0.25],
+             'properties': {'content': 'Owned inert '+str(i), 'chunk_index': i, 'source_file': 'owned.txt'}} for i in range(2)]
+
+
+class Batch:
+    def __init__(self, owner, name):
+        self.owner, self.name, self.number_errors, self.pending = owner, name, 0, []
+    def __enter__(self): return self
+    def add_object(self, properties, uuid=None, vector=None):
+        self.pending.append({'id': str(uuid), 'vector': copy.deepcopy(vector), 'properties': copy.deepcopy(properties)})
+        if self.owner.mutate_arguments:
+            properties['content'] = 'SDK argument mutation'; vector[0] = 999
+    def __exit__(self, *exc):
+        if self.owner.fail(self.name): self.number_errors = 1
+        else: self.owner.data[self.name] += self.pending
+        self.owner.closed.append(self.name)
+        if self.owner.corrupt(self.name) and self.owner.data[self.name]:
+            self.owner.data[self.name][0]['properties']['content'] = 'Owned readback corruption'
+        if self.owner.change_source and self.name != 'OwnedReindex':
+            self.owner.data['OwnedReindex'][0]['properties']['content'] = 'Newer independent write'
+
+
+class Collections:
+    def __init__(self, initial):
+        self.data = {'OwnedReindex': copy.deepcopy(initial)}; self.deleted = []; self.created = []; self.closed = []
+        self.fail = lambda name: False; self.corrupt = lambda name: False
+        self.change_source = self.mutate_arguments = False
+    def get(self, name):
+        def iterator(include_vector=False):
+            for record in self.data[name]:
+                yield SimpleNamespace(uuid=record['id'], properties=copy.deepcopy(record['properties']), vector={'default':copy.deepcopy(record['vector'])} if include_vector else None)
+        return SimpleNamespace(iterator=iterator, batch=SimpleNamespace(dynamic=lambda: Batch(self, name)))
+    def delete(self, name): self.deleted.append(name); del self.data[name]
+    def create(self, name, index, distance, hnsw):
+        self.created.append((name,index,distance,copy.deepcopy(hnsw))); self.data[name] = []
+
+
+class ReindexTests(unittest.TestCase):
+    def setUp(self):
+        self.original = records(); self.backend = Collections(self.original)
+        self.config = {'index_type':'hnsw','distance_metric':'cosine','hnsw_config':{'ef':64,'efConstruction':128,'maxConnections':64}}
+        self.embedding = Mock(side_effect=AssertionError('Reindex contacted embedding insertion'))
+        self.stale = Mock(return_value=1)
+        patches = [patch.object(tuning.wc,'get_client',return_value=SimpleNamespace(collections=self.backend)),
+                   patch.object(tuning.wc,'_create_collection_sync',side_effect=self.backend.create),
+                   patch.object(tuning.wc,'_collection_config_sync',return_value=self.config),
+                   patch.object(tuning.wc,'_insert_chunks_sync',self.embedding),
+                   patch.object(tuning.sources,'has_sources',return_value=False),
+                   patch.object(tuning.goldstandard,'mark_stale',self.stale),
+                   patch.object(tuning,'_jobs',{}),patch.object(tuning,'_active',{'OwnedReindex'})]
+        for change in patches: change.start(); self.addCleanup(change.stop)
+    def run_job(self, operation='reindex'):
+        tuning._jobs['owned'] = {'status':'queued','chunks_written':0,'notes':[]}
+        tuning._run('owned','OwnedReindex',operation,{'index_type':'flat','distance_metric':'dot'})
+        return tuning._jobs['owned']
+    def test_reindex_changes_physical_config_and_preserves_every_record_without_embedding(self):
+        job=self.run_job(); self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_written'],2)
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original); self.embedding.assert_not_called(); self.stale.assert_not_called()
+        self.assertTrue(all(entry[1:3]==('flat','dot') for entry in self.backend.created)); self.assertIn('verified unchanged',job['notes'][0])
+        self.assertNotIn('OwnedReindex',tuning._active)
+    def test_deferred_batch_failure_is_seen_before_original_deletion(self):
+        self.backend.fail=lambda name:name!='OwnedReindex'; job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertNotIn('OwnedReindex',self.backend.deleted)
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original); self.assertEqual(job['chunks_written'],0); self.stale.assert_not_called()
+    def test_staging_readback_mismatch_preserves_original(self):
+        self.backend.corrupt=lambda name:name!='OwnedReindex'; job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertNotIn('OwnedReindex',self.backend.deleted); self.stale.assert_not_called()
+    def test_observed_source_change_during_staging_is_not_overwritten(self):
+        self.backend.change_source=True; job=self.run_job(); self.assertEqual(job['status'],'failed')
+        self.assertNotIn('OwnedReindex',self.backend.deleted); self.assertEqual(self.backend.data['OwnedReindex'][0]['properties']['content'],'Newer independent write')
+    def test_final_deferred_failure_has_no_completion_claim_and_marks_retained_pairs(self):
+        self.backend.fail=lambda name:name=='OwnedReindex'; job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertEqual(job['chunks_written'],0); self.assertEqual(job['notes'],[])
+        self.stale.assert_called_once(); self.assertIn('cutover',self.stale.call_args.args[1])
+    def test_final_readback_mismatch_is_not_completed(self):
+        self.backend.corrupt=lambda name:name=='OwnedReindex'; job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertEqual(job['chunks_written'],0); self.stale.assert_called_once()
+    def test_missing_or_nonfinite_vectors_fail_before_any_creation(self):
+        for vector in [[],None,[math.nan],[math.inf],[True]]:
+            with self.subTest(vector=vector):
+                self.backend.data['OwnedReindex'][0]['vector']=vector; job=self.run_job()
+                self.assertEqual(job['status'],'failed'); self.assertEqual(self.backend.created,[]); self.assertEqual(self.backend.deleted,[])
+    def test_unsupported_named_vector_is_refused_without_guessing(self):
+        col=SimpleNamespace(iterator=lambda **kw:iter([SimpleNamespace(uuid=self.original[0]['id'],properties={},vector={'other':[1.0]})]))
+        with patch.object(tuning.wc,'get_client',return_value=SimpleNamespace(collections=SimpleNamespace(get=lambda name:col))):
+            with self.assertRaisesRegex(RuntimeError,'single default vector'): tuning._existing_records('OwnedReindex')
+    def test_duplicate_readback_id_is_refused(self):
+        self.backend.data['OwnedReindex'].append(copy.deepcopy(self.original[0])); job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertEqual(self.backend.created,[])
+    def test_sdk_argument_mutation_does_not_change_expected_snapshot(self):
+        self.backend.mutate_arguments=True; snapshot=tuning._existing_records('OwnedReindex'); before=copy.deepcopy(snapshot)
+        self.backend.create('OwnedCopy','flat','dot',{}); tuning._write_records('OwnedCopy',snapshot)
+        self.assertEqual(snapshot,before); self.assertEqual(self.backend.data['OwnedCopy'],self.original)
+    def test_empty_collection_reindexes_without_embedding(self):
+        self.backend.data['OwnedReindex']=[]; job=self.run_job()
+        self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_written'],0); self.embedding.assert_not_called(); self.stale.assert_not_called()
+    def test_reembed_retains_its_explicit_regeneration_path(self):
+        def embed(name,props):
+            self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},
+                                     {'id':'49000000-0000-4000-8000-000000000101','vector':[4.,5.,6.],'properties':copy.deepcopy(props[1])}]
+        self.embedding.side_effect=embed; job=self.run_job('reembed')
+        self.assertEqual(job['status'],'completed'); self.embedding.assert_called_once(); self.stale.assert_called_once()
+        self.assertNotEqual(self.backend.data['OwnedReindex'],self.original)
+
+if __name__=='__main__': unittest.main()
+```
+
+### scripts/verify/reindex.py
+
+```python
+"""Real Weaviate reindex with an unreachable embedding endpoint; owned fixtures only."""
+import asyncio, copy, json, os, tempfile, uuid
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+from config import settings
+from main import app
+from services import goldstandard as gs, tuning
+from services import weaviate_client as wc
+
+
+async def main():
+    token=uuid.uuid4().hex[:8]; name=os.environ.get('RAG_TEST_PREFIX','Vfy49')+'Reindex'+token
+    probe=name+'Probe'; sid='gs_'+token; job=None; checks=0
+    client=wc.get_client(); created=[]
+    with tempfile.TemporaryDirectory(prefix='owned-reindex-') as temp, \
+         patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
+         patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1):
+        def check(condition,label):
+            nonlocal checks
+            assert condition,label; checks+=1; print('PASS '+label,flush=True)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned') as api:
+            try:
+                await asyncio.to_thread(wc._create_collection_sync,probe,'hnsw','cosine',{}); created.append(probe)
+                try:
+                    await asyncio.to_thread(client.collections.get(probe).data.insert,properties={'content':'Owned endpoint refusal probe'})
+                except Exception as exc:
+                    message=str(exc).lower()
+                    check('connect' in message and ('127.0.0.1:1' in message or 'connection refused' in message),'actual vectorization fails against the closed embedding endpoint')
+                else: raise AssertionError('Owned embedding endpoint unexpectedly served a vector')
+                check(client.collections.get(probe).aggregate.over_all(total_count=True).total_count==0,'failed embedding probe stores no object')
+                await asyncio.to_thread(wc._create_collection_sync,name,'hnsw','cosine',{}); created.append(name)
+                col=client.collections.get(name)
+                source=[]
+                for i in range(2):
+                    identity=str(uuid.uuid4()); vector=[(i+1)/8.0]*768
+                    props={'content':'Owned inert reindex '+str(i),'source_file':'owned-inert.txt','source_type':'txt','chunk_index':i,'chunk_strategy':'fixed','chunk_size':150,'chunk_overlap':0,'created_at':'2026-09-28T00:00:00Z'}
+                    await asyncio.to_thread(col.data.insert,properties=props,uuid=identity,vector=vector)
+                    source.append(identity)
+                before=await asyncio.to_thread(tuning._existing_records,name)
+                check({r['id'] for r in before}==set(source),'stored explicit vectors and original UUIDs are readable with embeddings unavailable')
+                session={'session_id':sid,'collection':name,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_'+token,'question':'Owned question','answer':'Owned answer','ground_truth':'Owned truth','contexts':['Owned inert reindex'],'source_file':'owned-inert.txt','chunk_index':0,'status':'approved'}]}
+                gs.store_session(session); session_bytes=gs._session_path(sid).read_bytes()
+                request=await api.post('/tune/reindex',json={'collection':name,'index_type':'flat','distance_metric':'dot'})
+                check(request.status_code==202,'real reindex HTTP handler queues the job with closed embedding configuration'); job=request.json()['job_id']
+                for _ in range(900):
+                    response=await api.get('/tune/job/'+job); result=response.json()
+                    if result['status'] in {'completed','failed'}:break
+                    await asyncio.sleep(.1)
+                check(result['status']=='completed' and result['chunks_written']==len(before), 'job completes only after final backend verification: '+str(result))
+                after=await asyncio.to_thread(tuning._existing_records,name)
+                check({r['id']:r for r in after}=={r['id']:r for r in before},'UUIDs, every property and all stored vector values match exactly after reindex')
+                config=await asyncio.to_thread(wc._collection_config_sync,name)
+                check(config['index_type']=='flat' and config['distance_metric']=='dot','physical index and distance change to flat/dot')
+                check(gs._session_path(sid).read_bytes()==session_bytes and not gs.get_session(sid).get('stale'),'retained evaluation identity/content/validity are unchanged')
+                check(any('verified unchanged' in note for note in result['notes']),'completion notes truthfully report verified identity and vector preservation')
+            finally:
+                if job:
+                    while tuning.get_job(job)['status'] not in {'completed','failed'}: await asyncio.sleep(.1)
+                for owned in reversed(created):
+                    if client.collections.exists(owned): await asyncio.to_thread(client.collections.delete,owned)
+                gs._sessions.pop(sid,None)
+    client.close(); print(str(checks)+' real reindex checks passed',flush=True)
+
+asyncio.run(main())
+```
+
+### scripts/verify/compose_target.py
+
+```python
+"""Refuse an in-container verifier when RAG_API selects another deployment."""
+import sys
+from urllib.parse import urlsplit
+
+def matches_local_proxy(api, bindings):
+    try:
+        url=urlsplit(api)
+        if url.scheme!='http' or url.hostname not in ('localhost','127.0.0.1','::1') or url.username or url.password or url.path.rstrip('/')!='/api' or url.query or url.fragment:
+            return False
+        port=url.port or 80
+        for binding in bindings.splitlines():
+            host, published=binding.rsplit(':',1)
+            host=host.strip('[]')
+            if int(published)!=port:continue
+            if host in ('0.0.0.0','::') or host==url.hostname or (host=='127.0.0.1' and url.hostname=='localhost'):
+                return True
+        return False
+    except (ValueError,TypeError):return False
+
+if __name__=='__main__':
+    if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
+        print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
+        sys.exit(2)
 ```

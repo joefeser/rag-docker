@@ -477,7 +477,7 @@ import never modifies or deletes the package it read.
 | Goal | Requires | Mechanism |
 |---|---|---|
 | Change mode / `top_k` / `alpha` | nothing | per-request on `POST /query`; persist via §3.2 |
-| Change index type or distance metric | nothing | rebuild collection, re-insert the same vectors |
+| Change index type or distance metric | readable finite default vectors | rebuild with the same UUIDs, properties and vectors; verify exact backend readback, without embedding |
 | Change chunk size / overlap / strategy | `with-sources` | re-ingest from `sources/` |
 | Change embedding model | `with-sources` preferred | re-embed; dimensions may change, so the collection is rebuilt |
 | Add documents | matching embedding model | normal ingest |
@@ -497,8 +497,10 @@ collection `stale`, recording why and when. Sessions are not deleted and are not
 remapped: a wrong remap corrupts an evaluation baseline silently, which is worse
 than an honest stale flag.
 
-Changing only the index type or distance metric does **not** change chunk
-identity, and MUST NOT mark sessions stale.
+A successfully verified index/distance change preserves exact UUIDs, properties
+and vectors, and MUST NOT mark sessions stale. An observed source change during
+staging must be refused before replacement. Failure after reindex cutover
+marks retained sessions stale, because exact preservation was not verified.
 
 **Sessions are cached in memory as well as on disk.** Anything that writes a
 session file directly, without going through the gold-standard service, will be
@@ -623,6 +625,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
+| E23 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged |
 
 ---
 
@@ -631,3 +634,4 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 Incremental export, encryption and signing, corpus merging, cross-vector-store
 migration, gold-standard remapping after re-chunk, and HTTP transport as an
 alternative to the mounted directory.
+
