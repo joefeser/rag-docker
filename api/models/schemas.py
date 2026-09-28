@@ -81,8 +81,6 @@ class IngestConfig(BaseModel):
     def _relationships(self):
         if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
-        if self.chunking_strategy != "semantic" and self.min_chunk_size > self.chunk_size:
-            raise ValueError("min_chunk_size must not exceed chunk_size when size controls splitting")
         return self
 
 

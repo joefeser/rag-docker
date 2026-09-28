@@ -369,8 +369,9 @@ Accepts one or more files. For ZIP uploads, extracts and processes all supported
 Direct upload, saved ingest configuration and optional tuning chunking settings
 share validation. `chunk_size` must be a positive integer; overlap and minimum
 size must be nonnegative integers. For `overlap`/`language`, overlap must be
-smaller than chunk size. For size-based strategies, minimum size must not
-exceed chunk size; semantic splitting has no maximum-size relationship.
+smaller than chunk size. Minimum size is a merge preference and may exceed the
+split target; for example, fixed size 60/minimum 100 preserves the existing
+acceptance case by merging small chunks.
 `similarity_threshold` is finite and in 0.0–1.0, or `null` where saved/optional
 configuration permits it (the effective semantic default is 0.85). Boolean
 values are not numeric settings. Strategies must be one of the documented five.
@@ -1615,9 +1616,9 @@ page renders as one undifferentiated block.
 | Parameter | Default | Min | Max | Notes |
 |---|---|---|---|---|
 | `chunk_size` | 1000 | 200 | 16000 | In characters |
-| `chunk_overlap` | 200 | 0 | 2000 | In characters; must be ≤ `chunk_size` for size-based strategies |
+| `chunk_overlap` | 200 | 0 | 2000 | In characters; a merge preference that can exceed the split target |
 | `similarity_threshold` | 0.85 | 0.0 | 1.0 | Semantic chunking only |
-| `min_chunk_size` | 100 | 40 | 2000 | In characters; must be ≤ `chunk_size` for size-based strategies |
+| `min_chunk_size` | 100 | 40 | 2000 | In characters; a merge preference that can exceed the split target |
 | `top_k` | 5 | 1 | 20 | |
 | `alpha` | 0.75 | 0.0 | 1.0 | Hybrid mode only |
 | `ef` | 64 | 16 | 512 | HNSW query param |

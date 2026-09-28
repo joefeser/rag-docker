@@ -65,7 +65,7 @@ class SettingsTests(unittest.TestCase):
     def test_chunking_errors_on_saved_and_tuning_surfaces_precede_work(self):
         for update in ({'chunking_strategy': 'unknown'}, {'chunk_size': 0}, {'chunk_size': -1},
                        {'chunk_overlap': -1}, {'chunk_overlap': 1000}, {'min_chunk_size': -1},
-                       {'min_chunk_size': 1001}, {'similarity_threshold': -0.1}, {'similarity_threshold': 1.1},
+                       {'similarity_threshold': -0.1}, {'similarity_threshold': 1.1},
                        {'chunk_size': True}, {'similarity_threshold': False}):
             for route in ('/ingest/config', '/tune/rechunk', '/tune/reembed'):
                 with self.subTest(route=route, update=update): self.assert_rejected_without_work(route, {'collection': 'ReviewSettings', **update})
@@ -108,6 +108,15 @@ class SettingsTests(unittest.TestCase):
         for strategy in ('overlap', 'language'):
             with self.assertRaises(ValidationError): IngestConfig(chunking_strategy=strategy, chunk_overlap=1000)
         IngestConfig(chunking_strategy='overlap', chunk_size=201, chunk_overlap=200, min_chunk_size=0)
+
+    def test_fixed_minimum_can_exceed_split_target_as_existing_acceptance_requires(self):
+        body = {'collection':'ReviewSettings', 'chunking_strategy':'fixed', 'chunk_size':60, 'min_chunk_size':100}
+        self.assertEqual(self.client.post('/ingest/config',json=body).status_code,201)
+        self.assertEqual(self.client.post('/tune/rechunk',json=body).status_code,202)
+        response = self.client.post('/ingest/upload',data={'collection':'ReviewSettings','strategy':'fixed','chunk_size':'60','min_chunk_size':'100'},files={'files':('tiny.txt',b'inert synthetic text')})
+        self.assertEqual(response.status_code,202,response.text)
+        self.assertEqual(self.ingest_job.call_args.kwargs['min_chunk_size'],100)
+        self.assertEqual(len(chunker.chunk('x'*169,'fixed',chunk_size=60,min_chunk_size=100)),1)
 
     def test_saved_valid_ingest_and_retrieval_round_trips(self):
         ingest_body = {'collection': 'ReviewSettings', 'chunking_strategy': 'fixed', 'chunk_size': 150, 'min_chunk_size': 40}
