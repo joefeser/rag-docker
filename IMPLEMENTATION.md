@@ -959,6 +959,20 @@ class GenerateRequest(BaseModel):
     sample_size: int = 20
     seed: Optional[int] = None
 
+    @field_validator("sample_size", "seed", mode="before")
+    @classmethod
+    def _numeric(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Sampling settings cannot be booleans")
+        return value
+
+    @field_validator("sample_size")
+    @classmethod
+    def _sample_size(cls, value):
+        if not 1 <= value <= 100:
+            raise ValueError("sample_size must be between 1 and 100")
+        return value
+
 
 class GenerateResponse(BaseModel):
     session_id: str
@@ -1788,25 +1802,22 @@ async def hybrid_query(
     return await asyncio.to_thread(_hybrid_query_sync, collection_name, query, alpha, top_k)
 
 
-def _sample_chunks_sync(collection_name: str, limit: int) -> list[dict]:
+def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    from models.schemas import GenerateRequest
+    from services.chunk_sampling import select_chunks
+    request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.fetch_objects(
-        limit=limit,
+    objects = coll.iterator(
+        include_vector=False,
         return_properties=["content", "source_file", "chunk_index"],
+        cache_size=100,
     )
-    return [
-        {
-            "content": obj.properties.get("content", ""),
-            "source_file": obj.properties.get("source_file", ""),
-            "chunk_index": obj.properties.get("chunk_index", 0),
-        }
-        for obj in result.objects
-    ]
+    return select_chunks(objects, request.sample_size, request.seed)
 
 
-async def sample_chunks(collection_name: str, limit: int) -> list[dict]:
-    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit)
+async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit, seed)
 ```
 
 ### api/services/ollama_client.py
@@ -2355,6 +2366,57 @@ async def run_query(
     }
 ```
 
+### api/services/chunk_sampling.py
+
+```python
+"""Order-independent sampling of chunk objects by their stable UUIDs."""
+import hashlib
+import heapq
+import secrets
+from uuid import UUID
+
+MAX_SAMPLE_SIZE = 100
+
+
+def select_chunks(objects, limit: int, seed: int | None = None) -> list[dict]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_SAMPLE_SIZE:
+        raise ValueError("sample_size must be an integer between 1 and 100")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("seed must be an integer or null")
+    domain = b"rag-evaluation-sample-v1\0"
+    prefix = (domain + b"seed\0" + str(seed).encode("ascii") + b"\0" if seed is not None
+              else domain + b"nonce\0" + secrets.token_bytes(32) + b"\0")
+    base = hashlib.sha256(prefix)
+    heap = []
+    selected = set()
+    for obj in objects:
+        identity = UUID(str(obj.uuid))
+        if identity in selected:
+            continue
+        digest = base.copy()
+        digest.update(identity.bytes)
+        priority = int.from_bytes(digest.digest(), "big")
+        # Negated scores make the heap root the worst retained candidate.
+        key = (-priority, -identity.int)
+        if len(heap) == limit and key <= heap[0][:2]:
+            continue
+        row = {
+            "object_id": str(identity),
+            "content": obj.properties.get("content", ""),
+            "source_file": obj.properties.get("source_file", ""),
+            "chunk_index": obj.properties.get("chunk_index", 0),
+        }
+        entry = (*key, identity, row)
+        if len(heap) == limit:
+            removed = heapq.heapreplace(heap, entry)
+            selected.remove(removed[2])
+        else:
+            heapq.heappush(heap, entry)
+        selected.add(identity)
+    # The UUID tie-breaker also fixes output order if priorities collide.
+    return [entry[3] for entry in sorted(heap, key=lambda entry: (-entry[0], -entry[1]))]
+```
+
 ### api/services/goldstandard.py
 
 ```python
@@ -2626,7 +2688,9 @@ async def start_generation(
     sample_size: int,
     seed: int | None,
 ) -> dict:
-    all_chunks = await wc.sample_chunks(collection, limit=sample_size)
+    from models.schemas import GenerateRequest
+    request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
+    all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
     actual_size = len(all_chunks)
 
     session_id = f"gs_{uuid.uuid4().hex[:8]}"
@@ -5798,6 +5862,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -5840,6 +5906,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(request, exc):
+    # Invalid settings can include non-finite JSON numbers. Echoing their raw
+    # values in a JSONResponse would raise a serialization error instead of 422.
+    errors = [{key: value for key, value in error.items() if key not in ("input", "ctx")}
+              for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 app.add_middleware(
     CORSMiddleware,
@@ -8105,6 +8179,7 @@ drive the UI in a real browser.
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
+| `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
@@ -8342,6 +8417,55 @@ summary() {
   fi
   return 0
 }
+```
+
+### scripts/verify/chunk_sampling.py
+
+```python
+"""Real SDK sampling checks; owned synthetic objects with supplied vectors.
+
+Run inside a disposable API: python - < scripts/verify/chunk_sampling.py
+Does not call embedding or language models. UUID selection, not answer output,
+is the reproducibility contract. Deletes only its unique collection/config.
+"""
+import uuid
+from services import weaviate_client as wc
+from services.chunk_sampling import select_chunks
+
+collection='VfySampling'+uuid.uuid4().hex[:12]
+created=False
+try:
+    assert not wc._collection_exists_sync(collection)
+    wc._create_collection_sync(collection,'hnsw','cosine',{})
+    created=True
+    coll=wc.get_client().collections.get(collection)
+    for i in range(1,61):
+        coll.data.insert(uuid=uuid.UUID(int=i),properties={
+            'content':f'Inert sampling fixture {i}', 'source_file':'sampling.txt',
+            'chunk_index':i},vector=[0.1]*768)
+    assert coll.aggregate.over_all(total_count=True).total_count==60
+    print('PASS created 60 owned synthetic objects with supplied vectors',flush=True)
+    first=wc._sample_chunks_sync(collection,5,7)
+    assert len(first)==5 and len({r['object_id'] for r in first})==5
+    assert any(uuid.UUID(r['object_id']).int>5 for r in first)
+    print('PASS seeded sample reaches beyond the first five objects',flush=True)
+    assert wc._sample_chunks_sync(collection,5,7)==first
+    print('PASS repeated seed preserves UUIDs and ordered payloads',flush=True)
+    snapshot=list(coll.iterator(include_vector=False,return_properties=['content','source_file','chunk_index'],cache_size=100))
+    assert select_chunks(reversed(snapshot),5,7)==first
+    print('PASS reversed actual SDK objects preserve seeded selection',flush=True)
+    rows=wc._sample_chunks_sync(collection,100,7)
+    assert len(rows)==60 and {r['object_id'] for r in rows}=={str(uuid.UUID(int=i)) for i in range(1,61)}
+    print('PASS oversize request returns all available unique objects',flush=True)
+    unseeded=wc._sample_chunks_sync(collection,5,None)
+    assert len(unseeded)==5 and all(1<=uuid.UUID(r['object_id']).int<=60 for r in unseeded)
+    print('PASS null seed produces a bounded valid sample',flush=True)
+finally:
+    if created: wc._delete_collection_sync(collection)
+    wc.close_client()
+assert not wc._collection_exists_sync(collection)
+wc.close_client()
+print('PASS owned collection and configuration removed',flush=True)
 ```
 
 ### scripts/verify/fixtures.py

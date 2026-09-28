@@ -373,22 +373,19 @@ async def hybrid_query(
     return await asyncio.to_thread(_hybrid_query_sync, collection_name, query, alpha, top_k)
 
 
-def _sample_chunks_sync(collection_name: str, limit: int) -> list[dict]:
+def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    from models.schemas import GenerateRequest
+    from services.chunk_sampling import select_chunks
+    request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.fetch_objects(
-        limit=limit,
+    objects = coll.iterator(
+        include_vector=False,
         return_properties=["content", "source_file", "chunk_index"],
+        cache_size=100,
     )
-    return [
-        {
-            "content": obj.properties.get("content", ""),
-            "source_file": obj.properties.get("source_file", ""),
-            "chunk_index": obj.properties.get("chunk_index", 0),
-        }
-        for obj in result.objects
-    ]
+    return select_chunks(objects, request.sample_size, request.seed)
 
 
-async def sample_chunks(collection_name: str, limit: int) -> list[dict]:
-    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit)
+async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit, seed)
