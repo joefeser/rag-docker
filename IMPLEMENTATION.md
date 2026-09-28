@@ -982,7 +982,16 @@ class GoldPair(BaseModel):
     status: str
 
 
-class SessionResponse(BaseModel):
+class SessionValidity(BaseModel):
+    stale: bool = False
+    stale_reason: Optional[str] = None
+    stale_at: Optional[str] = None
+    orphaned: bool = False
+    orphaned_reason: Optional[str] = None
+    orphaned_at: Optional[str] = None
+
+
+class SessionResponse(SessionValidity):
     session_id: str
     status: str
     pairs_total: int
@@ -1037,6 +1046,14 @@ class RegenerateRequest(BaseModel):
 class SaveRequest(BaseModel):
     session_id: str
     filename: Optional[str] = None
+    allow_historical: bool = False
+
+    @field_validator("allow_historical", mode="before")
+    @classmethod
+    def _explicit_opt_in(cls, value):
+        if not isinstance(value, bool):
+            raise ValueError("allow_historical must be a boolean")
+        return value
 
 
 class SaveResponse(BaseModel):
@@ -1044,6 +1061,8 @@ class SaveResponse(BaseModel):
     pairs_saved: int
     pairs_excluded: int
     download_url: str
+    historical: bool = False
+    session_validity: SessionValidity = SessionValidity()
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -2723,10 +2742,22 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     out_path.write_text(json.dumps(ragas, indent=2))
 
 
-async def save_session(session_id: str, filename: str | None) -> dict | None:
+async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
         return None
+
+    from models.schemas import SessionValidity
+    if not isinstance(allow_historical, bool):
+        raise ValueError("allow_historical must be a boolean")
+    validity = SessionValidity.model_validate(session).model_dump()
+    historical = validity["stale"] or validity["orphaned"]
+    if historical and not allow_historical:
+        raise GoldStandardError(
+            "HISTORICAL_SESSION",
+            "This retained session is stale or orphaned and is not a current "
+            "collection baseline. Inspect its validity metadata and explicitly "
+            "set allow_historical=true to export historical pairs.", 409)
 
     approved = [p for p in session["pairs"] if p["status"] in ("approved", "edited")]
     excluded = len(session["pairs"]) - len(approved)
@@ -2761,6 +2792,8 @@ async def save_session(session_id: str, filename: str | None) -> dict | None:
         "pairs_saved": len(approved),
         "pairs_excluded": excluded,
         "download_url": f"/api/goldstandard/download/{filename}",
+        "historical": historical,
+        "session_validity": validity,
     }
 ```
 
@@ -5095,6 +5128,7 @@ from models.schemas import (
     SaveRequest,
     SaveResponse,
     SessionResponse,
+    SessionValidity,
 )
 from services import goldstandard as gs
 from services import weaviate_client as wc
@@ -5137,6 +5171,7 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        **SessionValidity.model_validate(session).model_dump(),
     )
 
 
@@ -5162,7 +5197,10 @@ async def regenerate(body: RegenerateRequest):
 
 @router.post("/save", response_model=SaveResponse)
 async def save(body: SaveRequest):
-    result = await gs.save_session(body.session_id, body.filename)
+    try:
+        result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if result is None:
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{body.session_id}' not found.")
     return SaveResponse(**result)
@@ -5798,6 +5836,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from utils import api_error
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -5840,6 +5880,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(request, exc):
+    # Invalid settings can include non-finite JSON numbers. Echoing their raw
+    # values in a JSONResponse would raise a serialization error instead of 422.
+    errors = [{key: value for key, value in error.items() if key not in ("input", "ctx")}
+              for error in exc.errors()]
+    return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
 app.add_middleware(
     CORSMiddleware,
@@ -6293,6 +6342,21 @@ export function useQueryConfig() {
 ```typescript
 const BASE = '/api'
 
+// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// It covers a whole request, so a multi-file upload counts every file. Kept
+// here only so the Import page can warn before sending; nginx enforces it.
+// Change both together.
+export const MAX_UPLOAD_MB = 512
+export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+// Errors the proxy answers itself, before the API sees the request. Those
+// arrive as nginx's HTML error pages, not the API's JSON error shape.
+const PROXY_ERRORS: Record<number, string> = {
+  413: `The upload is larger than the ${MAX_UPLOAD_MB} MB limit. Split it into smaller batches.`,
+  502: 'The API is not responding. It may still be starting; try again in a minute.',
+  504: 'The API took too long to respond.',
+}
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -6300,8 +6364,15 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
     headers,
     body: isFormData ? (body as FormData) : body !== undefined ? JSON.stringify(body) : undefined,
   })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data?.error?.message ?? `HTTP ${res.status}`)
+  // Read as text first: calling res.json() on an nginx error page threw a
+  // JSON syntax error, which is what the user saw instead of the real problem.
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
 }
 
@@ -6323,10 +6394,10 @@ export const api = {
   query: (body: QueryBody) => request<QueryResult>('POST', '/query', body),
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
-  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${sessionId}`),
-  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${sessionId}/pair/${pairId}`, body),
+  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
-  saveSession: (body: { session_id: string; filename?: string }) => request<SaveResult>('POST', '/goldstandard/save', body),
+  saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
   downloadUrl: (filename: string) => `${BASE}/goldstandard/download/${filename}`,
 
   // Transfer
@@ -6381,12 +6452,16 @@ export interface GenerateResult { session_id: string; status: string; pairs_tota
 export interface GoldPair {
   pair_id: string; question: string; answer: string; contexts: string[]; ground_truth: string; source_file: string; chunk_index: number; status: string
 }
-export interface Session {
+export interface SessionValidity {
+  stale?: boolean; stale_reason?: string | null; stale_at?: string | null
+  orphaned?: boolean; orphaned_reason?: string | null; orphaned_at?: string | null
+}
+export interface Session extends SessionValidity {
   session_id: string; status: string; pairs_total: number; pairs_attempted?: number
   pairs_completed: number; pairs_failed?: number; pairs: GoldPair[]; collection: string; errors?: string[]
 }
 export interface PatchPairBody { status: string; question?: string; answer?: string; ground_truth?: string }
-export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string }
+export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string; historical?: boolean; session_validity?: SessionValidity }
 export interface LatencyStats { p50: number; p95: number; p99: number }
 export interface LatencyRecord {
   timestamp: string
@@ -7296,6 +7371,8 @@ export default function GoldStandardPage() {
   const [sampleSize, setSampleSize] = useState(20)
   const [session, setSession] = useState<Session | null>(null)
   const [sessionId, setSessionId] = useState('')
+  const [sessionLookup, setSessionLookup] = useState('')
+  const [allowHistorical, setAllowHistorical] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [filename, setFilename] = useState('')
@@ -7315,26 +7392,46 @@ export default function GoldStandardPage() {
 
   useEffect(() => {
     if (!sessionId) return
+    let active = true
     pollRef.current = setInterval(async () => {
       try {
         const s = await api.getSession(sessionId)
+        if (!active) return
         setSession(s)
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
         }
       } catch { /* ignore */ }
     }, 2000)
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+    return () => { active = false; if (pollRef.current) clearInterval(pollRef.current) }
   }, [sessionId])
 
+  useEffect(() => {
+    setAllowHistorical(false)
+  }, [sessionId, session?.stale, session?.orphaned, session?.stale_at, session?.orphaned_at])
+
+  async function loadSession() {
+    const id = sessionLookup.trim()
+    if (!id) return
+    setError(''); setSaveResult(''); setLoading(true)
+    try {
+      const loaded = await api.getSession(id)
+      setSessionId(id); setSession(loaded); setAllowHistorical(false)
+      setFilename('')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally { setLoading(false) }
+  }
+
   async function generate() {
-    if (session && !confirm('This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?')) return
+    if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
     setLoading(true)
     setSaveResult('')
     try {
       const res = await api.generateGoldStandard({ collection, sample_size: sampleSize })
       setSessionId(res.session_id)
+      setSessionLookup(res.session_id)
       setSession(null)
       const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
       setFilename(`${collection}_${ts}.json`)
@@ -7369,8 +7466,8 @@ export default function GoldStandardPage() {
   async function saveExport() {
     if (!sessionId) return
     try {
-      const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined })
-      setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.`)
+      const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined, allow_historical: allowHistorical })
+      setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.${res.historical ? " Historical data; not a current collection baseline." : ""}`)
       window.open(api.downloadUrl(res.filename), '_blank')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -7398,7 +7495,8 @@ export default function GoldStandardPage() {
   const edited = session?.pairs.filter(p => p.status === 'edited').length ?? 0
   const rejected = session?.pairs.filter(p => p.status === 'rejected').length ?? 0
   const pending = session?.pairs.filter(p => p.status === 'pending').length ?? 0
-  const canExport = approved + edited > 0
+  const historical = Boolean(session?.stale || session?.orphaned)
+  const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -7432,7 +7530,25 @@ export default function GoldStandardPage() {
         )}
       </div>
 
+      <div className="bg-white border rounded p-4 mb-6">
+        <label htmlFor="retained-session" className="block text-sm font-semibold mb-2">Inspect a retained session</label>
+        <div className="flex gap-3">
+          <input id="retained-session" value={sessionLookup} onChange={e => setSessionLookup(e.target.value)} placeholder="Session ID" className="border rounded px-3 py-2 text-sm flex-1" />
+          <button onClick={loadSession} disabled={loading || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
+        </div>
+        {session && <p className="text-xs text-gray-500 mt-2">Session {session.session_id} · Collection {session.collection}</p>}
+      </div>
+
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
+      {session && historical && (
+        <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
+          <h2 className="font-semibold">Historical evaluation data</h2>
+          <p className="text-sm">These retained pairs are not a current collection baseline. Review them as historical data.</p>
+          {session.stale && <p className="text-sm mt-2">Stale: {session.stale_reason || 'No reason was recorded.'} {session.stale_at && <span>Recorded {session.stale_at}</span>}</p>}
+          {session.orphaned && <p className="text-sm mt-2">Orphaned: {session.orphaned_reason || 'No reason was recorded.'} {session.orphaned_at && <span>Recorded {session.orphaned_at}</span>}</p>}
+        </div>
+      )}
+
 
       {session && session.pairs.length > 0 && (
         <div className="bg-white border rounded p-4 mb-6">
@@ -7471,10 +7587,15 @@ export default function GoldStandardPage() {
       {session && session.pairs.length > 0 && (
         <div className="bg-white border rounded p-4">
           <h2 className="font-semibold mb-3">Phase 3 — Export</h2>
+          {historical && <label className="flex gap-2 items-start text-sm mb-3">
+            <input type="checkbox" checked={allowHistorical} onChange={e => setAllowHistorical(e.target.checked)} />
+            <span>I want to export historical pairs. The RAGAS file does not carry these validity warnings and must not be treated as a current baseline.</span>
+          </label>}
+
           <div className="flex gap-3 items-center">
             <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="filename.json" className="border rounded px-3 py-2 text-sm flex-1" />
             <button onClick={saveExport} disabled={!canExport} className="bg-green-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-green-700">
-              Export Approved
+              {historical ? "Export Historical Approved" : "Export Approved"}
             </button>
           </div>
           {saveResult && <p className="text-sm text-green-600 mt-2">{saveResult}</p>}
@@ -8108,6 +8229,11 @@ drive the UI in a real browser.
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
+
+`10_validity.sh` is called by suite05 (and thus all.sh). It runs
+`session_validity.py` inside the disposable API, using an owned real collection,
+synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
+It checks warning metadata, actual deletion marking and explicit historical export.
 
 ## Environment
 
@@ -9350,6 +9476,8 @@ check "the help page has no unsubstituted placeholders" $?
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
+bash ./10_validity.sh
+check "retained-session validity acceptance suite" $?
 summary
 ```
 
@@ -9392,6 +9520,84 @@ rc=$?
 drop_collection "$C"
 cleanup_prefixed
 exit $rc
+```
+
+### scripts/verify/session_validity.py
+
+```python
+"""Real backend/session marking and in-process HTTP validity/export acceptance.
+
+Run inside a disposable API: python - < scripts/verify/session_validity.py
+Uses a unique real collection, synthetic pairs and temporary local files. No
+startup sweep or model calls. Only its own collection/session/files are removed.
+"""
+import copy
+import os
+import tempfile
+import uuid
+from unittest.mock import patch
+from fastapi.testclient import TestClient
+from config import settings
+from main import app
+from services import goldstandard as gs, weaviate_client as wc
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Validity'+uuid.uuid4().hex[:12]
+session_id='gs_'+uuid.uuid4().hex[:8]
+client=TestClient(app)  # Do not run global startup sweeps alongside other tests.
+creation_attempted=False
+with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.object(settings,'upload_dir',directory):
+    try:
+        creation_attempted=True
+        response=client.post('/collections',json={'name':collection})
+        assert response.status_code==201,response.text
+        print('PASS unique real backend collection created',flush=True)
+        pairs=[{'pair_id':'validity_pair','question':'Inert question','answer':'Inert answer',
+            'contexts':['Inert retained context'],'ground_truth':'Inert truth','source_file':'inert.txt',
+            'chunk_index':0,'status':'approved'}]
+        session={'session_id':session_id,'collection':collection,'status':'completed',
+            'pairs_total':1,'pairs_completed':1,'pairs':pairs}
+        gs.store_session(session)
+        response=client.get('/goldstandard/session/'+session_id)
+        assert response.status_code==200,response.text
+        assert not response.json()['stale'] and not response.json()['orphaned']
+        assert response.json()['pairs']==pairs
+        print('PASS legacy defaults and retained pairs reach HTTP response',flush=True)
+        assert gs.mark_stale(collection,'Synthetic chunk-identity change')==1
+        response=client.get('/goldstandard/session/'+session_id)
+        assert response.json()['stale'] and response.json()['stale_reason']=='Synthetic chunk-identity change'
+        assert response.json()['stale_at']
+        print('PASS real persistence marker reason/timestamp reach HTTP response',flush=True)
+        response=client.post('/goldstandard/save',json={'session_id':session_id})
+        assert response.status_code==409 and response.json()['error']['code']=='HISTORICAL_SESSION',response.text
+        print('PASS stale export is refused without explicit choice',flush=True)
+        response=client.delete('/collections/'+collection+'?confirm=true')
+        assert response.status_code==200,response.text
+        creation_attempted=False
+        response=client.get('/goldstandard/session/'+session_id)
+        historical=response.json()
+        assert response.status_code==200 and historical['orphaned'] and historical['orphaned_reason'] and historical['orphaned_at']
+        assert historical['stale'] and historical['pairs']==pairs
+        print('PASS actual collection deletion forwards orphan warning without deleting history',flush=True)
+        before=copy.deepcopy(gs.get_session(session_id))
+        response=client.post('/goldstandard/save',json={'session_id':session_id,'allow_historical':True,'filename':'historical.json'})
+        assert response.status_code==200,response.text
+        exported=response.json()
+        assert exported['historical'] and exported['session_validity']['stale'] and exported['session_validity']['orphaned']
+        download=client.get('/goldstandard/download/'+exported['filename'])
+        assert download.status_code==200,download.text
+        rows=download.json()
+        assert len(rows)==1 and set(rows[0])=={'question','answer','contexts','ground_truth'}
+        assert gs.get_session(session_id)==before
+        print('PASS explicit historical export retains RAGAS fields and original history',flush=True)
+    finally:
+        if creation_attempted and wc._collection_exists_sync(collection):
+            response=client.delete('/collections/'+collection+'?confirm=true')
+            assert response.status_code==200,response.text
+        gs._sessions.pop(session_id,None)
+        wc.close_client()
+assert not wc._collection_exists_sync(collection)
+wc.close_client()
+print('PASS owned collection/session/files removed',flush=True)
 ```
 
 ### scripts/verify/browser/Dockerfile
@@ -10018,4 +10224,18 @@ echo
 echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
+```
+
+### scripts/verify/10_validity.sh
+
+```bash
+#!/usr/bin/env bash
+# Retained-session validity and explicit historical export, without model calls.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Retained evaluation validity and historical export"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_validity.py)
+check "legacy defaults, real stale/orphan markers, export guard and historical file" $?
+summary
 ```
