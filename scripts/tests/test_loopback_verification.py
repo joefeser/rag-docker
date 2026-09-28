@@ -32,6 +32,16 @@ class LoopbackVerificationTests(unittest.TestCase):
             with self.subTest(version=version):
                 self.assertEqual(self.run_block(0, version) == 0, accepted)
 
+    def test_embedded_verification_copies_match_runnable_sources(self):
+        implementation = (ROOT / 'IMPLEMENTATION.md').read_text()
+        for name, fence, language in [('scripts/verify/01_infrastructure.sh', '```', 'bash'),
+                                      ('scripts/verify/README.md', '````', 'markdown')]:
+            with self.subTest(path=name):
+                header = '### ' + name + '\n\n' + fence + language + '\n'
+                start = implementation.index(header) + len(header)
+                end = implementation.index('\n' + fence + '\n', start)
+                self.assertEqual(implementation[start:end], (ROOT / name).read_text().rstrip('\n'))
+
     def test_default_resolved_configuration_and_adverse_variants(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith('COMPOSE_')}
         resolved = json.loads(subprocess.check_output(
