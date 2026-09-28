@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import copy
+import threading
 import json
 import logging
 
@@ -38,6 +40,7 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
+_identity_lock = threading.Lock()
 
 
 def _sessions_dir() -> Path:
@@ -93,6 +96,57 @@ def store_session(session: dict) -> None:
     """
     _sessions[session["session_id"]] = session
     _save_session_sync(session)
+
+
+def _identity_available(session_id: str) -> bool:
+    if not re.fullmatch(r"gs_[0-9a-f]{8}", session_id):
+        raise ValueError("Imported session identity must use the local gs_ namespace")
+    if session_id in _sessions:
+        return False
+    try:
+        _session_path(session_id).lstat()
+    except FileNotFoundError:
+        return True
+    # Any existing bytes, including unreadable JSON or a dangling symlink,
+    # occupy their identity. Other storage errors fail instead of guessing.
+    return False
+
+
+def _allocate_identity(preferred: str | None = None) -> str:
+    if preferred is not None and _identity_available(preferred):
+        return preferred
+    for _ in range(128):
+        candidate = f"gs_{uuid.uuid4().hex[:8]}"
+        if _identity_available(candidate):
+            return candidate
+    raise RuntimeError("Could not allocate an unoccupied session identity")
+
+
+def _store_generated_session(session: dict) -> dict:
+    snapshot = copy.deepcopy(session)
+    with _identity_lock:
+        snapshot["session_id"] = _allocate_identity()
+        store_session(snapshot)
+    return copy.deepcopy(snapshot)
+
+
+def store_imported_session(session: dict, source_collection: str) -> dict:
+    """Serialize identity selection with generation; never overwrite an occupied slot.
+
+    This governs concurrent imports and generation starts in one API process. Durable mutation
+    semantics remain the session writer's responsibility (the separate45 fix).
+    """
+    snapshot = copy.deepcopy(session)
+    source_id = snapshot["session_id"]
+    with _identity_lock:
+        snapshot["session_id"] = _allocate_identity(source_id)
+        snapshot["imported_from"] = {
+            "session_id": source_id,
+            "collection": source_collection,
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+        }
+        store_session(snapshot)
+    return copy.deepcopy(snapshot)
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
@@ -269,9 +323,7 @@ async def start_generation(
     all_chunks = await wc.sample_chunks(collection, limit=sample_size)
     actual_size = len(all_chunks)
 
-    session_id = f"gs_{uuid.uuid4().hex[:8]}"
     session = {
-        "session_id": session_id,
         "collection": collection,
         "status": "generating",
         "pairs_total": actual_size,
@@ -283,8 +335,8 @@ async def start_generation(
         "pairs_failed": 0,
         "pairs": [],
     }
-    _sessions[session_id] = session
-    await _save_session(session)
+    session = await asyncio.to_thread(_store_generated_session, session)
+    session_id = session["session_id"]
 
     task = asyncio.create_task(_run_generation(session_id, all_chunks))
     _tasks.add(task)

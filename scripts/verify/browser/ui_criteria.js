@@ -181,6 +181,41 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // Imported identities are exposed through the existing visible job notes.
+  r.section('imported session lookup IDs');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const filename = 'ragpkg-owned-session.tar.gz';
+    const sourceId = 'gs_460abcde', localId = 'gs_460abcdf';
+    const submissions = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      let body;
+      if (path === '/api/packages') body = { packages: [{ filename, size_bytes: 100, collection: 'OwnedOriginal', chunk_count: 1, fidelity: 'chunks-only', created_at: '2026-09-28T00:00:00Z', readable: true }] };
+      else if (path === '/api/import' && request.method() === 'POST') {
+        submissions.push(JSON.parse(request.postData()));
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: 'owned-identity-job', status: 'queued', filename }) });
+      } else if (path === '/api/import/job/owned-identity-job') body = { job_id: 'owned-identity-job', status: 'completed', filename, on_conflict: 'rename', collection: 'OwnedImported', original_collection: 'OwnedOriginal', chunks_written: 1, fidelity: 'chunks-only', renamed: true, notes: ["evaluation session '" + sourceId + "' restored as local '" + localId + "' for 'OwnedImported'"], restored_sessions: [{ source_session_id: sourceId, session_id: localId, collection: 'OwnedImported' }], error: null, error_code: null, error_detail: null };
+      if (body) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(250);
+      await s.page.evaluate(value => {
+        const selector = [...document.querySelectorAll('select')].find(el => [...el.options].some(option => option.value === value));
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(selector, value);
+        selector.dispatchEvent(new Event('change', { bubbles: true }));
+        document.querySelector('input[name="conflict"][value="rename"]').click();
+      }, filename);
+      await clickByText(s.page, 'Import'); await sleep(600);
+      const text = await bodyText(s.page);
+      r.check('rename import submits selected package and explicit policy', submissions.length === 1 && submissions[0].filename === filename && submissions[0].on_conflict === 'rename');
+      r.check('completed import displays original and allocated session IDs for lookup', text.includes(sourceId) && text.includes(localId) && text.includes('OwnedImported'));
+      r.check('import identity notes do not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── transfer help page ─────────────────────────────────────────────────────
   r.section('transfer help page');
   {

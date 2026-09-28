@@ -795,6 +795,12 @@ class ImportStartResponse(BaseModel):
     filename: str
 
 
+class ImportedSessionMapping(BaseModel):
+    source_session_id: str
+    session_id: str
+    collection: str
+
+
 class ImportJobStatusResponse(BaseModel):
     job_id: str
     status: str
@@ -808,6 +814,7 @@ class ImportJobStatusResponse(BaseModel):
     fidelity: Optional[str]
     renamed: bool
     notes: list[str]
+    restored_sessions: list[ImportedSessionMapping] = Field(default_factory=list)
     error: Optional[str]
     error_code: Optional[str]
     error_detail: Optional[dict]
@@ -982,6 +989,12 @@ class GoldPair(BaseModel):
     status: str
 
 
+class SessionImportProvenance(BaseModel):
+    session_id: str = Field(pattern=r"^gs_[0-9a-f]{8}$")
+    collection: str
+    imported_at: str
+
+
 class SessionResponse(BaseModel):
     session_id: str
     status: str
@@ -994,6 +1007,7 @@ class SessionResponse(BaseModel):
     pairs: list[GoldPair]
     collection: str
     errors: list[str] = []
+    imported_from: SessionImportProvenance | None = None
 
 
 class PatchPairRequest(BaseModel):
@@ -2360,6 +2374,8 @@ async def run_query(
 ```python
 from __future__ import annotations
 import asyncio
+import copy
+import threading
 import json
 import logging
 
@@ -2398,6 +2414,7 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
+_identity_lock = threading.Lock()
 
 
 def _sessions_dir() -> Path:
@@ -2453,6 +2470,57 @@ def store_session(session: dict) -> None:
     """
     _sessions[session["session_id"]] = session
     _save_session_sync(session)
+
+
+def _identity_available(session_id: str) -> bool:
+    if not re.fullmatch(r"gs_[0-9a-f]{8}", session_id):
+        raise ValueError("Imported session identity must use the local gs_ namespace")
+    if session_id in _sessions:
+        return False
+    try:
+        _session_path(session_id).lstat()
+    except FileNotFoundError:
+        return True
+    # Any existing bytes, including unreadable JSON or a dangling symlink,
+    # occupy their identity. Other storage errors fail instead of guessing.
+    return False
+
+
+def _allocate_identity(preferred: str | None = None) -> str:
+    if preferred is not None and _identity_available(preferred):
+        return preferred
+    for _ in range(128):
+        candidate = f"gs_{uuid.uuid4().hex[:8]}"
+        if _identity_available(candidate):
+            return candidate
+    raise RuntimeError("Could not allocate an unoccupied session identity")
+
+
+def _store_generated_session(session: dict) -> dict:
+    snapshot = copy.deepcopy(session)
+    with _identity_lock:
+        snapshot["session_id"] = _allocate_identity()
+        store_session(snapshot)
+    return copy.deepcopy(snapshot)
+
+
+def store_imported_session(session: dict, source_collection: str) -> dict:
+    """Serialize identity selection with generation; never overwrite an occupied slot.
+
+    This governs concurrent imports and generation starts in one API process. Durable mutation
+    semantics remain the session writer's responsibility (the separate45 fix).
+    """
+    snapshot = copy.deepcopy(session)
+    source_id = snapshot["session_id"]
+    with _identity_lock:
+        snapshot["session_id"] = _allocate_identity(source_id)
+        snapshot["imported_from"] = {
+            "session_id": source_id,
+            "collection": source_collection,
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+        }
+        store_session(snapshot)
+    return copy.deepcopy(snapshot)
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
@@ -2629,9 +2697,7 @@ async def start_generation(
     all_chunks = await wc.sample_chunks(collection, limit=sample_size)
     actual_size = len(all_chunks)
 
-    session_id = f"gs_{uuid.uuid4().hex[:8]}"
     session = {
-        "session_id": session_id,
         "collection": collection,
         "status": "generating",
         "pairs_total": actual_size,
@@ -2643,8 +2709,8 @@ async def start_generation(
         "pairs_failed": 0,
         "pairs": [],
     }
-    _sessions[session_id] = session
-    await _save_session(session)
+    session = await asyncio.to_thread(_store_generated_session, session)
+    session_id = session["session_id"]
 
     task = asyncio.create_task(_run_generation(session_id, all_chunks))
     _tasks.add(task)
@@ -3782,7 +3848,8 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict,
     return written
 
 
-def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
+def _restore_sidecars(target: str, pkg: Path, original: str,
+                      restored_sessions: list[dict] | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -3833,7 +3900,13 @@ def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
             # Write through the service: a direct file write leaves the
             # in-memory cache holding the old version, which the next flagging
             # pass would write straight back over this one.
-            goldstandard.store_session(data)
+            saved = goldstandard.store_imported_session(data, original)
+            mapping = {"source_session_id": data["session_id"],
+                       "session_id": saved["session_id"], "collection": target}
+            if restored_sessions is not None:
+                restored_sessions.append(mapping)
+            notes.append(f"evaluation session '{mapping['source_session_id']}' "
+                         f"restored as local '{mapping['session_id']}' for '{target}'")
             restored += 1
         if restored:
             notes.append(f"{restored} gold-standard session(s) restored")
@@ -3926,7 +3999,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
         marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+        job.setdefault("restored_sessions", [])
+        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original, job["restored_sessions"])
 
         if staged and temp_collection:
             try:
@@ -3985,6 +4059,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         "fidelity": None,
         "renamed": False,
         "notes": [],
+        "restored_sessions": [],
         "error": None,
         "error_code": None,
         "error_detail": None,
@@ -5137,6 +5212,7 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        imported_from=session.get("imported_from"),
     )
 
 
@@ -6293,6 +6369,21 @@ export function useQueryConfig() {
 ```typescript
 const BASE = '/api'
 
+// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// It covers a whole request, so a multi-file upload counts every file. Kept
+// here only so the Import page can warn before sending; nginx enforces it.
+// Change both together.
+export const MAX_UPLOAD_MB = 512
+export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+// Errors the proxy answers itself, before the API sees the request. Those
+// arrive as nginx's HTML error pages, not the API's JSON error shape.
+const PROXY_ERRORS: Record<number, string> = {
+  413: `The upload is larger than the ${MAX_UPLOAD_MB} MB limit. Split it into smaller batches.`,
+  502: 'The API is not responding. It may still be starting; try again in a minute.',
+  504: 'The API took too long to respond.',
+}
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -6300,8 +6391,15 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
     headers,
     body: isFormData ? (body as FormData) : body !== undefined ? JSON.stringify(body) : undefined,
   })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data?.error?.message ?? `HTTP ${res.status}`)
+  // Read as text first: calling res.json() on an nginx error page threw a
+  // JSON syntax error, which is what the user saw instead of the real problem.
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
 }
 
@@ -6384,6 +6482,7 @@ export interface GoldPair {
 export interface Session {
   session_id: string; status: string; pairs_total: number; pairs_attempted?: number
   pairs_completed: number; pairs_failed?: number; pairs: GoldPair[]; collection: string; errors?: string[]
+  imported_from?: { session_id: string; collection: string; imported_at: string } | null
 }
 export interface PatchPairBody { status: string; question?: string; answer?: string; ground_truth?: string }
 export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string }
@@ -6417,6 +6516,7 @@ export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
   collection: string | null; original_collection: string | null; chunks_written: number
   fidelity: string | null; renamed: boolean; notes: string[]
+  restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface PackageSummary {
@@ -8149,6 +8249,8 @@ curl -s localhost:8080/api/collections | python3 -c \
   "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
+
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes ten owned cache/disk/collision/concurrent-import cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 ````
 
 ### scripts/verify/all.sh
@@ -9163,6 +9265,8 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./13_identity.sh
+check "imported evaluation identity acceptance suite" $?
 C="${PREFIX}Transfer"
 EXPORTS="$REPO_ROOT/exports"
 
@@ -9613,6 +9717,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── upload size limit ──────────────────────────────────────────────────────
+  // The Import page refuses a selection over the proxy's limit before sending.
+  // The file is sparse: it reports 513 MB but occupies no disk, and the check
+  // must stop it before the browser ever reads it. See issue #21.
+  r.section('upload size limit');
+  {
+    const fs = require('fs');
+    const big = '/tmp/vfy-oversize-upload.txt';
+    fs.closeSync(fs.openSync(big, 'w'));
+    fs.truncateSync(big, 513 * 1024 * 1024);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const hint = await bodyText(s.page);
+    r.check('the drop zone states the upload limit', hint.includes('up to 512 MB per upload'));
+    const input = await s.page.$('#file-input');
+    await input.uploadFile(big);
+    await sleep(500);
+    const posts = () => s.api.filter(x => x.method === 'POST' && x.url.includes('/ingest/upload')).length;
+    const before = posts();
+    const clicked = await clickByText(s.page, 'Start Ingest');
+    await sleep(900);
+    const text = await bodyText(s.page);
+    r.check('an oversize selection is refused with the limit named',
+            clicked && text.includes('one upload can be at most 512 MB'),
+            clicked ? text.slice(0, 160) : 'Start Ingest button not found');
+    r.check('an oversize selection sends no upload', posts() === before);
+    r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    fs.unlinkSync(big);
+    await s.ctx.close();
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {
@@ -9637,6 +9772,41 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the health page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // Imported identities are exposed through the existing visible job notes.
+  r.section('imported session lookup IDs');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const filename = 'ragpkg-owned-session.tar.gz';
+    const sourceId = 'gs_460abcde', localId = 'gs_460abcdf';
+    const submissions = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      let body;
+      if (path === '/api/packages') body = { packages: [{ filename, size_bytes: 100, collection: 'OwnedOriginal', chunk_count: 1, fidelity: 'chunks-only', created_at: '2026-09-28T00:00:00Z', readable: true }] };
+      else if (path === '/api/import' && request.method() === 'POST') {
+        submissions.push(JSON.parse(request.postData()));
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: 'owned-identity-job', status: 'queued', filename }) });
+      } else if (path === '/api/import/job/owned-identity-job') body = { job_id: 'owned-identity-job', status: 'completed', filename, on_conflict: 'rename', collection: 'OwnedImported', original_collection: 'OwnedOriginal', chunks_written: 1, fidelity: 'chunks-only', renamed: true, notes: ["evaluation session '" + sourceId + "' restored as local '" + localId + "' for 'OwnedImported'"], restored_sessions: [{ source_session_id: sourceId, session_id: localId, collection: 'OwnedImported' }], error: null, error_code: null, error_detail: null };
+      if (body) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(250);
+      await s.page.evaluate(value => {
+        const selector = [...document.querySelectorAll('select')].find(el => [...el.options].some(option => option.value === value));
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(selector, value);
+        selector.dispatchEvent(new Event('change', { bubbles: true }));
+        document.querySelector('input[name="conflict"][value="rename"]').click();
+      }, filename);
+      await clickByText(s.page, 'Import'); await sleep(600);
+      const text = await bodyText(s.page);
+      r.check('rename import submits selected package and explicit policy', submissions.length === 1 && submissions[0].filename === filename && submissions[0].on_conflict === 'rename');
+      r.check('completed import displays original and allocated session IDs for lookup', text.includes(sourceId) && text.includes(localId) && text.includes('OwnedImported'));
+      r.check('import identity notes do not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
   }
 
   // ── transfer help page ─────────────────────────────────────────────────────
@@ -10018,4 +10188,259 @@ echo
 echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
+```
+
+### scripts/verify/13_identity.sh
+
+```bash
+#!/usr/bin/env bash
+# Independent imported evaluation identities and real rename round trips.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$bindings" || exit 2
+require_stack
+section "Imported evaluation session identities"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/session_identity_cases.py)
+check "owned identity collision, preservation and allocation regressions" $?
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_identity.py)
+check "real export/edit/import-twice lookup and RAGAS roundtrip" $?
+summary
+```
+
+### scripts/verify/session_identity_cases.py
+
+```python
+"""Owned import identity preservation; run by13_identity.sh in the API image."""
+import asyncio,copy,json,os,sys,tempfile,unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock,patch
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+from config import settings
+from services import goldstandard as gs,importer
+
+
+def fixture():
+    return {'session_id':'gs_460abcde','collection':'OwnedOriginal','status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original answer','contexts':['Inert context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
+
+
+class IdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        for obj,key,value in [(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{})]:
+            change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
+        self.original=fixture();gs.store_session(copy.deepcopy(self.original));self.path=gs._session_path(self.original['session_id'])
+
+    def test_restore_twice_preserves_newer_original_review_and_independent_exports(self):
+        package=Path(self.tmp.name)/'owned-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        (gold/(self.original['session_id']+'.json')).write_text(json.dumps(self.original))
+        asyncio.run(gs.update_pair(self.original['session_id'],'p_owned',{'answer':'Newer human review','status':'edited'}));before=self.path.read_bytes()
+        imported=[]
+        for target in ['OwnedRenamedOne','OwnedRenamedTwo']:
+            mappings=[];notes=importer._restore_sidecars(target,package,'OwnedOriginal',mappings)
+            self.assertEqual(len(mappings),1);self.assertTrue(any(mappings[0]['session_id'] in note for note in notes))
+            session=gs.get_session(mappings[0]['session_id']);imported.append(session)
+            self.assertEqual(session['imported_from']['session_id'],self.original['session_id']);self.assertEqual(session['imported_from']['collection'],'OwnedOriginal')
+        identities=[self.original['session_id']]+[s['session_id'] for s in imported];self.assertEqual(len(set(identities)),3);self.assertEqual(self.path.read_bytes(),before)
+        for i,sid in enumerate(identities):
+            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/result['filename']).read_text())
+            self.assertEqual(rows[0]['answer'],'Newer human review' if i==0 else 'Original answer');self.assertEqual(set(rows[0]),{'question','answer','contexts','ground_truth'})
+        gs._sessions={};gs.load_sessions_from_disk();self.assertEqual({gs.get_session(sid)['collection'] for sid in identities},{'OwnedOriginal','OwnedRenamedOne','OwnedRenamedTwo'})
+
+    def test_concurrent_imports_select_distinct_local_identities(self):
+        before=self.path.read_bytes()
+        def run(i):
+            data=fixture();data['collection']='OwnedImported'+str(i)
+            return gs.store_imported_session(data,'OwnedOriginal')['session_id']
+        with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
+        self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(len(list(self.path.parent.glob('*.json'))),17)
+
+    def test_cold_cache_still_respects_existing_disk_identity(self):
+        before=self.path.read_bytes();gs._sessions={}
+        result=gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertNotEqual(result['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),before)
+
+    def test_unreadable_original_bytes_still_occupy_the_identity(self):
+        self.path.write_bytes(b'{owned retained unreadable bytes');gs._sessions={}
+        result=gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertNotEqual(result['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),b'{owned retained unreadable bytes')
+
+    def test_collision_exhaustion_is_bounded_without_overwrite(self):
+        before=self.path.read_bytes()
+        with patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcde'+'0'*24)) as ids:
+            with self.assertRaisesRegex(RuntimeError,'unoccupied session'):gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertEqual(ids.call_count,128);self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(gs._sessions),1)
+
+    def test_free_valid_source_identity_is_retained_with_provenance(self):
+        data=fixture();data['session_id']='gs_460abcdf';data['collection']='OwnedNew'
+        result=gs.store_imported_session(data,'ExternalOriginal')
+        self.assertEqual(result['session_id'],data['session_id']);self.assertEqual(result['imported_from']['collection'],'ExternalOriginal')
+        self.assertTrue(result['imported_from']['imported_at'].endswith('+00:00'))
+
+    def test_inputs_and_returned_snapshots_do_not_alias_imported_storage(self):
+        data=fixture();before=copy.deepcopy(data);result=gs.store_imported_session(data,'OwnedOriginal')
+        result['pairs'][0]['answer']='Returned mutation';data['pairs'][0]['answer']='Caller mutation'
+        self.assertEqual(gs.get_session(result['session_id'])['pairs'][0]['answer'],'Original answer');self.assertNotIn('imported_from',before)
+
+    def test_storage_inspection_failure_never_guesses_a_free_slot(self):
+        before=self.path.read_bytes()
+        with patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+            with self.assertRaises(PermissionError):gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(gs._sessions),1)
+
+    def test_generation_start_uses_the_same_namespace_without_overwriting_collision(self):
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()),patch.object(gs.uuid,'uuid4',side_effect=[SimpleNamespace(hex='460abcde'+'0'*24),SimpleNamespace(hex='460abcdf'+'0'*24)]):
+                result=await gs.start_generation('OwnedGeneration',1,None)
+                await asyncio.gather(*list(gs._tasks))
+            self.assertEqual(result['session_id'],'gs_460abcdf')
+        asyncio.run(run());self.assertEqual(self.path.read_bytes(),before)
+
+    def test_concurrent_generated_and_imported_sessions_share_identity_serialization(self):
+        before=self.path.read_bytes()
+        def run(i):
+            data=fixture();data['collection']='OwnedCreated'+str(i)
+            saved=(gs.store_imported_session(data,'OwnedOriginal') if i%2 else gs._store_generated_session(data))
+            return saved['session_id']
+        with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
+        self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
+
+
+if __name__=='__main__':unittest.main()
+```
+
+### scripts/verify/session_identity.py
+
+```python
+"""Owned real HTTP/package/backend export-edit-rename-import-twice acceptance.
+
+Pairs and vectors are synthetic; package/model metadata and import/export jobs
+are real. No generation call or startup sweep runs in this process.
+"""
+import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,uuid
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+from config import settings
+from main import app
+from services import exporter,goldstandard as gs,importer,weaviate_client as wc
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Identity'+uuid.uuid4().hex[:10]
+sid='gs_'+uuid.uuid4().hex[:8]
+created=False
+jobs=[]
+with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
+    root=Path(directory)
+    with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}):
+        async def completed(client,path):
+            while True:
+                response=await client.get(path);assert response.status_code==200,response.text
+                job=response.json()
+                if job['status'] not in ('queued','running'):
+                    assert job['status']=='completed',job
+                    return job
+                await asyncio.sleep(0.1)
+
+        async def run():
+            global created
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+                assert not wc._collection_exists_sync(collection),'Owned name already exists'
+                created=True
+                response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
+                coll=wc.get_client().collections.get(collection)
+                coll.data.insert(properties={'content':'Owned inert evaluation context','source_file':'inert.txt','chunk_index':0},vector=[0.1]*768)
+                session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original exported answer','contexts':['Owned inert evaluation context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
+                gs.store_session(session)
+                print('PASS owned real collection, supplied-vector object and synthetic evaluation session created',flush=True)
+                start=await client.post('/export',json={'collection':collection,'include_models':False});assert start.status_code==202,start.text
+                jobs.append((exporter,start.json()['job_id']))
+                exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=hashlib.sha256(archive.read_bytes()).hexdigest()
+                with tarfile.open(archive) as package:
+                    member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+sid+'.json'))
+                    retained=json.load(package.extractfile(member));assert retained['pairs'][0]['answer']=='Original exported answer'
+                print('PASS actual completed export package contains the original session snapshot',flush=True)
+                edited=await client.patch('/goldstandard/session/'+sid+'/pair/p_owned',json={'status':'edited','answer':'Newer acknowledged human answer'});assert edited.status_code==200,edited.text
+                original_path=gs._session_path(sid);original_bytes=original_path.read_bytes()
+                print('PASS newer original human edit acknowledged through HTTP after package export',flush=True)
+                mappings=[];targets=[]
+                for _ in range(2):
+                    start=await client.post('/import',json={'filename':exported['filename'],'on_conflict':'rename'});assert start.status_code==202,start.text
+                    jobs.append((importer,start.json()['job_id']))
+                    imported=await completed(client,'/import/job/'+start.json()['job_id'])
+                    assert imported['renamed'] and len(imported['restored_sessions'])==1,imported
+                    mapping=imported['restored_sessions'][0];assert mapping['source_session_id']==sid and mapping['collection']==imported['collection']
+                    assert any(mapping['session_id'] in note for note in imported['notes']),imported
+                    mappings.append(mapping);targets.append(imported['collection'])
+                    assert original_path.read_bytes()==original_bytes,'Original human edit was overwritten'
+                assert len({collection,*targets})==3 and len({sid,*[m['session_id'] for m in mappings]})==3
+                print('PASS two actual rename imports expose distinct collections and independent local session mappings without changing original bytes',flush=True)
+                for local_sid,target,expected in [(sid,collection,'Newer acknowledged human answer')]+[(m['session_id'],m['collection'],'Original exported answer') for m in mappings]:
+                    response=await client.get('/goldstandard/session/'+local_sid);assert response.status_code==200,response.text
+                    loaded=response.json();assert loaded['collection']==target and loaded['pairs'][0]['answer']==expected,loaded
+                    if local_sid!=sid:
+                        assert loaded['imported_from']['session_id']==sid and loaded['imported_from']['collection']==collection and loaded['imported_from']['imported_at']
+                    saved=await client.post('/goldstandard/save',json={'session_id':local_sid,'filename':'owned-'+local_sid+'.json'});assert saved.status_code==200,saved.text
+                    download=await client.get('/goldstandard/download/'+saved.json()['filename']);assert download.status_code==200,download.text
+                    rows=download.json();assert len(rows)==1 and rows[0]['answer']==expected and set(rows[0])=={'question','answer','contexts','ground_truth'},rows
+                print('PASS original and both reported imported IDs remain usable through HTTP lookup/provenance/save/download with exact four-field RAGAS rows',flush=True)
+                code="from config import settings;from services import goldstandard as gs;import json,sys;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();print(json.dumps([gs.get_session(s) for s in sys.argv[2:]]))"
+                identities=[sid]+[m['session_id'] for m in mappings]
+                reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),*identities],text=True,capture_output=True,check=True)
+                fresh=json.loads(reload.stdout);assert [row['collection'] for row in fresh]==[collection,*targets];assert fresh[0]['pairs'][0]['answer']=='Newer acknowledged human answer';assert all(row['imported_from']['session_id']==sid for row in fresh[1:])
+                print('PASS fresh independent API process restores all three session identities, newer original review and imported provenance',flush=True)
+                start=await client.post('/export',json={'collection':targets[0],'include_models':False});assert start.status_code==202,start.text
+                jobs.append((exporter,start.json()['job_id']))
+                reexported=await completed(client,'/export/job/'+start.json()['job_id'])
+                with tarfile.open(root/'exports'/reexported['filename']) as package:
+                    imported_sid=mappings[0]['session_id'];member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+imported_sid+'.json'))
+                    retained=json.load(package.extractfile(member));assert retained['session_id']==imported_sid and retained['imported_from']['session_id']==sid
+                assert hashlib.sha256(archive.read_bytes()).hexdigest()==digest
+                print('PASS re-export uses the allocated session filename/provenance and the original package remains byte-identical',flush=True)
+
+        async def owned():
+            try:await run()
+            finally:
+                # Let only our actual jobs reach terminal state before releasing
+                # temporary settings/storage or deleting their owned collections.
+                while any(module.get_job(jobid)['status'] in ('queued','running') for module,jobid in jobs):await asyncio.sleep(0.1)
+                if created:
+                    for name in wc.get_client().collections.list_all():
+                        if name==collection or name.startswith(collection+'_'):
+                            wc._delete_collection_sync(name)
+                wc.close_client()
+        asyncio.run(owned())
+assert not wc._collection_exists_sync(collection);wc.close_client()
+print('PASS only owned collections/packages/session fixtures removed',flush=True)
+```
+
+### scripts/verify/compose_target.py
+
+```python
+"""Refuse an in-container verifier when RAG_API selects another deployment."""
+import sys
+from urllib.parse import urlsplit
+
+def matches_local_proxy(api, bindings):
+    try:
+        url=urlsplit(api)
+        if url.scheme!='http' or url.hostname not in ('localhost','127.0.0.1','::1') or url.username or url.password or url.path.rstrip('/')!='/api' or url.query or url.fragment:
+            return False
+        port=url.port or 80
+        for binding in bindings.splitlines():
+            host, published=binding.rsplit(':',1)
+            host=host.strip('[]')
+            if int(published)!=port:continue
+            if host in ('0.0.0.0','::') or host==url.hostname or (host=='127.0.0.1' and url.hostname=='localhost'):
+                return True
+        return False
+    except (ValueError,TypeError):return False
+
+if __name__=='__main__':
+    if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
+        print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
+        sys.exit(2)
 ```

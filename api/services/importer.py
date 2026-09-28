@@ -332,7 +332,8 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict,
     return written
 
 
-def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
+def _restore_sidecars(target: str, pkg: Path, original: str,
+                      restored_sessions: list[dict] | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -383,7 +384,13 @@ def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
             # Write through the service: a direct file write leaves the
             # in-memory cache holding the old version, which the next flagging
             # pass would write straight back over this one.
-            goldstandard.store_session(data)
+            saved = goldstandard.store_imported_session(data, original)
+            mapping = {"source_session_id": data["session_id"],
+                       "session_id": saved["session_id"], "collection": target}
+            if restored_sessions is not None:
+                restored_sessions.append(mapping)
+            notes.append(f"evaluation session '{mapping['source_session_id']}' "
+                         f"restored as local '{mapping['session_id']}' for '{target}'")
             restored += 1
         if restored:
             notes.append(f"{restored} gold-standard session(s) restored")
@@ -476,7 +483,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
         marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+        job.setdefault("restored_sessions", [])
+        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original, job["restored_sessions"])
 
         if staged and temp_collection:
             try:
@@ -535,6 +543,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         "fidelity": None,
         "renamed": False,
         "notes": [],
+        "restored_sessions": [],
         "error": None,
         "error_code": None,
         "error_detail": None,

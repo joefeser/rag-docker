@@ -651,7 +651,7 @@ The `pairs` array contains only pairs whose generation has completed so far. Dur
 { "error": { "code": "SESSION_NOT_FOUND", "message": "Session 'gs_abc123' not found.", "detail": null } }
 ```
 
-**Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. The API loads existing session files on startup into an in-memory dict.
+**Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. Imported sessions use an available source identity, or allocate a new local `gs_` identity when the cache or any existing session file occupies it. Concurrent imports and generation starts share serialized identity selection within the single API process. The original session and its newer human edits are preserved. Imported sessions retain `imported_from` (`session_id`, `collection`, `imported_at` UTC); GET session exposes that provenance. RAGAS rows keep their four fields. Import job `restored_sessions` maps each source ID to its local ID and collection; existing UI notes display those IDs for lookup. The API loads existing session files on startup into an in-memory dict.
 
 ---
 
@@ -1809,6 +1809,8 @@ now lives once, in `api/services/ingest_config.py`.
       under a status saying otherwise. **Fixed**: a model validator requires
       `status="edited"` whenever content fields are present.*
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`).
+- [ ] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
+      *Registered `13_identity.sh` runs ten owned identity/preservation cases plus actual package/HTTP/backend/fresh-process acceptance; checked after the live run. The Transfer browser fixture exercises visible source/local lookup IDs.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.
       *2 approved + 1 edited saved; 1 rejected + 1 pending excluded.*
 - [x] Exported file is valid JSON and each pair matches the RAGAS schema.

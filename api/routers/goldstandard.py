@@ -56,6 +56,7 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        imported_from=session.get("imported_from"),
     )
 
 

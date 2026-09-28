@@ -86,3 +86,5 @@ curl -s localhost:8080/api/collections | python3 -c \
   "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
+
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes ten owned cache/disk/collision/concurrent-import cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.

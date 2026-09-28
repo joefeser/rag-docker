@@ -5,6 +5,8 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./13_identity.sh
+check "imported evaluation identity acceptance suite" $?
 C="${PREFIX}Transfer"
 EXPORTS="$REPO_ROOT/exports"
 
