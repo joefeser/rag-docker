@@ -420,9 +420,17 @@ imported twice — a numeric suffix is appended (`..._2`, `..._3`).
 
 ### 6.5 Atomicity
 
-A failure part-way MUST leave no partial collection, and MUST NOT destroy the
-collection it was importing over. `replace` therefore deletes only after the
-incoming package has been proven to insert cleanly.
+A failed new-target build MUST remove its partial collection. `replace` MUST
+retain a verified recovery copy before deleting the original. There is no atomic
+swap: a final create or write failure can leave the original name unavailable,
+and the error MUST identify the retained incoming data.
+
+All writers MUST check the supported completed-batch failure list after context
+exit, then confirm the persisted UUID set, properties and vectors. Duplicate IDs,
+partial acceptance and manifest count mismatches MUST fail. Supplied vectors are
+compared with float32 tolerance; generated vectors must be finite and nonempty.
+`chunks_written` and ingest stored counts represent confirmed objects, not enqueue
+attempts.
 
 **Correction — "promote" is not available.** An earlier revision required
 building into a temporary collection and renaming it on success. **Weaviate has
@@ -435,7 +443,7 @@ whether anything is at risk:
 |---|---|
 | `abort` | Fails before any build if the name is taken, so the build target is always new. Built directly; deleted on failure. |
 | `rename` | The target name is new by construction. Built directly; deleted on failure. |
-| `replace` | Built into `<name>__importing_<id8>` first. Only once that succeeds is the existing collection deleted and the real one built. |
+| `replace` | Built into `<name>__importing_<operation-id>` first. Only once that succeeds is the existing collection deleted and the real one built. |
 
 `replace` therefore performs **two insert passes**. That is the cost of a
 non-destructive replace in a database that cannot rename, and it is paid only
@@ -455,18 +463,27 @@ first request, which is what makes this safe.
 
 | Left behind by | Detected at startup by | Action |
 |---|---|---|
-| `replace` staging (`<name>__importing_<id8>`) | the name marker | delete; it is internal and would otherwise appear in the collection list as if it were real |
-| a tuning rebuild (`<name>__tuning_<id8>`) | the name marker | delete |
-| `abort`/`rename` partial target | an in-progress marker file recording the expected chunk count | delete **only if** the collection's actual count differs from the expected one |
-| an extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete; twelve of these were found holding 152 MB after kill testing, and a `with-models` package leaves 2.3 GB behind each time |
+| Owned import/tuning scratch | a valid durable `collection_operations/<operation-id>.json` record with state `scratch` | delete the recorded scratch collection and its copied sidecars |
+| Verified recovery | a durable record with state `recovery`, written before deleting the target | preserve the collection and all sidecars; log its identity and metadata snapshot directory |
+| Unowned marker-like name or unreadable ownership | insufficient ownership evidence | preserve; a substring or age is never deletion authority |
+| New-target partial import | a version-2 in-progress marker with expected UUIDs, properties and vectors | verify the full stored records; delete a proven mismatch, preserve on unreadable/legacy metadata or backend read failure |
+| Extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete the abandoned workspace; recovery sidecars are stored outside it |
 
-The count comparison is required, not an optimisation. A marker that outlives a
-*successful* import — a failed unlink, a full disk — must never cost the user a
-complete collection.
+Recovery ownership is atomic and flushed before the destructive step. Original
+source bytes and ingest/retrieval configs are copied under the recovery collection
+name; evaluation JSON is copied to the operation's metadata snapshot directory
+without overwriting live session identity. An imported recovery also retains its
+manifest and collection config. The error detail includes `recovered_as` and
+`sidecar_snapshots`. A recovery record remains preserved even if its backend
+collection is later missing, since its sidecars may still be useful.
 
-Both sweeps MUST log what they removed and say that the package is still in
-`./exports` and can simply be imported again. Nothing here is unrecoverable:
-import never modifies or deletes the package it read.
+The owner can export the named recovery collection, inspect its metadata snapshots,
+and intentionally recover or discard it. Automatic startup cleanup never discards
+recovery data. For an intentional full discard in the API container, load the
+identified operation record and call `collection_recovery.discard(record,
+weaviate_client.get_client())`; this removes that recorded collection, its copied
+sidecars and ownership metadata. Do not discard a record until its data is no
+longer needed. Import never modifies or deletes the original package in `./exports`.
 
 ---
 
@@ -506,6 +523,14 @@ silently undone: the cache still holds the previous version and the next
 flagging pass writes it back over the file. Import hit exactly this — a restored
 session reverted to the orphaned state of the collection it replaced. Every
 writer MUST go through the service.
+
+### 7.4 Failed rebuilds
+
+Before deleting the original, tuning MUST verify the staged rebuild and durably
+retain its source/config/evaluation sidecars. Final-create, batch and verification
+failures MUST report the recovery collection and preserve it across restart,
+including chunks-only data. Cleanup may delete scratch while the original remains
+safe, or delete recovery only after final persisted-record verification succeeds.
 
 ---
 
@@ -615,7 +640,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E12 | Import refuses `EMBEDDING_MISMATCH` when the target uses a different embedding model |
 | E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
-| E15 | An import that fails part-way leaves no partial or temporary collection |
+| E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
 | E16 | Re-chunking marks the collection's gold-standard sessions `stale` |
 | E17 | Re-chunking a `chunks-only` collection fails `SOURCES_REQUIRED` |
 | E18 | `replace` reports the number of orphaned sessions |

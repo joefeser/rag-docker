@@ -31,6 +31,33 @@ the same code:
 These tests talk to the running API, the real Weaviate and the real model, and
 drive the UI in a real browser.
 
+## Batch faults and recovery across restart
+
+Run the controlled regressions with the API dependencies installed:
+
+```bash
+python -m unittest discover -s scripts/tests -p 'test_batch*.py'
+```
+
+For a **disposable stack**, the following fault acceptance uses real Weaviate,
+synthetic `VfyBatchRecovery*` collections and the real embedding model. It injects
+final-create failures into the test process, retains import/tuning recovery,
+restarts the API, then verifies exact UUIDs, properties, vectors and sources.
+It also checks real completed-batch rejection, owned scratch cleanup and retention
+of an unowned marker-like collection. It must not run against a user's data stack.
+
+```bash
+docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
+docker compose restart api
+# Wait for /api/health to report healthy before the next phase.
+docker compose exec -T api python - check < scripts/verify/batch_recovery.py
+docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
+```
+
+If interrupted, keep the recorded fixtures and run `check` after restarting; run
+`cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
+live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
+
 ## Layout
 
 | File | Covers |
@@ -42,7 +69,7 @@ drive the UI in a real browser.
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, destructive replace fidelity, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 

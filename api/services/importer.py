@@ -16,7 +16,7 @@ depending on whether there is anything to protect:
 * `replace` builds into a temporary collection first, to prove the package
   inserts cleanly, and only then deletes the existing collection and builds the
   real one. That costs a second insert pass, which is the price of a
-  non-destructive replace in a database that cannot rename. If the second pass
+  staged replace with a recoverable failure path in a database that cannot rename. If the second pass
   fails, the temporary collection is *kept* and named in the error, so the data
   is recoverable rather than lost.
 """
@@ -39,6 +39,7 @@ from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
@@ -76,12 +77,14 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str) -> None:
-    _marker_path(collection).write_text(json.dumps({
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records: list[dict]) -> None:
+    collection_recovery.atomic_json(_marker_path(collection), {
+        "version": 2,
         "collection": collection,
         "expected_chunks": expected_chunks,
         "job_id": job_id,
-    }, indent=2))
+        "records": records,
+    })
 
 
 def _mark_finished(collection: str) -> None:
@@ -117,26 +120,36 @@ def sweep_stale_workdirs() -> list[str]:
 def sweep_interrupted_imports() -> list[str]:
     """Remove collections left half-built by a killed import.
 
-    The expected chunk count is compared rather than trusting the marker alone:
-    a marker that outlived a *successful* import — a failed unlink, a disk
-    error — must not cost the user a complete collection.
+    Compare the expected identities, properties and vectors, not just count.
+    Unreadable or legacy ownership cannot authorize destructive cleanup.
     """
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
         try:
             data = json.loads(marker.read_text())
             collection = data["collection"]
-            expected = int(data.get("expected_chunks", -1))
-        except (OSError, ValueError, KeyError):
-            marker.unlink(missing_ok=True)
+            expected = data["expected_chunks"]
+            records = data["records"]
+            if (data.get("version") != 2 or not _NAME_OK.fullmatch(collection)
+                    or collection != canonical(collection)
+                    or not isinstance(expected, int) or isinstance(expected, bool) or expected < 0
+                    or marker.name != f"{collection}.json" or marker.is_symlink()
+                    or not isinstance(records, list) or len(records) != expected
+                    or any(not isinstance(record.get("properties"), dict)
+                           or not batch_write._valid_vector(record.get("vector")) for record in records)
+                    or len({str(uuid.UUID(record["id"])) for record in records}) != expected):
+                raise ValueError("Invalid import ownership")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            _log.exception("Unreadable or legacy import marker %s; preserved", marker)
             continue
         try:
             if wc._collection_exists_sync(collection):
                 col = wc.get_client().collections.get(collection)
-                actual = col.aggregate.over_all(total_count=True).total_count or 0
-                if expected < 0 or actual != expected:
+                try:
+                    batch_write.verify(col, records, exact=True)
+                except batch_write.BatchVerificationError:
                     wc.get_client().collections.delete(collection)
-                    removed.append(f"{collection} ({actual} of {expected} chunks)")
+                    removed.append(f"{collection} (persisted records did not match import)")
         except Exception:                             # noqa: BLE001
             _log.exception("Could not resolve interrupted import of %r", collection)
             continue
@@ -292,8 +305,19 @@ def _create_from_package(name: str, pkg: Path) -> None:
     )
 
 
-def _insert_chunks(name: str, pkg: Path, manifest: dict,
-                   progress) -> int:
+def _package_records(pkg: Path, manifest: dict) -> list[dict]:
+    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
+    records = list(packager.iter_chunks_file(pkg))
+    for record in records:
+        vector = record.get("vector")
+        if not batch_write._valid_vector(vector):
+            raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has no valid vector.")
+        if expected_dims and len(vector) != expected_dims:
+            raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has the wrong vector width.")
+    return records
+
+
+def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     """Insert every chunk with its original uuid and vector.
 
     The uuid is preserved deliberately: gold-standard sessions reference chunks
@@ -301,32 +325,11 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict,
     """
     client = wc.get_client()
     col = client.collections.get(name)
-    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
-    written = 0
-    with col.batch.dynamic() as batch:
-        for record in packager.iter_chunks_file(pkg):
-            vector = record.get("vector")
-            if not isinstance(vector, list) or not vector:
-                raise PackageError("PACKAGE_CORRUPT",
-                                   f"Chunk {record.get('id')} has no vector.",
-                                   {"file": "chunks.jsonl", "id": record.get("id")})
-            if expected_dims and len(vector) != expected_dims:
-                raise PackageError(
-                    "PACKAGE_CORRUPT",
-                    f"Chunk {record.get('id')} has {len(vector)} dimensions but the "
-                    f"manifest declares {expected_dims}.",
-                    {"file": "chunks.jsonl", "id": record.get("id")})
-            batch.add_object(properties=record["properties"],
-                             uuid=record["id"],
-                             vector=vector)
-            written += 1
-            if progress and written % 500 == 0:
-                progress(written)
-        if batch.number_errors > 0:
-            raise PackageError(
-                "PACKAGE_CORRUPT",
-                f"Weaviate rejected {batch.number_errors} object(s) while importing.",
-                {"errors": batch.number_errors})
+    try:
+        written = batch_write.insert(col, _package_records(pkg, manifest),
+                                     expected_count=manifest["collection"]["chunk_count"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
     if progress:
         progress(written)
     return written
@@ -416,6 +419,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     # _build deletes its own collection on failure, so temp_collection being
     # set is not by itself evidence that anything survived to recover.
     staged = False
+    ownership: dict | None = None
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -453,12 +457,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         if exists and on_conflict == "replace":
             # Prove the package inserts cleanly before destroying anything.
-            temp_collection = f"{canonical(original)}__importing_{id8}"
-            if wc._collection_exists_sync(temp_collection):
-                wc.get_client().collections.delete(temp_collection)
+            ownership = collection_recovery.begin(target, "import", wc.get_client())
+            temp_collection = ownership["staging"]
             _build(temp_collection, pkg, manifest, progress)
-            staged = True
             job["chunks_written"] = 0
+            collection_recovery.retain(ownership, package=pkg)
+            staged = True
             # Counted before the delete, because the delete is what orphans them.
             orphaned = len(goldstandard.sessions_for(target))
             wc._delete_collection_sync(target)   # also drops its sources + config
@@ -471,7 +475,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     "collection were kept and marked orphaned")
 
         expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id)
+        _mark_started(target, expected, job_id, _package_records(pkg, manifest))
         marked = target
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
@@ -480,7 +484,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         if staged and temp_collection:
             try:
-                wc.get_client().collections.delete(temp_collection)
+                collection_recovery.discard(ownership, wc.get_client())
             except Exception:                         # noqa: BLE001
                 _log.exception("Could not remove staging collection %r", temp_collection)
             staged = False
@@ -497,7 +501,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # staging collection means the data is recoverable, not lost.
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection}
+            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -505,13 +510,19 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {"recovered_as": temp_collection}
+            job["error_detail"] = {"recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
         # behind, which is the case the startup sweep exists for.
         if marked:
             _mark_finished(marked)
+        if ownership and ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, wc.get_client())
+            except Exception:
+                _log.exception("Could not remove owned scratch collection %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
         with _lock:
             _active.discard(filename)
