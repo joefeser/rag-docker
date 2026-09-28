@@ -65,6 +65,8 @@ def load_sessions_from_disk() -> None:
     with _identity_lock:
         for p in _sessions_dir().glob("*.json"):
             try:
+                if p.is_symlink() or not p.is_file():
+                    continue
                 data = json.loads(p.read_text())
                 _sessions[data["session_id"]] = data
             except Exception:
@@ -79,6 +81,8 @@ def sessions_for(collection: str) -> list[dict]:
         # A session written by an import may not be in memory yet.
         for path in _sessions_dir().glob("*.json"):
             try:
+                if path.is_symlink() or not path.is_file():
+                    continue
                 data = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue

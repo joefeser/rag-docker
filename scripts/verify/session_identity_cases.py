@@ -1,5 +1,5 @@
 """Owned import identity preservation; run by13_identity.sh in the API image."""
-import asyncio,copy,json,os,sys,tempfile,threading,unittest
+import asyncio,copy,json,os,subprocess,sys,tempfile,threading,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,6 +67,14 @@ class IdentityTests(unittest.TestCase):
         saved=gs.store_imported_session(fixture(),'OwnedOriginal')
         self.assertNotEqual(saved['session_id'],self.original['session_id']);self.assertTrue(self.path.is_symlink())
         self.assertEqual(foreign.read_bytes(),b'owned retained bytes')
+
+    def test_cache_readers_skip_symlinks_and_fifo_without_opening_them(self):
+        directory=gs._sessions_dir();os.mkfifo(directory/'gs_460aa001.json')
+        foreign=Path(self.tmp.name)/'owned-foreign.json';data=fixture();data['pairs'][0]['answer']='Foreign bytes'
+        foreign.write_text(json.dumps(data));(directory/'gs_460aa002.json').symlink_to(foreign)
+        code="from config import settings;from services import goldstandard as gs;import sys;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();assert len(gs.sessions_for('OwnedOriginal'))==1;assert gs.get_session('gs_460abcde')['pairs'][0]['answer']=='Original answer'"
+        subprocess.run([sys.executable,'-c',code,self.tmp.name],env={**os.environ,'PYTHONPATH':str(Path(gs.__file__).parents[1])},check=True,timeout=5,capture_output=True)
+        self.assertTrue((directory/'gs_460aa001.json').exists());self.assertTrue((directory/'gs_460aa002.json').is_symlink());self.assertEqual(json.loads(foreign.read_text())['pairs'][0]['answer'],'Foreign bytes')
 
     def test_free_valid_source_identity_is_retained_with_provenance(self):
         data=fixture();data['session_id']='gs_460abcdf';data['collection']='OwnedNew'

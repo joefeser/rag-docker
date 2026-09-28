@@ -2439,6 +2439,8 @@ def load_sessions_from_disk() -> None:
     with _identity_lock:
         for p in _sessions_dir().glob("*.json"):
             try:
+                if p.is_symlink() or not p.is_file():
+                    continue
                 data = json.loads(p.read_text())
                 _sessions[data["session_id"]] = data
             except Exception:
@@ -2453,6 +2455,8 @@ def sessions_for(collection: str) -> list[dict]:
         # A session written by an import may not be in memory yet.
         for path in _sessions_dir().glob("*.json"):
             try:
+                if path.is_symlink() or not path.is_file():
+                    continue
                 data = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
@@ -8255,7 +8259,7 @@ curl -s localhost:8080/api/collections | python3 -c \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
 
-`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes thirteen owned cache/disk/collision/redirected-slot/historical-ID/concurrent-insertion cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes fourteen owned cache/disk/collision/redirected-slot/historical-ID/concurrent-insertion cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 ````
 
 ### scripts/verify/all.sh
@@ -10217,7 +10221,7 @@ summary
 
 ```python
 """Owned import identity preservation; run by13_identity.sh in the API image."""
-import asyncio,copy,json,os,sys,tempfile,threading,unittest
+import asyncio,copy,json,os,subprocess,sys,tempfile,threading,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -10285,6 +10289,14 @@ class IdentityTests(unittest.TestCase):
         saved=gs.store_imported_session(fixture(),'OwnedOriginal')
         self.assertNotEqual(saved['session_id'],self.original['session_id']);self.assertTrue(self.path.is_symlink())
         self.assertEqual(foreign.read_bytes(),b'owned retained bytes')
+
+    def test_cache_readers_skip_symlinks_and_fifo_without_opening_them(self):
+        directory=gs._sessions_dir();os.mkfifo(directory/'gs_460aa001.json')
+        foreign=Path(self.tmp.name)/'owned-foreign.json';data=fixture();data['pairs'][0]['answer']='Foreign bytes'
+        foreign.write_text(json.dumps(data));(directory/'gs_460aa002.json').symlink_to(foreign)
+        code="from config import settings;from services import goldstandard as gs;import sys;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();assert len(gs.sessions_for('OwnedOriginal'))==1;assert gs.get_session('gs_460abcde')['pairs'][0]['answer']=='Original answer'"
+        subprocess.run([sys.executable,'-c',code,self.tmp.name],env={**os.environ,'PYTHONPATH':str(Path(gs.__file__).parents[1])},check=True,timeout=5,capture_output=True)
+        self.assertTrue((directory/'gs_460aa001.json').exists());self.assertTrue((directory/'gs_460aa002.json').is_symlink());self.assertEqual(json.loads(foreign.read_text())['pairs'][0]['answer'],'Foreign bytes')
 
     def test_free_valid_source_identity_is_retained_with_provenance(self):
         data=fixture();data['session_id']='gs_460abcdf';data['collection']='OwnedNew'
