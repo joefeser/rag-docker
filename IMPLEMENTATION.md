@@ -615,22 +615,40 @@ settings = Settings()
 
 ```python
 from __future__ import annotations
-from typing import Any, Optional
-from pydantic import BaseModel, field_validator, model_validator
+from typing import Any, Optional, Annotated, Literal
+from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+
+
+def _numeric(value):
+    if isinstance(value, bool):
+        raise ValueError("A numeric setting cannot be a boolean")
+    return value
+
+
+IndexType = Literal["hnsw", "flat"]
+DistanceMetric = Literal["cosine", "dot", "l2-squared"]
+RetrievalMode = Literal["hnsw", "flat", "hybrid", "semantic"]
+ResponseFormat = Literal["end_user", "engineer"]
+ChunkingStrategy = Literal["fixed", "overlap", "language", "context_aware", "semantic"]
+PositiveSize = Annotated[int, BeforeValidator(_numeric), Field(ge=1)]
+NonnegativeSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0)]
+UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
+TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
+SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
 
 class HnswConfig(BaseModel):
-    efConstruction: int = 128
-    maxConnections: int = 64
-    ef: int = 64
+    efConstruction: Annotated[int, BeforeValidator(_numeric), Field(ge=64, le=512)] = 128
+    maxConnections: Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=128)] = 64
+    ef: SearchEf = 64
 
 
 class CreateCollectionRequest(BaseModel):
     name: str
-    index_type: str = "hnsw"
-    distance_metric: str = "cosine"
+    index_type: IndexType = "hnsw"
+    distance_metric: DistanceMetric = "cosine"
     hnsw_config: HnswConfig = HnswConfig()
 
 
@@ -669,11 +687,19 @@ class JobStatusResponse(BaseModel):
 
 
 class IngestConfig(BaseModel):
-    chunking_strategy: str = "overlap"
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    similarity_threshold: Optional[float] = None
-    min_chunk_size: int = 100
+    chunking_strategy: ChunkingStrategy = "overlap"
+    chunk_size: PositiveSize = 1000
+    chunk_overlap: NonnegativeSize = 200
+    similarity_threshold: Optional[UnitInterval] = None
+    min_chunk_size: NonnegativeSize = 100
+
+    @model_validator(mode="after")
+    def _relationships(self):
+        if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+        if self.chunking_strategy != "semantic" and self.min_chunk_size > self.chunk_size:
+            raise ValueError("min_chunk_size must not exceed chunk_size when size controls splitting")
+        return self
 
 
 class IngestConfigResponse(BaseModel):
@@ -690,43 +716,11 @@ class IngestConfigResponse(BaseModel):
 
 class SaveRetrievalConfigBody(BaseModel):
     collection: str
-    retrieval_mode: str = "hnsw"
-    top_k: int = 5
-    alpha: float = 0.75
-    ef: Optional[int] = None
-    response_format: str = "end_user"
-
-    @field_validator("retrieval_mode")
-    @classmethod
-    def _mode(cls, v: str) -> str:
-        # "semantic" routes to Weaviate near_text in rag_pipeline.run_query;
-        # it is offered on the Retrieval page, so the stored config must accept it.
-        allowed = ("hnsw", "flat", "hybrid", "semantic")
-        if v not in allowed:
-            raise ValueError(f"retrieval_mode must be one of {allowed}, got {v!r}")
-        return v
-
-    @field_validator("response_format")
-    @classmethod
-    def _fmt(cls, v: str) -> str:
-        allowed = ("end_user", "engineer")
-        if v not in allowed:
-            raise ValueError(f"response_format must be one of {allowed}, got {v!r}")
-        return v
-
-    @field_validator("top_k")
-    @classmethod
-    def _top_k(cls, v: int) -> int:
-        if not 1 <= v <= 50:
-            raise ValueError("top_k must be between 1 and 50")
-        return v
-
-    @field_validator("alpha")
-    @classmethod
-    def _alpha(cls, v: float) -> float:
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("alpha must be between 0 and 1")
-        return v
+    retrieval_mode: RetrievalMode = "hnsw"
+    top_k: TopK = 5
+    alpha: UnitInterval = 0.75
+    ef: Optional[SearchEf] = None
+    response_format: ResponseFormat = "end_user"
 
 
 class RetrievalConfigResponse(BaseModel):
@@ -835,18 +829,17 @@ CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semanti
 
 
 class _ChunkingFields(BaseModel):
-    chunking_strategy: Optional[str] = None
-    chunk_size: Optional[int] = None
-    chunk_overlap: Optional[int] = None
-    similarity_threshold: Optional[float] = None
-    min_chunk_size: Optional[int] = None
+    chunking_strategy: Optional[ChunkingStrategy] = None
+    chunk_size: Optional[PositiveSize] = None
+    chunk_overlap: Optional[NonnegativeSize] = None
+    similarity_threshold: Optional[UnitInterval] = None
+    min_chunk_size: Optional[NonnegativeSize] = None
 
-    @field_validator("chunking_strategy")
-    @classmethod
-    def _strategy(cls, v):
-        if v is not None and v not in CHUNKING_STRATEGIES:
-            raise ValueError(f"chunking_strategy must be one of {CHUNKING_STRATEGIES}, got {v!r}")
-        return v
+    @model_validator(mode="after")
+    def _relationships(self):
+        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                        if getattr(self, name) is not None})
+        return self
 
     def has_chunking(self) -> bool:
         return any(getattr(self, f) is not None for f in
@@ -876,23 +869,8 @@ class ReembedRequest(_ChunkingFields):
 
 class ReindexRequest(BaseModel):
     collection: str
-    index_type: Optional[str] = None
-    distance_metric: Optional[str] = None
-
-    @field_validator("index_type")
-    @classmethod
-    def _index(cls, v):
-        if v is not None and v not in ("hnsw", "flat"):
-            raise ValueError(f"index_type must be 'hnsw' or 'flat', got {v!r}")
-        return v
-
-    @field_validator("distance_metric")
-    @classmethod
-    def _distance(cls, v):
-        allowed = ("cosine", "dot", "l2-squared")
-        if v is not None and v not in allowed:
-            raise ValueError(f"distance_metric must be one of {allowed}, got {v!r}")
-        return v
+    index_type: Optional[IndexType] = None
+    distance_metric: Optional[DistanceMetric] = None
 
 
 class TuneStartResponse(BaseModel):
@@ -930,11 +908,11 @@ class TuneOptionsResponse(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     collection: str
-    retrieval_mode: str = "hnsw"
-    top_k: int = 5
-    alpha: float = 0.75
+    retrieval_mode: RetrievalMode = "hnsw"
+    top_k: TopK = 5
+    alpha: UnitInterval = 0.75
     include_citations: bool = False
-    response_format: str = "end_user"
+    response_format: ResponseFormat = "end_user"
 
 
 class Citation(BaseModel):
@@ -1423,6 +1401,7 @@ from weaviate.classes.config import Configure, Property, DataType, VectorDistanc
 from weaviate.classes.query import MetadataQuery
 
 from config import settings
+from models.schemas import CreateCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
@@ -1501,8 +1480,11 @@ def _create_collection_sync(
     distance_metric: str,
     hnsw_config: dict,
 ) -> None:
+    validated = CreateCollectionRequest(name=name, index_type=index_type,
+                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+    hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
-    dist = DISTANCE_MAP.get(distance_metric, VectorDistances.COSINE)
+    dist = DISTANCE_MAP[validated.distance_metric]
 
     if index_type == "flat":
         vector_index = Configure.VectorIndex.flat(distance_metric=dist)
@@ -1877,6 +1859,7 @@ async def check_health() -> dict:
 from __future__ import annotations
 import threading
 from typing import Any
+from models.schemas import IngestConfig
 
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
 
@@ -2003,6 +1986,12 @@ def chunk(
     min_chunk_size: int = 100,
     elements: list[Any] | None = None,
 ) -> list[str]:
+    config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                          chunk_overlap=chunk_overlap_size, similarity_threshold=similarity_threshold,
+                          min_chunk_size=min_chunk_size)
+    strategy, chunk_size, chunk_overlap_size = config.chunking_strategy, config.chunk_size, config.chunk_overlap
+    min_chunk_size = config.min_chunk_size
+    similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     if strategy == "fixed":
         return chunk_fixed(text, chunk_size, min_chunk_size)
     elif strategy == "overlap":
@@ -2011,12 +2000,12 @@ def chunk(
         return chunk_language(text, chunk_size, chunk_overlap_size, min_chunk_size)
     elif strategy == "context_aware":
         if elements is None:
-            return chunk_language(text, chunk_size, chunk_overlap_size, min_chunk_size)
+            return chunk_language(text, chunk_size, 0, min_chunk_size)
         return chunk_context_aware(elements, chunk_size, min_chunk_size)
     elif strategy == "semantic":
         return chunk_semantic(text, similarity_threshold, min_chunk_size)
     else:
-        return chunk_overlap(text, chunk_size, chunk_overlap_size, min_chunk_size)
+        raise ValueError(f"Unsupported chunking strategy: {strategy!r}")
 ```
 
 ### api/services/ingest_pipeline.py
@@ -2036,6 +2025,7 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
+from models.schemas import IngestConfig
 from services.chunker import chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
@@ -2166,6 +2156,12 @@ async def start_ingest_job(
     similarity_threshold: float,
     min_chunk_size: int,
 ) -> str:
+    config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                          chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                          min_chunk_size=min_chunk_size)
+    strategy, chunk_size, chunk_overlap, min_chunk_size = (
+        config.chunking_strategy, config.chunk_size, config.chunk_overlap, config.min_chunk_size)
+    similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     job_id = str(uuid.uuid4())[:8]
 
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
@@ -2265,6 +2261,7 @@ async def start_ingest_job(
 from __future__ import annotations
 import time
 
+from models.schemas import QueryRequest
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 
@@ -2312,6 +2309,11 @@ async def run_query(
     include_citations: bool,
     response_format: str,
 ) -> dict:
+    config = QueryRequest(question=question, collection=collection, retrieval_mode=retrieval_mode,
+                          top_k=top_k, alpha=alpha, include_citations=include_citations,
+                          response_format=response_format)
+    retrieval_mode, top_k, alpha, response_format = (
+        config.retrieval_mode, config.top_k, config.alpha, config.response_format)
     reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
     reformulated = reformulated.strip()
 
@@ -2321,7 +2323,7 @@ async def run_query(
         chunks = await wc.near_vector_query(collection, vector, top_k)
     elif retrieval_mode == "hybrid":
         chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
-    else:
+    elif retrieval_mode == "semantic":
         chunks = await wc.near_text_query(collection, reformulated, top_k)
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
@@ -4717,10 +4719,10 @@ import json
 import re
 from pathlib import Path
 from fastapi import APIRouter, Form, UploadFile, File
-from pydantic import BaseModel
+from pydantic import ValidationError
 
 from config import settings
-from models.schemas import IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadResponse, JobStatusResponse
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
@@ -4728,13 +4730,8 @@ from utils import api_error
 
 router = APIRouter(prefix="/ingest")
 
-class SaveIngestConfigBody(BaseModel):
+class SaveIngestConfigBody(IngestConfig):
     collection: str
-    chunking_strategy: str = "overlap"
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    similarity_threshold: float | None = None
-    min_chunk_size: int = 100
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -4747,6 +4744,13 @@ async def ingest_upload(
     min_chunk_size: int = Form(100),
     files: list[UploadFile] = File(...),
 ):
+    try:
+        IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                     chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                     min_chunk_size=min_chunk_size)
+    except ValidationError as exc:
+        return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
+                         detail={"errors": exc.errors(include_context=False, include_input=False)})
     if not await wc.collection_exists(collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
 
@@ -5798,6 +5802,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -5840,6 +5846,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(request, exc):
+    # Invalid settings can include non-finite JSON numbers. Echoing their raw
+    # values in a JSONResponse would raise a serialization error instead of 422.
+    errors = [{key: value for key, value in error.items() if key not in ("input", "ctx")}
+              for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 app.add_middleware(
     CORSMiddleware,
@@ -8100,6 +8115,7 @@ drive the UI in a real browser.
 |---|---|
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
+| `settings_validation.py` | standalone: `RAG_API=http://localhost:8080/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
@@ -10018,4 +10034,106 @@ echo
 echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
+```
+
+### scripts/verify/settings_validation.py
+
+```python
+"""Live HTTP settings acceptance on one disposable, uniquely named collection.
+
+RAG_API=http://127.0.0.1:18080/api python3 scripts/verify/settings_validation.py
+No query/model jobs are launched. Only this script's new collection is deleted.
+"""
+import json
+import os
+import uuid
+import urllib.error
+import urllib.request
+
+api = os.environ.get('RAG_API', 'http://localhost:8080/api').rstrip('/')
+collection = 'VfySettings' + uuid.uuid4().hex[:12]
+
+
+def request(path, body=None, method=None, raw=None, content_type='application/json'):
+    data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+    req = urllib.request.Request(api + path, data=data, method=method,
+                                 headers={'Content-Type': content_type})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as response:
+        return response.code, json.load(response)
+
+
+def expect(path, body, code):
+    status, result = request(path, body)
+    assert status == code, (path, status, result)
+    return result
+
+
+def names():
+    status, result = request('/collections')
+    assert status == 200, result
+    return {entry['name'] for entry in result['collections']}
+
+
+before = names()
+assert collection not in before
+expect('/collections', {'name': collection, 'index_type': 'invalid'}, 422)
+assert names() == before
+print('PASS invalid collection settings do not create a collection', flush=True)
+created = False
+try:
+    expect('/collections', {'name': collection}, 201)
+    created = True
+    print('PASS omitted collection settings preserve valid defaults', flush=True)
+
+    ingest = {'collection': collection, 'chunking_strategy': 'fixed', 'chunk_size': 150, 'min_chunk_size': 40}
+    retrieval = {'collection': collection, 'retrieval_mode': 'hybrid', 'top_k': 50, 'alpha': 1, 'ef': 512, 'response_format': 'engineer'}
+    expect('/ingest/config', ingest, 201)
+    expect('/retrieval/config', retrieval, 201)
+    _, saved_ingest = request('/ingest/config/' + collection)
+    _, saved_retrieval = request('/retrieval/config/' + collection)
+    assert saved_ingest['chunk_size'] == 150 and saved_ingest['chunk_overlap'] == 200
+    assert saved_retrieval['top_k'] == 50 and saved_retrieval['ef'] == 512
+    print('PASS valid saved settings round trip, including unused default overlap', flush=True)
+
+    for route, good, bad in (('/ingest/config', ingest, {'chunking_strategy': 'invalid'}),
+                             ('/ingest/config', ingest, {'chunk_size': 0}),
+                             ('/retrieval/config', retrieval, {'top_k': 0}),
+                             ('/retrieval/config', retrieval, {'alpha': 1.1})):
+        expect(route, {**good, **bad}, 422)
+    assert request('/ingest/config/' + collection)[1] == saved_ingest
+    assert request('/retrieval/config/' + collection)[1] == saved_retrieval
+    print('PASS rejected saved settings preserve prior configuration', flush=True)
+
+    for path, bad in (('/query', {'question': 'inert', 'retrieval_mode': 'invalid'}),
+                      ('/query', {'question': 'inert', 'response_format': 'invalid'}),
+                      ('/query', {'question': 'inert', 'top_k': True}),
+                      ('/tune/rechunk', {'chunk_overlap': 1000}),
+                      ('/tune/reembed', {'chunk_size': 0}),
+                      ('/tune/reindex', {'distance_metric': 'invalid'})):
+        expect(path, {'collection': collection, **bad}, 422)
+    print('PASS invalid query and tuning settings return 422', flush=True)
+
+    raw = ('{"collection":"' + collection + '","question":"inert","alpha":NaN}').encode()
+    assert request('/query', raw=raw)[0] == 422
+    print('PASS non-finite input has a serializable 422 response', flush=True)
+
+    boundary = 'ReviewSettingsBoundary'
+    form = (f'--{boundary}\r\nContent-Disposition: form-data; name="collection"\r\n\r\n{collection}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="chunk_size"\r\n\r\n0\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="inert.txt"\r\n'
+            f'Content-Type: text/plain\r\n\r\nInert review text.\r\n--{boundary}--\r\n').encode()
+    assert request('/ingest/upload', raw=form, content_type='multipart/form-data; boundary=' + boundary)[0] == 422
+    status, current = request('/collections')
+    assert status == 200
+    assert next(c for c in current['collections'] if c['name'] == collection)['object_count'] == 0
+    print('PASS invalid multipart settings leave the collection empty', flush=True)
+finally:
+    if created:
+        status, result = request('/collections/' + collection + '?confirm=true', method='DELETE')
+        assert status == 200, result
+assert collection not in names()
+print('PASS owned disposable collection removed', flush=True)
 ```

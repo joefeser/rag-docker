@@ -8,6 +8,7 @@ from weaviate.classes.config import Configure, Property, DataType, VectorDistanc
 from weaviate.classes.query import MetadataQuery
 
 from config import settings
+from models.schemas import CreateCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
@@ -86,8 +87,11 @@ def _create_collection_sync(
     distance_metric: str,
     hnsw_config: dict,
 ) -> None:
+    validated = CreateCollectionRequest(name=name, index_type=index_type,
+                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+    hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
-    dist = DISTANCE_MAP.get(distance_metric, VectorDistances.COSINE)
+    dist = DISTANCE_MAP[validated.distance_metric]
 
     if index_type == "flat":
         vector_index = Configure.VectorIndex.flat(distance_metric=dist)

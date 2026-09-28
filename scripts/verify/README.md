@@ -37,6 +37,7 @@ drive the UI in a real browser.
 |---|---|
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
+| `settings_validation.py` | standalone: `RAG_API=http://localhost:8080/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |

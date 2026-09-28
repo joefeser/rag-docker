@@ -1,6 +1,7 @@
 from __future__ import annotations
 import threading
 from typing import Any
+from models.schemas import IngestConfig
 
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
 
@@ -127,6 +128,12 @@ def chunk(
     min_chunk_size: int = 100,
     elements: list[Any] | None = None,
 ) -> list[str]:
+    config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                          chunk_overlap=chunk_overlap_size, similarity_threshold=similarity_threshold,
+                          min_chunk_size=min_chunk_size)
+    strategy, chunk_size, chunk_overlap_size = config.chunking_strategy, config.chunk_size, config.chunk_overlap
+    min_chunk_size = config.min_chunk_size
+    similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     if strategy == "fixed":
         return chunk_fixed(text, chunk_size, min_chunk_size)
     elif strategy == "overlap":
@@ -135,9 +142,9 @@ def chunk(
         return chunk_language(text, chunk_size, chunk_overlap_size, min_chunk_size)
     elif strategy == "context_aware":
         if elements is None:
-            return chunk_language(text, chunk_size, chunk_overlap_size, min_chunk_size)
+            return chunk_language(text, chunk_size, 0, min_chunk_size)
         return chunk_context_aware(elements, chunk_size, min_chunk_size)
     elif strategy == "semantic":
         return chunk_semantic(text, similarity_threshold, min_chunk_size)
     else:
-        return chunk_overlap(text, chunk_size, chunk_overlap_size, min_chunk_size)
+        raise ValueError(f"Unsupported chunking strategy: {strategy!r}")
