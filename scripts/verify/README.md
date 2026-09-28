@@ -77,17 +77,6 @@ Two rules the hard way:
   passed vacuously — asserting on a selector that matched nothing, or comparing
   a count to itself.
 
-## Cleaning up
-
-Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
-the end. If a run is interrupted:
-
-```bash
-curl -s localhost:8080/api/collections | python3 -c \
-  "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
-  | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
-```
-
 ## Bundled-model integrity
 
 On a disposable stack with its embedding model already pulled, run:
@@ -107,4 +96,15 @@ containment, interrupted publication and concurrent blob publication:
 
 ```bash
 python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
+```
+
+## Cleaning up
+
+Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
+the end. If a run is interrupted:
+
+```bash
+curl -s localhost:8080/api/collections | python3 -c \
+  "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
+  | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
