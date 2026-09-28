@@ -9652,7 +9652,8 @@ with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.ob
         assert response.status_code==201,response.text
         creation_attempted=True
         fault_id='gs_'+uuid.uuid4().hex[:8]
-        gs.store_session({**session,'session_id':fault_id})
+        gs.store_session({'session_id':fault_id,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':copy.deepcopy(pairs)})
+        assert not client.get('/goldstandard/session/'+fault_id).json()['stale']
         real_create=wc._create_collection_sync
         def fail_final_create(name,*args,**kwargs):
             if name==collection:
@@ -9681,6 +9682,11 @@ with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.ob
         if creation_attempted and wc._collection_exists_sync(collection):
             response=client.delete('/collections/'+collection+'?confirm=true')
             assert response.status_code==200,response.text
+        # Recovery-enabled source combinations may retain a verified stage.
+        # Only this helper's unique collection prefix authorizes its cleanup.
+        for name in wc.get_client().collections.list_all(simple=True):
+            if name.startswith(collection+'__'):
+                wc.get_client().collections.delete(name)
         gs._sessions.pop(session_id,None)
         if 'empty_id' in locals():gs._sessions.pop(empty_id,None)
         if 'fault_id' in locals():gs._sessions.pop(fault_id,None)
