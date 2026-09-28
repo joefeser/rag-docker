@@ -1833,8 +1833,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 `pairs_failed`. Failures whose exception carried an empty string were recorded as
 `''`; the type name is now always included.
 
-- [ ] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
-      *Registered `14_reindex.sh` controls deferred batch errors, readback mismatches, observed source changes and post-cutover validity; live backend acceptance pending.*
+- [x] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
+      *Registered `14_reindex.sh`: twelve controlled cases, two bounded polling cases and nine real backend/ASGI checks pass (2 shell groups, 0 failures). The real embedding probe is refused; supplied UUIDs/properties/vectors and retained session bytes remain exact while physical HNSW/cosine changes to flat/dot.*
 
 ### 10.4 Web UI
 
