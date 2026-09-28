@@ -10239,4 +10239,3 @@ echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
 ```
-
