@@ -181,6 +181,30 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── owned session-recovery diagnostic HTTP fixtures ───────────────────────
+  r.section('session recovery diagnostics');
+  for (const failure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/goldstandard/diagnostics') {
+        return request.respond({ status: failure ? 503 : 200, contentType: 'application/json', body: JSON.stringify(failure ? { error: { message: 'Synthetic diagnostic read failure' } } : { issues: [{ filename: 'gs_ownedfixture.json', code: 'SESSION_READ_FAILED', message: 'Owned unreadable snapshot preserved.' }] }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'networkidle2' }); await sleep(500);
+      const text = await bodyText(s.page);
+      if (failure) {
+        r.check('diagnostic refresh failure is visible', /Session recovery diagnostics could not be refreshed/.test(text));
+      } else {
+        r.check('retained-session recovery warning is visible on Health', /Evaluation session recovery needs attention/.test(text));
+        r.check('recovery warning exposes filename, code and preservation message', /gs_ownedfixture.json/.test(text) && /SESSION_READ_FAILED/.test(text) && /Owned unreadable snapshot preserved/.test(text));
+      }
+      r.check('diagnostic ' + (failure ? 'failure' : 'warning') + ' does not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── transfer help page ─────────────────────────────────────────────────────
   r.section('transfer help page');
   {

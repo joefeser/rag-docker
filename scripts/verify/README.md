@@ -59,6 +59,8 @@ drive the UI in a real browser.
 
 ## Writing a check
 
+`12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. Controlled regressions additionally hard-kill an owned writer at the replace boundary; native browser criteria verify recovery warnings and failed refresh using isolated HTTP responses.
+
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
 ```bash

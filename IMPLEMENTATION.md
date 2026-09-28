@@ -2362,6 +2362,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import copy
+import os
+import tempfile
+import threading
 
 import httpx
 import re
@@ -2398,11 +2402,16 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
+_state_lock = threading.RLock()
+_diagnostics: dict[str, dict] = {}
 
 
 def _sessions_dir() -> Path:
     p = Path(settings.upload_dir) / "goldstandard_sessions"
+    created = not p.exists()
     p.mkdir(parents=True, exist_ok=True)
+    if created:
+        _sync_directory(p.parent)
     return p
 
 
@@ -2410,85 +2419,153 @@ def _session_path(session_id: str) -> Path:
     return _sessions_dir() / f"{session_id}.json"
 
 
+def _record_issue(path: Path, code: str) -> None:
+    changed = _diagnostics.get(str(path), {}).get("code") != code
+    messages = {
+        "SESSION_READ_FAILED": "Session file could not be loaded. Original bytes are preserved; restore a valid copy and restart the API.",
+        "SESSION_INTERRUPTED_WRITE": "An interrupted write left an unpublished temporary snapshot. The final JSON file remains authoritative; inspect the temporary file before removing it.",
+        "SESSION_WRITE_FAILED": "Update failed before replacement; the previous snapshot remains authoritative. Check local storage before retrying.",
+        "SESSION_DURABILITY_UNCERTAIN": "Replacement occurred but directory durability could not be confirmed. Refresh the session and inspect local storage before retrying.",
+    }
+    _diagnostics[str(path)] = {"filename": path.name, "code": code, "message": messages[code]}
+    if changed:
+        log.error("Session persistence issue %s for %s", code, path.name)
+
+
+def _sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _save_session_sync(session: dict) -> None:
-    _session_path(session["session_id"]).write_text(json.dumps(session, indent=2))
+    """Publish one immutable snapshot under the single-process writer lock.
+
+    Before replace, errors leave both the prior disk snapshot and cache intact.
+    After replace, cache reflects disk even if directory fsync reports an
+    uncertain durability outcome. Neither failure is acknowledged as success.
+    """
+    with _state_lock:
+        snapshot = copy.deepcopy(session)
+        try:
+            path = _session_path(snapshot["session_id"])
+        except OSError as exc:
+            _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (str(snapshot["session_id"]) + ".json"), "SESSION_WRITE_FAILED")
+            raise GoldStandardError("SESSION_WRITE_FAILED", "Session directory could not be prepared. The previous snapshot is unchanged.", 503) from exc
+        temporary = None
+        replaced = False
+        try:
+            payload = json.dumps(snapshot, indent=2, allow_nan=False)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                    prefix="." + path.stem + "-", suffix=".tmp", delete=False) as output:
+                temporary = Path(output.name)
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            replaced = True
+            _sessions[snapshot["session_id"]] = snapshot
+            _sync_directory(path.parent)
+            _diagnostics.pop(str(path), None)
+        except (OSError, ValueError, TypeError) as exc:
+            code = "SESSION_DURABILITY_UNCERTAIN" if replaced else "SESSION_WRITE_FAILED"
+            _record_issue(path, code)
+            message = ("Session replacement occurred but durability could not be confirmed. Refresh the session and inspect diagnostics before retrying."
+                       if replaced else "Session update could not be persisted. The previous snapshot is unchanged.")
+            raise GoldStandardError(code, message, 503) from exc
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    log.exception("Could not remove owned session temporary file %s", temporary.name)
 
 
 async def _save_session(session: dict) -> None:
-    await asyncio.to_thread(_save_session_sync, session)
+    await asyncio.to_thread(store_session, session)
 
 
-def load_sessions_from_disk() -> None:
-    for p in _sessions_dir().glob("*.json"):
-        try:
-            data = json.loads(p.read_text())
-            _sessions[data["session_id"]] = data
-        except Exception:
-            pass
-
-
-def sessions_for(collection: str) -> list[dict]:
-    """Every session generated against a collection, in-memory and on disk."""
-    found = {sid: sess for sid, sess in _sessions.items()
-             if sess.get("collection") == collection}
-    # A session written by an import may not be in memory yet.
+def _scan_sessions_locked() -> None:
+    for temporary in _sessions_dir().glob(".gs_????????-*.tmp"):
+        _record_issue(temporary, "SESSION_INTERRUPTED_WRITE")
     for path in _sessions_dir().glob("*.json"):
         try:
             data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if data.get("collection") == collection and data["session_id"] not in found:
-            found[data["session_id"]] = data
-            _sessions[data["session_id"]] = data
-    return list(found.values())
+            if not isinstance(data, dict) or data.get("session_id") != path.stem or not isinstance(data.get("pairs"), list) or not all(isinstance(pair, dict) for pair in data["pairs"]):
+                raise ValueError("Invalid retained session structure")
+            from models.schemas import SessionResponse
+            SessionResponse.model_validate(data)
+            _sessions.setdefault(data["session_id"], data)
+            # Write failures remain visible until a successful write, even if
+            # the previous valid disk snapshot is readable.
+            if _diagnostics.get(str(path), {}).get("code") == "SESSION_READ_FAILED":
+                _diagnostics.pop(str(path), None)
+        except (OSError, ValueError, TypeError):
+            _record_issue(path, "SESSION_READ_FAILED")
+
+
+def load_sessions_from_disk() -> None:
+    with _state_lock:
+        _scan_sessions_locked()
+
+
+def session_diagnostics() -> list[dict]:
+    with _state_lock:
+        _scan_sessions_locked()
+        return copy.deepcopy([_diagnostics[key] for key in sorted(_diagnostics)])
+
+
+def sessions_for(collection: str) -> list[dict]:
+    with _state_lock:
+        _scan_sessions_locked()
+        return copy.deepcopy([session for session in _sessions.values()
+                              if session.get("collection") == collection])
 
 
 def store_session(session: dict) -> None:
-    """Write a session to disk *and* into the in-memory cache.
-
-    Anything outside this module that writes a session file directly will be
-    silently undone: the cache still holds the previous version, and the next
-    flagging pass writes that back over the file. Import learned this the hard
-    way — a restored session reverted to its pre-import orphaned state.
-    """
-    _sessions[session["session_id"]] = session
+    """Explicit whole-session storage; publishes cache only after replacement."""
     _save_session_sync(session)
 
 
-def _flag_sessions(collection: str, flag: str, reason: str) -> int:
-    """Mark every session for a collection, on disk and in memory.
+def _update_session_sync(session_id: str, change):
+    with _state_lock:
+        current = _sessions.get(session_id)
+        if current is None:
+            return None
+        snapshot = copy.deepcopy(current)
+        result = change(snapshot)
+        if snapshot != current:
+            _save_session_sync(snapshot)
+        return copy.deepcopy(result)
 
-    Sessions are never deleted and never remapped. A remap that guesses which
-    new chunk replaces an old one corrupts an evaluation baseline silently,
-    which is worse than an honest flag the user can act on.
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    marked = 0
-    for session in sessions_for(collection):
-        session[flag] = True
-        session[f"{flag}_reason"] = reason
-        session[f"{flag}_at"] = now
-        try:
-            _save_session_sync(session)
-        except OSError:
-            log.exception("Could not flag gold-standard session %s", session["session_id"])
-            continue
-        marked += 1
-    return marked
+
+def _flag_sessions(collection: str, flag: str, reason: str) -> int:
+    with _state_lock:
+        now = datetime.now(timezone.utc).isoformat()
+        marked = 0
+        for session in sessions_for(collection):
+            def change(current):
+                current[flag] = True
+                current[f"{flag}_reason"] = reason
+                current[f"{flag}_at"] = now
+            _update_session_sync(session["session_id"], change)
+            marked += 1
+        return marked
 
 
 def mark_stale(collection: str, reason: str) -> int:
-    """Chunk identity changed, so the pairs no longer describe what is stored."""
     return _flag_sessions(collection, "stale", reason)
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
-    """The collection is gone. Retained rather than deleted — see spec §8 rule 4."""
     return _flag_sessions(collection, "orphaned", reason)
 
 
 def get_session(session_id: str) -> dict | None:
-    return _sessions.get(session_id)
+    with _state_lock:
+        return copy.deepcopy(_sessions.get(session_id))
 
 
 def _parse_gs_json(text: str) -> dict:
@@ -2578,47 +2655,37 @@ async def _generate_pair(chunk: dict) -> dict:
 
 
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
-    session = _sessions[session_id]
     cancelled = False
     try:
         for chunk in chunks:
             try:
                 pair = await _generate_pair(chunk)
-                session["pairs"].append(pair)
-                session["pairs_completed"] += 1
-                await _save_session(session)
             except asyncio.CancelledError:
                 cancelled = True
                 raise
             except Exception as exc:
-                # Some of these carry an empty str(), which produced sessions
-                # whose only record of a lost pair was an empty string.
                 reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 log.warning("Gold-standard pair generation failed: %s", reason, exc_info=True)
-                session["pairs_failed"] = session.get("pairs_failed", 0) + 1
-                session.setdefault("errors", []).append(reason)
-                try:
-                    await _save_session(session)
-                except Exception:
-                    pass
-            finally:
-                if not cancelled:
-                    session["pairs_attempted"] = session.get("pairs_attempted", 0) + 1
+                def failed(current):
+                    current["pairs_failed"] = current.get("pairs_failed", 0) + 1
+                    current.setdefault("errors", []).append(reason)
+                    current["pairs_attempted"] = current.get("pairs_attempted", 0) + 1
+                await asyncio.to_thread(_update_session_sync, session_id, failed)
+            else:
+                def completed(current):
+                    current["pairs"].append(pair)
+                    current["pairs_completed"] += 1
+                    current["pairs_attempted"] = current.get("pairs_attempted", 0) + 1
+                await asyncio.to_thread(_update_session_sync, session_id, completed)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
-        if cancelled:
-            if session.get("status") == "generating":
-                session["status"] = "cancelled"
-                _save_session_sync(session)
-        else:
-            if session.get("status") == "generating":
-                if not session["pairs"] and session.get("errors"):
-                    session["status"] = "failed"
-                else:
-                    session["status"] = "completed"
-            try:
-                await _save_session(session)
-            except Exception:
-                _save_session_sync(session)
+        def finish(current):
+            if current.get("status") == "generating":
+                current["status"] = ("cancelled" if cancelled else
+                    "failed" if not current["pairs"] and current.get("errors") else "completed")
+        await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
 async def start_generation(
@@ -2643,7 +2710,6 @@ async def start_generation(
         "pairs_failed": 0,
         "pairs": [],
     }
-    _sessions[session_id] = session
     await _save_session(session)
 
     task = asyncio.create_task(_run_generation(session_id, all_chunks))
@@ -2653,11 +2719,14 @@ async def start_generation(
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            s = _sessions.get(session_id)
-            if s and s.get("status") == "generating":
-                s["status"] = "failed"
-                s.setdefault("errors", []).append(str(exc))
-                _save_session_sync(s)
+            def failed(current):
+                current["status"] = "failed"
+                current.setdefault("errors", []).append(type(exc).__name__)
+            try:
+                _update_session_sync(session_id, failed)
+            except GoldStandardError:
+                log.exception("Could not durably report failed generation for %s", session_id)
+
 
     task.add_done_callback(_on_task_done)
 
@@ -2670,19 +2739,17 @@ async def start_generation(
 
 
 async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | None:
-    session = _sessions.get(session_id)
-    if session is None:
+    def change(current):
+        for pair in current["pairs"]:
+            if pair["pair_id"] == pair_id:
+                pair.update({key: value for key, value in updates.items() if value is not None})
+                return pair
         return None
-    for pair in session["pairs"]:
-        if pair["pair_id"] == pair_id:
-            pair.update({k: v for k, v in updates.items() if v is not None})
-            await _save_session(session)
-            return pair
-    return None
+    return await asyncio.to_thread(_update_session_sync, session_id, change)
 
 
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
-    session = _sessions.get(session_id)
+    session = get_session(session_id)
     if session is None:
         return None
     if session.get("status") == "generating":
@@ -2713,9 +2780,16 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
                     f"The model did not return a usable question/answer pair "
                     f"({reason}). The existing pair is unchanged; try again.", 502) from exc
             new_pair["pair_id"] = pair_id
-            session["pairs"][i] = new_pair
-            await _save_session(session)
-            return new_pair
+            def replace(current):
+                for position, existing in enumerate(current["pairs"]):
+                    if existing["pair_id"] == pair_id:
+                        if existing != pair or current.get("status") == "generating":
+                            raise GoldStandardError("PAIR_CHANGED_DURING_REGENERATION",
+                                "The pair changed while regeneration was running. Its acknowledged edits are preserved; refresh before retrying.", 409)
+                        current["pairs"][position] = new_pair
+                        return new_pair
+                return None
+            return await asyncio.to_thread(_update_session_sync, session_id, replace)
     return None
 
 
@@ -2724,7 +2798,7 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
 
 
 async def save_session(session_id: str, filename: str | None) -> dict | None:
-    session = _sessions.get(session_id)
+    session = get_session(session_id)
     if session is None:
         return None
 
@@ -5108,11 +5182,14 @@ async def generate(body: GenerateRequest):
     if not await wc.collection_exists(body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
-    result = await gs.start_generation(
-        collection=body.collection,
-        sample_size=body.sample_size,
-        seed=body.seed,
-    )
+    try:
+        result = await gs.start_generation(
+            collection=body.collection,
+            sample_size=body.sample_size,
+            seed=body.seed,
+        )
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     return GenerateResponse(**result)
 
 
@@ -5143,7 +5220,10 @@ async def get_session(session_id: str):
 @router.patch("/session/{session_id}/pair/{pair_id}", response_model=GoldPair)
 async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
     updates = body.model_dump(exclude_none=True)
-    pair = await gs.update_pair(session_id, pair_id, updates)
+    try:
+        pair = await gs.update_pair(session_id, pair_id, updates)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if pair is None:
         return api_error(404, "PAIR_NOT_FOUND", f"Pair '{pair_id}' not found in session '{session_id}'.")
     return GoldPair(**pair)
@@ -5181,6 +5261,12 @@ async def download(filename: str):
         media_type="application/json",
         filename=filename,
     )
+
+
+@router.get("/diagnostics")
+async def diagnostics():
+    import asyncio
+    return {"issues": await asyncio.to_thread(gs.session_diagnostics)}
 ```
 
 ### api/routers/metrics.py
@@ -6293,6 +6379,21 @@ export function useQueryConfig() {
 ```typescript
 const BASE = '/api'
 
+// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// It covers a whole request, so a multi-file upload counts every file. Kept
+// here only so the Import page can warn before sending; nginx enforces it.
+// Change both together.
+export const MAX_UPLOAD_MB = 512
+export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+// Errors the proxy answers itself, before the API sees the request. Those
+// arrive as nginx's HTML error pages, not the API's JSON error shape.
+const PROXY_ERRORS: Record<number, string> = {
+  413: `The upload is larger than the ${MAX_UPLOAD_MB} MB limit. Split it into smaller batches.`,
+  502: 'The API is not responding. It may still be starting; try again in a minute.',
+  504: 'The API took too long to respond.',
+}
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -6300,8 +6401,15 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
     headers,
     body: isFormData ? (body as FormData) : body !== undefined ? JSON.stringify(body) : undefined,
   })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data?.error?.message ?? `HTTP ${res.status}`)
+  // Read as text first: calling res.json() on an nginx error page threw a
+  // JSON syntax error, which is what the user saw instead of the real problem.
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
 }
 
@@ -6339,6 +6447,7 @@ export const api = {
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
 
   getMetrics: () => request<MetricsResult>('GET', '/metrics/latency'),
+  getSessionDiagnostics: () => request<{ issues: { filename: string; code: string; message: string }[] }>('GET', '/goldstandard/diagnostics'),
   getHealth: () => request<HealthResult>('GET', '/health'),
 }
 
@@ -7983,7 +8092,11 @@ export default function HealthPage() {
   const [health, setHealth] = useState<HealthResult | null>(null)
   const [metrics, setMetrics] = useState<MetricsResult | null>(null)
 
+  const [sessionIssues, setSessionIssues] = useState<{ filename: string; code: string; message: string }[]>([])
+  const [diagnosticError, setDiagnosticError] = useState(false)
+
   async function load() {
+    api.getSessionDiagnostics().then(result => { setSessionIssues(result.issues); setDiagnosticError(false) }).catch(() => setDiagnosticError(true))
     try {
       const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
       setHealth(h)
@@ -8006,6 +8119,11 @@ export default function HealthPage() {
   return (
     <div className="max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-6">Health Dashboard</h1>
+      {diagnosticError && <p role="alert" className="text-amber-700 mb-4">Session recovery diagnostics could not be refreshed.</p>}
+      {sessionIssues.length > 0 && <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
+        <h2 className="font-semibold">Evaluation session recovery needs attention</h2>
+        {sessionIssues.map(issue => <p key={issue.filename} className="text-sm mt-2">{issue.filename}: {issue.code} — {issue.message}</p>)}
+      </div>}
       {health && (
         <div className="grid grid-cols-3 gap-4 mb-8">
           <div className="bg-white border rounded p-4">
@@ -8121,6 +8239,8 @@ drive the UI in a real browser.
 | `RAG_NETWORK` | detected | compose network for the browser container |
 
 ## Writing a check
+
+`12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. Controlled regressions additionally hard-kill an owned writer at the replace boundary; native browser criteria verify recovery warnings and failed refresh using isolated HTTP responses.
 
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
@@ -8976,6 +9096,100 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/12_persistence.sh
+
+```bash
+#!/usr/bin/env bash
+# Durable session edits, generation interleaving and visible recovery diagnostics.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Durable evaluation session updates"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_persistence.py)
+check "concurrent HTTP edits, fresh-process reload, write failures and diagnostics" $?
+summary
+```
+
+### scripts/verify/session_persistence.py
+
+```python
+"""Owned real backend, concurrent HTTP edits and fresh-process filesystem reload.
+
+No startup sweep or model contact. Generated pairs are controlled, while the
+collection/sample reads, HTTP handlers and filesystem durability are real.
+"""
+import asyncio,copy,json,os,subprocess,sys,tempfile,uuid
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+from config import settings
+from main import app
+from services import goldstandard as gs,weaviate_client as wc
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Persistence'+uuid.uuid4().hex[:10]
+created=False
+with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as directory,patch.object(settings,'upload_dir',directory):
+    async def run():
+        global created
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+            created=True
+            response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
+            coll=wc.get_client().collections.get(collection)
+            for i in range(2):coll.data.insert(properties={'content':'Owned inert chunk'+str(i),'source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            print('PASS unique real collection and supplied-vector chunks created',flush=True)
+            pending=asyncio.Event();release=asyncio.Event();calls=0
+            async def generated(chunk):
+                nonlocal calls
+                calls+=1
+                if calls==2:pending.set();await release.wait()
+                return {'pair_id':'p_owned'+str(calls),'question':'Original question','answer':'Original answer','contexts':[chunk['content']],'ground_truth':'Original truth','source_file':'inert.txt','chunk_index':calls-1,'status':'pending'}
+            with patch.object(gs,'_generate_pair',side_effect=generated):
+                started=await client.post('/goldstandard/generate',json={'collection':collection,'sample_size':2});assert started.status_code==202,started.text
+                sid=started.json()['session_id'];await asyncio.wait_for(pending.wait(),10)
+                tasks=list(gs._tasks)
+                responses=await asyncio.gather(*[client.patch('/goldstandard/session/'+sid+'/pair/p_owned1',json={'status':'edited',key:value}) for key,value in [('question','Acknowledged question'),('answer','Acknowledged answer'),('ground_truth','Acknowledged truth')]])
+                assert all(response.status_code==200 for response in responses),[response.text for response in responses]
+                await asyncio.to_thread(gs.mark_stale,collection,'Owned concurrent history flag')
+                release.set();await asyncio.gather(*tasks)
+            response=await client.get('/goldstandard/session/'+sid);assert response.status_code==200,response.text
+            state=gs.get_session(sid);pair=state['pairs'][0]
+            assert (pair['question'],pair['answer'],pair['ground_truth'])==('Acknowledged question','Acknowledged answer','Acknowledged truth')
+            assert len(state['pairs'])==2 and state['stale'] and state['status']=='completed'
+            print('PASS concurrent acknowledged HTTP edits and generation/history interleaving retained',flush=True)
+            code="from config import settings;from services import goldstandard as gs;import sys,json;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();print(json.dumps(gs.get_session(sys.argv[2])))"
+            reloaded=subprocess.run([sys.executable,'-c',code,directory,sid],capture_output=True,text=True,check=True)
+            assert json.loads(reloaded.stdout)==state,reloaded.stdout
+            print('PASS fresh API process reload retains every acknowledged update and flag',flush=True)
+            before=copy.deepcopy(state)
+            with patch.object(gs.os,'replace',side_effect=OSError('Owned pre-replace fault')):
+                failed=await client.patch('/goldstandard/session/'+sid+'/pair/p_owned1',json={'status':'edited','answer':'Rejected edit'})
+            assert failed.status_code==503 and failed.json()['error']['code']=='SESSION_WRITE_FAILED',failed.text
+            assert gs.get_session(sid)==before
+            issues=await client.get('/goldstandard/diagnostics');assert issues.status_code==200 and issues.json()['issues'][0]['code']=='SESSION_WRITE_FAILED',issues.text
+            print('PASS failed HTTP write is not acknowledged and diagnostic names failed snapshot',flush=True)
+            pending=asyncio.Event();release=asyncio.Event()
+            async def regenerate(chunk):pending.set();await release.wait();return {**before['pairs'][0],'answer':'Generated overwrite'}
+            with patch.object(gs,'_generate_pair',side_effect=regenerate):
+                task=asyncio.create_task(client.post('/goldstandard/regenerate',json={'session_id':sid,'pair_id':'p_owned1'}));await asyncio.wait_for(pending.wait(),10)
+                edit=await client.patch('/goldstandard/session/'+sid+'/pair/p_owned1',json={'status':'edited','answer':'Latest acknowledged answer'});assert edit.status_code==200,edit.text
+                release.set();conflict=await task
+            assert conflict.status_code==409 and conflict.json()['error']['code']=='PAIR_CHANGED_DURING_REGENERATION',conflict.text
+            assert gs.get_session(sid)['pairs'][0]['answer']=='Latest acknowledged answer'
+            print('PASS in-flight regeneration rejects changed target instead of losing acknowledged edit',flush=True)
+            corrupt=gs._sessions_dir()/('gs_'+uuid.uuid4().hex[:8]+'.json');corrupt.write_bytes(b'{owned incomplete snapshot')
+            response=await client.get('/goldstandard/diagnostics')
+            assert any(issue['filename']==corrupt.name and issue['code']=='SESSION_READ_FAILED' for issue in response.json()['issues']),response.text
+            assert corrupt.read_bytes()==b'{owned incomplete snapshot'
+            print('PASS real unreadable file preserved and reported through diagnostic HTTP endpoint',flush=True)
+    try:asyncio.run(run())
+    finally:
+        if created and wc._collection_exists_sync(collection):wc._delete_collection_sync(collection)
+        for sid in [sid for sid,s in gs._sessions.items() if s.get('collection')==collection]:gs._sessions.pop(sid,None)
+        wc.close_client()
+assert not wc._collection_exists_sync(collection);wc.close_client()
+print('PASS owned collection/session/files removed',flush=True)
+```
+
 ### scripts/verify/04_goldstandard.sh
 
 ```bash
@@ -8989,6 +9203,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./12_persistence.sh
+check "durable session acceptance suite" $?
 C="${PREFIX}Gold"
 
 section "§10.3 Gold Standard"
@@ -9613,6 +9829,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── upload size limit ──────────────────────────────────────────────────────
+  // The Import page refuses a selection over the proxy's limit before sending.
+  // The file is sparse: it reports 513 MB but occupies no disk, and the check
+  // must stop it before the browser ever reads it. See issue #21.
+  r.section('upload size limit');
+  {
+    const fs = require('fs');
+    const big = '/tmp/vfy-oversize-upload.txt';
+    fs.closeSync(fs.openSync(big, 'w'));
+    fs.truncateSync(big, 513 * 1024 * 1024);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const hint = await bodyText(s.page);
+    r.check('the drop zone states the upload limit', hint.includes('up to 512 MB per upload'));
+    const input = await s.page.$('#file-input');
+    await input.uploadFile(big);
+    await sleep(500);
+    const posts = () => s.api.filter(x => x.method === 'POST' && x.url.includes('/ingest/upload')).length;
+    const before = posts();
+    const clicked = await clickByText(s.page, 'Start Ingest');
+    await sleep(900);
+    const text = await bodyText(s.page);
+    r.check('an oversize selection is refused with the limit named',
+            clicked && text.includes('one upload can be at most 512 MB'),
+            clicked ? text.slice(0, 160) : 'Start Ingest button not found');
+    r.check('an oversize selection sends no upload', posts() === before);
+    r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    fs.unlinkSync(big);
+    await s.ctx.close();
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {
@@ -9637,6 +9884,30 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the health page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── owned session-recovery diagnostic HTTP fixtures ───────────────────────
+  r.section('session recovery diagnostics');
+  for (const failure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/goldstandard/diagnostics') {
+        return request.respond({ status: failure ? 503 : 200, contentType: 'application/json', body: JSON.stringify(failure ? { error: { message: 'Synthetic diagnostic read failure' } } : { issues: [{ filename: 'gs_ownedfixture.json', code: 'SESSION_READ_FAILED', message: 'Owned unreadable snapshot preserved.' }] }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'networkidle2' }); await sleep(500);
+      const text = await bodyText(s.page);
+      if (failure) {
+        r.check('diagnostic refresh failure is visible', /Session recovery diagnostics could not be refreshed/.test(text));
+      } else {
+        r.check('retained-session recovery warning is visible on Health', /Evaluation session recovery needs attention/.test(text));
+        r.check('recovery warning exposes filename, code and preservation message', /gs_ownedfixture.json/.test(text) && /SESSION_READ_FAILED/.test(text) && /Owned unreadable snapshot preserved/.test(text));
+      }
+      r.check('diagnostic ' + (failure ? 'failure' : 'warning') + ' does not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
   }
 
   // ── transfer help page ─────────────────────────────────────────────────────

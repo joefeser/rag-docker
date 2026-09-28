@@ -6,7 +6,11 @@ export default function HealthPage() {
   const [health, setHealth] = useState<HealthResult | null>(null)
   const [metrics, setMetrics] = useState<MetricsResult | null>(null)
 
+  const [sessionIssues, setSessionIssues] = useState<{ filename: string; code: string; message: string }[]>([])
+  const [diagnosticError, setDiagnosticError] = useState(false)
+
   async function load() {
+    api.getSessionDiagnostics().then(result => { setSessionIssues(result.issues); setDiagnosticError(false) }).catch(() => setDiagnosticError(true))
     try {
       const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
       setHealth(h)
@@ -29,6 +33,11 @@ export default function HealthPage() {
   return (
     <div className="max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-6">Health Dashboard</h1>
+      {diagnosticError && <p role="alert" className="text-amber-700 mb-4">Session recovery diagnostics could not be refreshed.</p>}
+      {sessionIssues.length > 0 && <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
+        <h2 className="font-semibold">Evaluation session recovery needs attention</h2>
+        {sessionIssues.map(issue => <p key={issue.filename} className="text-sm mt-2">{issue.filename}: {issue.code} — {issue.message}</p>)}
+      </div>}
       {health && (
         <div className="grid grid-cols-3 gap-4 mb-8">
           <div className="bg-white border rounded p-4">

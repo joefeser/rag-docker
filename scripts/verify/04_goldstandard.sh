@@ -8,6 +8,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./12_persistence.sh
+check "durable session acceptance suite" $?
 C="${PREFIX}Gold"
 
 section "§10.3 Gold Standard"

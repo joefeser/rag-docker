@@ -68,6 +68,7 @@ export const api = {
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
 
   getMetrics: () => request<MetricsResult>('GET', '/metrics/latency'),
+  getSessionDiagnostics: () => request<{ issues: { filename: string; code: string; message: string }[] }>('GET', '/goldstandard/diagnostics'),
   getHealth: () => request<HealthResult>('GET', '/health'),
 }
 
