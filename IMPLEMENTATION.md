@@ -2422,6 +2422,7 @@ def _session_path(session_id: str) -> Path:
 def _record_issue(path: Path, code: str) -> None:
     changed = _diagnostics.get(str(path), {}).get("code") != code
     messages = {
+        "SESSION_STORAGE_UNAVAILABLE": "Session storage could not be inspected. Existing files are preserved; inspect local storage and restart after recovery.",
         "SESSION_READ_FAILED": "Session file could not be loaded. Original bytes are preserved; restore a valid copy and restart the API.",
         "SESSION_INTERRUPTED_WRITE": "An interrupted write left an unpublished temporary snapshot. The final JSON file remains authoritative; inspect the temporary file before removing it.",
         "SESSION_WRITE_FAILED": "Update failed before replacement; the previous snapshot remains authoritative. Check local storage before retrying.",
@@ -2488,9 +2489,20 @@ async def _save_session(session: dict) -> None:
 
 
 def _scan_sessions_locked() -> None:
-    for temporary in _sessions_dir().glob(".gs_????????-*.tmp"):
-        _record_issue(temporary, "SESSION_INTERRUPTED_WRITE")
-    for path in _sessions_dir().glob("*.json"):
+    try:
+        root = _sessions_dir()
+        with os.scandir(root) as entries:
+            paths = [Path(entry.path) for entry in entries]
+    except (OSError, ValueError, RuntimeError):
+        _record_issue(Path(settings.upload_dir) / "goldstandard_sessions", "SESSION_STORAGE_UNAVAILABLE")
+        return
+    _diagnostics.pop(str(root), None)
+    for temporary in paths:
+        if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", temporary.name):
+            _record_issue(temporary, "SESSION_INTERRUPTED_WRITE")
+    for path in paths:
+        if not path.name.endswith(".json"):
+            continue
         try:
             data = json.loads(path.read_text())
             if not isinstance(data, dict) or data.get("session_id") != path.stem or not isinstance(data.get("pairs"), list) or not all(isinstance(pair, dict) for pair in data["pairs"]):
@@ -2520,8 +2532,20 @@ def session_diagnostics() -> list[dict]:
 def sessions_for(collection: str) -> list[dict]:
     with _state_lock:
         _scan_sessions_locked()
-        return copy.deepcopy([session for session in _sessions.values()
-                              if session.get("collection") == collection])
+        found = []
+        for sid, session in _sessions.items():
+            if session.get("collection") != collection:
+                continue
+            try:
+                from models.schemas import SessionResponse
+                SessionResponse.model_validate(session)
+                if sid != session.get("session_id"):
+                    raise ValueError("Cached session key does not match identity")
+            except (ValueError, TypeError):
+                _record_issue(Path(str(sid) + ".json"), "SESSION_READ_FAILED")
+                continue
+            found.append(session)
+        return copy.deepcopy(found)
 
 
 def store_session(session: dict) -> None:

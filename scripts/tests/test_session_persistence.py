@@ -145,6 +145,14 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
         self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
 
+    def test_storage_scan_failure_reports_without_destroying_cached_state(self):
+        before=gs.get_session(self.data['session_id'])
+        with patch.object(gs.os,'scandir',side_effect=OSError('Owned storage read failure')):
+            gs.load_sessions_from_disk()
+            self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_STORAGE_UNAVAILABLE')
+        self.assertEqual(gs.get_session(self.data['session_id']),before)
+        self.assertEqual(gs.session_diagnostics(),[])
+
     def test_model_failure_and_cancellation_status_are_persisted(self):
         async def run():
             initial=fixture();initial.update(status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
