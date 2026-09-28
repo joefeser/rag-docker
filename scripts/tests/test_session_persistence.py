@@ -127,6 +127,24 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         finally:
             if child.poll() is None:child.kill();child.communicate(timeout=5)
 
+    def test_export_keeps_captured_snapshot_while_new_edit_commits(self):
+        initial=fixture();initial['pairs'][0]['status']='approved';gs.store_session(initial)
+        started=threading.Event();release=threading.Event();original=gs._save_export_sync
+        def delayed(path,rows):
+            started.set()
+            if not release.wait(5):raise AssertionError('Owned export was not released')
+            original(path,rows)
+        async def run():
+            with patch.object(gs,'_save_export_sync',side_effect=delayed):
+                task=asyncio.create_task(gs.save_session(initial['session_id'],'snapshot.json'))
+                self.assertTrue(await asyncio.to_thread(started.wait,5))
+                try:await gs.update_pair(initial['session_id'],'p_0',{'answer':'Later acknowledged edit'})
+                finally:release.set()
+                result=await task;self.assertEqual(result['pairs_saved'],1)
+        asyncio.run(run())
+        self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
+
     def test_model_failure_and_cancellation_status_are_persisted(self):
         async def run():
             initial=fixture();initial.update(status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
