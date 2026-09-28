@@ -381,8 +381,8 @@ Ignored overlap settings remain ignored for fixed/context-aware/semantic; the
 context-aware fallback uses language splitting with zero overlap.
 
 Invalid multipart settings return **422 `INVALID_SETTINGS` before collection
-lookup, upload staging or job creation**. Invalid JSON settings return 422 with
-field errors. Raw input/error-context values are omitted from validation replies
+lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
+sanitized field errors in `error.detail`. Raw input/error-context values are omitted from validation replies
 so non-finite input also produces a serializable 422. Defaults remain unchanged.
 
 **Response 202 (accepted, async):**
@@ -869,6 +869,7 @@ Standard error codes:
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
 | `INVALID_PARAMETER` | 422 | Request parameter out of range or invalid |
+| `INVALID_SETTINGS` | 422 | Multipart chunking settings invalid before ingest work |
 | `SESSION_NOT_FOUND` | 404 | Gold standard session ID not found |
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
@@ -1615,13 +1616,15 @@ page renders as one undifferentiated block.
 
 ## 8. Configuration Defaults and Constraints
 
+The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
+
 | Parameter | Default | Min | Max | Notes |
 |---|---|---|---|---|
-| `chunk_size` | 1000 | 200 | 16000 | In characters |
-| `chunk_overlap` | 200 | 0 | 2000 | In characters; a merge preference that can exceed the split target |
+| `chunk_size` | 1000 | 1 | Unbounded | Positive characters; UI slider uses 200–16000 |
+| `chunk_overlap` | 200 | 0 | Strategy-dependent | Repeated characters between adjacent chunks; must be less than `chunk_size` for overlap/language, ignored by other strategies |
 | `similarity_threshold` | 0.85 | 0.0 | 1.0 | Semantic chunking only |
-| `min_chunk_size` | 100 | 40 | 2000 | In characters; a merge preference that can exceed the split target |
-| `top_k` | 5 | 1 | 20 | |
+| `min_chunk_size` | 100 | 0 | Unbounded | Soft merge preference in characters; may exceed the split target; UI slider uses 40–2000 |
+| `top_k` | 5 | 1 | 50 | API bounds |
 | `alpha` | 0.75 | 0.0 | 1.0 | Hybrid mode only |
 | `ef` | 64 | 16 | 512 | HNSW query param |
 | `efConstruction` | 128 | 64 | 512 | HNSW build param |
@@ -1766,6 +1769,9 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
+- [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
+      *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
+
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the
@@ -1795,6 +1801,9 @@ now lives once, in `api/services/ingest_config.py`.
       A 513 MB sparse file gets 413.*
 
 ### 10.2 Query
+
+- [x] Invalid query enums, bounds and non-finite values return a serializable 422 before retrieval or model work.
+      *Controlled tests assert no backend/model calls; `07_settings.sh` exercises real HTTP errors. The full valid-query suite passes nine checks.*
 
 - [x] A question against an ingested collection returns a non-empty answer.
 - [x] All four retrieval modes return results without error.

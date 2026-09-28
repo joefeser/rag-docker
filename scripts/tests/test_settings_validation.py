@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, MagicMock, patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -86,7 +86,8 @@ class SettingsTests(unittest.TestCase):
                 body = '{"question":"synthetic","collection":"ReviewSettings","' + field + '":' + token + '}'
                 response = self.client.post(route, content=body, headers={'Content-Type': 'application/json'})
                 self.assertEqual(response.status_code, 422, response.text)
-                self.assertTrue(response.json().get('detail'))
+                self.assertTrue(response.json()['error']['detail'])
+                self.assertEqual(response.json()['error']['code'],'INVALID_PARAMETER')
                 self.exists.assert_not_called(); self.query_work.assert_not_called()
 
     def test_valid_defaults_and_boundary_settings(self):
@@ -125,6 +126,17 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(response.status_code,202,response.text)
         self.assertEqual(self.tune_job.call_args.args[2]['chunking']['strategy'],'fixed')
 
+    def test_exact_smallest_chunk_target_roundtrips_and_zero_is_rejected(self):
+        body={'collection':'ReviewSettings','chunking_strategy':'fixed','chunk_size':1,'min_chunk_size':0}
+        self.assertEqual(self.client.post('/ingest/config',json=body).status_code,201)
+        saved=self.client.get('/ingest/config/ReviewSettings').json()
+        self.assertEqual(saved['chunk_size'],1)
+        self.assertEqual(saved['min_chunk_size'],0)
+        response=self.client.post('/ingest/config',json={**body,'chunk_size':0})
+        self.assertEqual(response.status_code,422)
+        self.assertEqual(response.json()['error']['code'],'INVALID_PARAMETER')
+        self.assertEqual(self.client.get('/ingest/config/ReviewSettings').json(),saved)
+
     def test_saved_valid_ingest_and_retrieval_round_trips(self):
         ingest_body = {'collection': 'ReviewSettings', 'chunking_strategy': 'fixed', 'chunk_size': 150, 'min_chunk_size': 40}
         response = self.client.post('/ingest/config', json=ingest_body)
@@ -154,6 +166,50 @@ class InternalBoundaryTests(unittest.TestCase):
             with patch.object(wc, 'get_client') as client:
                 with self.assertRaises(ValidationError): wc._create_collection_sync('ReviewSettings', index, distance, config)
                 client.assert_not_called()
+
+    def test_stored_hnsw_settings_are_preserved_while_new_requests_remain_strict(self):
+        legacy={'efConstruction':1000,'maxConnections':256,'ef':-1}
+        with self.assertRaises(ValidationError):
+            CreateCollectionRequest(name='ReviewStored',hnsw_config=legacy)
+        client=MagicMock()
+        with patch.object(wc,'get_client',return_value=client), \
+             patch.object(wc.Configure.VectorIndex,'hnsw') as configure:
+            wc._create_collection_sync('ReviewStored','hnsw','cosine',legacy,preserve_hnsw=True)
+            self.assertEqual(configure.call_args.kwargs['ef_construction'],1000)
+            self.assertEqual(configure.call_args.kwargs['max_connections'],256)
+            self.assertEqual(configure.call_args.kwargs['ef'],-1)
+            client.collections.create.assert_called_once()
+        for index,distance,config in (('invalid','cosine',legacy),('hnsw','invalid',legacy),
+                ('hnsw','cosine',{'ef':0}),('hnsw','cosine',{'ef':False}),
+                ('hnsw','cosine',{'efConstruction':0}),('hnsw','cosine',{'maxConnections':-1})):
+            with patch.object(wc,'get_client') as backend:
+                with self.assertRaises(ValidationError):
+                    wc._create_collection_sync('ReviewStored',index,distance,config,preserve_hnsw=True)
+                backend.assert_not_called()
+
+    def test_package_creation_explicitly_preserves_stored_hnsw(self):
+        from services import importer
+        legacy={'efConstruction':1000,'maxConnections':256,'ef':-1}
+        with tempfile.TemporaryDirectory() as directory, patch.object(wc,'_create_collection_sync') as create:
+            pkg=Path(directory);(pkg/'collection.json').write_text(json.dumps({'hnsw_config':legacy}))
+            importer._create_from_package('ReviewStored',pkg)
+            create.assert_called_once_with('ReviewStored','hnsw','cosine',legacy,preserve_hnsw=True)
+
+    def test_rebuild_preserves_stored_hnsw_for_staging_and_replacement(self):
+        from services import tuning
+        legacy={'efConstruction':1000,'maxConnections':256,'ef':-1}
+        config={'index_type':'hnsw','distance_metric':'cosine','hnsw_config':legacy}
+        client=MagicMock();client.collections.get.return_value.iterator.return_value=[]
+        client.collections.get.return_value.batch.dynamic.return_value.__enter__.return_value.number_errors=0
+        with patch.object(wc,'_collection_config_sync',return_value=config), \
+             patch.object(wc,'get_client',return_value=client), \
+             patch.object(wc,'_create_collection_sync') as create, \
+             patch.object(wc,'_insert_chunks_sync'):
+            self.assertEqual(tuning._rebuild('ReviewStored',[],None,None,None),0)
+            self.assertEqual(create.call_count,2)
+            for call in create.call_args_list:
+                self.assertEqual(call.args[1:],('hnsw','cosine',legacy))
+                self.assertEqual(call.kwargs,{'preserve_hnsw':True})
 
     def test_chunker_rejects_before_semantic_model_or_splitter_work(self):
         for strategy, size, overlap in (('unknown',1000,200), ('semantic',0,200), ('overlap',1000,1000)):
@@ -187,7 +243,9 @@ class ImplementationTests(unittest.TestCase):
         names = ['api/models/schemas.py', 'api/main.py', 'api/routers/ingest.py',
                  'api/services/chunker.py', 'api/services/ingest_pipeline.py',
                  'api/services/rag_pipeline.py', 'api/services/weaviate_client.py',
-                 'scripts/verify/settings_validation.py', 'scripts/verify/05_transfer.sh']
+                 'scripts/verify/settings_validation.py', 'scripts/verify/05_transfer.sh',
+                 'api/services/tuning.py','api/services/importer.py',
+                 'scripts/verify/all.sh','scripts/verify/07_settings.sh']
         for name in names:
             with self.subTest(file=name):
                 language = 'bash' if name.endswith('.sh') else 'python'

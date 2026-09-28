@@ -72,6 +72,14 @@ try:
     assert status == 200 and minimum['chunk_size'] == 60 and minimum['min_chunk_size'] == 100
     print('PASS fixed minimum above split target saves and round trips', flush=True)
 
+    expect('/ingest/config', {'collection': collection, 'chunking_strategy':'fixed',
+                              'chunk_size':1, 'min_chunk_size':0}, 201)
+    status, smallest = request('/ingest/config/' + collection)
+    assert status == 200 and smallest['chunk_size'] == 1 and smallest['min_chunk_size'] == 0
+    expect('/ingest/config', {'collection':collection,'chunking_strategy':'fixed','chunk_size':0},422)
+    assert request('/ingest/config/' + collection)[1] == smallest
+    print('PASS smallest accepted chunk target and neighboring rejection preserve settings',flush=True)
+
     for path, bad in (('/query', {'question': 'inert', 'retrieval_mode': 'invalid'}),
                       ('/query', {'question': 'inert', 'response_format': 'invalid'}),
                       ('/query', {'question': 'inert', 'top_k': True}),

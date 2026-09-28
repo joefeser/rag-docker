@@ -36,6 +36,26 @@ class CreateCollectionRequest(BaseModel):
     hnsw_config: HnswConfig = HnswConfig()
 
 
+class StoredHnswConfig(BaseModel):
+    # Existing SDK/server settings may exceed the workbench's new-request UI
+    # ranges. Preserve them during import/rebuild without accepting booleans,
+    # zero/negative sizes or unsupported index/distance names.
+    efConstruction: PositiveSize = 128
+    maxConnections: PositiveSize = 64
+    ef: Annotated[int, BeforeValidator(_numeric), Field(ge=-1)] = 64
+
+    @field_validator("ef")
+    @classmethod
+    def _nonzero_ef(cls, value):
+        if value == 0:
+            raise ValueError("Stored ef must be -1 (dynamic) or positive")
+        return value
+
+
+class StoredCollectionRequest(CreateCollectionRequest):
+    hnsw_config: StoredHnswConfig = StoredHnswConfig()
+
+
 class CollectionInfo(BaseModel):
     name: str
     object_count: int

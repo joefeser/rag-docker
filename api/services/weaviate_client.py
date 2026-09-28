@@ -8,7 +8,7 @@ from weaviate.classes.config import Configure, Property, DataType, VectorDistanc
 from weaviate.classes.query import MetadataQuery
 
 from config import settings
-from models.schemas import CreateCollectionRequest
+from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
@@ -86,8 +86,11 @@ def _create_collection_sync(
     index_type: str,
     distance_metric: str,
     hnsw_config: dict,
+    *,
+    preserve_hnsw: bool = False,
 ) -> None:
-    validated = CreateCollectionRequest(name=name, index_type=index_type,
+    schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
+    validated = schema(name=name, index_type=index_type,
                                         distance_metric=distance_metric, hnsw_config=hnsw_config)
     hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()

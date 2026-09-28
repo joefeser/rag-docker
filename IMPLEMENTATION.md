@@ -652,6 +652,26 @@ class CreateCollectionRequest(BaseModel):
     hnsw_config: HnswConfig = HnswConfig()
 
 
+class StoredHnswConfig(BaseModel):
+    # Existing SDK/server settings may exceed the workbench's new-request UI
+    # ranges. Preserve them during import/rebuild without accepting booleans,
+    # zero/negative sizes or unsupported index/distance names.
+    efConstruction: PositiveSize = 128
+    maxConnections: PositiveSize = 64
+    ef: Annotated[int, BeforeValidator(_numeric), Field(ge=-1)] = 64
+
+    @field_validator("ef")
+    @classmethod
+    def _nonzero_ef(cls, value):
+        if value == 0:
+            raise ValueError("Stored ef must be -1 (dynamic) or positive")
+        return value
+
+
+class StoredCollectionRequest(CreateCollectionRequest):
+    hnsw_config: StoredHnswConfig = StoredHnswConfig()
+
+
 class CollectionInfo(BaseModel):
     name: str
     object_count: int
@@ -1399,7 +1419,7 @@ from weaviate.classes.config import Configure, Property, DataType, VectorDistanc
 from weaviate.classes.query import MetadataQuery
 
 from config import settings
-from models.schemas import CreateCollectionRequest
+from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
@@ -1477,8 +1497,11 @@ def _create_collection_sync(
     index_type: str,
     distance_metric: str,
     hnsw_config: dict,
+    *,
+    preserve_hnsw: bool = False,
 ) -> None:
-    validated = CreateCollectionRequest(name=name, index_type=index_type,
+    schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
+    validated = schema(name=name, index_type=index_type,
                                         distance_metric=distance_metric, hnsw_config=hnsw_config)
     hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
@@ -3747,6 +3770,7 @@ def _create_from_package(name: str, pkg: Path) -> None:
         cfg.get("index_type", "hnsw"),
         cfg.get("distance_metric", "cosine"),
         cfg.get("hnsw_config") or {},
+        preserve_hnsw=True,
     )
 
 
@@ -4297,7 +4321,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
 
     staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw)
+    wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
     try:
         wc._insert_chunks_sync(staging, properties)
         staged = [
@@ -4315,7 +4339,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         # Past this point the original is replaced. Everything that could fail
         # has already run against the staging collection.
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
         target = client.collections.get(collection)
         with target.batch.dynamic() as batch:
             for record in staged:
@@ -5809,7 +5833,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from utils import api_error
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -5860,7 +5884,7 @@ async def request_validation_error(request, exc):
     # values in a JSONResponse would raise a serialization error instead of 422.
     errors = [{key: value for key, value in error.items() if key not in ("input", "ctx")}
               for error in exc.errors()]
-    return JSONResponse(status_code=422, content={"detail": errors})
+    return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
 app.add_middleware(
     CORSMiddleware,
@@ -8121,6 +8145,7 @@ drive the UI in a real browser.
 |---|---|
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
+| `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
 | `settings_validation.py` | standalone: `RAG_API=http://localhost:8080/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
@@ -8209,7 +8234,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -10043,6 +10068,20 @@ echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
 ```
 
+### scripts/verify/07_settings.sh
+
+```bash
+#!/usr/bin/env bash
+# Settings validation through the running API; the helper owns its collection.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Settings validation before work"
+RAG_API="$API" python3 ./settings_validation.py
+check "live settings validation and owned-fixture cleanup" $?
+summary
+```
+
 ### scripts/verify/settings_validation.py
 
 ```python
@@ -10119,6 +10158,14 @@ try:
     status, minimum = request('/ingest/config/' + collection)
     assert status == 200 and minimum['chunk_size'] == 60 and minimum['min_chunk_size'] == 100
     print('PASS fixed minimum above split target saves and round trips', flush=True)
+
+    expect('/ingest/config', {'collection': collection, 'chunking_strategy':'fixed',
+                              'chunk_size':1, 'min_chunk_size':0}, 201)
+    status, smallest = request('/ingest/config/' + collection)
+    assert status == 200 and smallest['chunk_size'] == 1 and smallest['min_chunk_size'] == 0
+    expect('/ingest/config', {'collection':collection,'chunking_strategy':'fixed','chunk_size':0},422)
+    assert request('/ingest/config/' + collection)[1] == smallest
+    print('PASS smallest accepted chunk target and neighboring rejection preserve settings',flush=True)
 
     for path, bad in (('/query', {'question': 'inert', 'retrieval_mode': 'invalid'}),
                       ('/query', {'question': 'inert', 'response_format': 'invalid'}),
