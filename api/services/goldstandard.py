@@ -44,6 +44,8 @@ _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
 _state_lock = threading.RLock()
 _diagnostics: dict[str, dict] = {}
+_scan_lock = threading.Lock()
+_store_revision = 0
 
 
 def _sessions_dir() -> Path:
@@ -88,6 +90,7 @@ def _save_session_sync(session: dict) -> None:
     After replace, cache reflects disk even if directory fsync reports an
     uncertain durability outcome. Neither failure is acknowledged as success.
     """
+    global _store_revision
     with _state_lock:
         snapshot = copy.deepcopy(session)
         try:
@@ -108,8 +111,12 @@ def _save_session_sync(session: dict) -> None:
             os.replace(temporary, path)
             replaced = True
             _sessions[snapshot["session_id"]] = snapshot
+            _store_revision += 1
             _sync_directory(path.parent)
-            _diagnostics.pop(str(path), None)
+            if snapshot.get("persistence_error"):
+                _record_issue(path, snapshot["persistence_error"]["code"])
+            else:
+                _diagnostics.pop(str(path), None)
         except (OSError, ValueError, TypeError) as exc:
             code = "SESSION_DURABILITY_UNCERTAIN" if replaced else "SESSION_WRITE_FAILED"
             _record_issue(path, code)
@@ -128,54 +135,75 @@ async def _save_session(session: dict) -> None:
     await asyncio.to_thread(store_session, session)
 
 
-def _scan_sessions_locked() -> None:
-    storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
-    try:
+def _scan_sessions() -> None:
+    """Inspect disk without blocking writers, then publish only a current scan."""
+    global _store_revision
+    with _scan_lock:
+        with _state_lock:
+            revision = _store_revision
+        storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
         root = storage_label
-        with os.scandir(root) as entries:
-            paths = [Path(entry.path) for entry in entries]
-    except FileNotFoundError:
-        _diagnostics.pop(str(storage_label), None)
-        return
-    except (OSError, ValueError, RuntimeError):
-        _record_issue(storage_label, "SESSION_STORAGE_UNAVAILABLE")
-        return
-    _diagnostics.pop(str(storage_label), None)
-    for temporary in paths:
-        if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", temporary.name):
-            _record_issue(temporary, "SESSION_INTERRUPTED_WRITE")
-    for path in paths:
-        if not path.name.endswith(".json"):
-            continue
+        loaded = {}
+        issues = {}
         try:
-            data = json.loads(path.read_text())
-            if not isinstance(data, dict) or data.get("session_id") != path.stem or not isinstance(data.get("pairs"), list) or not all(isinstance(pair, dict) for pair in data["pairs"]):
-                raise ValueError("Invalid retained session structure")
-            from models.schemas import SessionResponse
-            SessionResponse.model_validate(data)
-            _sessions.setdefault(data["session_id"], data)
-            # Write failures remain visible until a successful write, even if
-            # the previous valid disk snapshot is readable.
-            if _diagnostics.get(str(path), {}).get("code") == "SESSION_READ_FAILED":
-                _diagnostics.pop(str(path), None)
-        except (OSError, ValueError, TypeError):
-            _record_issue(path, "SESSION_READ_FAILED")
+            with os.scandir(root) as entries:
+                paths = [Path(entry.path) for entry in entries]
+        except FileNotFoundError:
+            paths = []
+        except (OSError, ValueError, RuntimeError):
+            with _state_lock:
+                if revision == _store_revision:
+                    _record_issue(storage_label, "SESSION_STORAGE_UNAVAILABLE")
+            return
+        for path in paths:
+            if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", path.name):
+                issues[path] = "SESSION_INTERRUPTED_WRITE"
+            elif path.name.endswith(".json"):
+                try:
+                    data = json.loads(path.read_text())
+                    if not isinstance(data, dict) or data.get("session_id") != path.stem or not isinstance(data.get("pairs"), list) or not all(isinstance(pair, dict) for pair in data["pairs"]):
+                        raise ValueError("Invalid retained session structure")
+                    from models.schemas import SessionResponse
+                    SessionResponse.model_validate(data)
+                    loaded[data["session_id"]] = data
+                    retained_error = data.get("persistence_error")
+                    if isinstance(retained_error, dict) and retained_error.get("code") in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
+                        issues[path] = retained_error["code"]
+                except (OSError, ValueError, TypeError):
+                    issues[path] = "SESSION_READ_FAILED"
+        with _state_lock:
+            # A concurrent durable commit wins over an older inspection, including
+            # its cache and write-failure diagnostics. The next refresh rescans.
+            if revision != _store_revision:
+                return
+            _diagnostics.pop(str(storage_label), None)
+            present = {str(path) for path in paths}
+            for key, issue in list(_diagnostics.items()):
+                if issue["code"] in ("SESSION_READ_FAILED", "SESSION_INTERRUPTED_WRITE") and Path(key).parent == root and (key not in present or Path(key) not in issues):
+                    _diagnostics.pop(key, None)
+            for sid, data in loaded.items():
+                if sid not in _sessions:
+                    _sessions[sid] = data
+                    _store_revision += 1
+            for path, code in issues.items():
+                # Preserve the independent failed-write policy at the same path.
+                if _diagnostics.get(str(path), {}).get("code") not in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
+                    _record_issue(path, code)
 
 
 def load_sessions_from_disk() -> None:
-    with _state_lock:
-        _scan_sessions_locked()
+    _scan_sessions()
 
 
 def session_diagnostics() -> list[dict]:
+    _scan_sessions()
     with _state_lock:
-        _scan_sessions_locked()
         return copy.deepcopy([_diagnostics[key] for key in sorted(_diagnostics)])
 
 
 def sessions_for(collection: str) -> list[dict]:
+    _scan_sessions()
     with _state_lock:
-        _scan_sessions_locked()
         found = []
         for sid, session in _sessions.items():
             if session.get("collection") != collection:
@@ -210,17 +238,23 @@ def _update_session_sync(session_id: str, change):
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
-    with _state_lock:
-        now = datetime.now(timezone.utc).isoformat()
-        marked = 0
-        for session in sessions_for(collection):
-            def change(current):
-                current[flag] = True
-                current[f"{flag}_reason"] = reason
-                current[f"{flag}_at"] = now
+    sessions = sessions_for(collection)
+    now = datetime.now(timezone.utc).isoformat()
+    marked = 0
+    for session in sessions:
+        def change(current):
+            current[flag] = True
+            current[f"{flag}_reason"] = reason
+            current[f"{flag}_at"] = now
+        try:
             _update_session_sync(session["session_id"], change)
             marked += 1
-        return marked
+        except GoldStandardError:
+            # The primary collection mutation already happened. Preserve the
+            # failed-write diagnostic and continue other markers; never turn a
+            # completed delete/rebuild into a fictitious primary failure.
+            log.exception("Could not durably mark session %s %s", session["session_id"], flag)
+    return marked
 
 
 def mark_stale(collection: str, reason: str) -> int:
@@ -322,8 +356,28 @@ async def _generate_pair(chunk: dict) -> dict:
     }
 
 
+def _failed_generation(current: dict, exc: Exception) -> None:
+    current["status"] = "failed"
+    reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
+              else f"{type(exc).__name__}: {exc}")
+    errors = current.setdefault("errors", [])
+    if reason not in errors:
+        errors.append(reason)
+    if isinstance(exc, GoldStandardError):
+        current["persistence_error"] = {"code": exc.code, "message": exc.message}
+
+
+async def _record_generation_failure(session_id: str, exc: Exception) -> None:
+    try:
+        await asyncio.to_thread(_update_session_sync, session_id,
+                                lambda current: _failed_generation(current, exc))
+    except Exception:
+        log.exception("Could not durably report failed generation for %s", session_id)
+
+
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
     cancelled = False
+    persistence_failure = None
     try:
         for chunk in chunks:
             try:
@@ -345,11 +399,17 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
                     current["pairs_completed"] += 1
                     current["pairs_attempted"] = current.get("pairs_attempted", 0) + 1
                 await asyncio.to_thread(_update_session_sync, session_id, completed)
+    except GoldStandardError as exc:
+        persistence_failure = exc
+        raise
     except asyncio.CancelledError:
         cancelled = True
         raise
     finally:
         def finish(current):
+            if persistence_failure is not None:
+                _failed_generation(current, persistence_failure)
+                return
             if current.get("status") == "generating":
                 current["status"] = ("cancelled" if cancelled else
                     "failed" if not current["pairs"] and current.get("errors") else "completed")
@@ -387,14 +447,9 @@ async def start_generation(
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            def failed(current):
-                current["status"] = "failed"
-                current.setdefault("errors", []).append(type(exc).__name__)
-            try:
-                _update_session_sync(session_id, failed)
-            except GoldStandardError:
-                log.exception("Could not durably report failed generation for %s", session_id)
-
+            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            _tasks.add(reporter)
+            reporter.add_done_callback(_tasks.discard)
 
     task.add_done_callback(_on_task_done)
 

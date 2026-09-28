@@ -2404,6 +2404,8 @@ _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
 _state_lock = threading.RLock()
 _diagnostics: dict[str, dict] = {}
+_scan_lock = threading.Lock()
+_store_revision = 0
 
 
 def _sessions_dir() -> Path:
@@ -2448,6 +2450,7 @@ def _save_session_sync(session: dict) -> None:
     After replace, cache reflects disk even if directory fsync reports an
     uncertain durability outcome. Neither failure is acknowledged as success.
     """
+    global _store_revision
     with _state_lock:
         snapshot = copy.deepcopy(session)
         try:
@@ -2468,8 +2471,12 @@ def _save_session_sync(session: dict) -> None:
             os.replace(temporary, path)
             replaced = True
             _sessions[snapshot["session_id"]] = snapshot
+            _store_revision += 1
             _sync_directory(path.parent)
-            _diagnostics.pop(str(path), None)
+            if snapshot.get("persistence_error"):
+                _record_issue(path, snapshot["persistence_error"]["code"])
+            else:
+                _diagnostics.pop(str(path), None)
         except (OSError, ValueError, TypeError) as exc:
             code = "SESSION_DURABILITY_UNCERTAIN" if replaced else "SESSION_WRITE_FAILED"
             _record_issue(path, code)
@@ -2488,54 +2495,75 @@ async def _save_session(session: dict) -> None:
     await asyncio.to_thread(store_session, session)
 
 
-def _scan_sessions_locked() -> None:
-    storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
-    try:
+def _scan_sessions() -> None:
+    """Inspect disk without blocking writers, then publish only a current scan."""
+    global _store_revision
+    with _scan_lock:
+        with _state_lock:
+            revision = _store_revision
+        storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
         root = storage_label
-        with os.scandir(root) as entries:
-            paths = [Path(entry.path) for entry in entries]
-    except FileNotFoundError:
-        _diagnostics.pop(str(storage_label), None)
-        return
-    except (OSError, ValueError, RuntimeError):
-        _record_issue(storage_label, "SESSION_STORAGE_UNAVAILABLE")
-        return
-    _diagnostics.pop(str(storage_label), None)
-    for temporary in paths:
-        if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", temporary.name):
-            _record_issue(temporary, "SESSION_INTERRUPTED_WRITE")
-    for path in paths:
-        if not path.name.endswith(".json"):
-            continue
+        loaded = {}
+        issues = {}
         try:
-            data = json.loads(path.read_text())
-            if not isinstance(data, dict) or data.get("session_id") != path.stem or not isinstance(data.get("pairs"), list) or not all(isinstance(pair, dict) for pair in data["pairs"]):
-                raise ValueError("Invalid retained session structure")
-            from models.schemas import SessionResponse
-            SessionResponse.model_validate(data)
-            _sessions.setdefault(data["session_id"], data)
-            # Write failures remain visible until a successful write, even if
-            # the previous valid disk snapshot is readable.
-            if _diagnostics.get(str(path), {}).get("code") == "SESSION_READ_FAILED":
-                _diagnostics.pop(str(path), None)
-        except (OSError, ValueError, TypeError):
-            _record_issue(path, "SESSION_READ_FAILED")
+            with os.scandir(root) as entries:
+                paths = [Path(entry.path) for entry in entries]
+        except FileNotFoundError:
+            paths = []
+        except (OSError, ValueError, RuntimeError):
+            with _state_lock:
+                if revision == _store_revision:
+                    _record_issue(storage_label, "SESSION_STORAGE_UNAVAILABLE")
+            return
+        for path in paths:
+            if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", path.name):
+                issues[path] = "SESSION_INTERRUPTED_WRITE"
+            elif path.name.endswith(".json"):
+                try:
+                    data = json.loads(path.read_text())
+                    if not isinstance(data, dict) or data.get("session_id") != path.stem or not isinstance(data.get("pairs"), list) or not all(isinstance(pair, dict) for pair in data["pairs"]):
+                        raise ValueError("Invalid retained session structure")
+                    from models.schemas import SessionResponse
+                    SessionResponse.model_validate(data)
+                    loaded[data["session_id"]] = data
+                    retained_error = data.get("persistence_error")
+                    if isinstance(retained_error, dict) and retained_error.get("code") in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
+                        issues[path] = retained_error["code"]
+                except (OSError, ValueError, TypeError):
+                    issues[path] = "SESSION_READ_FAILED"
+        with _state_lock:
+            # A concurrent durable commit wins over an older inspection, including
+            # its cache and write-failure diagnostics. The next refresh rescans.
+            if revision != _store_revision:
+                return
+            _diagnostics.pop(str(storage_label), None)
+            present = {str(path) for path in paths}
+            for key, issue in list(_diagnostics.items()):
+                if issue["code"] in ("SESSION_READ_FAILED", "SESSION_INTERRUPTED_WRITE") and Path(key).parent == root and (key not in present or Path(key) not in issues):
+                    _diagnostics.pop(key, None)
+            for sid, data in loaded.items():
+                if sid not in _sessions:
+                    _sessions[sid] = data
+                    _store_revision += 1
+            for path, code in issues.items():
+                # Preserve the independent failed-write policy at the same path.
+                if _diagnostics.get(str(path), {}).get("code") not in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
+                    _record_issue(path, code)
 
 
 def load_sessions_from_disk() -> None:
-    with _state_lock:
-        _scan_sessions_locked()
+    _scan_sessions()
 
 
 def session_diagnostics() -> list[dict]:
+    _scan_sessions()
     with _state_lock:
-        _scan_sessions_locked()
         return copy.deepcopy([_diagnostics[key] for key in sorted(_diagnostics)])
 
 
 def sessions_for(collection: str) -> list[dict]:
+    _scan_sessions()
     with _state_lock:
-        _scan_sessions_locked()
         found = []
         for sid, session in _sessions.items():
             if session.get("collection") != collection:
@@ -2570,17 +2598,23 @@ def _update_session_sync(session_id: str, change):
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
-    with _state_lock:
-        now = datetime.now(timezone.utc).isoformat()
-        marked = 0
-        for session in sessions_for(collection):
-            def change(current):
-                current[flag] = True
-                current[f"{flag}_reason"] = reason
-                current[f"{flag}_at"] = now
+    sessions = sessions_for(collection)
+    now = datetime.now(timezone.utc).isoformat()
+    marked = 0
+    for session in sessions:
+        def change(current):
+            current[flag] = True
+            current[f"{flag}_reason"] = reason
+            current[f"{flag}_at"] = now
+        try:
             _update_session_sync(session["session_id"], change)
             marked += 1
-        return marked
+        except GoldStandardError:
+            # The primary collection mutation already happened. Preserve the
+            # failed-write diagnostic and continue other markers; never turn a
+            # completed delete/rebuild into a fictitious primary failure.
+            log.exception("Could not durably mark session %s %s", session["session_id"], flag)
+    return marked
 
 
 def mark_stale(collection: str, reason: str) -> int:
@@ -2682,8 +2716,28 @@ async def _generate_pair(chunk: dict) -> dict:
     }
 
 
+def _failed_generation(current: dict, exc: Exception) -> None:
+    current["status"] = "failed"
+    reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
+              else f"{type(exc).__name__}: {exc}")
+    errors = current.setdefault("errors", [])
+    if reason not in errors:
+        errors.append(reason)
+    if isinstance(exc, GoldStandardError):
+        current["persistence_error"] = {"code": exc.code, "message": exc.message}
+
+
+async def _record_generation_failure(session_id: str, exc: Exception) -> None:
+    try:
+        await asyncio.to_thread(_update_session_sync, session_id,
+                                lambda current: _failed_generation(current, exc))
+    except Exception:
+        log.exception("Could not durably report failed generation for %s", session_id)
+
+
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
     cancelled = False
+    persistence_failure = None
     try:
         for chunk in chunks:
             try:
@@ -2705,11 +2759,17 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
                     current["pairs_completed"] += 1
                     current["pairs_attempted"] = current.get("pairs_attempted", 0) + 1
                 await asyncio.to_thread(_update_session_sync, session_id, completed)
+    except GoldStandardError as exc:
+        persistence_failure = exc
+        raise
     except asyncio.CancelledError:
         cancelled = True
         raise
     finally:
         def finish(current):
+            if persistence_failure is not None:
+                _failed_generation(current, persistence_failure)
+                return
             if current.get("status") == "generating":
                 current["status"] = ("cancelled" if cancelled else
                     "failed" if not current["pairs"] and current.get("errors") else "completed")
@@ -2747,14 +2807,9 @@ async def start_generation(
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            def failed(current):
-                current["status"] = "failed"
-                current.setdefault("errors", []).append(type(exc).__name__)
-            try:
-                _update_session_sync(session_id, failed)
-            except GoldStandardError:
-                log.exception("Could not durably report failed generation for %s", session_id)
-
+            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            _tasks.add(reporter)
+            reporter.add_done_callback(_tasks.discard)
 
     task.add_done_callback(_on_task_done)
 
@@ -4022,7 +4077,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                 # legitimate operation over data the user may not care about.
                 replace_notes.append(
                     f"{orphaned} gold-standard session(s) from the replaced "
-                    "collection were kept and marked orphaned")
+                    "collection were kept; inspect session recovery diagnostics "
+                    "if an orphan marker could not be persisted")
 
         expected = manifest.get("collection", {}).get("chunk_count", -1)
         _mark_started(target, expected, job_id)
@@ -8114,7 +8170,7 @@ export default function HelpTransferPage() {
 ### ui/src/pages/HealthPage.tsx
 
 ```typescript
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api, HealthResult, MetricsResult } from '../api/client'
 import LatencyCharts from '../components/LatencyCharts'
 
@@ -8125,8 +8181,21 @@ export default function HealthPage() {
   const [sessionIssues, setSessionIssues] = useState<{ filename: string; code: string; message: string }[]>([])
   const [diagnosticError, setDiagnosticError] = useState(false)
 
+  const [diagnosticPending, setDiagnosticPending] = useState(true)
+  const diagnosticTicket = useRef(0)
+
   async function load() {
-    api.getSessionDiagnostics().then(result => { setSessionIssues(result.issues); setDiagnosticError(false) }).catch(() => setDiagnosticError(true))
+    const ticket = ++diagnosticTicket.current
+    setDiagnosticPending(true)
+    api.getSessionDiagnostics().then(result => {
+      if (ticket !== diagnosticTicket.current) return
+      setSessionIssues(result.issues); setDiagnosticError(false)
+    }).catch(() => {
+      if (ticket !== diagnosticTicket.current) return
+      setSessionIssues([]); setDiagnosticError(true)
+    }).finally(() => {
+      if (ticket === diagnosticTicket.current) setDiagnosticPending(false)
+    })
     try {
       const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
       setHealth(h)
@@ -8137,7 +8206,7 @@ export default function HealthPage() {
   useEffect(() => {
     load()
     const interval = setInterval(load, 30000)
-    return () => clearInterval(interval)
+    return () => { ++diagnosticTicket.current; clearInterval(interval) }
   }, [])
 
   function StatusBadge({ status }: { status: string }) {
@@ -8149,9 +8218,10 @@ export default function HealthPage() {
   return (
     <div className="max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-6">Health Dashboard</h1>
+      {diagnosticPending && <p role="status" className="text-gray-500 mb-4">Refreshing session recovery diagnostics…</p>}
       {diagnosticError && <p role="alert" className="text-amber-700 mb-4">Session recovery diagnostics could not be refreshed.</p>}
       {sessionIssues.length > 0 && <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
-        <h2 className="font-semibold">Evaluation session recovery needs attention</h2>
+        <h2 className="font-semibold">{diagnosticPending ? "Previous evaluation session recovery results — refresh pending" : "Evaluation session recovery needs attention"}</h2>
         {sessionIssues.map(issue => <p key={issue.filename} className="text-sm mt-2">{issue.filename}: {issue.code} — {issue.message}</p>)}
       </div>}
       {health && (
@@ -8270,7 +8340,7 @@ drive the UI in a real browser.
 
 ## Writing a check
 
-`12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. Controlled regressions additionally hard-kill an owned writer at the replace boundary; native browser criteria verify recovery warnings and failed refresh using isolated HTTP responses.
+`12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. The same registered script executes `session_persistence_cases.py` in the API image: owned filesystem/concurrency cases additionally hard-kill an owned writer at the replace boundary, pause archive inspection during a concurrent commit, retain generation failure codes and test marker-failure continuation. Native browser criteria verify pending, failed and out-of-order diagnostic refreshes using isolated HTTP responses. The in-container script rejects remote or mismatched `RAG_API` targets before health/backend execution.
 
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
@@ -9133,8 +9203,12 @@ summary
 # Durable session edits, generation interleaving and visible recovery diagnostics.
 set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
+bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$bindings" || exit 2
 require_stack
 section "Durable evaluation session updates"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/session_persistence_cases.py)
+check "owned persistence failure, concurrency and interruption regressions" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_persistence.py)
 check "concurrent HTTP edits, fresh-process reload, write failures and diagnostics" $?
 summary
@@ -9187,7 +9261,7 @@ with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as director
             assert len(state['pairs'])==2 and state['stale'] and state['status']=='completed'
             print('PASS concurrent acknowledged HTTP edits and generation/history interleaving retained',flush=True)
             code="from config import settings;from services import goldstandard as gs;import sys,json;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();print(json.dumps(gs.get_session(sys.argv[2])))"
-            reloaded=subprocess.run([sys.executable,'-c',code,directory,sid],capture_output=True,text=True,check=True)
+            reloaded=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,directory,sid],capture_output=True,text=True,check=True)
             assert json.loads(reloaded.stdout)==state,reloaded.stdout
             print('PASS fresh API process reload retains every acknowledged update and flag',flush=True)
             before=copy.deepcopy(state)
@@ -9206,11 +9280,28 @@ with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as director
             assert conflict.status_code==409 and conflict.json()['error']['code']=='PAIR_CHANGED_DURING_REGENERATION',conflict.text
             assert gs.get_session(sid)['pairs'][0]['answer']=='Latest acknowledged answer'
             print('PASS in-flight regeneration rejects changed target instead of losing acknowledged edit',flush=True)
+            # Marker persistence is secondary to an already completed deletion.
+            original_replace=gs.os.replace
+            def marker_fault(src,dst):
+                if Path(dst).stem==sid:raise OSError('Owned deletion marker failure')
+                return original_replace(src,dst)
+            with patch.object(gs.os,'replace',side_effect=marker_fault):
+                deleted=await client.delete('/collections/'+collection)
+            assert deleted.status_code==200 and deleted.json()['objects_deleted']==2,deleted.text
+            assert not wc._collection_exists_sync(collection)
+            from routers import collections as collection_routes
+            assert collection not in collection_routes._load_registry()
+            assert any(issue['filename']==sid+'.json' and issue['code']=='SESSION_WRITE_FAILED' for issue in gs.session_diagnostics())
+            print('PASS completed real HTTP deletion remains200 and registry removal completes despite marker persistence failure',flush=True)
             corrupt=gs._sessions_dir()/('gs_'+uuid.uuid4().hex[:8]+'.json');corrupt.write_bytes(b'{owned incomplete snapshot')
             response=await client.get('/goldstandard/diagnostics')
             assert any(issue['filename']==corrupt.name and issue['code']=='SESSION_READ_FAILED' for issue in response.json()['issues']),response.text
             assert corrupt.read_bytes()==b'{owned incomplete snapshot'
             print('PASS real unreadable file preserved and reported through diagnostic HTTP endpoint',flush=True)
+            corrupt.unlink()
+            response=await client.get('/goldstandard/diagnostics')
+            assert not any(issue['filename']==corrupt.name for issue in response.json()['issues'])
+            print('PASS removed unreadable file clears its recovery issue while failed-write diagnostic remains',flush=True)
     try:asyncio.run(run())
     finally:
         if created and wc._collection_exists_sync(collection):wc._delete_collection_sync(collection)
@@ -9940,6 +10031,53 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     } finally { await s.ctx.close(); }
   }
 
+  // Controlled refresh timing exercises visible pending, failure and ordering.
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.evaluateOnNewDocument(() => {
+      const original = window.setInterval;
+      window.setInterval = (fn, delay, ...args) => {
+        if (delay === 30000) { window.__ownedHealthRefresh = fn; return 45001; }
+        return original(fn, delay, ...args);
+      };
+    });
+    const pending = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      if (new URL(request.url()).pathname === '/api/goldstandard/diagnostics') pending.push(request);
+      else request.continue();
+    });
+    const next = async () => {
+      for (let i = 0; i < 100 && !pending.length; i++) await sleep(50);
+      if (!pending.length) throw new Error('Owned diagnostic refresh did not arrive');
+      return pending.shift();
+    };
+    const respond = (request, filename, status = 200) => request.respond({ status, contentType: 'application/json', body: JSON.stringify(status === 200 ? { issues: [{ filename, code: 'SESSION_READ_FAILED', message: 'Owned retained result.' }] } : { error: { message: 'Owned refresh failure' } }) });
+    const refresh = () => s.page.evaluate(() => window.__ownedHealthRefresh());
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'domcontentloaded' });
+      const initial = await next(); await sleep(150);
+      r.check('initial diagnostic pending state is visible', /Refreshing session recovery diagnostics/.test(await bodyText(s.page)));
+      await respond(initial, 'gs_previousfixture.json'); await sleep(250);
+      await refresh(); const failed = await next(); await sleep(100);
+      let text = await bodyText(s.page);
+      r.check('pending refresh labels retained diagnostics as previous results', /Previous evaluation session recovery results/.test(text) && /gs_previousfixture.json/.test(text));
+      await respond(failed, '', 503); await sleep(250); text = await bodyText(s.page);
+      r.check('failed refresh removes old current-issue claims and clears pending state', /could not be refreshed/.test(text) && !/gs_previousfixture.json|Refreshing session recovery diagnostics/.test(text));
+      await refresh(); const recovered = await next(); await respond(recovered, 'gs_currentfixture.json'); await sleep(250); text = await bodyText(s.page);
+      r.check('successful refresh clears the error and pending indicators', /gs_currentfixture.json/.test(text) && !/could not be refreshed|Refreshing session recovery diagnostics/.test(text));
+      await refresh(); const older = await next(); await refresh(); const newer = await next();
+      await respond(newer, 'gs_latestfixture.json'); await sleep(200);
+      await respond(older, '', 503); await sleep(250); text = await bodyText(s.page);
+      r.check('late failed response cannot overwrite newer diagnostic success', /gs_latestfixture.json/.test(text) && !/could not be refreshed/.test(text));
+      await refresh(); const olderSuccess = await next(); await refresh(); const newerSuccess = await next();
+      await respond(newerSuccess, 'gs_finalfixture.json'); await sleep(150);
+      await respond(olderSuccess, 'gs_stalefixture.json'); await sleep(250); text = await bodyText(s.page);
+      r.check('late successful response cannot replace newer diagnostic results', /gs_finalfixture.json/.test(text) && !/gs_stalefixture.json/.test(text));
+      r.check('refresh error and timing fixtures do not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── transfer help page ─────────────────────────────────────────────────────
   r.section('transfer help page');
   {
@@ -10319,4 +10457,319 @@ echo
 echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
+```
+
+### scripts/verify/session_persistence_cases.py
+
+```python
+"""Durable acknowledged mutations and controlled failure/interleaving acceptance."""
+import asyncio,json,os,sys,tempfile,threading,unittest,subprocess,time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import AsyncMock,patch
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+from config import settings
+from services import goldstandard as gs
+
+
+def fixture():
+    return {'session_id':'gs_450abcde','collection':'OwnedPersistence','status':'completed','pairs_total':2,'pairs_completed':2,'pairs':[{'pair_id':'p_'+str(i),'question':'Original','answer':'Original','contexts':['Inert'],'ground_truth':'Original','source_file':'inert.txt','chunk_index':i,'status':'pending'} for i in range(2)]}
+
+class PersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        for obj,key,value in [(settings,'upload_dir',self.tmp.name),(gs,'_sessions',{}),(gs,'_diagnostics',{})]:
+            change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
+        self.data=fixture();gs.store_session(self.data)
+
+    def restart(self):
+        gs._sessions={};gs.load_sessions_from_disk();return gs.get_session(self.data['session_id'])
+
+    def test_parallel_acknowledged_fields_survive_restart(self):
+        data=fixture();data["pairs"]=[{**data["pairs"][0],"pair_id":"p_"+str(i)} for i in range(8)];data.update(pairs_total=8,pairs_completed=8);gs.store_session(data)
+        barrier=threading.Barrier(16)
+        def edit(i):
+            barrier.wait();return asyncio.run(gs.update_pair(self.data['session_id'],'p_'+str(i//2),{('question' if i%2==0 else 'answer'):str(i)}))
+        with ThreadPoolExecutor(max_workers=16) as pool:results=list(pool.map(edit,range(16)))
+        self.assertTrue(all(results));state=self.restart()
+        for i in range(16):self.assertEqual(state['pairs'][i//2]['question' if i%2==0 else 'answer'],str(i))
+
+    def test_replace_failure_leaves_previous_snapshot_and_reports_failure(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes()
+        with patch.object(gs.os,'replace',side_effect=OSError('Controlled replace fault')):
+            with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Failed edit'}))
+        self.assertEqual(error.exception.code,'SESSION_WRITE_FAILED')
+        self.assertEqual(path.read_bytes(),before);self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+        self.assertFalse(list(path.parent.glob('*.tmp')))
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Accepted edit'}));self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_file_fsync_failure_leaves_old_snapshot(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes()
+        with patch.object(gs.os,'fsync',side_effect=OSError('Controlled file fsync')):
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Not accepted'}))
+        self.assertEqual(path.read_bytes(),before);self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+
+    def test_after_replace_failure_is_uncertain_and_cache_matches_disk(self):
+        with patch.object(gs,'_sync_directory',side_effect=OSError('Controlled directory fsync')):
+            with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Replaced'}))
+        self.assertEqual(error.exception.code,'SESSION_DURABILITY_UNCERTAIN')
+        self.assertEqual(json.loads(gs._session_path(self.data['session_id']).read_text()),gs.get_session(self.data['session_id']))
+        self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Replaced')
+
+    def test_unreadable_and_invalid_files_are_preserved_reported(self):
+        files={'gs_450bad00.json':'{incomplete','gs_450bad01.json':'[]','gs_450bad02.json':'{"session_id":"gs_450bad02","pairs":[]}'}
+        for name,text in files.items():(gs._sessions_dir()/name).write_text(text)
+        self.assertEqual(len(gs.session_diagnostics()),3)
+        for name,text in files.items():self.assertEqual((gs._sessions_dir()/name).read_text(),text)
+        self.assertEqual(len(gs.sessions_for('OwnedPersistence')),1)
+
+    def test_no_mutable_aliases_from_storage_reads_or_exports(self):
+        self.data['pairs'][0]['answer']='Caller mutation'
+        gs.get_session(self.data['session_id'])['pairs'][0]['answer']='Reader mutation'
+        gs.sessions_for('OwnedPersistence')[0]['pairs'].clear()
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Original')
+
+    def test_generation_review_flags_interleave_without_lost_updates(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            initial=fixture();initial.update(status='generating',pairs_total=3);gs.store_session(initial)
+            async def pair(chunk):pending.set();await release.wait();return {**initial['pairs'][0],'pair_id':'p_generated'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs._run_generation(initial['session_id'],[{'content':'Inert'}]));await pending.wait()
+                await asyncio.gather(gs.update_pair(initial['session_id'],'p_0',{'answer':'Reviewed answer'}),gs.update_pair(initial['session_id'],'p_1',{'question':'Reviewed question'}))
+                await asyncio.to_thread(gs.mark_stale,'OwnedPersistence','Controlled identity change')
+                release.set();await task
+        asyncio.run(run());state=self.restart();self.assertEqual(state['status'],'completed');self.assertEqual(len(state['pairs']),3)
+        self.assertEqual(state['pairs'][0]['answer'],'Reviewed answer');self.assertEqual(state['pairs'][1]['question'],'Reviewed question');self.assertTrue(state['stale']);self.assertEqual(state['pairs_attempted'],1)
+
+    def test_regeneration_rejects_changed_target_preserving_acknowledged_edit(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            async def pair(chunk):pending.set();await release.wait();return {**fixture()['pairs'][0],'answer':'Generated replacement'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs.regenerate_pair(self.data['session_id'],'p_0'));await pending.wait()
+                await gs.update_pair(self.data['session_id'],'p_0',{'answer':'Acknowledged review'});release.set()
+                with self.assertRaises(gs.GoldStandardError) as error:await task
+                self.assertEqual(error.exception.code,'PAIR_CHANGED_DURING_REGENERATION')
+        asyncio.run(run());self.assertEqual(self.restart()['pairs'][0]['answer'],'Acknowledged review')
+
+    def test_regeneration_preserves_other_pair_edits_and_history_flags(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            async def pair(chunk):pending.set();await release.wait();return {**fixture()['pairs'][0],'answer':'Generated replacement'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs.regenerate_pair(self.data['session_id'],'p_0'));await pending.wait()
+                await gs.update_pair(self.data['session_id'],'p_1',{'answer':'Other review'})
+                gs.mark_orphaned('OwnedPersistence','Controlled deletion');release.set();await task
+        asyncio.run(run());state=self.restart();self.assertTrue(state['orphaned']);self.assertEqual([p['answer'] for p in state['pairs']],['Generated replacement','Other review'])
+
+    def test_hard_killed_writer_preserves_valid_snapshot_reports_owned_temporary(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes();marker=Path(self.tmp.name)/'replace-boundary'
+        code="""import sys,time,asyncio
+from pathlib import Path
+from config import settings
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+def stopped(src,dst):
+    Path(sys.argv[2]).write_text('ready')
+    time.sleep(30)
+gs.os.replace=stopped
+asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
+"""
+        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+        child=subprocess.Popen([sys.executable,'-c',code,self.tmp.name,str(marker)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            deadline=time.monotonic()+5
+            while not marker.exists() and child.poll() is None and time.monotonic()<deadline:time.sleep(0.02)
+            self.assertTrue(marker.exists(),'Owned child did not reach replace boundary')
+            child.kill();child.communicate(timeout=5)
+            self.assertEqual(path.read_bytes(),before);self.assertEqual(self.restart(),self.data)
+            issues=gs.session_diagnostics();self.assertEqual(len(issues),1);self.assertEqual(issues[0]['code'],'SESSION_INTERRUPTED_WRITE')
+            self.assertTrue(list(path.parent.glob('.gs_450abcde-*.tmp')))
+        finally:
+            if child.poll() is None:child.kill();child.communicate(timeout=5)
+
+    def test_export_keeps_captured_snapshot_while_new_edit_commits(self):
+        initial=fixture();initial['pairs'][0]['status']='approved';gs.store_session(initial)
+        started=threading.Event();release=threading.Event();original=gs._save_export_sync
+        def delayed(path,rows):
+            started.set()
+            if not release.wait(5):raise AssertionError('Owned export was not released')
+            original(path,rows)
+        async def run():
+            with patch.object(gs,'_save_export_sync',side_effect=delayed):
+                task=asyncio.create_task(gs.save_session(initial['session_id'],'snapshot.json'))
+                self.assertTrue(await asyncio.to_thread(started.wait,5))
+                try:await gs.update_pair(initial['session_id'],'p_0',{'answer':'Later acknowledged edit'})
+                finally:release.set()
+                result=await task;self.assertEqual(result['pairs_saved'],1)
+        asyncio.run(run())
+        self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
+
+    def test_scan_of_missing_storage_does_not_create_directory(self):
+        with tempfile.TemporaryDirectory() as missing:
+            with patch.object(settings,'upload_dir',missing):
+                self.assertEqual(gs.session_diagnostics(),[])
+                self.assertFalse((Path(missing)/'goldstandard_sessions').exists())
+
+    def test_storage_scan_failure_reports_without_destroying_cached_state(self):
+        before=gs.get_session(self.data['session_id'])
+        with patch.object(gs.os,'scandir',side_effect=OSError('Owned storage read failure')):
+            gs.load_sessions_from_disk()
+            self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_STORAGE_UNAVAILABLE')
+        self.assertEqual(gs.get_session(self.data['session_id']),before)
+        self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_model_failure_and_cancellation_status_are_persisted(self):
+        async def run():
+            initial=fixture();initial.update(status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+            with patch.object(gs,'_generate_pair',new=AsyncMock(side_effect=ValueError('Controlled model failure'))):await gs._run_generation(initial['session_id'],[{}])
+            self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
+            initial['status']='generating';gs.store_session(initial);pending=asyncio.Event()
+            async def wait(chunk):pending.set();await asyncio.Event().wait()
+            with patch.object(gs,'_generate_pair',side_effect=wait):
+                task=asyncio.create_task(gs._run_generation(initial['session_id'],[{}]));await pending.wait();task.cancel()
+                with self.assertRaises(asyncio.CancelledError):await task
+        asyncio.run(run());self.assertEqual(self.restart()['status'],'cancelled')
+
+    def test_removed_read_and_temporary_issues_clear_but_write_failure_remains(self):
+        root=gs._sessions_dir();bad=root/'gs_450bad00.json';temporary=root/'.gs_450abcde-owned.tmp'
+        bad.write_text('{');temporary.write_text('unpublished');self.assertEqual(len(gs.session_diagnostics()),2)
+        with patch.object(gs.os,'replace',side_effect=OSError('Owned replacement failure')):
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Rejected'}))
+        bad.unlink();temporary.unlink();issues=gs.session_diagnostics()
+        self.assertEqual([issue['code'] for issue in issues],['SESSION_WRITE_FAILED'])
+
+    def test_scan_does_not_block_edit_or_publish_stale_read_failure(self):
+        path=gs._session_path(self.data['session_id']);path.write_text('{')
+        entered=threading.Event();release=threading.Event();original=Path.read_text
+        def read(p,*args,**kwargs):
+            text=original(p,*args,**kwargs)
+            if p==path:
+                entered.set()
+                if not release.wait(5):raise AssertionError('Owned scan was not released')
+            return text
+        with ThreadPoolExecutor(max_workers=2) as pool,patch.object(Path,'read_text',read):
+            scan=pool.submit(gs.session_diagnostics);self.assertTrue(entered.wait(5))
+            edit=pool.submit(lambda:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Committed during scan'})))
+            try:self.assertEqual(edit.result(timeout=2)['answer'],'Committed during scan')
+            finally:release.set()
+            self.assertEqual(scan.result(timeout=5),[])
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Committed during scan')
+
+    def test_marker_failure_continues_other_sessions_without_primary_failure(self):
+        second=fixture();second['session_id']='gs_450abcdf';gs.store_session(second);original=gs.os.replace
+        def replace(src,dst):
+            if Path(dst).stem==self.data['session_id']:raise OSError('Owned marker failure')
+            return original(src,dst)
+        with patch.object(gs.os,'replace',side_effect=replace):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),1)
+        self.assertNotIn('orphaned',gs.get_session(self.data['session_id']))
+        self.assertTrue(gs.get_session(second['session_id'])['orphaned'])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    def test_generation_commit_failure_retains_code_after_followup_status_writes(self):
+        async def run():
+            initial=fixture();initial.update(status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+            original=gs.os.replace;calls=0
+            def replace(src,dst):
+                nonlocal calls
+                calls+=1
+                if calls==1:raise OSError('Owned first pair commit failure')
+                return original(src,dst)
+            with patch.object(gs,'_generate_pair',new=AsyncMock(return_value=fixture()['pairs'][0])),patch.object(gs.os,'replace',side_effect=replace):
+                with self.assertRaises(gs.GoldStandardError):await gs._run_generation(initial['session_id'],[{}])
+                await gs._record_generation_failure(initial['session_id'],gs.GoldStandardError('SESSION_WRITE_FAILED','Session update could not be persisted. The previous snapshot is unchanged.',503))
+        asyncio.run(run());state=self.restart();self.assertEqual(state['status'],'failed')
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED');self.assertIn('SESSION_WRITE_FAILED',state['errors'][0])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    def test_generation_failure_reporter_keeps_event_loop_responsive(self):
+        async def run():
+            entered=threading.Event();release=threading.Event();original=gs._update_session_sync
+            def delayed(sid,change):
+                entered.set()
+                if not release.wait(5):raise AssertionError('Owned failure reporter was not released')
+                return original(sid,change)
+            with patch.object(gs,'_update_session_sync',side_effect=delayed):
+                task=asyncio.create_task(gs._record_generation_failure(self.data['session_id'],RuntimeError('Owned unexpected failure')))
+                self.assertTrue(await asyncio.to_thread(entered.wait,5))
+                try:await asyncio.wait_for(asyncio.sleep(0.02),0.5)
+                finally:release.set()
+                await task
+        asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
+
+    def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
+        from services import tuning
+        job={'status':'queued'};jobid='owned-marker-job'
+        with patch.dict(tuning._jobs,{jobid:job}),patch.object(tuning.sources,'has_sources',return_value=False),patch.object(tuning,'_existing_chunks',return_value=[{'content':'Inert'}]),patch.object(tuning,'_rebuild',return_value=1) as rebuild,patch.object(gs.os,'replace',side_effect=OSError('Owned marker failure')):
+            tuning._run(jobid,'OwnedPersistence','reembed',{})
+        rebuild.assert_called_once();self.assertEqual(job['status'],'completed');self.assertEqual(job['chunks_written'],1)
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+
+    def test_replace_import_continues_after_marker_failure_and_reports_retention_truthfully(self):
+        from services import importer
+        job={'status':'queued'};jobid='owned-import-marker-job';pkg=Path(self.tmp.name)
+        manifest={'collection':{'name':'OwnedPersistence','chunk_count':1}}
+        def deleted(name):
+            gs.mark_orphaned(name,'Owned completed primary replacement')
+            return 1
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(importer._jobs,{jobid:job}))
+            for obj,name,kwargs in [
+                (importer.packager,'exports_dir',{'return_value':pkg}),
+                (importer.packager,'open_package',{'return_value':(pkg,manifest)}),
+                (importer.packager,'verify_digests',{'return_value':None}),
+                (importer.packager,'sha256_file',{'return_value':'01234567'*8}),
+                (importer,'_check_embedding',{'return_value':None}),
+                (importer,'_ensure_models',{'return_value':[]}),
+                (importer,'_restore_sidecars',{'return_value':[]}),
+                (importer,'_mark_started',{'return_value':None}),
+                (importer,'_mark_finished',{'return_value':None}),
+                (importer.wc,'_collection_exists_sync',{'side_effect':lambda name:name=='OwnedPersistence'}),
+                (importer.wc,'_delete_collection_sync',{'side_effect':deleted}),
+                (importer.wc,'get_client',{}),
+                (gs.os,'replace',{'side_effect':OSError('Owned marker failure')})]:
+                stack.enter_context(patch.object(obj,name,**kwargs))
+            build=stack.enter_context(patch.object(importer,'_build',return_value=1))
+            importer._run(jobid,'owned-package.tar.gz','replace')
+        self.assertEqual(build.call_count,2);self.assertEqual(job['status'],'completed')
+        self.assertIn('inspect session recovery diagnostics',job['notes'][0]);self.assertNotIn('marked orphaned',job['notes'][0])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+### scripts/verify/compose_target.py
+
+```python
+"""Refuse an in-container verifier when RAG_API selects another deployment."""
+import sys
+from urllib.parse import urlsplit
+
+def matches_local_proxy(api, bindings):
+    try:
+        url=urlsplit(api)
+        if url.scheme!='http' or url.hostname not in ('localhost','127.0.0.1','::1') or url.username or url.password or url.path.rstrip('/')!='/api' or url.query or url.fragment:
+            return False
+        port=url.port or 80
+        for binding in bindings.splitlines():
+            host, published=binding.rsplit(':',1)
+            host=host.strip('[]')
+            if int(published)!=port:continue
+            if host in ('0.0.0.0','::') or host==url.hostname or (host=='127.0.0.1' and url.hostname=='localhost'):
+                return True
+        return False
+    except (ValueError,TypeError):return False
+
+if __name__=='__main__':
+    if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
+        print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
+        sys.exit(2)
 ```

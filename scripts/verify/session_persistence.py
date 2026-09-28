@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as director
             assert len(state['pairs'])==2 and state['stale'] and state['status']=='completed'
             print('PASS concurrent acknowledged HTTP edits and generation/history interleaving retained',flush=True)
             code="from config import settings;from services import goldstandard as gs;import sys,json;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();print(json.dumps(gs.get_session(sys.argv[2])))"
-            reloaded=subprocess.run([sys.executable,'-c',code,directory,sid],capture_output=True,text=True,check=True)
+            reloaded=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,directory,sid],capture_output=True,text=True,check=True)
             assert json.loads(reloaded.stdout)==state,reloaded.stdout
             print('PASS fresh API process reload retains every acknowledged update and flag',flush=True)
             before=copy.deepcopy(state)
@@ -61,11 +61,28 @@ with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as director
             assert conflict.status_code==409 and conflict.json()['error']['code']=='PAIR_CHANGED_DURING_REGENERATION',conflict.text
             assert gs.get_session(sid)['pairs'][0]['answer']=='Latest acknowledged answer'
             print('PASS in-flight regeneration rejects changed target instead of losing acknowledged edit',flush=True)
+            # Marker persistence is secondary to an already completed deletion.
+            original_replace=gs.os.replace
+            def marker_fault(src,dst):
+                if Path(dst).stem==sid:raise OSError('Owned deletion marker failure')
+                return original_replace(src,dst)
+            with patch.object(gs.os,'replace',side_effect=marker_fault):
+                deleted=await client.delete('/collections/'+collection)
+            assert deleted.status_code==200 and deleted.json()['objects_deleted']==2,deleted.text
+            assert not wc._collection_exists_sync(collection)
+            from routers import collections as collection_routes
+            assert collection not in collection_routes._load_registry()
+            assert any(issue['filename']==sid+'.json' and issue['code']=='SESSION_WRITE_FAILED' for issue in gs.session_diagnostics())
+            print('PASS completed real HTTP deletion remains200 and registry removal completes despite marker persistence failure',flush=True)
             corrupt=gs._sessions_dir()/('gs_'+uuid.uuid4().hex[:8]+'.json');corrupt.write_bytes(b'{owned incomplete snapshot')
             response=await client.get('/goldstandard/diagnostics')
             assert any(issue['filename']==corrupt.name and issue['code']=='SESSION_READ_FAILED' for issue in response.json()['issues']),response.text
             assert corrupt.read_bytes()==b'{owned incomplete snapshot'
             print('PASS real unreadable file preserved and reported through diagnostic HTTP endpoint',flush=True)
+            corrupt.unlink()
+            response=await client.get('/goldstandard/diagnostics')
+            assert not any(issue['filename']==corrupt.name for issue in response.json()['issues'])
+            print('PASS removed unreadable file clears its recovery issue while failed-write diagnostic remains',flush=True)
     try:asyncio.run(run())
     finally:
         if created and wc._collection_exists_sync(collection):wc._delete_collection_sync(collection)

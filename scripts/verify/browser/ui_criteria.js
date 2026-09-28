@@ -205,6 +205,53 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     } finally { await s.ctx.close(); }
   }
 
+  // Controlled refresh timing exercises visible pending, failure and ordering.
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.evaluateOnNewDocument(() => {
+      const original = window.setInterval;
+      window.setInterval = (fn, delay, ...args) => {
+        if (delay === 30000) { window.__ownedHealthRefresh = fn; return 45001; }
+        return original(fn, delay, ...args);
+      };
+    });
+    const pending = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      if (new URL(request.url()).pathname === '/api/goldstandard/diagnostics') pending.push(request);
+      else request.continue();
+    });
+    const next = async () => {
+      for (let i = 0; i < 100 && !pending.length; i++) await sleep(50);
+      if (!pending.length) throw new Error('Owned diagnostic refresh did not arrive');
+      return pending.shift();
+    };
+    const respond = (request, filename, status = 200) => request.respond({ status, contentType: 'application/json', body: JSON.stringify(status === 200 ? { issues: [{ filename, code: 'SESSION_READ_FAILED', message: 'Owned retained result.' }] } : { error: { message: 'Owned refresh failure' } }) });
+    const refresh = () => s.page.evaluate(() => window.__ownedHealthRefresh());
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'domcontentloaded' });
+      const initial = await next(); await sleep(150);
+      r.check('initial diagnostic pending state is visible', /Refreshing session recovery diagnostics/.test(await bodyText(s.page)));
+      await respond(initial, 'gs_previousfixture.json'); await sleep(250);
+      await refresh(); const failed = await next(); await sleep(100);
+      let text = await bodyText(s.page);
+      r.check('pending refresh labels retained diagnostics as previous results', /Previous evaluation session recovery results/.test(text) && /gs_previousfixture.json/.test(text));
+      await respond(failed, '', 503); await sleep(250); text = await bodyText(s.page);
+      r.check('failed refresh removes old current-issue claims and clears pending state', /could not be refreshed/.test(text) && !/gs_previousfixture.json|Refreshing session recovery diagnostics/.test(text));
+      await refresh(); const recovered = await next(); await respond(recovered, 'gs_currentfixture.json'); await sleep(250); text = await bodyText(s.page);
+      r.check('successful refresh clears the error and pending indicators', /gs_currentfixture.json/.test(text) && !/could not be refreshed|Refreshing session recovery diagnostics/.test(text));
+      await refresh(); const older = await next(); await refresh(); const newer = await next();
+      await respond(newer, 'gs_latestfixture.json'); await sleep(200);
+      await respond(older, '', 503); await sleep(250); text = await bodyText(s.page);
+      r.check('late failed response cannot overwrite newer diagnostic success', /gs_latestfixture.json/.test(text) && !/could not be refreshed/.test(text));
+      await refresh(); const olderSuccess = await next(); await refresh(); const newerSuccess = await next();
+      await respond(newerSuccess, 'gs_finalfixture.json'); await sleep(150);
+      await respond(olderSuccess, 'gs_stalefixture.json'); await sleep(250); text = await bodyText(s.page);
+      r.check('late successful response cannot replace newer diagnostic results', /gs_finalfixture.json/.test(text) && !/gs_stalefixture.json/.test(text));
+      r.check('refresh error and timing fixtures do not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── transfer help page ─────────────────────────────────────────────────────
   r.section('transfer help page');
   {
