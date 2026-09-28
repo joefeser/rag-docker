@@ -5,7 +5,7 @@ import threading
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
-from weaviate.classes.query import MetadataQuery
+from weaviate.classes.query import MetadataQuery, Filter
 
 from config import settings
 from services import ingest_config
@@ -375,16 +375,24 @@ async def hybrid_query(
 
 def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
     from models.schemas import GenerateRequest
-    from services.chunk_sampling import select_chunks
+    from services.chunk_sampling import select_chunk_ids
     request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
     coll = client.collections.get(collection_name)
-    objects = coll.iterator(
-        include_vector=False,
-        return_properties=["content", "source_file", "chunk_index"],
-        cache_size=100,
-    )
-    return select_chunks(objects, request.sample_size, request.seed)
+    objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
+    identities = select_chunk_ids(objects, request.sample_size, request.seed)
+    if not identities:
+        return []
+    payloads = coll.query.fetch_objects(
+        filters=Filter.by_id().contains_any(identities), limit=len(identities),
+        include_vector=False, return_properties=["content", "source_file", "chunk_index"],
+    ).objects
+    by_id = {str(obj.uuid): obj.properties for obj in payloads}
+    # Concurrent deletion can remove a winner between the UUID and payload passes.
+    return [{"object_id": identity, "content": by_id[identity].get("content", ""),
+             "source_file": by_id[identity].get("source_file", ""),
+             "chunk_index": by_id[identity].get("chunk_index", 0)}
+            for identity in identities if identity in by_id]
 
 
 async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:

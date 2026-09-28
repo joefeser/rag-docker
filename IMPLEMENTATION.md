@@ -1434,7 +1434,7 @@ import threading
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
-from weaviate.classes.query import MetadataQuery
+from weaviate.classes.query import MetadataQuery, Filter
 
 from config import settings
 from services import ingest_config
@@ -1804,16 +1804,24 @@ async def hybrid_query(
 
 def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
     from models.schemas import GenerateRequest
-    from services.chunk_sampling import select_chunks
+    from services.chunk_sampling import select_chunk_ids
     request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
     coll = client.collections.get(collection_name)
-    objects = coll.iterator(
-        include_vector=False,
-        return_properties=["content", "source_file", "chunk_index"],
-        cache_size=100,
-    )
-    return select_chunks(objects, request.sample_size, request.seed)
+    objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
+    identities = select_chunk_ids(objects, request.sample_size, request.seed)
+    if not identities:
+        return []
+    payloads = coll.query.fetch_objects(
+        filters=Filter.by_id().contains_any(identities), limit=len(identities),
+        include_vector=False, return_properties=["content", "source_file", "chunk_index"],
+    ).objects
+    by_id = {str(obj.uuid): obj.properties for obj in payloads}
+    # Concurrent deletion can remove a winner between the UUID and payload passes.
+    return [{"object_id": identity, "content": by_id[identity].get("content", ""),
+             "source_file": by_id[identity].get("source_file", ""),
+             "chunk_index": by_id[identity].get("chunk_index", 0)}
+            for identity in identities if identity in by_id]
 
 
 async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
@@ -2369,7 +2377,7 @@ async def run_query(
 ### api/services/chunk_sampling.py
 
 ```python
-"""Order-independent sampling of chunk objects by their stable UUIDs."""
+"""Order-independent selection of stable chunk UUIDs."""
 import hashlib
 import heapq
 import secrets
@@ -2378,7 +2386,7 @@ from uuid import UUID
 MAX_SAMPLE_SIZE = 100
 
 
-def select_chunks(objects, limit: int, seed: int | None = None) -> list[dict]:
+def select_chunk_ids(objects, limit: int, seed: int | None = None) -> list[str]:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_SAMPLE_SIZE:
         raise ValueError("sample_size must be an integer between 1 and 100")
     if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
@@ -2400,13 +2408,7 @@ def select_chunks(objects, limit: int, seed: int | None = None) -> list[dict]:
         key = (-priority, -identity.int)
         if len(heap) == limit and key <= heap[0][:2]:
             continue
-        row = {
-            "object_id": str(identity),
-            "content": obj.properties.get("content", ""),
-            "source_file": obj.properties.get("source_file", ""),
-            "chunk_index": obj.properties.get("chunk_index", 0),
-        }
-        entry = (*key, identity, row)
+        entry = (*key, identity)
         if len(heap) == limit:
             removed = heapq.heapreplace(heap, entry)
             selected.remove(removed[2])
@@ -2414,7 +2416,7 @@ def select_chunks(objects, limit: int, seed: int | None = None) -> list[dict]:
             heapq.heappush(heap, entry)
         selected.add(identity)
     # The UUID tie-breaker also fixes output order if priorities collide.
-    return [entry[3] for entry in sorted(heap, key=lambda entry: (-entry[0], -entry[1]))]
+    return [str(entry[2]) for entry in sorted(heap, key=lambda entry: (-entry[0], -entry[1]))]
 ```
 
 ### api/services/goldstandard.py
@@ -9062,8 +9064,22 @@ set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
 require_stack
 section "Evaluation sampling across iterator pages"
-(cd ../.. && docker compose exec -T api python - < scripts/verify/chunk_sampling.py)
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/chunk_sampling.py)
 check "seeded selection, iterator paging, bounds and owned-fixture cleanup" $?
+section "Generation request validation before backend/model work"
+for body in \
+  '{"collection":"MissingSamplingFixture","sample_size":0}' \
+  '{"collection":"MissingSamplingFixture","sample_size":101}' \
+  '{"collection":"MissingSamplingFixture","sample_size":true}' \
+  '{"collection":"MissingSamplingFixture","sample_size":1.5}' \
+  '{"collection":"MissingSamplingFixture","seed":false}' \
+  '{"collection":"MissingSamplingFixture","seed":1.5}' \
+  '{"collection":"MissingSamplingFixture","seed":NaN}' \
+  '{"collection":"MissingSamplingFixture","sample_size":Infinity}'
+do
+  code=$(api_post_code /goldstandard/generate "$body")
+  check_eq "invalid sampling request rejected with422: $body" "$code" "422"
+done
 summary
 ```
 
@@ -9077,15 +9093,16 @@ Does not call embedding or language models. UUID selection, not answer output,
 is the reproducibility contract. Deletes only its unique collection/config.
 """
 import uuid
+import os
 from services import weaviate_client as wc
-from services.chunk_sampling import select_chunks
+from services.chunk_sampling import select_chunk_ids
 
-collection='VfySampling'+uuid.uuid4().hex[:12]
-created=False
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Sampling'+uuid.uuid4().hex[:12]
+creation_attempted=False
 try:
     assert not wc._collection_exists_sync(collection)
+    creation_attempted=True
     wc._create_collection_sync(collection,'hnsw','cosine',{})
-    created=True
     coll=wc.get_client().collections.get(collection)
     for i in range(1,161):
         coll.data.insert(uuid=uuid.UUID(int=i),properties={
@@ -9099,9 +9116,11 @@ try:
     print('PASS seeded sample reaches beyond the first 100-object iterator page',flush=True)
     assert wc._sample_chunks_sync(collection,5,7)==first
     print('PASS repeated seed preserves UUIDs and ordered payloads',flush=True)
-    snapshot=list(coll.iterator(include_vector=False,return_properties=['content','source_file','chunk_index'],cache_size=100))
-    assert select_chunks(reversed(snapshot),5,7)==first
-    print('PASS reversed actual SDK objects preserve seeded selection',flush=True)
+    snapshot=list(coll.iterator(include_vector=False,return_properties=[],cache_size=100))
+    assert len(snapshot)==160 and all(not obj.properties for obj in snapshot)
+    assert all(row['source_file']=='sampling.txt' and row['content']==f"Inert sampling fixture {uuid.UUID(row['object_id']).int}" for row in first)
+    assert select_chunk_ids(reversed(snapshot),5,7)==[row['object_id'] for row in first]
+    print('PASS UUID-only SDK scan and reversed order preserve selected payloads',flush=True)
     maximum=wc._sample_chunks_sync(collection,100,7)
     assert len(maximum)==100 and len({r['object_id'] for r in maximum})==100
     print('PASS maximum request is bounded across multiple iterator pages',flush=True)
@@ -9113,7 +9132,7 @@ try:
     assert len(unseeded)==5 and all(1<=uuid.UUID(r['object_id']).int<=60 for r in unseeded)
     print('PASS null seed produces a bounded valid sample',flush=True)
 finally:
-    if created: wc._delete_collection_sync(collection)
+    if creation_attempted and wc._collection_exists_sync(collection): wc._delete_collection_sync(collection)
     wc.close_client()
 assert not wc._collection_exists_sync(collection)
 wc.close_client()
