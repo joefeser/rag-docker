@@ -145,6 +145,12 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
         self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
 
+    def test_scan_of_missing_storage_does_not_create_directory(self):
+        with tempfile.TemporaryDirectory() as missing:
+            with patch.object(settings,'upload_dir',missing):
+                self.assertEqual(gs.session_diagnostics(),[])
+                self.assertFalse((Path(missing)/'goldstandard_sessions').exists())
+
     def test_storage_scan_failure_reports_without_destroying_cached_state(self):
         before=gs.get_session(self.data['session_id'])
         with patch.object(gs.os,'scandir',side_effect=OSError('Owned storage read failure')):

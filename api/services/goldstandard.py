@@ -129,14 +129,18 @@ async def _save_session(session: dict) -> None:
 
 
 def _scan_sessions_locked() -> None:
+    storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
     try:
-        root = _sessions_dir()
+        root = storage_label
+        if not root.exists():
+            _diagnostics.pop(str(storage_label), None)
+            return
         with os.scandir(root) as entries:
             paths = [Path(entry.path) for entry in entries]
     except (OSError, ValueError, RuntimeError):
-        _record_issue(Path(settings.upload_dir) / "goldstandard_sessions", "SESSION_STORAGE_UNAVAILABLE")
+        _record_issue(storage_label, "SESSION_STORAGE_UNAVAILABLE")
         return
-    _diagnostics.pop(str(root), None)
+    _diagnostics.pop(str(storage_label), None)
     for temporary in paths:
         if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", temporary.name):
             _record_issue(temporary, "SESSION_INTERRUPTED_WRITE")
