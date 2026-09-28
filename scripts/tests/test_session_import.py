@@ -84,6 +84,21 @@ class SessionImportTests(unittest.TestCase):
         self.assertFalse(gs._sessions)
         self.assertFalse((self.root / 'uploads' / 'goldstandard_sessions').exists())
 
+    def test_export_uses_detached_persisted_sessions_during_cached_updates(self):
+        gs._sessions[self.original['session_id']] = self.original
+        self.assertEqual(packager._goldstandard_sessions('Corpus'), [])
+        gs.store_session(self.original)
+        persisted = copy.deepcopy(self.original)
+        exported = packager._goldstandard_sessions('Corpus')
+        self.assertEqual(exported, [persisted])
+        self.assertIsNot(exported[0], self.original)
+        self.assertIsNot(exported[0]['pairs'], self.original['pairs'])
+        self.original['pairs_completed'] += 1
+        self.original['pairs'][0]['question'] = 'A concurrent cached edit'
+        self.original['pairs'].append(copy.deepcopy(self.original['pairs'][0]))
+        self.assertEqual(exported, [persisted])
+        self.assertEqual(packager._goldstandard_sessions('Corpus'), [persisted])
+
     def test_preflight_rejects_malformed_json(self):
         (self.pkg / 'goldstandard' / 'session.json').write_text('{')
         with self.assertRaises(packager.PackageError) as error:

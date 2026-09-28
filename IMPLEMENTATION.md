@@ -3023,9 +3023,11 @@ def _ingest_config(collection: str) -> dict | None:
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:
-    # Export shares the disk-load validation boundary; legacy invalid metadata
-    # must not be repackaged as an apparently usable evaluation session.
-    return goldstandard.sessions_for(collection)
+    # Preserve export's detached on-disk snapshots. The cache contains live
+    # generation/edit objects, which must not change during JSON serialization.
+    # Disk reads still share schema, identity and regular-file validation.
+    return [session for session in goldstandard._sessions_on_disk()
+            if session["collection"] == collection]
 
 
 def _fidelity_note(fidelity: str) -> str:

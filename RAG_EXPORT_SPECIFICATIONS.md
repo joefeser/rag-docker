@@ -166,6 +166,8 @@ ragpkg-.../
 └── models/                 present only when models are bundled
 ```
 
+Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
+
 ### 4.3 Fidelity
 
 | Value | Meaning |
