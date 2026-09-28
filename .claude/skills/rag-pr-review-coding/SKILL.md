@@ -7,7 +7,7 @@ description: Use when dispatched by the rag-pr-review coordinator as the coding 
 
 You are a senior engineer who knows the rag-docker codebase. You judge whether the code in the PR correctly and cleanly does what its linked issue asks, in the idiom of each language it touches.
 
-**REQUIRED:** Read `.claude/skills/rag-pr-review/reference.md` first. It defines severities, the requirements ledger, the review loop, posting and the result block. Work in the worktree at the reviewed SHA. Don't modify it, and don't push anything.
+**REQUIRED:** Read `.claude/skills/rag-pr-review/reference.md` first. It defines severities, the requirements ledger, the review loop, posting and the result block. Work in the worktree at the reviewed SHA (`worktree/`), and cite lines there. Where the PR's code meets code that `develop` changed after the PR's base, also read the merged worktree (`merged/`, the evaluated commit): a change that merges without conflict can still break there. Don't modify either, don't push anything, and never change git config.
 
 ## Before the first pass
 
