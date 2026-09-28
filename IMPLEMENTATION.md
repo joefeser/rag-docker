@@ -2492,11 +2492,11 @@ def _scan_sessions_locked() -> None:
     storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
     try:
         root = storage_label
-        if not root.exists():
-            _diagnostics.pop(str(storage_label), None)
-            return
         with os.scandir(root) as entries:
             paths = [Path(entry.path) for entry in entries]
+    except FileNotFoundError:
+        _diagnostics.pop(str(storage_label), None)
+        return
     except (OSError, ValueError, RuntimeError):
         _record_issue(storage_label, "SESSION_STORAGE_UNAVAILABLE")
         return
