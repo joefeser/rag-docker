@@ -69,10 +69,10 @@ git merge-tree --write-tree origin/develop <reviewed-sha>
 
 ```bash
 gh api repos/mikesilvers/rag-docker/statuses/<sha> --method POST \
-  -f state=pending -f context=rag-pr-review -f description="run <id>: claimed, develop <develop-sha7>"
+  -f state=pending -f context=rag-pr-review -f description="run <id>: claimed, develop <develop-sha>"
 ```
 
-The develop SHA in the claim is what a resumed run, even in another session, compares against.
+Use the full 40-character develop SHA (the description stays under GitHub's 140-character limit). It's what a resumed run, even in another session, compares with `git rev-parse origin/develop` after `git fetch origin develop`: equal strings mean `develop` hasn't moved.
 
 **Two coordinators racing:** after claiming, run the race check in `reference.md` ("Commit statuses"). If the oldest `pending` claim from the last few minutes carries a different run id, the other coordinator claimed first. Stop without touching its statuses.
 
