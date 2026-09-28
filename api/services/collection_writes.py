@@ -12,10 +12,14 @@ _registry_lock = threading.Lock()
 _registry = {}
 
 
+def canonical(collection):
+    """The same first-character alias normalization used by the backend SDK."""
+    return collection[:1].upper() + collection[1:]
+
+
 @contextmanager
 def guard(collection):
-    # Weaviate canonicalizes the first character, including get()/insert().
-    collection = collection[:1].upper() + collection[1:]
+    collection = canonical(collection)
     with _registry_lock:
         entry = _registry.setdefault(collection, [threading.RLock(), 0])
         entry[1] += 1

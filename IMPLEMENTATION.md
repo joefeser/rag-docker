@@ -1566,10 +1566,12 @@ async def collection_exists(name: str) -> bool:
 
 @collection_writes.serialized("name")
 def _delete_collection_sync(name: str) -> int:
+    name = collection_writes.canonical(name)
     client = get_client()
     coll = client.collections.get(name)
     count = coll.aggregate.over_all(total_count=True).total_count
     client.collections.delete(name)
+    collection_recovery.retire_deleted(name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
     sources.delete(name)
@@ -4403,6 +4405,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     Re-chunk/re-embed use the embedding insert path. Reindex supplies original
     records and verifies them before replacement and after the final copy.
     """
+    collection = collection_writes.canonical(collection)
     if records is not None:
         wc._validate_reindex_vectorizer_sync(collection)
     config = wc._collection_config_sync(collection)
@@ -4487,7 +4490,9 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
 
 @collection_writes.serialized("collection")
 def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
+    collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
+    job["collection"] = collection
     job["status"] = "running"
 
     def progress(n: int) -> None:
@@ -4568,6 +4573,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
 
 
 async def start_tune_job(collection: str, operation: str, params: dict) -> str:
+    collection = collection_writes.canonical(collection)
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if collection in _active:
@@ -8301,7 +8307,7 @@ drive the UI in a real browser.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
-| `14_reindex.sh` | exact-record reindex: 20 record/cutover/vectorizer/concurrency cases, nine writer/import-boundary cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 35 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `14_reindex.sh` | exact-record reindex: 22 record/cutover/vectorizer/concurrency cases, thirteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 38 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
@@ -8350,6 +8356,8 @@ curl -s localhost:8080/api/collections | python3 -c \
 `reindex_verifier_cases.py` checks actual async failure cleanup and the parent shell cleanup predicate without a backend/model call. The registered suite transports its helper, the actual `lib.sh`, and these controlled tests into an owned temporary API directory. `test_collection_writes.py` checks waiting writers, case aliases, reentrancy, failures, independent collections and actual import/backend entry points, a paused complete replace-import cutover and sidecar restoration, positive ownership before import staging, and ordinary staging failure/recovery cleanup. The live suite refuses altered property vectorization and removes exact durably owned import scratch after an independent process exits without finally.
 
 The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
+
+Tuning normalizes the backend first-character alias before active-job admission, journaling and sidecar access. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
 ````
 
 ### scripts/verify/all.sh
@@ -10556,6 +10564,22 @@ class ReindexTests(unittest.TestCase):
         self.assertEqual(job['status'],'failed');self.stale.assert_called_once()
         retained=job['error_detail']['recovered_as'];self.assertEqual(self.backend.data[retained],self.original)
         self.assertEqual(job['chunks_written'],0)
+    def test_lowercase_alias_uses_canonical_job_and_cutover_identity(self):
+        tuning._jobs['owned']={'status':'queued','chunks_written':0,'notes':[]}
+        tuning._run('owned','ownedReindex','reindex',{'index_type':'flat','distance_metric':'dot'})
+        job=tuning._jobs['owned'];self.assertEqual(job['status'],'completed');self.assertEqual(job['collection'],'OwnedReindex')
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        self.assertTrue(all(name.startswith('OwnedReindex') for name,_,_,_ in self.backend.created))
+    def test_alias_jobs_share_the_same_active_identity(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        async def check():
+            with patch.object(tuning,'_active',set()),patch.object(tuning.asyncio,'to_thread',new=AsyncMock(return_value=None)):
+                identity=await tuning.start_tune_job('ownedReindex','reindex',{})
+                self.assertEqual(tuning._jobs[identity]['collection'],'OwnedReindex')
+                with self.assertRaises(RuntimeError):await tuning.start_tune_job('OwnedReindex','reindex',{})
+                await asyncio.sleep(0)
+        asyncio.run(check())
     def test_reembed_retains_its_explicit_regeneration_path(self):
         def embed(name,props):
             self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},
@@ -10702,6 +10726,9 @@ print('PASS independent API lifespan restores recovery, exact records and histor
     restarted=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child,stage,sid],input=json.dumps(before),text=True,capture_output=True,env=env,timeout=30)
     if restarted.returncode:print(restarted.stderr,flush=True)
     check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
+    deletion=await api.delete('/collections/'+stage[:1].lower()+stage[1:])
+    check(deletion.status_code==200 and deletion.json()['objects_deleted']==len(before),'explicit lowercase-alias DELETE removes the retained backend copy')
+    check(not await asyncio.to_thread(paths[0].exists) and not await asyncio.to_thread(snapshot.parent.parent.exists),'explicit recovery deletion retires exactly its ownership journal and metadata snapshots')
 
 
 async def additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check):
@@ -10766,7 +10793,9 @@ async def main():
                         check('connect' in message and ('127.0.0.1:1' in message or 'connection refused' in message),'actual vectorization fails against the closed embedding endpoint')
                     else: raise AssertionError('Owned embedding endpoint unexpectedly served a vector')
                     check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
-                    await asyncio.to_thread(wc._create_collection_sync,name,'hnsw','cosine',{})
+                    alias=name[:1].lower()+name[1:]
+                    creation=await api.post('/collections',json={'name':alias,'index_type':'hnsw','distance_metric':'cosine'})
+                    check(creation.status_code==201 and creation.json()['name']==alias,'collection HTTP creation echoes a supported lowercase alias')
                     col=client.collections.get(name)
                     source=[]
                     for i in range(2):
@@ -10778,10 +10807,10 @@ async def main():
                     check({r['id'] for r in before}==set(source),'stored explicit vectors and original UUIDs are readable with embeddings unavailable')
                     session={'session_id':sid,'collection':name,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_'+token,'question':'Owned question','answer':'Owned answer','ground_truth':'Owned truth','contexts':['Owned inert reindex'],'source_file':'owned-inert.txt','chunk_index':0,'status':'approved'}]}
                     await asyncio.to_thread(gs.store_session,session); session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
-                    request=await api.post('/tune/reindex',json={'collection':name,'index_type':'flat','distance_metric':'dot'})
+                    request=await api.post('/tune/reindex',json={'collection':alias,'index_type':'flat','distance_metric':'dot'})
                     check(request.status_code==202,'real reindex HTTP handler queues the job with closed embedding configuration'); job=request.json()['job_id'];jobs.append((tuning,job))
                     result=await completed(api,'/tune/job/'+job)
-                    check(result['status']=='completed' and result['chunks_written']==len(before), 'job completes only after final backend verification: '+str(result))
+                    check(result['status']=='completed' and result['collection']==name and result['chunks_written']==len(before), 'job completes only after final backend verification: '+str(result))
                     after=await asyncio.to_thread(tuning._existing_records,name)
                     check({r['id']:r for r in after}=={r['id']:r for r in before},'UUIDs, every property and all stored vector values match exactly after reindex')
                     config=await asyncio.to_thread(wc._collection_config_sync,name)
@@ -10870,10 +10899,14 @@ _registry_lock = threading.Lock()
 _registry = {}
 
 
+def canonical(collection):
+    """The same first-character alias normalization used by the backend SDK."""
+    return collection[:1].upper() + collection[1:]
+
+
 @contextmanager
 def guard(collection):
-    # Weaviate canonicalizes the first character, including get()/insert().
-    collection = collection[:1].upper() + collection[1:]
+    collection = canonical(collection)
     with _registry_lock:
         entry = _registry.setdefault(collection, [threading.RLock(), 0])
         entry[1] += 1
@@ -11054,25 +11087,47 @@ def discard(record: dict, client) -> None:
     _sync_dir(_root())
 
 
+
+def _read_owned_record(path: Path) -> dict:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
+    record = json.loads(path.read_text())
+    token = record["operation_id"]
+    operation = record["operation"]
+    marker = "__importing_" if operation == "import" else "__tuning_"
+    if (type(record.get("version")) is not int or record["version"] != 1 or operation not in ("import", "tune")
+            or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
+            or record["staging"] != f"{record['target']}{marker}{token}"
+            or record["state"] not in ("scratch", "recovery", "cleanup")):
+        raise ValueError("Invalid collection ownership record")
+    return record
+
+
+def retire_deleted(name: str, client) -> None:
+    """Retire exact recovery ownership only after explicit backend deletion.
+
+    A missing backend copy at startup does not itself authorize losing retained
+    snapshots. Invalid or unrelated journals never grant cleanup authority.
+    """
+    for path in sorted(_root().glob("*.json")):
+        try:
+            record = _read_owned_record(path)
+        except Exception:
+            log.exception("Unreadable collection ownership %s; preserved", path)
+            continue
+        if record["staging"] == name and record["state"] in ("recovery", "cleanup"):
+            discard(record, client)
+
+
 def sweep(client) -> list[str]:
     removed = []
     for path in sorted(_root().glob("*.json")):
         try:
-            if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
-                raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
-            record = json.loads(path.read_text())
-            token = record["operation_id"]
-            operation = record["operation"]
-            marker = "__importing_" if operation == "import" else "__tuning_"
-            if (type(record.get("version")) is not int or record["version"] != 1 or operation not in ("import", "tune")
-                    or not re.fullmatch(r"[0-9a-f]{32}", token)
-                    or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
-                    or record["staging"] != f"{record['target']}{marker}{token}"
-                    or record["state"] not in ("scratch", "recovery", "cleanup")):
-                raise ValueError("Invalid collection ownership record")
+            record = _read_owned_record(path)
             if record["state"] == "recovery":
                 log.warning("Retained recovery collection %r; sidecar snapshots: %s",
-                            record["staging"], _root() / token)
+                            record["staging"], _root() / record["operation_id"])
                 continue
             discard(record, client)
             removed.append(record["staging"])
@@ -11204,6 +11259,46 @@ class ImportCutoverTests(unittest.TestCase):
         module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');retained=job['error_detail']['recovered_as']
         self.assertIn(retained,backend);self.assertTrue(Path(job['error_detail']['sidecar_snapshots']).is_dir())
         self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
+
+
+class DeletedRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from config import settings
+        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs
+        self.recovery,self.wc=recovery,wc
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{})]:stack.enter_context(change)
+        self.backend={'OwnedRecovery'}
+        class Collections:
+            def exists(inner,name):return name in self.backend
+            def delete(inner,name):self.backend.remove(name)
+            def get(inner,name):return SimpleNamespace(aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
+        self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
+        self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
+    def test_explicit_alias_delete_retires_only_matching_recovery_snapshots(self):
+        import json
+        other=self.recovery.begin('OwnedRecovery','import',self.client);self.backend.add(other['staging']);self.recovery.retain(other)
+        corrupt=self.recovery._root()/'invalid.json';corrupt.write_text(json.dumps({**self.owner,'operation_id':'invalid'}))
+        name=self.owner['staging'];self.assertEqual(self.wc._delete_collection_sync(name[:1].lower()+name[1:]),3)
+        self.assertNotIn(name,self.backend);self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists());self.assertFalse((self.recovery._root()/(self.owner['operation_id']+'.json')).exists())
+        self.assertIn(other['staging'],self.backend);self.assertTrue((self.recovery._root()/other['operation_id']).is_dir());self.assertTrue(corrupt.is_file())
+    def test_deleting_original_preserves_distinct_retained_recovery(self):
+        self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
+        self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_missing_backend_at_startup_does_not_authorize_snapshot_loss(self):
+        self.backend.remove(self.owner['staging']);self.assertEqual(self.recovery.sweep(self.client),[])
+        self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_explicit_cleanup_failure_is_resumed_from_durable_intent(self):
+        import json
+        from unittest.mock import patch
+        with patch.object(self.recovery.shutil,'rmtree',side_effect=OSError('Owned cleanup failure')):
+            with self.assertRaises(OSError):self.wc._delete_collection_sync(self.owner['staging'])
+        journal=self.recovery._root()/(self.owner['operation_id']+'.json');self.assertEqual(json.loads(journal.read_text())['state'],'cleanup')
+        self.assertEqual(self.recovery.sweep(self.client),[self.owner['staging']]);self.assertFalse(journal.exists());self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists())
 
 
 

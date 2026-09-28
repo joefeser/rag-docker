@@ -226,6 +226,22 @@ class ReindexTests(unittest.TestCase):
         self.assertEqual(job['status'],'failed');self.stale.assert_called_once()
         retained=job['error_detail']['recovered_as'];self.assertEqual(self.backend.data[retained],self.original)
         self.assertEqual(job['chunks_written'],0)
+    def test_lowercase_alias_uses_canonical_job_and_cutover_identity(self):
+        tuning._jobs['owned']={'status':'queued','chunks_written':0,'notes':[]}
+        tuning._run('owned','ownedReindex','reindex',{'index_type':'flat','distance_metric':'dot'})
+        job=tuning._jobs['owned'];self.assertEqual(job['status'],'completed');self.assertEqual(job['collection'],'OwnedReindex')
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        self.assertTrue(all(name.startswith('OwnedReindex') for name,_,_,_ in self.backend.created))
+    def test_alias_jobs_share_the_same_active_identity(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        async def check():
+            with patch.object(tuning,'_active',set()),patch.object(tuning.asyncio,'to_thread',new=AsyncMock(return_value=None)):
+                identity=await tuning.start_tune_job('ownedReindex','reindex',{})
+                self.assertEqual(tuning._jobs[identity]['collection'],'OwnedReindex')
+                with self.assertRaises(RuntimeError):await tuning.start_tune_job('OwnedReindex','reindex',{})
+                await asyncio.sleep(0)
+        asyncio.run(check())
     def test_reembed_retains_its_explicit_regeneration_path(self):
         def embed(name,props):
             self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},

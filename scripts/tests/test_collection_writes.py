@@ -120,5 +120,45 @@ class ImportCutoverTests(unittest.TestCase):
         self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
 
 
+class DeletedRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from config import settings
+        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs
+        self.recovery,self.wc=recovery,wc
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{})]:stack.enter_context(change)
+        self.backend={'OwnedRecovery'}
+        class Collections:
+            def exists(inner,name):return name in self.backend
+            def delete(inner,name):self.backend.remove(name)
+            def get(inner,name):return SimpleNamespace(aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
+        self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
+        self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
+    def test_explicit_alias_delete_retires_only_matching_recovery_snapshots(self):
+        import json
+        other=self.recovery.begin('OwnedRecovery','import',self.client);self.backend.add(other['staging']);self.recovery.retain(other)
+        corrupt=self.recovery._root()/'invalid.json';corrupt.write_text(json.dumps({**self.owner,'operation_id':'invalid'}))
+        name=self.owner['staging'];self.assertEqual(self.wc._delete_collection_sync(name[:1].lower()+name[1:]),3)
+        self.assertNotIn(name,self.backend);self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists());self.assertFalse((self.recovery._root()/(self.owner['operation_id']+'.json')).exists())
+        self.assertIn(other['staging'],self.backend);self.assertTrue((self.recovery._root()/other['operation_id']).is_dir());self.assertTrue(corrupt.is_file())
+    def test_deleting_original_preserves_distinct_retained_recovery(self):
+        self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
+        self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_missing_backend_at_startup_does_not_authorize_snapshot_loss(self):
+        self.backend.remove(self.owner['staging']);self.assertEqual(self.recovery.sweep(self.client),[])
+        self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_explicit_cleanup_failure_is_resumed_from_durable_intent(self):
+        import json
+        from unittest.mock import patch
+        with patch.object(self.recovery.shutil,'rmtree',side_effect=OSError('Owned cleanup failure')):
+            with self.assertRaises(OSError):self.wc._delete_collection_sync(self.owner['staging'])
+        journal=self.recovery._root()/(self.owner['operation_id']+'.json');self.assertEqual(json.loads(journal.read_text())['state'],'cleanup')
+        self.assertEqual(self.recovery.sweep(self.client),[self.owner['staging']]);self.assertFalse(journal.exists());self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists())
+
+
 
 if __name__=='__main__':unittest.main()

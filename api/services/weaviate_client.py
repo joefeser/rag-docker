@@ -136,10 +136,12 @@ async def collection_exists(name: str) -> bool:
 
 @collection_writes.serialized("name")
 def _delete_collection_sync(name: str) -> int:
+    name = collection_writes.canonical(name)
     client = get_client()
     coll = client.collections.get(name)
     count = coll.aggregate.over_all(total_count=True).total_count
     client.collections.delete(name)
+    collection_recovery.retire_deleted(name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
     sources.delete(name)

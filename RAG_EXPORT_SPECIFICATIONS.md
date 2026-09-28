@@ -643,3 +643,5 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 Incremental export, encryption and signing, corpus merging, cross-vector-store
 migration, gold-standard remapping after re-chunk, and HTTP transport as an
 alternative to the mounted directory.
+
+Tuning normalizes the backend first-character alias before active-job admission, journaling and sidecar access. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.

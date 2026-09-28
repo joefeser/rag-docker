@@ -186,6 +186,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     Re-chunk/re-embed use the embedding insert path. Reindex supplies original
     records and verifies them before replacement and after the final copy.
     """
+    collection = collection_writes.canonical(collection)
     if records is not None:
         wc._validate_reindex_vectorizer_sync(collection)
     config = wc._collection_config_sync(collection)
@@ -270,7 +271,9 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
 
 @collection_writes.serialized("collection")
 def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
+    collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
+    job["collection"] = collection
     job["status"] = "running"
 
     def progress(n: int) -> None:
@@ -351,6 +354,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
 
 
 async def start_tune_job(collection: str, operation: str, params: dict) -> str:
+    collection = collection_writes.canonical(collection)
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if collection in _active:
