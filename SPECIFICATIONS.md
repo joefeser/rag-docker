@@ -1501,7 +1501,7 @@ not part of the saved retrieval configuration.
 
 ### 7.7 Gold Standard Page
 
-A retained session can be loaded/refreshed by its session ID, including when its collection no longer exists. Its collection and ID remain visible. Stale/orphaned sessions show reasons and recorded timestamps above review/export; missing legacy metadata has clear defaults. Loading or receiving new validity metadata resets the historical-export checkbox.
+A retained session can be loaded/refreshed by its session ID, including when its collection no longer exists. Its collection and ID remain visible. Stale/orphaned sessions show reasons and recorded timestamps above review/export; missing legacy metadata has clear defaults. Loading or receiving new validity metadata resets the historical-export checkbox. A new lookup clears the previous session and export controls before fetching, including when the lookup fails. Export shows a disabled progress state while its request is pending, and duplicate clicks cannot start another request.
 
 **Route:** `/goldstandard`  
 **Roles:** Engineer, Developer
@@ -1795,7 +1795,7 @@ now lives once, in `api/services/ingest_config.py`.
 ### 10.3 Gold Standard
 
 - [x] Retained stale/orphaned session warnings reach the live API and browser, with reasons/timestamps and legacy defaults. Historical export requires explicit choice, keeps RAGAS compatibility and preserves the original session.
-      *Eight controlled runtime groups plus one ten-source documentation group pass; seven real backend/in-process HTTP checks verify actual stale/orphan markers and historical export. An actual browser against the built UI and isolated real API shows legacy defaults, warning reasons/timestamps, reset consent after actual deletion, empty historical warnings and explicit four-field RAGAS download. Suite10 is called by05/all.sh; full suite is recorded separately.*
+      *Six controlled service/runtime groups plus one twelve-source documentation group cover validity/export and rebuild failure boundaries. Registered real backend/in-process HTTP checks cover actual stale/orphan markers, strict choices, missing sessions, empty history, compatible exports and a failed destructive cutover; browser fixtures cover empty history, failed lookup and duplicate export requests. An actual browser against the built UI and isolated real API shows legacy defaults, warning reasons/timestamps, reset consent after actual deletion, empty historical warnings and explicit four-field RAGAS download. Suite10 is called by05/all.sh; full suite is recorded separately.*
 
 - [x] Generate call returns `sample_size` pairs (or fewer if collection has fewer chunks).
       *Originally failed: sessions routinely lost pairs because the model returns
