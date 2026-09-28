@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -77,25 +78,63 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str, records: list[dict]) -> None:
-    collection_recovery.atomic_json(_marker_path(collection), {
-        "version": 2,
-        "collection": collection,
-        "expected_chunks": expected_chunks,
-        "job_id": job_id,
-        "records": records,
-    })
+def _read_marker(path: Path) -> tuple[dict, Path]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
+    data = json.loads(path.read_text())
+    collection, count = data["collection"], data["expected_chunks"]
+    snapshot = data["expected_snapshot"]
+    if (type(data.get("version")) is not int or data["version"] != 3
+            or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
+            or path.name != f"{collection}.json" or type(count) is not int or count < 0
+            or data["state"] not in ("building", "cleanup")
+            or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
+        raise ValueError("Invalid import ownership")
+    return data, _markers_dir() / snapshot["file"]
+
+
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> None:
+    snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
+    try:
+        with batch_write.ExpectedRecords() as expected:
+            expected.capture(records, expected_chunks)
+            expected.snapshot(snapshot)
+        with snapshot.open("rb") as data:
+            os.fsync(data.fileno())
+        collection_recovery._sync_dir(_markers_dir())
+        collection_recovery._sync_dir(Path(settings.upload_dir))
+        collection_recovery.atomic_json(_marker_path(collection), {
+            "version": 3, "collection": collection, "expected_chunks": expected_chunks,
+            "job_id": job_id, "state": "building",
+            "expected_snapshot": {"file": snapshot.name, "sha256": packager.sha256_file(snapshot)},
+        })
+    except Exception:
+        try:
+            snapshot.unlink(missing_ok=True)
+        except OSError:
+            _log.exception("Could not remove unpublished expectation snapshot %s", snapshot)
+        raise
 
 
 def _mark_finished(collection: str) -> None:
-    _marker_path(collection).unlink(missing_ok=True)
+    marker = _marker_path(collection)
+    if not marker.exists():
+        return
+    record, snapshot = _read_marker(marker)
+    if record["state"] != "cleanup":
+        record["state"] = "cleanup"
+        collection_recovery.atomic_json(marker, record)
+    snapshot.unlink(missing_ok=True)
+    marker.unlink()
+    collection_recovery._sync_dir(_markers_dir())
 
 
 # Extraction workspaces created by an import or a re-chunk. Both remove their
 # own directory in a `finally`, which a hard kill skips -- twelve of these were
 # found holding 152 MB after the kill tests, and a with-models package would
 # leave 2.3 GB behind each time.
-_WORKDIR_PREFIXES = ("import-", "rechunk-")
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -126,34 +165,28 @@ def sweep_interrupted_imports() -> list[str]:
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
         try:
-            data = json.loads(marker.read_text())
+            data, snapshot = _read_marker(marker)
             collection = data["collection"]
-            expected = data["expected_chunks"]
-            records = data["records"]
-            if (data.get("version") != 2 or not _NAME_OK.fullmatch(collection)
-                    or collection != canonical(collection)
-                    or not isinstance(expected, int) or isinstance(expected, bool) or expected < 0
-                    or marker.name != f"{collection}.json" or marker.is_symlink()
-                    or not isinstance(records, list) or len(records) != expected
-                    or any(not isinstance(record.get("properties"), dict)
-                           or not batch_write._valid_vector(record.get("vector")) for record in records)
-                    or len({str(uuid.UUID(record["id"])) for record in records}) != expected):
-                raise ValueError("Invalid import ownership")
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            _log.exception("Unreadable or legacy import marker %s; preserved", marker)
+            if data["state"] == "building":
+                if snapshot.is_symlink() or not snapshot.is_file():
+                    raise ValueError("Expected-record snapshot is not a regular file")
+                if packager.sha256_file(snapshot) != data["expected_snapshot"]["sha256"]:
+                    raise ValueError("Expected-record snapshot integrity mismatch")
+                with batch_write.ExpectedRecords() as expected:
+                    expected.load_snapshot(snapshot, data["expected_chunks"])
+                    if wc._collection_exists_sync(collection):
+                        col = wc.get_client().collections.get(collection)
+                        try:
+                            expected.verify(col, exact=True)
+                        except batch_write.BatchVerificationError:
+                            wc.get_client().collections.delete(collection)
+                            removed.append(f"{collection} (persisted records did not match import)")
+            # Cleanup is an explicit durable phase: failure here never converts
+            # a verified target back into a candidate for backend deletion.
+            _mark_finished(collection)
+        except Exception:
+            _log.exception("Could not resolve import ownership %s; preserved", marker)
             continue
-        try:
-            if wc._collection_exists_sync(collection):
-                col = wc.get_client().collections.get(collection)
-                try:
-                    batch_write.verify(col, records, exact=True)
-                except batch_write.BatchVerificationError:
-                    wc.get_client().collections.delete(collection)
-                    removed.append(f"{collection} (persisted records did not match import)")
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not resolve interrupted import of %r", collection)
-            continue
-        marker.unlink(missing_ok=True)
     return removed
 
 
@@ -305,16 +338,22 @@ def _create_from_package(name: str, pkg: Path) -> None:
     )
 
 
-def _package_records(pkg: Path, manifest: dict) -> list[dict]:
+def _package_records(pkg: Path, manifest: dict):
     expected_dims = (manifest.get("embedding") or {}).get("dimensions")
-    records = list(packager.iter_chunks_file(pkg))
-    for record in records:
+    for record in packager.iter_chunks_file(pkg):
+        try:
+            uuid.UUID(record["id"])
+            if not isinstance(record["properties"], dict):
+                raise ValueError("Chunk properties must be an object")
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise PackageError("PACKAGE_CORRUPT", f"Invalid chunk identity or properties: {exc}",
+                               {"file": "chunks.jsonl"}) from exc
         vector = record.get("vector")
         if not batch_write._valid_vector(vector):
             raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has no valid vector.")
         if expected_dims and len(vector) != expected_dims:
             raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has the wrong vector width.")
-    return records
+        yield record
 
 
 def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
@@ -326,7 +365,7 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     client = wc.get_client()
     col = client.collections.get(name)
     try:
-        written = batch_write.insert(col, _package_records(pkg, manifest),
+        written = batch_write.insert(col, lambda: _package_records(pkg, manifest),
                                      expected_count=manifest["collection"]["chunk_count"])
     except (ValueError, KeyError, TypeError) as exc:
         raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
@@ -400,12 +439,14 @@ def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
     _create_from_package(target, pkg)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
-    except Exception:
+    except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
             wc.get_client().collections.delete(target)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove partial collection %r", target)
+        except Exception as cleanup:
+            raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
+                               f"partial target cleanup failed ({cleanup})",
+                               {"collection": target, "cleanup_pending": True}) from original
         raise
 
 
@@ -475,7 +516,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     "collection were kept and marked orphaned")
 
         expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id, _package_records(pkg, manifest))
+        _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
         marked = target
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
@@ -516,8 +557,11 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
         # behind, which is the case the startup sweep exists for.
-        if marked:
-            _mark_finished(marked)
+        if marked and not (job.get("error_detail") or {}).get("cleanup_pending"):
+            try:
+                _mark_finished(marked)
+            except Exception:
+                _log.exception("Could not finish import marker for %r; startup will retry", marked)
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())

@@ -1413,17 +1413,40 @@ def delete(collection: str) -> None:
 ### api/services/batch_write.py
 
 ```python
-"""Completed-batch checks shared by ingestion, import and tuning."""
+"""Completed-batch checks with bounded, disk-backed record expectations."""
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import math
+import sqlite3
+import struct
+import tempfile
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
 from weaviate.classes.query import Filter
+from config import settings
+
+log = logging.getLogger(__name__)
+LOOKUP_SIZE = 100
 
 
 class BatchVerificationError(RuntimeError):
     """A completed read proved that stored records differ from expectations."""
+
+
+class BatchCleanupError(RuntimeError):
+    def __init__(self, original: Exception, cleanup: Exception):
+        self.original = original
+        self.cleanup = cleanup
+        super().__init__(f"{type(original).__name__}: {original}; ingestion cleanup "
+                         f"could not be confirmed ({type(cleanup).__name__}: {cleanup}). "
+                         "Accepted chunks may remain; resolve cleanup before retrying.")
 
 
 def _properties(value):
@@ -1433,13 +1456,13 @@ def _properties(value):
         return {key: _properties(item) for key, item in value.items() if item is not None}
     if isinstance(value, list):
         return [_properties(item) for item in value]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
     return value
 
 
 def _record_properties(value: dict) -> dict:
     value = dict(value)
-    # Weaviate returns DATE properties as datetime objects, including for a
-    # package whose source spelling was Z or another equivalent UTC offset.
     if isinstance(value.get("created_at"), str):
         value["created_at"] = datetime.fromisoformat(value["created_at"].replace("Z", "+00:00"))
     return _properties(value)
@@ -1451,78 +1474,204 @@ def _valid_vector(vector) -> bool:
         for n in vector)
 
 
-def verify(collection, records: list[dict], *, exact: bool) -> int:
-    """Confirm identities, properties and vectors; count alone cannot prove this."""
-    expected = {str(uuid.UUID(str(record["id"]))): record for record in records}
-    seen = set()
-    def stored_objects():
-        if exact:
-            yield from collection.iterator(include_vector=True)
-        else:
-            ids = list(expected)
-            for start in range(0, len(ids), 100):
-                selected = ids[start:start + 100]
-                yield from collection.query.fetch_objects(
-                    filters=Filter.by_id().contains_any(selected),
-                    limit=len(selected), include_vector=True).objects
-
-    for obj in stored_objects():
-        key = str(obj.uuid)
-        if key not in expected:
-            if exact:
-                raise BatchVerificationError(f"Unexpected stored object {key}")
-            continue
-        if key in seen:
-            raise BatchVerificationError(f"Duplicate stored object {key}")
-        record = expected[key]
-        if _record_properties(obj.properties or {}) != _record_properties(record["properties"]):
-            raise BatchVerificationError(f"Stored properties differ for {key}")
-        vector = (obj.vector or {}).get("default")
-        if not _valid_vector(vector):
-            raise BatchVerificationError(f"Stored vector is missing or invalid for {key}")
-        requested = record.get("vector")
-        if requested is not None and (len(requested) != len(vector) or not all(
-                math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-6)
-                for a, b in zip(requested, vector))):
-            raise BatchVerificationError(f"Stored vector differs for {key}")
-        seen.add(key)
-    if seen != expected.keys():
-        raise BatchVerificationError(f"Confirmed {len(seen)} of {len(expected)} expected objects")
-    return len(seen)
+def _property_digest(properties: dict) -> bytes:
+    return hashlib.sha256(json.dumps(_record_properties(properties), sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False).encode()).digest()
 
 
-def insert(collection, records, *, exact: bool = True, expected_count: int | None = None) -> int:
-    """Enqueue once, wait for the final flush, then verify persisted records.
+def _vector_digest(vector) -> bytes:
+    if not _valid_vector(vector):
+        raise ValueError("Missing or invalid vector")
+    digest = hashlib.sha256()
+    for number in vector:
+        try:
+            encoded = struct.pack("<f", number)
+        except (OverflowError, struct.error) as exc:
+            raise ValueError("Vector exceeds finite float32 storage") from exc
+        if not math.isfinite(struct.unpack("<f", encoded)[0]):
+            raise ValueError("Vector exceeds finite float32 storage")
+        digest.update(encoded)
+    return digest.digest()
 
-    Explicit UUIDs prevent a caller's attempted count from hiding duplicate IDs.
-    Generated vectors are checked for validity; supplied vectors are compared
-    with float32 storage tolerance. No progress is published before confirmation.
+
+def _factory(records):
+    if callable(records):
+        return records
+    if iter(records) is records:
+        raise ValueError("A one-shot iterator needs a reusable record factory")
+    return lambda: iter(records)
+
+
+class ExpectedRecords:
+    """UUIDs and SHA-256 fingerprints on disk; no corpus vectors held in RAM.
+
+    The SQLite cache is limited to 1 MiB. Capture/preflight and writing each
+    stream records separately; transient verification state never changes a
+    durable expectation snapshot used by restart cleanup.
     """
-    prepared = []
-    identities = set()
-    for item in records:
-        record = dict(item)
-        key = str(uuid.UUID(str(record["id"]))) if "id" in record else str(uuid.uuid4())
-        if key in identities:
-            raise ValueError(f"Duplicate chunk UUID {key}")
-        identities.add(key)
-        record["id"] = key
-        if "vector" in record and not _valid_vector(record["vector"]):
-            raise ValueError(f"Missing or invalid vector for {key}")
-        _record_properties(record["properties"])
-        prepared.append(record)
-    if expected_count is not None and len(prepared) != expected_count:
-        raise ValueError(f"Package contains {len(prepared)} objects but declares {expected_count}")
-    with collection.batch.dynamic() as batch:
-        for record in prepared:
-            batch.add_object(properties=record["properties"], uuid=record["id"],
-                             vector=record.get("vector"))
-    # failed_objects belongs to the wrapper and is reset per dynamic() call.
-    # It includes errors from the final flush, unlike an in-context check.
-    failed = collection.batch.failed_objects
-    if failed:
-        raise RuntimeError(f"Weaviate rejected {len(failed)} batch object(s)")
-    return verify(collection, prepared, exact=exact)
+    def __init__(self):
+        Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix="batch-verify-", dir=settings.upload_dir)
+        self.path = Path(self.temp.name) / "expected.sqlite3"
+        self.db = sqlite3.connect(self.path)
+        self.db.execute("PRAGMA cache_size=-1024")
+        self.db.execute("PRAGMA temp_store=FILE")
+        self.db.execute("PRAGMA user_version=1")
+        self.db.execute("CREATE TABLE expected (position INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, "
+                        "properties BLOB NOT NULL, vector BLOB, seen INTEGER NOT NULL DEFAULT 0)")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        # Temporary index cleanup cannot turn a confirmed write into a failed
+        # ingest after its rollback boundary has already passed.
+        try:
+            self.db.close()
+            self.temp.cleanup()
+        except (OSError, sqlite3.Error):
+            log.exception("Could not remove temporary batch verification index %s", self.path)
+
+    @property
+    def count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM expected").fetchone()[0]
+
+    def capture(self, records, expected_count=None, *, generated_only=False):
+        if expected_count is not None and (type(expected_count) is not int or expected_count < 0):
+            raise ValueError("Declared object count must be a nonnegative integer")
+        for position, record in enumerate(_factory(records)()):
+            if generated_only and "id" in record:
+                raise ValueError("Owned ingestion cleanup requires newly generated UUIDs")
+            key = str(uuid.UUID(str(record["id"]))) if "id" in record else str(uuid.uuid4())
+            vector = _vector_digest(record["vector"]) if "vector" in record else None
+            try:
+                self.db.execute("INSERT INTO expected(position,id,properties,vector) VALUES (?,?,?,?)",
+                                (position, key, _property_digest(record["properties"]), vector))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"Duplicate chunk UUID {key}") from exc
+        if expected_count is not None and self.count != expected_count:
+            raise ValueError(f"Package contains {self.count} objects but declares {expected_count}")
+        self.db.commit()
+
+    def snapshot(self, destination: Path):
+        with closing(sqlite3.connect(destination)) as target:
+            self.db.backup(target)
+
+    def load_snapshot(self, source: Path, expected_count: int):
+        with closing(sqlite3.connect("file:" + quote(str(source)) + "?mode=ro", uri=True)) as original:
+            if original.execute("PRAGMA user_version").fetchone()[0] != 1:
+                raise ValueError("Unsupported expected-record snapshot")
+            original.backup(self.db)
+        self.db.execute("PRAGMA cache_size=-1024")
+        if self.count != expected_count:
+            raise ValueError("Expected-record snapshot count mismatch")
+        for position, row in enumerate(self.db.execute(
+                "SELECT position,id,properties,vector,seen FROM expected ORDER BY position")):
+            index, key, properties, vector, seen = row
+            if (index != position or str(uuid.UUID(key)) != key
+                    or not isinstance(properties, bytes) or len(properties) != 32
+                    or (vector is not None and (not isinstance(vector, bytes) or len(vector) != 32))
+                    or seen != 0):
+                raise ValueError("Invalid expected-record snapshot entry")
+
+    def prepare(self, position, record):
+        expected = self.db.execute("SELECT id,properties,vector FROM expected WHERE position=?",
+                                   (position,)).fetchone()
+        if expected is None:
+            raise ValueError("Record stream changed after preflight")
+        key, properties, vector = expected
+        actual_id = str(uuid.UUID(str(record["id"]))) if "id" in record else key
+        actual_vector = _vector_digest(record["vector"]) if "vector" in record else None
+        if (actual_id != key or _property_digest(record["properties"]) != properties or actual_vector != vector):
+            raise ValueError("Record stream changed after preflight")
+        return {**record, "id": key}
+
+    def id_batches(self):
+        cursor = self.db.execute("SELECT id FROM expected ORDER BY position")
+        while rows := cursor.fetchmany(LOOKUP_SIZE):
+            yield [row[0] for row in rows]
+
+    def verify(self, collection, *, exact: bool) -> int:
+        self.db.execute("UPDATE expected SET seen=0")
+
+        def stored_objects():
+            if exact:
+                yield from collection.iterator(include_vector=True)
+            else:
+                for ids in self.id_batches():
+                    yield from collection.query.fetch_objects(
+                        filters=Filter.by_id().contains_any(ids), limit=len(ids), include_vector=True).objects
+
+        for obj in stored_objects():
+            key = str(obj.uuid)
+            expected = self.db.execute("SELECT properties,vector,seen FROM expected WHERE id=?", (key,)).fetchone()
+            if expected is None:
+                if exact:
+                    raise BatchVerificationError(f"Unexpected stored object {key}")
+                continue
+            properties, vector, seen = expected
+            if seen:
+                raise BatchVerificationError(f"Duplicate stored object {key}")
+            if _property_digest(obj.properties or {}) != properties:
+                raise BatchVerificationError(f"Stored properties differ for {key}")
+            try:
+                actual_vector = _vector_digest((obj.vector or {}).get("default"))
+            except ValueError as exc:
+                raise BatchVerificationError(f"Stored vector is missing or invalid for {key}") from exc
+            if vector is not None and vector != actual_vector:
+                raise BatchVerificationError(f"Stored float32 vector differs for {key}")
+            self.db.execute("UPDATE expected SET seen=1 WHERE id=?", (key,))
+        confirmed = self.db.execute("SELECT COUNT(*) FROM expected WHERE seen=1").fetchone()[0]
+        if confirmed != self.count:
+            raise BatchVerificationError(f"Confirmed {confirmed} of {self.count} expected objects")
+        return confirmed
+
+    def rollback(self, collection):
+        for ids in self.id_batches():
+            result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
+            if result.failed:
+                raise RuntimeError(f"Could not remove {result.failed} owned ingestion object(s)")
+            remaining = collection.query.fetch_objects(filters=Filter.by_id().contains_any(ids), limit=len(ids))
+            if remaining.objects:
+                raise RuntimeError("Owned ingestion objects remain after cleanup")
+
+
+def verify(collection, records, *, exact: bool) -> int:
+    with ExpectedRecords() as expected:
+        expected.capture(records)
+        return expected.verify(collection, exact=exact)
+
+
+def insert(collection, records, *, exact: bool = True, expected_count: int | None = None,
+           cleanup_owned: bool = False) -> int:
+    """Preflight a reusable stream, flush, then compare persisted fingerprints.
+
+    Only ingestion-generated UUIDs may be rolled back individually. Import and
+    tuning own new collections and retain/remove them at their operation boundary.
+    """
+    factory = _factory(records)
+    with ExpectedRecords() as expected:
+        expected.capture(factory, expected_count, generated_only=cleanup_owned)
+        try:
+            queued = 0
+            with collection.batch.dynamic() as batch:
+                for position, record in enumerate(factory()):
+                    record = expected.prepare(position, record)
+                    batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
+                    queued += 1
+                if queued != expected.count:
+                    raise ValueError("Record stream changed after preflight")
+            failed = collection.batch.failed_objects
+            if failed:
+                raise RuntimeError(f"Weaviate rejected {len(failed)} batch object(s)")
+            return expected.verify(collection, exact=exact)
+        except Exception as original:
+            if cleanup_owned:
+                try:
+                    expected.rollback(collection)
+                except Exception as cleanup:
+                    raise BatchCleanupError(original, cleanup) from original
+            raise
 ```
 
 ### api/services/collection_recovery.py
@@ -1659,10 +1808,18 @@ def retain(record: dict, *, package: Path | None = None) -> None:
 
 def discard(record: dict, client) -> None:
     """Delete an owned copy after success, or scratch while the target is safe."""
+    # Persist intent before the first deletion. Startup can finish this exact
+    # authorized cleanup even if backend or filesystem cleanup is interrupted.
+    if record["state"] != "cleanup":
+        updated = {**record, "state": "cleanup"}
+        _write(updated)
+        record.update(updated)
     name = record["staging"]
     if client.collections.exists(name):
         client.collections.delete(name)
     sources.delete(name)
+    if sources.collection_dir(name).exists():
+        raise OSError(f"Could not remove recovery sources for {name}")
     for kind in ("ingest", "retrieval"):
         (Path(settings.upload_dir) / f"{kind}_configs" / f"{name}.json").unlink(missing_ok=True)
     metadata = _root() / record["operation_id"]
@@ -1676,8 +1833,8 @@ def sweep(client) -> list[str]:
     removed = []
     for path in sorted(_root().glob("*.json")):
         try:
-            if path.is_symlink() or not path.is_file():
-                raise ValueError("Ownership record is not a regular file")
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+                raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
             record = json.loads(path.read_text())
             token = record["operation_id"]
             operation = record["operation"]
@@ -1686,7 +1843,7 @@ def sweep(client) -> list[str]:
                     or not re.fullmatch(r"[0-9a-f]{32}", token)
                     or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
                     or record["staging"] != f"{record['target']}{marker}{token}"
-                    or record["state"] not in ("scratch", "recovery")):
+                    or record["state"] not in ("scratch", "recovery", "cleanup")):
                 raise ValueError("Invalid collection ownership record")
             if record["state"] == "recovery":
                 log.warning("Retained recovery collection %r; sidecar snapshots: %s",
@@ -1963,7 +2120,8 @@ async def get_collection_config(name: str) -> dict:
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
-    batch_write.insert(coll, ({"properties": chunk} for chunk in chunks), exact=False)
+    batch_write.insert(coll, lambda: ({"properties": chunk} for chunk in chunks),
+                       exact=False, cleanup_owned=True)
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
@@ -3744,6 +3902,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -3796,25 +3955,63 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str, records: list[dict]) -> None:
-    collection_recovery.atomic_json(_marker_path(collection), {
-        "version": 2,
-        "collection": collection,
-        "expected_chunks": expected_chunks,
-        "job_id": job_id,
-        "records": records,
-    })
+def _read_marker(path: Path) -> tuple[dict, Path]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
+    data = json.loads(path.read_text())
+    collection, count = data["collection"], data["expected_chunks"]
+    snapshot = data["expected_snapshot"]
+    if (type(data.get("version")) is not int or data["version"] != 3
+            or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
+            or path.name != f"{collection}.json" or type(count) is not int or count < 0
+            or data["state"] not in ("building", "cleanup")
+            or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
+        raise ValueError("Invalid import ownership")
+    return data, _markers_dir() / snapshot["file"]
+
+
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> None:
+    snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
+    try:
+        with batch_write.ExpectedRecords() as expected:
+            expected.capture(records, expected_chunks)
+            expected.snapshot(snapshot)
+        with snapshot.open("rb") as data:
+            os.fsync(data.fileno())
+        collection_recovery._sync_dir(_markers_dir())
+        collection_recovery._sync_dir(Path(settings.upload_dir))
+        collection_recovery.atomic_json(_marker_path(collection), {
+            "version": 3, "collection": collection, "expected_chunks": expected_chunks,
+            "job_id": job_id, "state": "building",
+            "expected_snapshot": {"file": snapshot.name, "sha256": packager.sha256_file(snapshot)},
+        })
+    except Exception:
+        try:
+            snapshot.unlink(missing_ok=True)
+        except OSError:
+            _log.exception("Could not remove unpublished expectation snapshot %s", snapshot)
+        raise
 
 
 def _mark_finished(collection: str) -> None:
-    _marker_path(collection).unlink(missing_ok=True)
+    marker = _marker_path(collection)
+    if not marker.exists():
+        return
+    record, snapshot = _read_marker(marker)
+    if record["state"] != "cleanup":
+        record["state"] = "cleanup"
+        collection_recovery.atomic_json(marker, record)
+    snapshot.unlink(missing_ok=True)
+    marker.unlink()
+    collection_recovery._sync_dir(_markers_dir())
 
 
 # Extraction workspaces created by an import or a re-chunk. Both remove their
 # own directory in a `finally`, which a hard kill skips -- twelve of these were
 # found holding 152 MB after the kill tests, and a with-models package would
 # leave 2.3 GB behind each time.
-_WORKDIR_PREFIXES = ("import-", "rechunk-")
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -3845,34 +4042,28 @@ def sweep_interrupted_imports() -> list[str]:
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
         try:
-            data = json.loads(marker.read_text())
+            data, snapshot = _read_marker(marker)
             collection = data["collection"]
-            expected = data["expected_chunks"]
-            records = data["records"]
-            if (data.get("version") != 2 or not _NAME_OK.fullmatch(collection)
-                    or collection != canonical(collection)
-                    or not isinstance(expected, int) or isinstance(expected, bool) or expected < 0
-                    or marker.name != f"{collection}.json" or marker.is_symlink()
-                    or not isinstance(records, list) or len(records) != expected
-                    or any(not isinstance(record.get("properties"), dict)
-                           or not batch_write._valid_vector(record.get("vector")) for record in records)
-                    or len({str(uuid.UUID(record["id"])) for record in records}) != expected):
-                raise ValueError("Invalid import ownership")
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            _log.exception("Unreadable or legacy import marker %s; preserved", marker)
+            if data["state"] == "building":
+                if snapshot.is_symlink() or not snapshot.is_file():
+                    raise ValueError("Expected-record snapshot is not a regular file")
+                if packager.sha256_file(snapshot) != data["expected_snapshot"]["sha256"]:
+                    raise ValueError("Expected-record snapshot integrity mismatch")
+                with batch_write.ExpectedRecords() as expected:
+                    expected.load_snapshot(snapshot, data["expected_chunks"])
+                    if wc._collection_exists_sync(collection):
+                        col = wc.get_client().collections.get(collection)
+                        try:
+                            expected.verify(col, exact=True)
+                        except batch_write.BatchVerificationError:
+                            wc.get_client().collections.delete(collection)
+                            removed.append(f"{collection} (persisted records did not match import)")
+            # Cleanup is an explicit durable phase: failure here never converts
+            # a verified target back into a candidate for backend deletion.
+            _mark_finished(collection)
+        except Exception:
+            _log.exception("Could not resolve import ownership %s; preserved", marker)
             continue
-        try:
-            if wc._collection_exists_sync(collection):
-                col = wc.get_client().collections.get(collection)
-                try:
-                    batch_write.verify(col, records, exact=True)
-                except batch_write.BatchVerificationError:
-                    wc.get_client().collections.delete(collection)
-                    removed.append(f"{collection} (persisted records did not match import)")
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not resolve interrupted import of %r", collection)
-            continue
-        marker.unlink(missing_ok=True)
     return removed
 
 
@@ -4024,16 +4215,22 @@ def _create_from_package(name: str, pkg: Path) -> None:
     )
 
 
-def _package_records(pkg: Path, manifest: dict) -> list[dict]:
+def _package_records(pkg: Path, manifest: dict):
     expected_dims = (manifest.get("embedding") or {}).get("dimensions")
-    records = list(packager.iter_chunks_file(pkg))
-    for record in records:
+    for record in packager.iter_chunks_file(pkg):
+        try:
+            uuid.UUID(record["id"])
+            if not isinstance(record["properties"], dict):
+                raise ValueError("Chunk properties must be an object")
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise PackageError("PACKAGE_CORRUPT", f"Invalid chunk identity or properties: {exc}",
+                               {"file": "chunks.jsonl"}) from exc
         vector = record.get("vector")
         if not batch_write._valid_vector(vector):
             raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has no valid vector.")
         if expected_dims and len(vector) != expected_dims:
             raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has the wrong vector width.")
-    return records
+        yield record
 
 
 def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
@@ -4045,7 +4242,7 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     client = wc.get_client()
     col = client.collections.get(name)
     try:
-        written = batch_write.insert(col, _package_records(pkg, manifest),
+        written = batch_write.insert(col, lambda: _package_records(pkg, manifest),
                                      expected_count=manifest["collection"]["chunk_count"])
     except (ValueError, KeyError, TypeError) as exc:
         raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
@@ -4119,12 +4316,14 @@ def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
     _create_from_package(target, pkg)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
-    except Exception:
+    except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
             wc.get_client().collections.delete(target)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove partial collection %r", target)
+        except Exception as cleanup:
+            raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
+                               f"partial target cleanup failed ({cleanup})",
+                               {"collection": target, "cleanup_pending": True}) from original
         raise
 
 
@@ -4194,7 +4393,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     "collection were kept and marked orphaned")
 
         expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id, _package_records(pkg, manifest))
+        _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
         marked = target
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
@@ -4235,8 +4434,11 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
         # behind, which is the case the startup sweep exists for.
-        if marked:
-            _mark_finished(marked)
+        if marked and not (job.get("error_detail") or {}).get("cleanup_pending"):
+            try:
+                _mark_finished(marked)
+            except Exception:
+                _log.exception("Could not finish import marker for %r; startup will retry", marked)
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())
@@ -4576,15 +4778,17 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     try:
         wc._create_collection_sync(staging, new_index, new_distance, hnsw)
         wc._insert_chunks_sync(staging, properties)
-        staged = [
-            {"id": str(o.uuid),
-             "vector": (o.vector or {}).get("default"),
-             "properties": dict(o.properties or {})}
-            for o in client.collections.get(staging).iterator(include_vector=True)
-        ]
-        if len(staged) != len(properties):
+        def staged():
+            return (
+                {"id": str(o.uuid),
+                 "vector": (o.vector or {}).get("default"),
+                 "properties": dict(o.properties or {})}
+                for o in client.collections.get(staging).iterator(include_vector=True)
+            )
+        staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+        if staged_count != len(properties):
             raise RuntimeError(
-                f"staged {len(staged)} chunks but expected {len(properties)}")
+                f"staged {staged_count} chunks but expected {len(properties)}")
         collection_recovery.retain(ownership)
         # The final create, write and verification can still fail. Durable
         # recovery ownership must precede deletion, including on a hard kill.
@@ -8392,8 +8596,9 @@ For a **disposable stack**, the following fault acceptance uses real Weaviate,
 synthetic `VfyBatchRecovery*` collections and the real embedding model. It injects
 final-create failures into the test process, retains import/tuning recovery,
 restarts the API, then verifies exact UUIDs, properties, vectors and sources.
-It also checks real completed-batch rejection, owned scratch cleanup and retention
-of an unowned marker-like collection. It must not run against a user's data stack.
+It also checks real completed-batch rejection/partial acceptance, ingestion UUID
+rollback after a post-write read fault, resumption of metadata cleanup after backend
+deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack.
 
 ```bash
 docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
@@ -9685,6 +9890,228 @@ rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
 summary
+```
+
+### scripts/verify/batch_recovery.py
+
+```python
+"""Destructive fault acceptance for a disposable stack, using only Vfy names.
+
+Run prepare in the API container, restart the API, then run check and cleanup.
+No production fault switches are added to the server.
+"""
+import argparse
+import asyncio
+import json
+import re
+import sys
+import tarfile
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, '/app')
+from config import settings
+from services import batch_write, collection_recovery as recovery, goldstandard, importer, ollama_client, packager, sources, tuning, weaviate_client as wc
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+    print('PASS ' + message)
+
+
+def prepare(prefix, state_path):
+    require(not state_path.exists(), 'no previous acceptance state is overwritten')
+    client = wc.get_client()
+    require(not any(name.startswith(prefix) for name in client.collections.list_all()), 'disposable names are unused')
+    vector = asyncio.run(ollama_client.embed('synthetic recovery acceptance text'))
+    rows = [dict(id=str(uuid.uuid4()), properties={'content': f'synthetic chunk {i}',
+            'source_file': 'synthetic.txt', 'chunk_index': i, 'created_at': '2026-09-27T00:00:00Z'}, vector=vector)
+            for i in range(2)]
+    state = {'prefix': prefix, 'recoveries': [], 'names': [], 'archives': []}
+    state_path.write_text(json.dumps(state))
+
+    def save():
+        state_path.write_text(json.dumps(state, indent=2, default=lambda value: value.isoformat()))
+
+    def collection(suffix):
+        name = prefix + suffix
+        state['names'].append(name)
+        save()
+        wc._create_collection_sync(name, 'hnsw', 'cosine', {})
+        batch_write.insert(client.collections.get(name), rows)
+        return name
+
+    rejected = collection('Reject')
+    col = client.collections.get(rejected)
+    invalid = [{**row, 'id': str(uuid.uuid4()), 'properties': {**row['properties'], 'chunk_index': 'not an integer'}} for row in rows]
+    invalid[1]['properties'] = dict(rows[1]['properties'])
+    try:
+        batch_write.insert(col, invalid, exact=False)
+    except RuntimeError:
+        require(bool(col.batch.failed_objects), 'real completed batch rejection is reported')
+        stored_ids = {str(obj.uuid) for obj in col.iterator()}
+        require(invalid[0]['id'] not in stored_ids and invalid[1]['id'] in stored_ids,
+                'real partial acceptance still fails the batch')
+    else:
+        raise AssertionError('real invalid batch reported success')
+
+    before_attempt = list(packager.read_chunks(rejected))
+    original_fetch = col.query.fetch_objects
+    def fail_verification_read(*args, **kwargs):
+        if kwargs.get('include_vector'):
+            raise OSError('controlled post-write read fault')
+        return original_fetch(*args, **kwargs)
+    with patch.object(col.query, 'fetch_objects', side_effect=fail_verification_read):
+        try:
+            batch_write.insert(col, lambda: ({'properties': row['properties']} for row in rows),
+                               exact=False, cleanup_owned=True)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('post-write read fault reported success')
+    require(batch_write.verify(col, before_attempt, exact=True) == len(before_attempt),
+            'failed ingestion removes only its generated UUIDs and preserves prior records')
+
+    def remember(name, detail):
+        record_path = next(p for p in recovery._root().glob('*.json')
+                           if json.loads(p.read_text()).get('staging') == detail['recovered_as'])
+        record = json.loads(record_path.read_text())
+        expected = list(packager.read_chunks(record['staging']))
+        require(len(expected) == 2, name + ' retains every verified record')
+        state['recoveries'].append({'record': record, 'rows': expected})
+        save()
+
+    tune_name = collection('Tune')
+    sources.store(tune_name, 'synthetic.txt', b'synthetic retained source')
+    real_create = wc._create_collection_sync
+    def fail_create(name, *args):
+        if name == tune_name:
+            raise RuntimeError('controlled final-create fault')
+        return real_create(name, *args)
+    with patch.object(wc, '_create_collection_sync', side_effect=fail_create):
+        try:
+            tuning._rebuild(tune_name, [row['properties'] for row in rows], None, None, None)
+        except packager.PackageError as exc:
+            remember('tuning', exc.detail)
+        else:
+            raise AssertionError('tuning final-create fault reported success')
+
+    import_name = collection('Import')
+    package = Path(settings.upload_dir) / (prefix + '-package')
+    package.mkdir()
+    (package / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    (package / 'collection.json').write_text('{}')
+    source_dir = package / 'sources'
+    source_dir.mkdir()
+    (source_dir / 'synthetic-source').write_bytes(b'synthetic imported source')
+    manifest = {'package_format': 1, 'collection': {'name': import_name, 'chunk_count': 2},
+                'embedding': {'model': settings.embed_model, 'dimensions': len(vector)},
+                'fidelity': 'with-sources', 'files': {str(p.relative_to(package)): 'sha256:' + packager.sha256_file(p)
+                    for p in package.rglob('*') if p.is_file()}}
+    (package / 'manifest.json').write_text(json.dumps(manifest))
+    archive = packager.exports_dir() / (prefix + '-fixture.tar.gz')
+    state['archives'].append(str(archive))
+    save()
+    with tarfile.open(archive, 'w:gz') as tar:
+        tar.add(package, arcname='package')
+    def fail_import_create(name, *args):
+        if name == import_name:
+            raise RuntimeError('controlled final-create fault')
+        return real_create(name, *args)
+    importer._jobs['live-acceptance'] = {'chunks_written': 0}
+    with patch.object(wc, '_create_collection_sync', side_effect=fail_import_create):
+        importer._run('live-acceptance', archive.name, 'replace')
+    job = importer._jobs['live-acceptance']
+    require(job['status'] == 'failed' and job['chunks_written'] == 0, 'replace failure reports zero confirmed target writes')
+    remember('replace import', job['error_detail'])
+
+    cleanup_record = recovery.begin(prefix + 'Cleanup', 'tune', client)
+    wc._create_collection_sync(cleanup_record['staging'], 'hnsw', 'cosine', {})
+    recovery.retain(cleanup_record)
+    metadata = recovery._root() / cleanup_record['operation_id']
+    actual_rmtree = recovery.shutil.rmtree
+    def fail_metadata_cleanup(path, *args, **kwargs):
+        if Path(path) == metadata:
+            raise OSError('controlled metadata cleanup fault')
+        return actual_rmtree(path, *args, **kwargs)
+    with patch.object(recovery.shutil, 'rmtree', side_effect=fail_metadata_cleanup):
+        try:
+            recovery.discard(cleanup_record, client)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('cleanup fault was not observed')
+    require(cleanup_record['state'] == 'cleanup' and not client.collections.exists(cleanup_record['staging']),
+            'cleanup intent survives filesystem failure after backend deletion')
+    state['cleanup_record'] = cleanup_record
+    save()
+
+    unrelated = collection('__tuning_user_data')
+    state['unrelated'] = unrelated
+    scratch = recovery.begin(prefix + 'Scratch', 'tune', client)
+    wc._create_collection_sync(scratch['staging'], 'hnsw', 'cosine', {})
+    state['scratch'] = scratch['staging']
+    save()
+    print('READY restart the API before check')
+
+
+def check(state):
+    client = wc.get_client()
+    for entry in state['recoveries']:
+        record = entry['record']
+        require(client.collections.exists(record['staging']), 'recovery survives API restart: ' + record['operation'])
+        require(batch_write.verify(client.collections.get(record['staging']), entry['rows'], exact=True) == 2,
+                'recovery UUIDs, properties and vectors match: ' + record['operation'])
+        source_dir = sources.collection_dir(record['staging'])
+        require(source_dir.is_dir() and any(source_dir.iterdir()), 'recovery sources survive: ' + record['operation'])
+        require((recovery._root() / (record['operation_id'] + '.json')).is_file(), 'recovery ownership survives: ' + record['operation'])
+    require(client.collections.exists(state['unrelated']), 'unowned marker-like collection survives restart')
+    require(not client.collections.exists(state['scratch']), 'positively owned scratch is removed at startup')
+    cleanup_record = state['cleanup_record']
+    require(not (recovery._root() / (cleanup_record['operation_id'] + '.json')).exists(),
+            'startup finishes interrupted recovery journal cleanup')
+    require(not (recovery._root() / cleanup_record['operation_id']).exists(),
+            'startup removes remaining cleanup metadata')
+
+
+def cleanup(state, state_path):
+    client = wc.get_client()
+    for entry in state['recoveries']:
+        recovery.discard(entry['record'], client)
+    for name in state['names'] + [state.get('scratch', '')]:
+        if name and client.collections.exists(name):
+            wc._delete_collection_sync(name)
+        elif name:
+            sources.delete(name)
+            wc.ingest_config.delete(name)
+            wc.retrieval_config.delete(name)
+    for archive in state['archives']:
+        Path(archive).unlink(missing_ok=True)
+    import shutil
+    shutil.rmtree(Path(settings.upload_dir) / (state['prefix'] + '-package'), ignore_errors=True)
+    state_path.unlink()
+    print('PASS disposable recovery fixtures removed')
+
+
+if __name__ == '__main__':
+    args = argparse.ArgumentParser()
+    args.add_argument('phase', choices=('prepare', 'check', 'cleanup'))
+    args.add_argument('--prefix', default='VfyBatchRecovery')
+    options = args.parse_args()
+    if not re.fullmatch(r'Vfy[A-Za-z0-9_]+', options.prefix):
+        args.error('prefix must be a safe Vfy collection prefix')
+    state_path = Path(settings.upload_dir) / (options.prefix + '-acceptance.json')
+    try:
+        if options.phase == 'prepare':
+            prepare(options.prefix, state_path)
+        elif options.phase == 'check':
+            check(json.loads(state_path.read_text()))
+        else:
+            cleanup(json.loads(state_path.read_text()), state_path)
+    finally:
+        wc.close_client()
 ```
 
 ### scripts/verify/06_ui.sh

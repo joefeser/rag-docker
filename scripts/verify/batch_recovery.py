@@ -60,6 +60,23 @@ def prepare(prefix, state_path):
     else:
         raise AssertionError('real invalid batch reported success')
 
+    before_attempt = list(packager.read_chunks(rejected))
+    original_fetch = col.query.fetch_objects
+    def fail_verification_read(*args, **kwargs):
+        if kwargs.get('include_vector'):
+            raise OSError('controlled post-write read fault')
+        return original_fetch(*args, **kwargs)
+    with patch.object(col.query, 'fetch_objects', side_effect=fail_verification_read):
+        try:
+            batch_write.insert(col, lambda: ({'properties': row['properties']} for row in rows),
+                               exact=False, cleanup_owned=True)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('post-write read fault reported success')
+    require(batch_write.verify(col, before_attempt, exact=True) == len(before_attempt),
+            'failed ingestion removes only its generated UUIDs and preserves prior records')
+
     def remember(name, detail):
         record_path = next(p for p in recovery._root().glob('*.json')
                            if json.loads(p.read_text()).get('staging') == detail['recovered_as'])
@@ -113,6 +130,27 @@ def prepare(prefix, state_path):
     require(job['status'] == 'failed' and job['chunks_written'] == 0, 'replace failure reports zero confirmed target writes')
     remember('replace import', job['error_detail'])
 
+    cleanup_record = recovery.begin(prefix + 'Cleanup', 'tune', client)
+    wc._create_collection_sync(cleanup_record['staging'], 'hnsw', 'cosine', {})
+    recovery.retain(cleanup_record)
+    metadata = recovery._root() / cleanup_record['operation_id']
+    actual_rmtree = recovery.shutil.rmtree
+    def fail_metadata_cleanup(path, *args, **kwargs):
+        if Path(path) == metadata:
+            raise OSError('controlled metadata cleanup fault')
+        return actual_rmtree(path, *args, **kwargs)
+    with patch.object(recovery.shutil, 'rmtree', side_effect=fail_metadata_cleanup):
+        try:
+            recovery.discard(cleanup_record, client)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('cleanup fault was not observed')
+    require(cleanup_record['state'] == 'cleanup' and not client.collections.exists(cleanup_record['staging']),
+            'cleanup intent survives filesystem failure after backend deletion')
+    state['cleanup_record'] = cleanup_record
+    save()
+
     unrelated = collection('__tuning_user_data')
     state['unrelated'] = unrelated
     scratch = recovery.begin(prefix + 'Scratch', 'tune', client)
@@ -134,6 +172,11 @@ def check(state):
         require((recovery._root() / (record['operation_id'] + '.json')).is_file(), 'recovery ownership survives: ' + record['operation'])
     require(client.collections.exists(state['unrelated']), 'unowned marker-like collection survives restart')
     require(not client.collections.exists(state['scratch']), 'positively owned scratch is removed at startup')
+    cleanup_record = state['cleanup_record']
+    require(not (recovery._root() / (cleanup_record['operation_id'] + '.json')).exists(),
+            'startup finishes interrupted recovery journal cleanup')
+    require(not (recovery._root() / cleanup_record['operation_id']).exists(),
+            'startup removes remaining cleanup metadata')
 
 
 def cleanup(state, state_path):

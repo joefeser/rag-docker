@@ -259,7 +259,8 @@ async def get_collection_config(name: str) -> dict:
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
-    batch_write.insert(coll, ({"properties": chunk} for chunk in chunks), exact=False)
+    batch_write.insert(coll, lambda: ({"properties": chunk} for chunk in chunks),
+                       exact=False, cleanup_owned=True)
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:

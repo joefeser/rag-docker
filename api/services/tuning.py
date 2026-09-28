@@ -146,15 +146,17 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     try:
         wc._create_collection_sync(staging, new_index, new_distance, hnsw)
         wc._insert_chunks_sync(staging, properties)
-        staged = [
-            {"id": str(o.uuid),
-             "vector": (o.vector or {}).get("default"),
-             "properties": dict(o.properties or {})}
-            for o in client.collections.get(staging).iterator(include_vector=True)
-        ]
-        if len(staged) != len(properties):
+        def staged():
+            return (
+                {"id": str(o.uuid),
+                 "vector": (o.vector or {}).get("default"),
+                 "properties": dict(o.properties or {})}
+                for o in client.collections.get(staging).iterator(include_vector=True)
+            )
+        staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+        if staged_count != len(properties):
             raise RuntimeError(
-                f"staged {len(staged)} chunks but expected {len(properties)}")
+                f"staged {staged_count} chunks but expected {len(properties)}")
         collection_recovery.retain(ownership)
         # The final create, write and verification can still fail. Durable
         # recovery ownership must precede deletion, including on a hard kill.

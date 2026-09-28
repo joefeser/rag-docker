@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+import weakref
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,8 @@ class Batch:
                 record['id'] = str(uuid.uuid4())
             if fault == 'properties':
                 record['properties']['content'] = 'wrong'
+            if fault == 'invalid_vector':
+                record['vector'] = []
             if fault == 'vector':
                 record['vector'] = [9.0, 9.0]
             self.collection.rows[record['id']] = record
@@ -67,7 +70,13 @@ class Collection:
         self.batch = Batch(self)
         self.query = SimpleNamespace(fetch_objects=lambda filters, **kwargs: SimpleNamespace(
             objects=[obj for obj in self.iterator(include_vector=True) if str(obj.uuid) in filters.value]))
+        self.data = SimpleNamespace(delete_many=self.delete_many)
         self.aggregate = SimpleNamespace(over_all=lambda **kwargs: SimpleNamespace(total_count=len(self.rows)))
+
+    def delete_many(self, where):
+        for key in where.value:
+            self.rows.pop(key, None)
+        return SimpleNamespace(failed=0)
 
     def iterator(self, include_vector=False):
         if self.fault == 'read':
@@ -109,6 +118,13 @@ class Collections:
 
 
 class WriterTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        setting = patch.object(settings, 'upload_dir', self.temp.name)
+        setting.start()
+        self.addCleanup(setting.stop)
+
     def test_final_flush_rejection_is_observed_after_exit(self):
         col = Collection('Corpus', 'reject')
         with self.assertRaisesRegex(RuntimeError, 'rejected'):
@@ -147,6 +163,44 @@ class WriterTests(unittest.TestCase):
         client = SimpleNamespace(collections=SimpleNamespace(get=lambda name: col))
         with patch.object(wc, 'get_client', return_value=client), self.assertRaises(RuntimeError):
             wc._insert_chunks_sync('Corpus', [{'content': 'new'}])
+
+    def test_generated_ingestion_failure_rolls_back_only_attempt_ids(self):
+        for fault in ('partial', 'properties', 'invalid_vector', 'reject'):
+            with self.subTest(fault=fault):
+                col = Collection('Corpus')
+                previous = records(1)
+                batch_write.insert(col, previous)
+                col.fault = fault
+                client = SimpleNamespace(collections=SimpleNamespace(get=lambda name: col))
+                with patch.object(wc, 'get_client', return_value=client), self.assertRaises(RuntimeError):
+                    wc._insert_chunks_sync('Corpus', [{'content': 'new 1'}, {'content': 'new 2'}])
+                self.assertEqual(set(col.rows), {previous[0]['id']})
+
+    def test_ingestion_cleanup_failure_preserves_original_error_and_reports_uncertainty(self):
+        col = Collection('Corpus', 'partial')
+        client = SimpleNamespace(collections=SimpleNamespace(get=lambda name: col))
+        with patch.object(wc, 'get_client', return_value=client), \
+                patch.object(col.data, 'delete_many', side_effect=OSError('cleanup outage')), \
+                self.assertRaises(batch_write.BatchCleanupError) as error:
+            wc._insert_chunks_sync('Corpus', [{'content': 'new 1'}, {'content': 'new 2'}])
+        self.assertIsInstance(error.exception.original, batch_write.BatchVerificationError)
+        self.assertIn('Accepted chunks may remain', str(error.exception))
+        self.assertEqual(len(col.rows), 1)
+
+    def test_reusable_stream_keeps_decoded_record_lifetime_bounded(self):
+        live = weakref.WeakSet()
+        class Record(dict):
+            __hash__ = object.__hash__
+        def stream():
+            for i in range(500):
+                record = Record(id=str(uuid.uuid5(uuid.NAMESPACE_OID, str(i))),
+                                properties={'content': 'synthetic ' * 100}, vector=[0.25] * 32)
+                live.add(record)
+                self.assertLessEqual(len(live), 2)
+                yield record
+        col = Collection('Corpus')
+        self.assertEqual(batch_write.insert(col, stream, expected_count=500), 500)
+
 
 
 class RecoveryTests(unittest.TestCase):
@@ -365,6 +419,107 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(recovery.sweep(self.client), [])
         self.assertTrue((recovery._root() / record['operation_id']).is_dir())
         self.assertTrue((recovery._root() / (record['operation_id'] + '.json')).is_file())
+
+    def test_marker_is_small_and_uses_compact_bounded_expectations(self):
+        def stream():
+            for i in range(2000):
+                yield dict(id=str(uuid.uuid5(uuid.NAMESPACE_OID, str(i))),
+                           properties={'content': 'x' * 4096}, vector=[0.25] * 64)
+        importer._mark_started('Corpus', 2000, 'job', stream)
+        marker = importer._marker_path('Corpus')
+        data, snapshot = importer._read_marker(marker)
+        self.assertLess(marker.stat().st_size, 1024)
+        self.assertNotIn('records', data)
+        self.assertLess(snapshot.stat().st_size, 2000 * 512)
+        importer._mark_finished('Corpus')
+        self.assertFalse(marker.exists())
+        self.assertFalse(snapshot.exists())
+
+    def test_failed_new_target_cleanup_keeps_marker_for_startup_retry(self):
+        pkg, manifest = self.package()
+        importer._jobs['job'] = {'chunks_written': 0}
+        actual_delete = self.cols.delete
+        def create_rejected(name, *args):
+            self.cols.create(name)
+            self.cols.get(name).fault = 'reject'
+        def fail_partial_delete(name):
+            if '_imported_' in name:
+                raise OSError('partial target cleanup unavailable')
+            return actual_delete(name)
+        with patch.object(importer.packager, 'open_package', return_value=(pkg, manifest)), \
+                patch.object(importer.packager, 'verify_digests'), \
+                patch.object(importer, '_check_embedding'), \
+                patch.object(importer, '_ensure_models', return_value=[]), \
+                patch.object(wc, '_create_collection_sync', side_effect=create_rejected), \
+                patch.object(self.cols, 'delete', side_effect=fail_partial_delete):
+            importer._run('job', 'fixture.tar.gz', 'rename')
+        job = importer._jobs['job']
+        self.assertEqual(job['status'], 'failed')
+        self.assertTrue(job['error_detail']['cleanup_pending'])
+        target = job['error_detail']['collection']
+        self.assertTrue(importer._marker_path(target).exists())
+        self.assertTrue(self.cols.exists(target))
+        self.assertEqual(len(importer.sweep_interrupted_imports()), 1)
+        self.assertFalse(self.cols.exists(target))
+        self.assertFalse(importer._marker_path(target).exists())
+        self.assertTrue(self.cols.exists('Corpus'))
+
+    def test_oversized_legacy_marker_is_preserved_without_decoding(self):
+        marker = importer._marker_path('Corpus')
+        marker.write_bytes(b'{' + b'x' * 5000)
+        with patch.object(Path, 'read_text', side_effect=AssertionError('must not decode large metadata')):
+            self.assertEqual(importer.sweep_interrupted_imports(), [])
+        self.assertTrue(marker.exists())
+        self.assertTrue(self.cols.exists('Corpus'))
+
+    def test_corrupt_expected_snapshot_preserves_backend_and_ownership(self):
+        importer._mark_started('Corpus', 2, 'job', self.original)
+        marker = importer._marker_path('Corpus')
+        data, snapshot = importer._read_marker(marker)
+        snapshot.write_bytes(b'corrupt snapshot')
+        self.assertEqual(importer.sweep_interrupted_imports(), [])
+        self.assertTrue(marker.exists())
+        self.assertTrue(self.cols.exists('Corpus'))
+
+    def test_recovery_metadata_cleanup_failure_is_resumed_at_startup(self):
+        self.cols.create_failure = True
+        with self.assertRaises(importer.PackageError):
+            self.rebuild()
+        record = self.recovery_record()
+        with patch.object(recovery.shutil, 'rmtree', side_effect=OSError('metadata cleanup failed')), \
+                self.assertRaises(OSError):
+            recovery.discard(record, self.client)
+        path = recovery._root() / (record['operation_id'] + '.json')
+        self.assertEqual(json.loads(path.read_text())['state'], 'cleanup')
+        self.assertFalse(self.cols.exists(record['staging']))
+        self.assertEqual(recovery.sweep(self.client), [record['staging']])
+        self.assertFalse(path.exists())
+        self.assertFalse((recovery._root() / record['operation_id']).exists())
+
+    def test_cleanup_intent_is_persisted_before_backend_deletion(self):
+        record = recovery.begin('Corpus', 'tune', self.client)
+        self.cols.create(record['staging'])
+        with patch.object(recovery, '_write', side_effect=OSError('cannot persist cleanup')), \
+                self.assertRaises(OSError):
+            recovery.discard(record, self.client)
+        self.assertTrue(self.cols.exists(record['staging']))
+        self.assertEqual(record['state'], 'scratch')
+
+    def test_marker_cleanup_failure_never_deletes_verified_target_on_restart(self):
+        importer._mark_started('Corpus', 2, 'job', self.original)
+        marker = importer._marker_path('Corpus')
+        actual_unlink = Path.unlink
+        def fail_unlink(path, *args, **kwargs):
+            if path == marker:
+                raise OSError('marker cleanup failed')
+            return actual_unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', new=fail_unlink), self.assertRaises(OSError):
+            importer._mark_finished('Corpus')
+        self.assertEqual(json.loads(marker.read_text())['state'], 'cleanup')
+        self.cols.get('Corpus').rows.clear()  # later legitimate changes must not be swept as partial
+        self.assertEqual(importer.sweep_interrupted_imports(), [])
+        self.assertTrue(self.cols.exists('Corpus'))
+        self.assertFalse(marker.exists())
 
     def test_interrupted_import_compares_records_not_only_count(self):
         importer._mark_started('Corpus', 2, 'job', self.original)

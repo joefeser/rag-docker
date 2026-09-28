@@ -11,7 +11,7 @@ class ImplementationTests(unittest.TestCase):
                  'api/services/batch_write.py', 'api/services/collection_recovery.py',
                  'api/services/importer.py', 'api/services/tuning.py')]
         files += [(name, '```', 'bash') for name in ('scripts/verify/01_infrastructure.sh', 'scripts/verify/05_transfer.sh')]
-        files += [('scripts/verify/README.md', '````', 'markdown')]
+        files += [('scripts/verify/README.md', '````', 'markdown'), ('scripts/verify/batch_recovery.py', '```', 'python')]
         for name, fence, language in files:
             with self.subTest(file=name):
                 header = '### ' + name + '\n\n' + fence + language + '\n'

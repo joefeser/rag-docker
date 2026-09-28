@@ -129,10 +129,18 @@ def retain(record: dict, *, package: Path | None = None) -> None:
 
 def discard(record: dict, client) -> None:
     """Delete an owned copy after success, or scratch while the target is safe."""
+    # Persist intent before the first deletion. Startup can finish this exact
+    # authorized cleanup even if backend or filesystem cleanup is interrupted.
+    if record["state"] != "cleanup":
+        updated = {**record, "state": "cleanup"}
+        _write(updated)
+        record.update(updated)
     name = record["staging"]
     if client.collections.exists(name):
         client.collections.delete(name)
     sources.delete(name)
+    if sources.collection_dir(name).exists():
+        raise OSError(f"Could not remove recovery sources for {name}")
     for kind in ("ingest", "retrieval"):
         (Path(settings.upload_dir) / f"{kind}_configs" / f"{name}.json").unlink(missing_ok=True)
     metadata = _root() / record["operation_id"]
@@ -146,8 +154,8 @@ def sweep(client) -> list[str]:
     removed = []
     for path in sorted(_root().glob("*.json")):
         try:
-            if path.is_symlink() or not path.is_file():
-                raise ValueError("Ownership record is not a regular file")
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+                raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
             record = json.loads(path.read_text())
             token = record["operation_id"]
             operation = record["operation"]
@@ -156,7 +164,7 @@ def sweep(client) -> list[str]:
                     or not re.fullmatch(r"[0-9a-f]{32}", token)
                     or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
                     or record["staging"] != f"{record['target']}{marker}{token}"
-                    or record["state"] not in ("scratch", "recovery")):
+                    or record["state"] not in ("scratch", "recovery", "cleanup")):
                 raise ValueError("Invalid collection ownership record")
             if record["state"] == "recovery":
                 log.warning("Retained recovery collection %r; sidecar snapshots: %s",

@@ -43,8 +43,9 @@ For a **disposable stack**, the following fault acceptance uses real Weaviate,
 synthetic `VfyBatchRecovery*` collections and the real embedding model. It injects
 final-create failures into the test process, retains import/tuning recovery,
 restarts the API, then verifies exact UUIDs, properties, vectors and sources.
-It also checks real completed-batch rejection, owned scratch cleanup and retention
-of an unowned marker-like collection. It must not run against a user's data stack.
+It also checks real completed-batch rejection/partial acceptance, ingestion UUID
+rollback after a post-write read fault, resumption of metadata cleanup after backend
+deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack.
 
 ```bash
 docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
