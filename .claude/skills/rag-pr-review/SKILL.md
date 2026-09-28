@@ -46,7 +46,7 @@ Record `headRefOid` as the **reviewed SHA**, and `origin/develop` as the **devel
 ### 3. Check that it merges
 
 ```bash
-git merge-tree --write-tree origin/develop <reviewed sha>
+git merge-tree --write-tree origin/develop <reviewed-sha>
 ```
 
 - **Exit 0:** it merges cleanly. The first line of output is the merged tree; keep it for step 5.
@@ -60,7 +60,7 @@ git merge-tree --write-tree origin/develop <reviewed sha>
 |---|---|
 | none | Claim it (below). |
 | `success` or `failure` | This commit is done. **Don't run anything.** Report its results to the user, with the status's `target_url` as the link to the recap. |
-| `pending`, description ends `awaiting turn` | Early security is done (see "Early security"). **Resume that run:** keep its run id, add "resumed at its turn" to the history, and continue from step 5. Security isn't dispatched again, and neither is the go-ahead asked again, if both have final statuses and the security findings file is in the bundle. If the findings file is missing (another session ran it), dispatch security again. |
+| `pending`, description ends `awaiting turn` | Early security is done (see "Early security"). **Resume that run:** keep its run id, add "resumed at its turn" to the history, and continue from step 5. Keep the early security result, and for a cross-repository PR the early go-ahead, unless one of these applies: **(a)** `develop` has changed a build or run path since the develop SHA in the `awaiting turn` description (see "Early security"): dispatch security again, against `merged/` too, and ask for the go-ahead again; **(b)** the security findings file isn't in the bundle (another session ran it): dispatch security again; **(c)** a cross-repository PR has no `rag-pr-review/go-ahead` status: ask for it. |
 | `pending`, any other description, created in the last 2 hours | Another evaluation is running. **Don't start.** Tell the user. |
 | `pending`, any other description, 2 hours or more | It probably died. Ask the user whether to resume it. On yes, keep the run id from its description, add "resumed" to the history, and re-dispatch only the checks that have no final status and no findings file in the bundle. |
 | `error` | It was abandoned. Ask the user before starting it again. |
@@ -88,11 +88,11 @@ Then set every check's status to `pending` with the description `waiting`: `rag-
     ```bash
     GIT_AUTHOR_NAME=rag-pr-review GIT_AUTHOR_EMAIL=rag-pr-review@localhost \
     GIT_COMMITTER_NAME=rag-pr-review GIT_COMMITTER_EMAIL=rag-pr-review@localhost \
-      git commit-tree <tree> -p <develop sha> -p <reviewed sha> -m "Evaluate PR #N merged with develop" > <bundle>/evaluated-sha
+      git commit-tree <tree> -p <develop-sha> -p <reviewed-sha> -m "Evaluate PR #N merged with develop" > <bundle>/evaluated-sha
     git worktree add --detach <bundle>/merged "$(cat <bundle>/evaluated-sha)"
     ```
 
-    If the reviewed SHA already contains the develop SHA (`git merge-base --is-ancestor <develop sha> <reviewed sha>`), the merge would be the head itself: add `merged/` at the reviewed SHA instead.
+    If the reviewed SHA already contains the develop SHA (`git merge-base --is-ancestor <develop-sha> <reviewed-sha>`), the merge would be the head itself: add `merged/` at the reviewed SHA instead.
 - If the PR carries any `Passed:` or `FAILED:` label, remove all eight review labels now. They belong to an earlier commit. Removing labels sends no notification.
 
 ### 6. Classify the PR and choose models
@@ -112,7 +112,7 @@ Never use `haiku` for a verdict. Record the model and a one-line reason for each
 Use the Agent tool with `subagent_type: general-purpose` and the chosen `model`. `{skills}` is the absolute path of the `.claude/skills` directory this skill was loaded from, not the PR worktree's: a PR branch may predate the skills or change them, and reviewers must follow the maintainer's copy. Give each one this prompt, filled in:
 
 > You are the {coding|security|testing} reviewer for rag-docker PR #N. Invoke the `rag-pr-review-{coding|security|tests}` skill with the Skill tool and follow it exactly. If the Skill tool can't find it, read `{skills}/rag-pr-review-{…}/SKILL.md` and `{skills}/rag-pr-review/reference.md` in full and follow them exactly. Wherever the skills say `.claude/skills/`, use `{skills}/`.
-> Reviewed SHA: {sha}. Evaluated commit: {evaluated sha}, the reviewed SHA merged with `develop` at {develop sha7}. Source-of-truth issue(s): #{n}{; Part of — deferred: …}. Context bundle: {path}. Worktree (reviewed SHA): {path}/worktree. Merged worktree (evaluated commit): {path}/merged. Cross-repository PR: {true|false}. Your model: {model}.
+> Reviewed SHA: {sha}. Evaluated commit: {evaluated-sha}, the reviewed SHA merged with `develop` at {develop-sha7}. Source-of-truth issue(s): #{n}{; Part of — deferred: …}. Context bundle: {path}. Worktree (reviewed SHA): {path}/worktree. Merged worktree (evaluated commit): {path}/merged. Cross-repository PR: {true|false}. Your model: {model}.
 > Write your findings file and return the result block, both as defined in `reference.md`. Post nothing on GitHub, apply no labels, and never change git config.
 
 - Dispatch **coding** and **security** together, in the background.
@@ -193,14 +193,21 @@ For each PR, in any order and in parallel:
 3. Step 5's bundle, without `merged/` (it's built at the PR's turn).
 4. Dispatch security only, as in step 7.
 5. When it returns, set `rag-pr-review/security` to `pending` with the description `passed; final at completion` or `failed; final at completion`. Statuses become final only in step 9.
-6. For a cross-repository PR with no High, ask the user for the go-ahead. Ask for every PR in the batch together, in one question. Record each answer as the `rag-pr-review/go-ahead` status.
-7. Set the overall status to `pending`, `run <id>: awaiting turn`.
+6. **If security found a High,** stop here and finish the run now as NOT READY (steps 9–10), with coding, tests and the build check recorded as `not run (security High)`. The creator then gets the findings at once.
+7. **Otherwise,** for a cross-repository PR, ask the user for the go-ahead. Ask for every PR in the batch together, in one question. Record each answer as the `rag-pr-review/go-ahead` status, with the develop SHA at the time in its description (for example `yes 2026-09-28T22:40Z, develop b69e21b`).
+8. Set the overall status to `pending`, `run <id>: develop <sha7>, awaiting turn`, with the develop SHA this security review was done against.
 
 **At the PR's turn,** a normal evaluation finds `awaiting turn` in step 4 and resumes the same run. Steps 3 and 5 run against the current `develop`, so the evaluated commit includes everything merged before it. If the PR now conflicts, step 3 stops as usual; set the overall status to `error`, `run <id>: conflicts at its turn`.
 
 **If the head moves while awaiting its turn,** the early run belongs to the old SHA. Set that SHA's overall status to `error`, `run <id>: superseded by <new sha7>`. The new head needs its own security review and go-ahead.
 
-**If security found a High,** don't wait for the PR's turn. Finish the run now as NOT READY (steps 9–10), with coding, tests and the build check recorded as `not run (security High)`. The creator then gets the findings at once.
+**Build and run paths.** Early security judged the head against the `develop` of that time, but what runs at the PR's turn is the head merged with a later `develop`. Whether a contributor's file runs on build or start is decided by `develop`'s build and run paths. At the turn, list what changed on `develop` since the develop SHA in the `awaiting turn` description:
+
+```bash
+git diff --name-only <early-develop-sha7> origin/develop
+```
+
+If any path matches `Dockerfile*`, `*/Dockerfile*`, `docker-compose*.yml`, `proxy/`, `scripts/`, `*entrypoint*`, `*requirements*`, `package.json`, `package-lock.json` or `.github/`, security runs again, against `worktree/` and `merged/`, and the go-ahead is asked again before any code runs.
 
 ## Common mistakes
 
@@ -215,7 +222,7 @@ For each PR, in any order and in parallel:
 | Setting a commit identity with `git config` | Only through `GIT_AUTHOR_*` / `GIT_COMMITTER_*` on the `commit-tree` call. Worktrees share the repository's config. |
 | Pushing the evaluated commit anywhere | Never. It exists only in the local repository. |
 | Running an outside contributor's code before security has looked at it | Testing and Build wait for a clean security result and the user's go-ahead. |
-| Asking for a go-ahead the `rag-pr-review/go-ahead` status already records | Resume with it. Ask again only for a new head. |
+| Asking for a go-ahead the `rag-pr-review/go-ahead` status already records | Resume with it. Ask again only for a new head, or when `develop` has changed a build or run path since it was given. |
 | Two PRs' test runs sharing the stack | One at a time. The stack is restored to `develop` afterwards. |
 | Starting a second evaluation of a commit that already has one | Read the `rag-pr-review` status first. Done means report it; awaiting turn means resume it; other pending means don't start; stale means ask, then resume. |
 | Trusting a status or review someone else created | Only statuses and reviews created by the authenticated account count. |
