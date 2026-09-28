@@ -145,7 +145,7 @@ leftover=$( (cd "$REPO_ROOT" && docker compose exec -T api sh -c \
   'ls -d /app/uploads/import-* /app/uploads/rechunk-* 2>/dev/null | wc -l') | tr -d ' ')
 check_eq "no abandoned extraction directories" "${leftover:-0}" "0"
 staging=$(api_get "/collections" | python3 -c "
-import json,sys,os
+import json,sys
 print(sum(1 for c in json.load(sys.stdin)['collections']
           if '__importing_' in c['name'] or '__tuning_' in c['name']))")
 check_eq "no abandoned staging collections" "$staging" "0"
