@@ -990,7 +990,7 @@ class GoldPair(BaseModel):
 
 
 class SessionImportProvenance(BaseModel):
-    session_id: str = Field(pattern=r"^gs_[0-9a-f]{8}$")
+    session_id: str
     collection: str
     imported_at: str
 
@@ -2414,7 +2414,7 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
-_identity_lock = threading.Lock()
+_identity_lock = threading.RLock()
 
 
 def _sessions_dir() -> Path:
@@ -2436,28 +2436,30 @@ async def _save_session(session: dict) -> None:
 
 
 def load_sessions_from_disk() -> None:
-    for p in _sessions_dir().glob("*.json"):
-        try:
-            data = json.loads(p.read_text())
-            _sessions[data["session_id"]] = data
-        except Exception:
-            pass
+    with _identity_lock:
+        for p in _sessions_dir().glob("*.json"):
+            try:
+                data = json.loads(p.read_text())
+                _sessions[data["session_id"]] = data
+            except Exception:
+                pass
 
 
 def sessions_for(collection: str) -> list[dict]:
     """Every session generated against a collection, in-memory and on disk."""
-    found = {sid: sess for sid, sess in _sessions.items()
-             if sess.get("collection") == collection}
-    # A session written by an import may not be in memory yet.
-    for path in _sessions_dir().glob("*.json"):
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if data.get("collection") == collection and data["session_id"] not in found:
-            found[data["session_id"]] = data
-            _sessions[data["session_id"]] = data
-    return list(found.values())
+    with _identity_lock:
+        found = {sid: sess for sid, sess in _sessions.items()
+                 if sess.get("collection") == collection}
+        # A session written by an import may not be in memory yet.
+        for path in _sessions_dir().glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if data.get("collection") == collection and data["session_id"] not in found:
+                found[data["session_id"]] = data
+                _sessions[data["session_id"]] = data
+        return list(found.values())
 
 
 def store_session(session: dict) -> None:
@@ -2468,13 +2470,16 @@ def store_session(session: dict) -> None:
     flagging pass writes that back over the file. Import learned this the hard
     way — a restored session reverted to its pre-import orphaned state.
     """
-    _sessions[session["session_id"]] = session
-    _save_session_sync(session)
+    with _identity_lock:
+        _sessions[session["session_id"]] = session
+        _save_session_sync(session)
 
 
 def _identity_available(session_id: str) -> bool:
-    if not re.fullmatch(r"gs_[0-9a-f]{8}", session_id):
-        raise ValueError("Imported session identity must use the local gs_ namespace")
+    if not isinstance(session_id, str) or not re.fullmatch(r"gs_[0-9a-f]{8}", session_id):
+        # A source identity is provenance, never a local filesystem address.
+        # Historical IDs receive a fresh canonical local identity.
+        return False
     if session_id in _sessions:
         return False
     try:
@@ -8250,7 +8255,7 @@ curl -s localhost:8080/api/collections | python3 -c \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
 
-`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes ten owned cache/disk/collision/concurrent-import cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes twelve owned cache/disk/collision/historical-ID/concurrent-insertion cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 ````
 
 ### scripts/verify/all.sh
@@ -10212,7 +10217,7 @@ summary
 
 ```python
 """Owned import identity preservation; run by13_identity.sh in the API image."""
-import asyncio,copy,json,os,sys,tempfile,unittest
+import asyncio,copy,json,os,sys,tempfile,threading,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -10309,6 +10314,36 @@ class IdentityTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
         self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
 
+    def test_historical_source_identity_gets_safe_local_id_and_usable_provenance(self):
+        from models.schemas import SessionResponse
+        package=Path(self.tmp.name)/'legacy-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        data=fixture();data['session_id']='legacy-review-2024';(gold/'legacy.json').write_text(json.dumps(data))
+        mappings=[];importer._restore_sidecars('OwnedLegacy',package,'OwnedOriginal',mappings)
+        local=mappings[0]['session_id'];self.assertRegex(local,r'^gs_[0-9a-f]{8}$')
+        loaded=gs.get_session(local);self.assertEqual(loaded['imported_from']['session_id'],data['session_id'])
+        self.assertEqual(SessionResponse.model_validate(loaded).imported_from.session_id,data['session_id'])
+        self.assertFalse((gs._sessions_dir()/'legacy-review-2024.json').exists())
+        result=asyncio.run(gs.save_session(local,'legacy-rows.json'));self.assertEqual(json.loads((Path(self.tmp.name)/result['filename']).read_text())[0]['answer'],'Original answer')
+
+    def test_cache_iteration_serializes_with_generation_insertion(self):
+        entered=threading.Event();release=threading.Event();started=threading.Event();mutated=threading.Event()
+        class PausedCache(dict):
+            def __setitem__(cache,key,value):
+                super(PausedCache,cache).__setitem__(key,value);mutated.set()
+            def items(cache):
+                iterator=iter(super(PausedCache,cache).items())
+                entered.set();self.assertTrue(release.wait(2),'Cache fixture was not released')
+                return iterator
+        gs._sessions=PausedCache(gs._sessions)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reading=pool.submit(gs.sessions_for,'OwnedOriginal');self.assertTrue(entered.wait(2))
+            def create():
+                started.set();return gs._store_generated_session(fixture())
+            writing=pool.submit(create);self.assertTrue(started.wait(2))
+            try:self.assertFalse(mutated.wait(.1),'Insertion bypassed the cache snapshot lock')
+            finally:release.set()
+            self.assertEqual(len(reading.result(timeout=2)),1);self.assertRegex(writing.result(timeout=2)['session_id'],r'^gs_[0-9a-f]{8}$')
+
 
 if __name__=='__main__':unittest.main()
 ```
@@ -10321,7 +10356,7 @@ if __name__=='__main__':unittest.main()
 Pairs and vectors are synthetic; package/model metadata and import/export jobs
 are real. No generation call or startup sweep runs in this process.
 """
-import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,uuid
+import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
 from pathlib import Path
 from unittest.mock import patch
 import httpx
@@ -10329,42 +10364,95 @@ from config import settings
 from main import app
 from services import exporter,goldstandard as gs,importer,weaviate_client as wc
 
+
+def archive_session(archive, identity):
+    with tarfile.open(archive) as package:
+        member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+identity+'.json'))
+        return json.load(package.extractfile(member))
+
+def file_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def legacy_archive(archive,root,identity,source_id):
+    with tempfile.TemporaryDirectory(prefix='owned-legacy-package-',dir=root) as temp:
+        work=Path(temp)
+        with tarfile.open(archive) as package:package.extractall(work,filter='data')
+        package_root=next(path for path in work.iterdir() if path.is_dir())
+        relative='goldstandard/'+identity+'.json';sidecar=package_root/relative
+        data=json.loads(sidecar.read_text());data['session_id']=source_id;sidecar.write_text(json.dumps(data))
+        manifest_path=package_root/'manifest.json';manifest=json.loads(manifest_path.read_text())
+        manifest['files'][relative]='sha256:'+file_digest(sidecar);manifest_path.write_text(json.dumps(manifest,sort_keys=True,indent=2))
+        output=archive.parent/(archive.name.removesuffix('.tar.gz')+'-legacy.tar.gz')
+        with tarfile.open(output,'w:gz') as package:package.add(package_root,arcname=package_root.name)
+        return output.name
+
+async def completed(client,path,timeout=300):
+    deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
+    while True:
+        remaining=deadline-asyncio.get_running_loop().time()
+        if remaining<=0:raise TimeoutError(f'Owned job {path} exceeded {timeout}s; last status={last}')
+        try:response=await asyncio.wait_for(client.get(path),remaining)
+        except asyncio.TimeoutError as exc:raise TimeoutError(f'Owned job {path} exceeded {timeout}s; last status={last}') from exc
+        assert response.status_code==200,response.text
+        job=response.json();last=job.get('status','missing')
+        if last not in ('queued','running'):
+            assert last=='completed',job
+            return job
+        await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
+
+async def settle_owned_jobs(jobs,timeout=30):
+    deadline=asyncio.get_running_loop().time()+timeout
+    while True:
+        pending=[(module.__name__,jobid,(module.get_job(jobid) or {}).get('status','missing')) for module,jobid in jobs if (module.get_job(jobid) or {}).get('status') not in ('completed','failed')]
+        if not pending or asyncio.get_running_loop().time()>=deadline:return pending
+        await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
+
+async def bounded_poll_cases():
+    from types import SimpleNamespace
+    class StuckClient:
+        async def get(self,path):return SimpleNamespace(status_code=200,text='',json=lambda:{'status':'running'})
+    try:await completed(StuckClient(),'/owned/stuck-job',timeout=.01)
+    except TimeoutError as exc:assert '/owned/stuck-job' in str(exc) and 'running' in str(exc)
+    else:raise AssertionError('Stuck owned job did not meet its deadline')
+    pending=await settle_owned_jobs([(SimpleNamespace(__name__='owned',get_job=lambda identity:{'status':'queued'}),'owned-cleanup-job')],timeout=.01)
+    assert pending==[('owned','owned-cleanup-job','queued')]
+    print('PASS two controlled job-poll and cleanup deadline cases',flush=True)
+
 collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Identity'+uuid.uuid4().hex[:10]
 sid='gs_'+uuid.uuid4().hex[:8]
-created=False
+protected_neighbor=collection+'_protected'
+neighbor_created=False
+created_names=set()
+created_lock=threading.Lock()
+original_create=wc._create_collection_sync
+def record_create(name,*args,**kwargs):
+    original_create(name,*args,**kwargs)
+    with created_lock:created_names.add(name)
 jobs=[]
 with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
     root=Path(directory)
-    with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}):
-        async def completed(client,path):
-            while True:
-                response=await client.get(path);assert response.status_code==200,response.text
-                job=response.json()
-                if job['status'] not in ('queued','running'):
-                    assert job['status']=='completed',job
-                    return job
-                await asyncio.sleep(0.1)
-
+    with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
         async def run():
-            global created
+            global neighbor_created
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
-                assert not wc._collection_exists_sync(collection),'Owned name already exists'
-                created=True
+                await bounded_poll_cases()
+                assert not await asyncio.to_thread(wc._collection_exists_sync,collection),'Owned name already exists'
+                assert not await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Protected fixture name already exists'
+                await asyncio.to_thread(original_create,protected_neighbor,'hnsw','cosine',{})
+                neighbor_created=True
                 response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
-                coll=wc.get_client().collections.get(collection)
-                coll.data.insert(properties={'content':'Owned inert evaluation context','source_file':'inert.txt','chunk_index':0},vector=[0.1]*768)
+                coll=await asyncio.to_thread(lambda:wc.get_client().collections.get(collection))
+                await asyncio.to_thread(coll.data.insert,properties={'content':'Owned inert evaluation context','source_file':'inert.txt','chunk_index':0},vector=[0.1]*768)
                 session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original exported answer','contexts':['Owned inert evaluation context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
-                gs.store_session(session)
+                await asyncio.to_thread(gs.store_session,session)
                 print('PASS owned real collection, supplied-vector object and synthetic evaluation session created',flush=True)
                 start=await client.post('/export',json={'collection':collection,'include_models':False});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
-                exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=hashlib.sha256(archive.read_bytes()).hexdigest()
-                with tarfile.open(archive) as package:
-                    member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+sid+'.json'))
-                    retained=json.load(package.extractfile(member));assert retained['pairs'][0]['answer']=='Original exported answer'
+                exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=await asyncio.to_thread(file_digest,archive)
+                retained=await asyncio.to_thread(archive_session,archive,sid);assert retained['pairs'][0]['answer']=='Original exported answer'
                 print('PASS actual completed export package contains the original session snapshot',flush=True)
                 edited=await client.patch('/goldstandard/session/'+sid+'/pair/p_owned',json={'status':'edited','answer':'Newer acknowledged human answer'});assert edited.status_code==200,edited.text
-                original_path=gs._session_path(sid);original_bytes=original_path.read_bytes()
+                original_path=await asyncio.to_thread(gs._session_path,sid);original_bytes=await asyncio.to_thread(original_path.read_bytes)
                 print('PASS newer original human edit acknowledged through HTTP after package export',flush=True)
                 mappings=[];targets=[]
                 for _ in range(2):
@@ -10375,7 +10463,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                     mapping=imported['restored_sessions'][0];assert mapping['source_session_id']==sid and mapping['collection']==imported['collection']
                     assert any(mapping['session_id'] in note for note in imported['notes']),imported
                     mappings.append(mapping);targets.append(imported['collection'])
-                    assert original_path.read_bytes()==original_bytes,'Original human edit was overwritten'
+                    assert await asyncio.to_thread(original_path.read_bytes)==original_bytes,'Original human edit was overwritten'
                 assert len({collection,*targets})==3 and len({sid,*[m['session_id'] for m in mappings]})==3
                 print('PASS two actual rename imports expose distinct collections and independent local session mappings without changing original bytes',flush=True)
                 for local_sid,target,expected in [(sid,collection,'Newer acknowledged human answer')]+[(m['session_id'],m['collection'],'Original exported answer') for m in mappings]:
@@ -10395,25 +10483,47 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 start=await client.post('/export',json={'collection':targets[0],'include_models':False});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
                 reexported=await completed(client,'/export/job/'+start.json()['job_id'])
-                with tarfile.open(root/'exports'/reexported['filename']) as package:
-                    imported_sid=mappings[0]['session_id'];member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+imported_sid+'.json'))
-                    retained=json.load(package.extractfile(member));assert retained['session_id']==imported_sid and retained['imported_from']['session_id']==sid
-                assert hashlib.sha256(archive.read_bytes()).hexdigest()==digest
+                imported_sid=mappings[0]['session_id'];retained=await asyncio.to_thread(archive_session,root/'exports'/reexported['filename'],imported_sid)
+                assert retained['session_id']==imported_sid and retained['imported_from']['session_id']==sid
+                assert await asyncio.to_thread(file_digest,archive)==digest
                 print('PASS re-export uses the allocated session filename/provenance and the original package remains byte-identical',flush=True)
+                source_id='legacy-review-2024';legacy_filename=await asyncio.to_thread(legacy_archive,archive,root,sid,source_id)
+                start=await client.post('/import',json={'filename':legacy_filename,'on_conflict':'rename'});assert start.status_code==202,start.text
+                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'])
+                mapping=legacy['restored_sessions'][0];local=mapping['session_id']
+                assert mapping['source_session_id']==source_id and local.startswith('gs_') and len(local)==11
+                response=await client.get('/goldstandard/session/'+local);assert response.status_code==200,response.text
+                assert response.json()['imported_from']['session_id']==source_id
+                print('PASS digest-valid historical-ID archive completes actual import with canonical local lookup and original provenance',flush=True)
+                saved=await client.post('/goldstandard/save',json={'session_id':local,'filename':'owned-legacy-rows.json'});assert saved.status_code==200,saved.text
+                download=await client.get('/goldstandard/download/'+saved.json()['filename']);assert download.status_code==200,download.text
+                assert download.json()[0]['answer']=='Original exported answer'
+                reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),local],text=True,capture_output=True,check=True)
+                assert json.loads(reload.stdout)[0]['imported_from']['session_id']==source_id
+                assert await asyncio.to_thread(original_path.read_bytes)==original_bytes
+                print('PASS historical imported session keeps usable HTTP/RAGAS/restart state while original newer review remains unchanged',flush=True)
+
 
         async def owned():
             try:await run()
             finally:
-                # Let only our actual jobs reach terminal state before releasing
-                # temporary settings/storage or deleting their owned collections.
-                while any(module.get_job(jobid)['status'] in ('queued','running') for module,jobid in jobs):await asyncio.sleep(0.1)
-                if created:
-                    for name in wc.get_client().collections.list_all():
-                        if name==collection or name.startswith(collection+'_'):
-                            wc._delete_collection_sync(name)
-                wc.close_client()
+                pending=await settle_owned_jobs(jobs)
+                if pending:
+                    # This standalone verifier owns these worker threads. Hard
+                    # exit prevents asyncio's executor shutdown joining a stuck
+                    # job forever, and preserves its exact fixture directory.
+                    print('FAIL owned jobs did not settle: '+repr(pending)+'; preserved fixture directory '+str(root),flush=True)
+                    os._exit(2)
+                for name in sorted(created_names):
+                    if await asyncio.to_thread(wc._collection_exists_sync,name):
+                        await asyncio.to_thread(wc._delete_collection_sync,name)
+                if neighbor_created:
+                    assert await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Exact cleanup deleted a similarly named protected collection'
+                    await asyncio.to_thread(wc._delete_collection_sync,protected_neighbor)
+                    print('PASS exact recorded-name cleanup leaves a similarly named collection intact until explicit fixture teardown',flush=True)
+                await asyncio.to_thread(wc.close_client)
         asyncio.run(owned())
-assert not wc._collection_exists_sync(collection);wc.close_client()
+assert all(not wc._collection_exists_sync(name) for name in created_names);wc.close_client()
 print('PASS only owned collections/packages/session fixtures removed',flush=True)
 ```
 

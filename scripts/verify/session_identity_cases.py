@@ -1,5 +1,5 @@
 """Owned import identity preservation; run by13_identity.sh in the API image."""
-import asyncio,copy,json,os,sys,tempfile,unittest
+import asyncio,copy,json,os,sys,tempfile,threading,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,6 +95,36 @@ class IdentityTests(unittest.TestCase):
             return saved['session_id']
         with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
         self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
+
+    def test_historical_source_identity_gets_safe_local_id_and_usable_provenance(self):
+        from models.schemas import SessionResponse
+        package=Path(self.tmp.name)/'legacy-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        data=fixture();data['session_id']='legacy-review-2024';(gold/'legacy.json').write_text(json.dumps(data))
+        mappings=[];importer._restore_sidecars('OwnedLegacy',package,'OwnedOriginal',mappings)
+        local=mappings[0]['session_id'];self.assertRegex(local,r'^gs_[0-9a-f]{8}$')
+        loaded=gs.get_session(local);self.assertEqual(loaded['imported_from']['session_id'],data['session_id'])
+        self.assertEqual(SessionResponse.model_validate(loaded).imported_from.session_id,data['session_id'])
+        self.assertFalse((gs._sessions_dir()/'legacy-review-2024.json').exists())
+        result=asyncio.run(gs.save_session(local,'legacy-rows.json'));self.assertEqual(json.loads((Path(self.tmp.name)/result['filename']).read_text())[0]['answer'],'Original answer')
+
+    def test_cache_iteration_serializes_with_generation_insertion(self):
+        entered=threading.Event();release=threading.Event();started=threading.Event();mutated=threading.Event()
+        class PausedCache(dict):
+            def __setitem__(cache,key,value):
+                super(PausedCache,cache).__setitem__(key,value);mutated.set()
+            def items(cache):
+                iterator=iter(super(PausedCache,cache).items())
+                entered.set();self.assertTrue(release.wait(2),'Cache fixture was not released')
+                return iterator
+        gs._sessions=PausedCache(gs._sessions)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reading=pool.submit(gs.sessions_for,'OwnedOriginal');self.assertTrue(entered.wait(2))
+            def create():
+                started.set();return gs._store_generated_session(fixture())
+            writing=pool.submit(create);self.assertTrue(started.wait(2))
+            try:self.assertFalse(mutated.wait(.1),'Insertion bypassed the cache snapshot lock')
+            finally:release.set()
+            self.assertEqual(len(reading.result(timeout=2)),1);self.assertRegex(writing.result(timeout=2)['session_id'],r'^gs_[0-9a-f]{8}$')
 
 
 if __name__=='__main__':unittest.main()

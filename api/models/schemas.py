@@ -374,7 +374,7 @@ class GoldPair(BaseModel):
 
 
 class SessionImportProvenance(BaseModel):
-    session_id: str = Field(pattern=r"^gs_[0-9a-f]{8}$")
+    session_id: str
     collection: str
     imported_at: str
 

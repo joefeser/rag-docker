@@ -3,7 +3,7 @@
 Pairs and vectors are synthetic; package/model metadata and import/export jobs
 are real. No generation call or startup sweep runs in this process.
 """
-import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,uuid
+import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
 from pathlib import Path
 from unittest.mock import patch
 import httpx
@@ -11,42 +11,95 @@ from config import settings
 from main import app
 from services import exporter,goldstandard as gs,importer,weaviate_client as wc
 
+
+def archive_session(archive, identity):
+    with tarfile.open(archive) as package:
+        member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+identity+'.json'))
+        return json.load(package.extractfile(member))
+
+def file_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def legacy_archive(archive,root,identity,source_id):
+    with tempfile.TemporaryDirectory(prefix='owned-legacy-package-',dir=root) as temp:
+        work=Path(temp)
+        with tarfile.open(archive) as package:package.extractall(work,filter='data')
+        package_root=next(path for path in work.iterdir() if path.is_dir())
+        relative='goldstandard/'+identity+'.json';sidecar=package_root/relative
+        data=json.loads(sidecar.read_text());data['session_id']=source_id;sidecar.write_text(json.dumps(data))
+        manifest_path=package_root/'manifest.json';manifest=json.loads(manifest_path.read_text())
+        manifest['files'][relative]='sha256:'+file_digest(sidecar);manifest_path.write_text(json.dumps(manifest,sort_keys=True,indent=2))
+        output=archive.parent/(archive.name.removesuffix('.tar.gz')+'-legacy.tar.gz')
+        with tarfile.open(output,'w:gz') as package:package.add(package_root,arcname=package_root.name)
+        return output.name
+
+async def completed(client,path,timeout=300):
+    deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
+    while True:
+        remaining=deadline-asyncio.get_running_loop().time()
+        if remaining<=0:raise TimeoutError(f'Owned job {path} exceeded {timeout}s; last status={last}')
+        try:response=await asyncio.wait_for(client.get(path),remaining)
+        except asyncio.TimeoutError as exc:raise TimeoutError(f'Owned job {path} exceeded {timeout}s; last status={last}') from exc
+        assert response.status_code==200,response.text
+        job=response.json();last=job.get('status','missing')
+        if last not in ('queued','running'):
+            assert last=='completed',job
+            return job
+        await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
+
+async def settle_owned_jobs(jobs,timeout=30):
+    deadline=asyncio.get_running_loop().time()+timeout
+    while True:
+        pending=[(module.__name__,jobid,(module.get_job(jobid) or {}).get('status','missing')) for module,jobid in jobs if (module.get_job(jobid) or {}).get('status') not in ('completed','failed')]
+        if not pending or asyncio.get_running_loop().time()>=deadline:return pending
+        await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
+
+async def bounded_poll_cases():
+    from types import SimpleNamespace
+    class StuckClient:
+        async def get(self,path):return SimpleNamespace(status_code=200,text='',json=lambda:{'status':'running'})
+    try:await completed(StuckClient(),'/owned/stuck-job',timeout=.01)
+    except TimeoutError as exc:assert '/owned/stuck-job' in str(exc) and 'running' in str(exc)
+    else:raise AssertionError('Stuck owned job did not meet its deadline')
+    pending=await settle_owned_jobs([(SimpleNamespace(__name__='owned',get_job=lambda identity:{'status':'queued'}),'owned-cleanup-job')],timeout=.01)
+    assert pending==[('owned','owned-cleanup-job','queued')]
+    print('PASS two controlled job-poll and cleanup deadline cases',flush=True)
+
 collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Identity'+uuid.uuid4().hex[:10]
 sid='gs_'+uuid.uuid4().hex[:8]
-created=False
+protected_neighbor=collection+'_protected'
+neighbor_created=False
+created_names=set()
+created_lock=threading.Lock()
+original_create=wc._create_collection_sync
+def record_create(name,*args,**kwargs):
+    original_create(name,*args,**kwargs)
+    with created_lock:created_names.add(name)
 jobs=[]
 with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
     root=Path(directory)
-    with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}):
-        async def completed(client,path):
-            while True:
-                response=await client.get(path);assert response.status_code==200,response.text
-                job=response.json()
-                if job['status'] not in ('queued','running'):
-                    assert job['status']=='completed',job
-                    return job
-                await asyncio.sleep(0.1)
-
+    with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
         async def run():
-            global created
+            global neighbor_created
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
-                assert not wc._collection_exists_sync(collection),'Owned name already exists'
-                created=True
+                await bounded_poll_cases()
+                assert not await asyncio.to_thread(wc._collection_exists_sync,collection),'Owned name already exists'
+                assert not await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Protected fixture name already exists'
+                await asyncio.to_thread(original_create,protected_neighbor,'hnsw','cosine',{})
+                neighbor_created=True
                 response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
-                coll=wc.get_client().collections.get(collection)
-                coll.data.insert(properties={'content':'Owned inert evaluation context','source_file':'inert.txt','chunk_index':0},vector=[0.1]*768)
+                coll=await asyncio.to_thread(lambda:wc.get_client().collections.get(collection))
+                await asyncio.to_thread(coll.data.insert,properties={'content':'Owned inert evaluation context','source_file':'inert.txt','chunk_index':0},vector=[0.1]*768)
                 session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original exported answer','contexts':['Owned inert evaluation context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
-                gs.store_session(session)
+                await asyncio.to_thread(gs.store_session,session)
                 print('PASS owned real collection, supplied-vector object and synthetic evaluation session created',flush=True)
                 start=await client.post('/export',json={'collection':collection,'include_models':False});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
-                exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=hashlib.sha256(archive.read_bytes()).hexdigest()
-                with tarfile.open(archive) as package:
-                    member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+sid+'.json'))
-                    retained=json.load(package.extractfile(member));assert retained['pairs'][0]['answer']=='Original exported answer'
+                exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=await asyncio.to_thread(file_digest,archive)
+                retained=await asyncio.to_thread(archive_session,archive,sid);assert retained['pairs'][0]['answer']=='Original exported answer'
                 print('PASS actual completed export package contains the original session snapshot',flush=True)
                 edited=await client.patch('/goldstandard/session/'+sid+'/pair/p_owned',json={'status':'edited','answer':'Newer acknowledged human answer'});assert edited.status_code==200,edited.text
-                original_path=gs._session_path(sid);original_bytes=original_path.read_bytes()
+                original_path=await asyncio.to_thread(gs._session_path,sid);original_bytes=await asyncio.to_thread(original_path.read_bytes)
                 print('PASS newer original human edit acknowledged through HTTP after package export',flush=True)
                 mappings=[];targets=[]
                 for _ in range(2):
@@ -57,7 +110,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                     mapping=imported['restored_sessions'][0];assert mapping['source_session_id']==sid and mapping['collection']==imported['collection']
                     assert any(mapping['session_id'] in note for note in imported['notes']),imported
                     mappings.append(mapping);targets.append(imported['collection'])
-                    assert original_path.read_bytes()==original_bytes,'Original human edit was overwritten'
+                    assert await asyncio.to_thread(original_path.read_bytes)==original_bytes,'Original human edit was overwritten'
                 assert len({collection,*targets})==3 and len({sid,*[m['session_id'] for m in mappings]})==3
                 print('PASS two actual rename imports expose distinct collections and independent local session mappings without changing original bytes',flush=True)
                 for local_sid,target,expected in [(sid,collection,'Newer acknowledged human answer')]+[(m['session_id'],m['collection'],'Original exported answer') for m in mappings]:
@@ -77,23 +130,45 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 start=await client.post('/export',json={'collection':targets[0],'include_models':False});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
                 reexported=await completed(client,'/export/job/'+start.json()['job_id'])
-                with tarfile.open(root/'exports'/reexported['filename']) as package:
-                    imported_sid=mappings[0]['session_id'];member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+imported_sid+'.json'))
-                    retained=json.load(package.extractfile(member));assert retained['session_id']==imported_sid and retained['imported_from']['session_id']==sid
-                assert hashlib.sha256(archive.read_bytes()).hexdigest()==digest
+                imported_sid=mappings[0]['session_id'];retained=await asyncio.to_thread(archive_session,root/'exports'/reexported['filename'],imported_sid)
+                assert retained['session_id']==imported_sid and retained['imported_from']['session_id']==sid
+                assert await asyncio.to_thread(file_digest,archive)==digest
                 print('PASS re-export uses the allocated session filename/provenance and the original package remains byte-identical',flush=True)
+                source_id='legacy-review-2024';legacy_filename=await asyncio.to_thread(legacy_archive,archive,root,sid,source_id)
+                start=await client.post('/import',json={'filename':legacy_filename,'on_conflict':'rename'});assert start.status_code==202,start.text
+                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'])
+                mapping=legacy['restored_sessions'][0];local=mapping['session_id']
+                assert mapping['source_session_id']==source_id and local.startswith('gs_') and len(local)==11
+                response=await client.get('/goldstandard/session/'+local);assert response.status_code==200,response.text
+                assert response.json()['imported_from']['session_id']==source_id
+                print('PASS digest-valid historical-ID archive completes actual import with canonical local lookup and original provenance',flush=True)
+                saved=await client.post('/goldstandard/save',json={'session_id':local,'filename':'owned-legacy-rows.json'});assert saved.status_code==200,saved.text
+                download=await client.get('/goldstandard/download/'+saved.json()['filename']);assert download.status_code==200,download.text
+                assert download.json()[0]['answer']=='Original exported answer'
+                reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),local],text=True,capture_output=True,check=True)
+                assert json.loads(reload.stdout)[0]['imported_from']['session_id']==source_id
+                assert await asyncio.to_thread(original_path.read_bytes)==original_bytes
+                print('PASS historical imported session keeps usable HTTP/RAGAS/restart state while original newer review remains unchanged',flush=True)
+
 
         async def owned():
             try:await run()
             finally:
-                # Let only our actual jobs reach terminal state before releasing
-                # temporary settings/storage or deleting their owned collections.
-                while any(module.get_job(jobid)['status'] in ('queued','running') for module,jobid in jobs):await asyncio.sleep(0.1)
-                if created:
-                    for name in wc.get_client().collections.list_all():
-                        if name==collection or name.startswith(collection+'_'):
-                            wc._delete_collection_sync(name)
-                wc.close_client()
+                pending=await settle_owned_jobs(jobs)
+                if pending:
+                    # This standalone verifier owns these worker threads. Hard
+                    # exit prevents asyncio's executor shutdown joining a stuck
+                    # job forever, and preserves its exact fixture directory.
+                    print('FAIL owned jobs did not settle: '+repr(pending)+'; preserved fixture directory '+str(root),flush=True)
+                    os._exit(2)
+                for name in sorted(created_names):
+                    if await asyncio.to_thread(wc._collection_exists_sync,name):
+                        await asyncio.to_thread(wc._delete_collection_sync,name)
+                if neighbor_created:
+                    assert await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Exact cleanup deleted a similarly named protected collection'
+                    await asyncio.to_thread(wc._delete_collection_sync,protected_neighbor)
+                    print('PASS exact recorded-name cleanup leaves a similarly named collection intact until explicit fixture teardown',flush=True)
+                await asyncio.to_thread(wc.close_client)
         asyncio.run(owned())
-assert not wc._collection_exists_sync(collection);wc.close_client()
+assert all(not wc._collection_exists_sync(name) for name in created_names);wc.close_client()
 print('PASS only owned collections/packages/session fixtures removed',flush=True)

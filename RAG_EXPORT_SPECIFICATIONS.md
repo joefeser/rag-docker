@@ -514,7 +514,7 @@ writer MUST go through the service.
 1. Deleting a collection deletes its sources, its ingest and retrieval configs,
    and leaves its gold-standard sessions orphaned per rule 4 below.
 2. Exports in `./exports` are never deleted automatically.
-3. Import never modifies the package file. Imported evaluation sessions MUST preserve every occupied local session identity (including disk-only or unreadable retained files). A collision allocates an independent local `gs_` identity, retaining the package session/collection and UTC import time as `imported_from`. The import job reports `restored_sessions` entries with `source_session_id`, `session_id` and `collection`, also naming those IDs in existing visible notes. Exporting a renamed collection uses its allocated local IDs as session filenames; RAGAS output keeps its four fields. Import identity selection is serialized with generation starts in the single API process; durable writer and historical validity contracts remain separate.
+3. Import never modifies the package file. Imported evaluation sessions MUST preserve every occupied local session identity (including disk-only or unreadable retained files). A collision or historical/noncanonical source identity allocates an independent canonical local `gs_` identity, retaining the package session/collection and UTC import time as `imported_from`. The import job reports `restored_sessions` entries with `source_session_id`, `session_id` and `collection`, also naming those IDs in existing visible notes. Exporting a renamed collection uses its allocated local IDs as session filenames; RAGAS output keeps its four fields. Import identity selection is serialized with generation starts in the single API process; durable writer and historical validity contracts remain separate.
 4. **Replaced collections:** when `on_conflict=replace` removes an existing
    collection, its gold-standard sessions are **retained and marked orphaned**,
    and the import result reports how many. Silent deletion destroys evaluation
@@ -623,7 +623,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
-| E23 | Export, edit original, rename-import twice: all three session identities retain independent review/export state and reported import provenance |
+| E24 | Export, edit original, rename-import twice: all three session identities retain independent review/export state and reported import provenance |
 
 ---
 

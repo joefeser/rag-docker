@@ -40,7 +40,7 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
-_identity_lock = threading.Lock()
+_identity_lock = threading.RLock()
 
 
 def _sessions_dir() -> Path:
@@ -62,28 +62,30 @@ async def _save_session(session: dict) -> None:
 
 
 def load_sessions_from_disk() -> None:
-    for p in _sessions_dir().glob("*.json"):
-        try:
-            data = json.loads(p.read_text())
-            _sessions[data["session_id"]] = data
-        except Exception:
-            pass
+    with _identity_lock:
+        for p in _sessions_dir().glob("*.json"):
+            try:
+                data = json.loads(p.read_text())
+                _sessions[data["session_id"]] = data
+            except Exception:
+                pass
 
 
 def sessions_for(collection: str) -> list[dict]:
     """Every session generated against a collection, in-memory and on disk."""
-    found = {sid: sess for sid, sess in _sessions.items()
-             if sess.get("collection") == collection}
-    # A session written by an import may not be in memory yet.
-    for path in _sessions_dir().glob("*.json"):
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if data.get("collection") == collection and data["session_id"] not in found:
-            found[data["session_id"]] = data
-            _sessions[data["session_id"]] = data
-    return list(found.values())
+    with _identity_lock:
+        found = {sid: sess for sid, sess in _sessions.items()
+                 if sess.get("collection") == collection}
+        # A session written by an import may not be in memory yet.
+        for path in _sessions_dir().glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if data.get("collection") == collection and data["session_id"] not in found:
+                found[data["session_id"]] = data
+                _sessions[data["session_id"]] = data
+        return list(found.values())
 
 
 def store_session(session: dict) -> None:
@@ -94,13 +96,16 @@ def store_session(session: dict) -> None:
     flagging pass writes that back over the file. Import learned this the hard
     way — a restored session reverted to its pre-import orphaned state.
     """
-    _sessions[session["session_id"]] = session
-    _save_session_sync(session)
+    with _identity_lock:
+        _sessions[session["session_id"]] = session
+        _save_session_sync(session)
 
 
 def _identity_available(session_id: str) -> bool:
-    if not re.fullmatch(r"gs_[0-9a-f]{8}", session_id):
-        raise ValueError("Imported session identity must use the local gs_ namespace")
+    if not isinstance(session_id, str) or not re.fullmatch(r"gs_[0-9a-f]{8}", session_id):
+        # A source identity is provenance, never a local filesystem address.
+        # Historical IDs receive a fresh canonical local identity.
+        return False
     if session_id in _sessions:
         return False
     try:
