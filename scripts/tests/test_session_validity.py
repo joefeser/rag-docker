@@ -21,7 +21,7 @@ def session():
             'contexts':['Inert historical context'],'ground_truth':'Inert truth',
             'source_file':'inert.txt','chunk_index':i,'status':status}
            for i,status in enumerate(('approved','edited','pending','rejected'))]
-    return {'session_id':'gs_validity_fixture','collection':'ValidityFixture','status':'completed',
+    return {'session_id':'gs_47abcdef','collection':'ValidityFixture','status':'completed',
             'pairs_total':4,'pairs_completed':4,'pairs':pairs}
 
 
