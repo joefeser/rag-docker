@@ -1,10 +1,11 @@
 """Overlap window invariants on inert synthetic text and the ingest worker."""
 import os
+import runpy
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
 from services import chunker, ingest_pipeline
@@ -76,6 +77,52 @@ class OverlapTests(unittest.TestCase):
             with self.subTest(values=(size,overlap,minimum)), self.assertRaises(ValueError):
                 chunker.chunk_overlap('inert',size,overlap,minimum)
 
+    def test_window_limit_accepts_boundary_and_rejects_before_slicing(self):
+        count=chunker.MAX_OVERLAP_WINDOWS
+        self.assertEqual(len(chunker.chunk_overlap('x'*(10+count-1),10,9,0)),count)
+        class NoSlices(str):
+            def __getitem__(self,key):raise AssertionError('window allocated before rejection')
+        with self.assertRaisesRegex(ValueError,'per-file limit'):
+            chunker.chunk_overlap(NoSlices('x'*(10+count)),10,9,0)
+
+    def test_repeated_payload_limit_has_an_independent_boundary(self):
+        with patch.object(chunker,'MAX_OVERLAP_OUTPUT_CHARACTERS',100):
+            chunks=chunker.chunk_overlap('x'*55,10,5,0)
+            self.assertEqual(sum(map(len,chunks)),100)
+            with self.assertRaisesRegex(ValueError,'characters'):
+                chunker.chunk_overlap('x'*56,10,5,0)
+
+    def test_over_budget_file_fails_before_storage_and_other_file_continues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);bad=root/'over-budget.txt';bad.write_text('inert')
+            good=root/'accepted.txt';good.write_text('inert')
+            job_id='overlap-budget-test'
+            job={'status':'queued','files_total':2,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
+            ingest_pipeline._jobs[job_id]=job
+            try:
+                with patch.object(ingest_pipeline,'_parse_file',side_effect=[('x'*100000,[]),('inert text',[])]), \
+                     patch.object(ingest_pipeline.wc,'_insert_chunks_sync') as store, \
+                     patch.object(ingest_pipeline.sources,'store') as retained:
+                    ingest_pipeline._process_job_sync(job_id,[bad,good],root,'ReviewOverlap','overlap',1000,999,0.85,100)
+                    store.assert_called_once();retained.assert_called_once()
+                    self.assertEqual(store.call_args.args[1][0]['source_file'],'accepted.txt')
+                self.assertEqual(job['status'],'partial',job)
+                self.assertEqual((job['files_completed'],job['files_failed'],job['chunks_stored']),(1,1,1))
+                self.assertIn('over-budget.txt',job['errors'][0]);self.assertIn('per-file limit',job['errors'][0])
+            finally:ingest_pipeline._jobs.pop(job_id,None)
+
+    def test_live_helper_rejects_empty_parser_output_instead_of_vacuous_success(self):
+        root=Path(__file__).resolve().parents[2]
+        with patch.dict(os.environ,{'RAG_OVERLAP_REAL_EMBEDDING':'0'}), \
+             patch.object(ingest_pipeline,'_parse_file',return_value=('',[])), \
+             patch.object(ingest_pipeline.wc,'_collection_exists_sync',return_value=False), \
+             patch.object(ingest_pipeline.wc,'get_client',return_value=MagicMock()), \
+             patch.object(ingest_pipeline.wc,'_delete_collection_sync') as delete, \
+             patch.object(ingest_pipeline.wc,'close_client'):
+            with self.assertRaisesRegex(AssertionError,'parser returned no nonblank text'):
+                runpy.run_path(str(root/'scripts/verify/overlap_chunks.py'))
+            delete.assert_called_once()
+
     def test_entrypoint_uses_the_bounded_overlap_strategy(self):
         text = 'entrypoint' * 1000
         self.assertEqual(recover(chunker.chunk(text, 'overlap', 1000, 200), 200), text)
@@ -113,7 +160,9 @@ class ImplementationTests(unittest.TestCase):
         text = (root / 'IMPLEMENTATION.md').read_text()
         for name,fence,language in [('api/services/chunker.py','```','python'),
                                      ('scripts/verify/overlap_chunks.py','```','python'),
-                                     ('scripts/verify/README.md','````','markdown')]:
+                                     ('scripts/verify/README.md','````','markdown'),
+                                     ('scripts/verify/02_ingest.sh','```','bash'),
+                                     ('scripts/verify/08_overlap.sh','```','bash')]:
             with self.subTest(file=name):
                 header = '### ' + name + '\n\n' + fence + language + '\n'
                 start = text.index(header) + len(header)

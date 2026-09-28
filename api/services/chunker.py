@@ -4,6 +4,9 @@ from typing import Any
 
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
 
+MAX_OVERLAP_WINDOWS = 10_000
+MAX_OVERLAP_OUTPUT_CHARACTERS = 10_000_000
+
 _semantic_model = None
 _semantic_model_lock = threading.Lock()
 
@@ -49,6 +52,17 @@ def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size
         raise ValueError("min_chunk_size must be nonnegative")
     if not text.strip():
         return []
+
+    stride = chunk_size - chunk_overlap
+    windows = 1 if len(text) <= chunk_size else 1 + (len(text) - chunk_size + stride - 1) // stride
+    # Count repeated overlap before allocating slices. The count and payload
+    # limits are conservative before the optional tail merge removes overlap.
+    output_characters = len(text) + (windows - 1) * chunk_overlap
+    if windows > MAX_OVERLAP_WINDOWS or output_characters > MAX_OVERLAP_OUTPUT_CHARACTERS:
+        raise ValueError(
+            f"Overlap output exceeds per-file limit: {windows} pre-merge windows "
+            f"(maximum {MAX_OVERLAP_WINDOWS}), {output_characters} characters "
+            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.")
 
     chunks: list[str] = []
     start = 0

@@ -1880,6 +1880,9 @@ from typing import Any
 
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
 
+MAX_OVERLAP_WINDOWS = 10_000
+MAX_OVERLAP_OUTPUT_CHARACTERS = 10_000_000
+
 _semantic_model = None
 _semantic_model_lock = threading.Lock()
 
@@ -1925,6 +1928,17 @@ def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size
         raise ValueError("min_chunk_size must be nonnegative")
     if not text.strip():
         return []
+
+    stride = chunk_size - chunk_overlap
+    windows = 1 if len(text) <= chunk_size else 1 + (len(text) - chunk_size + stride - 1) // stride
+    # Count repeated overlap before allocating slices. The count and payload
+    # limits are conservative before the optional tail merge removes overlap.
+    output_characters = len(text) + (windows - 1) * chunk_overlap
+    if windows > MAX_OVERLAP_WINDOWS or output_characters > MAX_OVERLAP_OUTPUT_CHARACTERS:
+        raise ValueError(
+            f"Overlap output exceeds per-file limit: {windows} pre-merge windows "
+            f"(maximum {MAX_OVERLAP_WINDOWS}), {output_characters} characters "
+            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.")
 
     chunks: list[str] = []
     start = 0
@@ -8131,7 +8145,8 @@ drive the UI in a real browser.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
-| `overlap_chunks.py` | standalone inside disposable API: `python - < scripts/verify/overlap_chunks.py`; real parser/ingest/Weaviate overlap coverage and tail bounds on an owned collection |
+| `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
+| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
@@ -8372,19 +8387,37 @@ summary() {
 }
 ```
 
+### scripts/verify/08_overlap.sh
+
+```bash
+#!/usr/bin/env bash
+# Real parser/window/ingest/storage acceptance on an owned text-only fixture.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Bounded overlap text storage"
+(cd ../.. && docker compose exec -T -e RAG_OVERLAP_REAL_EMBEDDING="${RAG_OVERLAP_REAL_EMBEDDING:-0}" api python - < scripts/verify/overlap_chunks.py)
+check "overlap coverage, bounds, budget rejection and owned-fixture cleanup" $?
+summary
+```
+
 ### scripts/verify/overlap_chunks.py
 
 ```python
-"""Real parser/ingest/Weaviate overlap acceptance on one owned collection.
+"""Real parser/ingest/Weaviate text-storage acceptance on one owned collection.
 
-Run inside a disposable API with its embedding model already present:
-python - < scripts/verify/overlap_chunks.py
+Run inside a disposable API: python - < scripts/verify/overlap_chunks.py
+Default fixture disables vectorization to isolate text/window storage from
+model availability. RAG_OVERLAP_REAL_EMBEDDING=1 optionally uses production
+Ollama vectorization; do not treat the default as model acceptance.
 Only this script's unique collection and temporary source/config paths are used.
 """
+import os
 import tempfile
 import uuid
 from pathlib import Path
 from unittest.mock import patch
+from weaviate.classes.config import Configure, VectorDistances
 from config import settings
 from services import chunker, ingest_pipeline, weaviate_client as wc
 
@@ -8392,9 +8425,16 @@ collection = 'VfyOverlap' + uuid.uuid4().hex[:12]
 assert not wc._collection_exists_sync(collection)
 created = False
 try:
-    wc._create_collection_sync(collection, 'hnsw', 'cosine', {})
+    real_embedding = os.environ.get('RAG_OVERLAP_REAL_EMBEDDING') == '1'
+    if real_embedding:
+        wc._create_collection_sync(collection, 'hnsw', 'cosine', {})
+    else:
+        wc.get_client().collections.create(name=collection,
+            vectorizer_config=Configure.Vectorizer.none(),
+            vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE),
+            properties=wc.COLLECTION_PROPERTIES)
     created = True
-    print('PASS owned overlap collection created', flush=True)
+    print('PASS owned overlap collection created; mode=' + ('real embedding' if real_embedding else 'text storage without vectorization'),flush=True)
     with tempfile.TemporaryDirectory(prefix='overlap-live-') as directory:
         root = Path(directory)
         cases = [('long_token', 'x' * 10000, 200, 100),
@@ -8406,6 +8446,7 @@ try:
                 stage = root/label; stage.mkdir()
                 source = stage/(label + '.txt'); source.write_text(text)
                 parsed, _ = ingest_pipeline._parse_file(source)
+                assert parsed.strip(), f'{label}: parser returned no nonblank text'
                 expected = chunker.chunk_overlap(parsed,1000,overlap,minimum)
                 job_id = 'overlap-' + uuid.uuid4().hex[:8]
                 job = {'status':'queued', 'files_total':1, 'files_completed':0, 'files_failed':0,
@@ -8418,6 +8459,7 @@ try:
                     saved = sorted((o.properties for o in objects if o.properties['source_file'] == source.name),
                                    key=lambda p:p['chunk_index'])
                     chunks = [p['content'] for p in saved]
+                    assert chunks and expected, f'{label}: no windows were stored'
                     assert chunks == expected and job['chunks_stored'] == len(chunks), (label,job)
                     restored = chunks[0] + ''.join(c[overlap:] for c in chunks[1:]) if chunks else ''
                     assert restored == parsed, label
@@ -8427,6 +8469,19 @@ try:
                     print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
                 finally:
                     ingest_pipeline._jobs.pop(job_id,None)
+        stage=root/'budget';stage.mkdir()
+        source=stage/'over-budget.txt';source.write_text('x'*100000)
+        job_id='overlap-budget-'+uuid.uuid4().hex[:8]
+        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
+        ingest_pipeline._jobs[job_id]=job
+        try:
+            ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,999,0.85,100)
+            assert job['status']=='failed' and job['files_failed']==1 and job['chunks_stored']==0,job
+            assert any('per-file limit' in error for error in job['errors']),job
+            stored=list(wc.get_client().collections.get(collection).iterator())
+            assert not any(o.properties['source_file']==source.name for o in stored)
+            print('PASS excessive overlap output fails before object storage',flush=True)
+        finally: ingest_pipeline._jobs.pop(job_id,None)
     print('PASS owned temporary source paths removed', flush=True)
 finally:
     if created:
@@ -8865,9 +8920,14 @@ summary
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
-[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+# Regenerate when the newest fixture is missing, so a directory left by an
+# older run does not hide a check behind a missing file.
+[ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
+# Run the independent text-storage window acceptance without model work.
+bash ./08_overlap.sh
+check "bounded overlap text-storage acceptance" $?
 C="${PREFIX}Ingest"
 
 # Uploads a set of files and echoes the finished job document to a file.
@@ -8918,6 +8978,36 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
 check "each skip names the unsupported extension" $?
+
+# ── upload size limit at the proxy ───────────────────────────────────────────
+# nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
+# a 413 before the API sees them, so every real-world PDF failed through the
+# UI while the few-KB fixtures here all passed. These go through $API, which is
+# the proxy, on purpose. See issue #21.
+size=$(python3 -c "import os;print(os.path.getsize('$FIX/large.pdf'))")
+[ "$size" -gt 1048576 ]
+check "the large fixture is over nginx's 1 MB default" $? "$size bytes"
+
+drop_collection "$C"; make_collection "$C"
+if ingest "$C" fixed 300 50 "$FIX/large.pdf"; then
+  read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+else
+  status="rejected"; completed=0; chunks=0
+fi
+[ "$status" = completed ] && [ "$completed" = 1 ] && [ "$chunks" -gt 0 ]
+check "an upload over 1 MB is accepted through the proxy and ingests" $? \
+  "status=$status completed=$completed chunks=$chunks"
+
+# Just over the 512 MB limit. A sparse file, so nothing is written to disk, and
+# nginx answers from the Content-Length header without reading the body.
+big_dir=$(mktemp -d)
+python3 -c "open('$big_dir/oversize.txt','wb').truncate(513*1024*1024)"
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "strategy=fixed" -F "files=@$big_dir/oversize.txt")
+rm -rf "$big_dir"
+check_eq "an upload over the 512 MB limit is refused with 413" "$code" "413"
 
 # ── every chunking strategy against a PDF ────────────────────────────────────
 for strategy in fixed overlap language context_aware semantic; do

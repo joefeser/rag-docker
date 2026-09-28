@@ -1209,6 +1209,7 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 #### Fixed Size with Overlap (`overlap`)
 - Splitter: explicit character windows, independent of paragraph/word separators
 - Parameters: `chunk_size`, `chunk_overlap`, `min_chunk_size`
+- Per-file pre-merge output limits: at most 10,000 windows and 10,000,000 total window characters, including repeated overlap. Count and total payload are computed before allocating windows. Excess fails that file with a clear ingest-job error; other files can continue. These are candidate/payload character bounds, not parser or encoded-byte limits. The optional final-tail merge does not relax the pre-allocation limits.
 - Behavior: consecutive windows share exactly `chunk_overlap` characters. Nonblank
   text is covered in order, including internal and boundary whitespace; blank-only
   input yields no chunks. Python character counts, rather than encoded byte counts,
@@ -1755,6 +1756,9 @@ exporter, and needed a fourth time here — which is how the omission survived. 
 now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
+
+- [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
+      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
