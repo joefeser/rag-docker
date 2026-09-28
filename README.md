@@ -238,6 +238,15 @@ All API settings are environment variables in `docker-compose.yml`:
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 
+**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/nginx.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
+
+```bash
+docker compose build ui
+docker compose up -d --force-recreate ui proxy
+```
+
+`--force-recreate` matters for the proxy. `nginx.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
+
 ## Data persistence
 
 Four named Docker volumes persist data across restarts:
@@ -626,6 +635,8 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 **4. Disconnect any active VPN** — VPNs frequently block Docker's connection to Docker Hub. Disconnect, retry the pull, then reconnect once all images are cached.
 
 **Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull phi3.5` etc.) is in progress. Run `docker compose logs -f ollama` to watch. If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
+
+**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old `nginx.conf`: run `docker compose up -d --force-recreate proxy`.
 
 **Port 8080 already in use** — The proxy publishes on host port 8080 (`docker-compose.yml`, the `proxy` service: `"8080:80"`). Change the host side to any free port, for example `"9090:80"`, then access the UI at `http://localhost:9090`. Only the number to the left of the colon may change — nginx listens on 80 inside the container.
 
