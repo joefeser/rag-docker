@@ -343,6 +343,20 @@ class GenerateRequest(BaseModel):
     sample_size: int = 20
     seed: Optional[int] = None
 
+    @field_validator("sample_size", "seed", mode="before")
+    @classmethod
+    def _numeric(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Sampling settings cannot be booleans")
+        return value
+
+    @field_validator("sample_size")
+    @classmethod
+    def _sample_size(cls, value):
+        if not 1 <= value <= 100:
+            raise ValueError("sample_size must be between 1 and 100")
+        return value
+
 
 class GenerateResponse(BaseModel):
     session_id: str
