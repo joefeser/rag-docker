@@ -98,7 +98,10 @@ def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -
     snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
     try:
         with batch_write.ExpectedRecords() as expected:
-            expected.capture(records, expected_chunks)
+            try:
+                expected.capture(records, expected_chunks)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
             expected.snapshot(snapshot)
         with snapshot.open("rb") as data:
             os.fsync(data.fileno())

@@ -435,6 +435,48 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertFalse(snapshot.exists())
 
+    def import_new_target(self, pkg, manifest):
+        importer._jobs['preflight'] = {'chunks_written': 0}
+        with patch.object(importer.packager, 'open_package', return_value=(pkg, manifest)), \
+                patch.object(importer.packager, 'verify_digests'), \
+                patch.object(importer, '_check_embedding'), \
+                patch.object(importer, '_ensure_models', return_value=[]), \
+                patch.object(importer, '_create_from_package') as create:
+            importer._run('preflight', 'fixture.tar.gz', 'abort')
+        create.assert_not_called()
+        return importer._jobs['preflight']
+
+    def test_new_target_invalid_package_preflight_reports_package_corrupt(self):
+        for fault in ('duplicate', 'count', 'timestamp'):
+            with self.subTest(fault=fault):
+                pkg, manifest = self.package()
+                manifest['collection']['name'] = 'NewCorpus'
+                rows = json.loads(json.dumps(self.original))
+                if fault == 'duplicate':
+                    rows[1]['id'] = rows[0]['id']
+                elif fault == 'count':
+                    manifest['collection']['chunk_count'] = 3
+                else:
+                    rows[0]['properties']['created_at'] = 'not-a-date'
+                (pkg / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                job = self.import_new_target(pkg, manifest)
+                self.assertEqual(job['status'], 'failed')
+                self.assertEqual(job['error_code'], 'PACKAGE_CORRUPT')
+                self.assertEqual(job['error_detail'], {'file': 'chunks.jsonl'})
+                self.assertEqual(job['chunks_written'], 0)
+                self.assertEqual(list(importer._markers_dir().iterdir()), [])
+                self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+
+    def test_new_target_snapshot_io_error_remains_import_failed(self):
+        pkg, manifest = self.package()
+        manifest['collection']['name'] = 'NewCorpus'
+        with patch.object(batch_write.ExpectedRecords, 'snapshot', side_effect=OSError('disk unavailable')):
+            job = self.import_new_target(pkg, manifest)
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['error_code'], 'IMPORT_FAILED')
+        self.assertIn('disk unavailable', job['error'])
+        self.assertEqual(list(importer._markers_dir().iterdir()), [])
+
     def test_failed_new_target_cleanup_keeps_marker_for_startup_retry(self):
         pkg, manifest = self.package()
         importer._jobs['job'] = {'chunks_written': 0}
