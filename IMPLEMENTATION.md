@@ -2370,6 +2370,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
+from models.schemas import SessionResponse
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 
@@ -2398,45 +2399,114 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
+_SESSION_ID = re.compile(r"gs_[0-9a-f]{8}")
+
+
+def validate_session_id(session_id: str) -> None:
+    """Imported identities use the same grammar as locally generated ones."""
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        raise ValueError("Invalid evaluation session ID.")
+
+
+def validate_session(session: dict) -> None:
+    """Validate without normalising or dropping historical validity metadata."""
+    SessionResponse.model_validate(session, strict=True)
+    validate_session_id(session["session_id"])
+
+
+def _session_storage_root() -> Path:
+    upload = Path(settings.upload_dir).resolve()
+    p = upload / "goldstandard_sessions"
+    if p.is_symlink() or (p.exists() and not p.is_dir()):
+        raise ValueError("Evaluation session storage is not a regular directory.")
+    root = p.resolve()
+    if root.parent != upload:
+        raise ValueError("Evaluation session storage is outside the upload directory.")
+    return root
 
 
 def _sessions_dir() -> Path:
-    p = Path(settings.upload_dir) / "goldstandard_sessions"
+    p = _session_storage_root()
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def _session_path(session_id: str) -> Path:
-    return _sessions_dir() / f"{session_id}.json"
+    validate_session_id(session_id)
+    # Preflight must be read-only; the writer creates the directory only after
+    # every imported session has been checked.
+    root = _session_storage_root()
+    candidate = root / f"{session_id}.json"
+    if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+        raise ValueError("Evaluation session destination is not a regular file.")
+    target = candidate.resolve()
+    # Grammar prevents metadata-derived paths; containment also refuses an
+    # existing file symlink which would redirect a valid identity's write.
+    if target.parent != root:
+        raise ValueError("Evaluation session destination is outside session storage.")
+    return target
 
 
 def _save_session_sync(session: dict) -> None:
-    _session_path(session["session_id"]).write_text(json.dumps(session, indent=2))
+    path = _session_path(session["session_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(session, indent=2))
 
 
 async def _save_session(session: dict) -> None:
     await asyncio.to_thread(_save_session_sync, session)
 
 
-def load_sessions_from_disk() -> None:
-    for p in _sessions_dir().glob("*.json"):
+def _sessions_on_disk() -> list[dict]:
+    """Leave invalid legacy files untouched and reported, outside the cache.
+
+    A previously accepted ID must not make post-deletion flagging raise after
+    the collection has already gone. Every disk reader uses this same boundary.
+    """
+    try:
+        paths = sorted(_session_storage_root().glob("*.json"))
+    except (OSError, ValueError, RuntimeError):
+        log.exception("Cannot read evaluation session storage; existing files are unchanged")
+        return []
+    sessions = []
+    for p in paths:
         try:
+            if p.is_symlink() or not p.is_file():
+                raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(p.read_text())
-            _sessions[data["session_id"]] = data
-        except Exception:
-            pass
+            validate_session(data)
+            if p != _session_path(data["session_id"]):
+                raise ValueError("Evaluation session filename does not match its identity.")
+        except (OSError, ValueError, RuntimeError):
+            log.warning("Skipping invalid evaluation session %s; file is unchanged", p,
+                        exc_info=True)
+            continue
+        sessions.append(data)
+    return sessions
+
+
+def load_sessions_from_disk() -> None:
+    for data in _sessions_on_disk():
+        _sessions[data["session_id"]] = data
 
 
 def sessions_for(collection: str) -> list[dict]:
     """Every session generated against a collection, in-memory and on disk."""
-    found = {sid: sess for sid, sess in _sessions.items()
-             if sess.get("collection") == collection}
-    # A session written by an import may not be in memory yet.
-    for path in _sessions_dir().glob("*.json"):
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
+    found = {}
+    for sid, sess in list(_sessions.items()):
+        if sess.get("collection") != collection:
             continue
+        try:
+            validate_session(sess)
+            if sid != sess["session_id"]:
+                raise ValueError("Cached evaluation identity does not match its key.")
+            _session_path(sid)
+        except (OSError, ValueError, RuntimeError):
+            log.warning("Skipping invalid cached evaluation session %s", sid, exc_info=True)
+            continue
+        found[sid] = sess
+    # A session written by an import may not be in memory yet.
+    for data in _sessions_on_disk():
         if data.get("collection") == collection and data["session_id"] not in found:
             found[data["session_id"]] = data
             _sessions[data["session_id"]] = data
@@ -2451,8 +2521,9 @@ def store_session(session: dict) -> None:
     flagging pass writes that back over the file. Import learned this the hard
     way — a restored session reverted to its pre-import orphaned state.
     """
-    _sessions[session["session_id"]] = session
+    validate_session(session)
     _save_session_sync(session)
+    _sessions[session["session_id"]] = session
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
@@ -2470,7 +2541,7 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
         session[f"{flag}_at"] = now
         try:
             _save_session_sync(session)
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
             log.exception("Could not flag gold-standard session %s", session["session_id"])
             continue
         marked += 1
@@ -2789,6 +2860,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from config import settings
+from services import goldstandard
 from services import ingest_config
 from services import model_bundle
 from services import retrieval_config
@@ -2951,19 +3023,9 @@ def _ingest_config(collection: str) -> dict | None:
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:
-    out = []
-    d = Path(settings.upload_dir) / "goldstandard_sessions"
-    if not d.is_dir():
-        return out
-    for p in sorted(d.glob("*.json")):
-        try:
-            data = json.loads(p.read_text())
-        except (OSError, ValueError):
-            _log.warning("Skipping unreadable gold-standard session %s", p.name)
-            continue
-        if data.get("collection") == collection:
-            out.append(data)
-    return out
+    # Export shares the disk-load validation boundary; legacy invalid metadata
+    # must not be repackaged as an apparently usable evaluation session.
+    return goldstandard.sessions_for(collection)
 
 
 def _fidelity_note(fidelity: str) -> str:
@@ -3253,6 +3315,11 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
             raise PackageError(
                 "PACKAGE_UNREADABLE",
                 f"Package contains a link ('{member.name}'), which is not allowed.",
+                {"member": member.name})
+        if not (member.isfile() or member.isdir()):
+            raise PackageError(
+                "PACKAGE_UNREADABLE",
+                "Package contains a non-regular archive member.",
                 {"member": member.name})
         target = (dest / member.name).resolve()
         if target != root and root not in target.parents:
@@ -3782,7 +3849,45 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict,
     return written
 
 
-def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
+def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
+    """Preflight every evaluation sidecar before touching live state.
+
+    A valid archive and matching digests prove neither metadata validity nor
+    safe persistence destinations. Retain these parsed snapshots so restoration
+    cannot discover an invalid later session after a replacement has begun.
+    """
+    gold = pkg / "goldstandard"
+    if not gold.exists():
+        return []
+    if not gold.is_dir():
+        raise PackageError("PACKAGE_CORRUPT", "goldstandard must be a directory.",
+                           {"file": "goldstandard"})
+    sessions: list[dict] = []
+    identities: set[str] = set()
+    for path in sorted(gold.glob("*.json")):
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("Evaluation session must be a regular file.")
+            data = json.loads(path.read_text())
+            goldstandard.validate_session(data)
+            if canonical(data["collection"]) != canonical(original):
+                raise ValueError("Evaluation session belongs to a different collection.")
+            if data["session_id"] in identities:
+                raise ValueError("Duplicate evaluation session identity.")
+            # Check the live write boundary too, before any collection/model
+            # mutation. This catches pre-existing redirected destinations.
+            goldstandard._session_path(data["session_id"])
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise PackageError(
+                "PACKAGE_CORRUPT", "Invalid evaluation session metadata.",
+                {"file": f"goldstandard/{path.name}"}) from exc
+        identities.add(data["session_id"])
+        sessions.append(data)
+    return sessions
+
+
+def _restore_sidecars(target: str, pkg: Path, original: str,
+                      validated_sessions: list[dict]) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -3811,16 +3916,10 @@ def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
         except Exception as exc:                      # noqa: BLE001
             notes.append(f"retrieval settings could not be restored: {exc}")
 
-    gold = pkg / "goldstandard"
-    if gold.is_dir():
-        (Path(settings.upload_dir) / "goldstandard_sessions").mkdir(parents=True, exist_ok=True)
+    if validated_sessions:
         restored = 0
-        for session_file in sorted(gold.glob("*.json")):
-            try:
-                data = json.loads(session_file.read_text())
-            except ValueError:
-                notes.append(f"gold-standard session {session_file.name} was unreadable")
-                continue
+        for session in validated_sessions:
+            data = dict(session)
             # The session points at the collection by name; after a rename that
             # name is different, and a session pointing at nothing is worse than
             # no session.
@@ -3888,6 +3987,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                f"'{original}' is not a usable collection name.",
                                {"name": original})
 
+        validated_sessions = _read_goldstandard_sessions(pkg, original)
+
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
         exists = wc._collection_exists_sync(target)                 # check 5
@@ -3926,7 +4027,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
         marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+        notes = model_notes + replace_notes + _restore_sidecars(
+            target, pkg, original, validated_sessions)
 
         if staged and temp_collection:
             try:

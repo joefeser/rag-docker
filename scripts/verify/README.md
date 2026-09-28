@@ -1,5 +1,7 @@
 # Verification suite
 
+Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
+
 Integration tests that run the acceptance criteria in `SPECIFICATIONS.md` §10
 and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a live stack.
 
