@@ -240,6 +240,15 @@ All API settings are environment variables in `docker-compose.yml`:
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 
+**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/nginx.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
+
+```bash
+docker compose build ui
+docker compose up -d --force-recreate ui proxy
+```
+
+`--force-recreate` matters for the proxy. `nginx.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
+
 ## Data persistence
 
 Four named Docker volumes persist data across restarts:
@@ -632,6 +641,7 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 **Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80.
 
 **Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. This workbench currently has no API authentication; authenticated LAN access with TLS is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
+**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old `nginx.conf`: run `docker compose up -d --force-recreate proxy`.
 
 **Build fails with `ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device`** — Docker's virtual disk is full, not your host disk — the two are reported separately, and `df -h` on the host will look fine. A virtual disk of 8 GB or so cannot hold ~6.5 GB of images plus build cache, so the build runs out of room partway through `pip install`. Check the real numbers with:
 

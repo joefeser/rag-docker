@@ -350,6 +350,8 @@ Content-Type: multipart/form-data
 
 Accepts one or more files. For ZIP uploads, extracts and processes all supported files within the archive. For folder-equivalent uploads (multiple files in one request), processes all submitted files.
 
+**Size limit:** one request may be at most **512 MB**, all files together. The proxy enforces this (`client_max_body_size` in `proxy/nginx.conf`) and answers an oversize request itself with **HTTP 413**, an nginx HTML page rather than the API's JSON error shape, before the API sees it. The proxy streams accepted uploads to the API without buffering them, and the API writes each file to disk in blocks rather than holding it in memory. The Import page refuses a selection over the limit before sending it.
+
 **Form fields:**
 
 | Field | Type | Required | Description |
@@ -1752,6 +1754,15 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] On parser failure for one file, other files in the batch continue processing.
       *A corrupt PDF with two good files gave `partial`, 2 completed, 1 failed,
       and the parser error recorded against the offending filename.*
+- [x] An upload over 1 MB is accepted through the proxy and ingests; one over 512 MB is refused with 413.
+      *nginx's default 1 MB body limit rejected every real-world PDF with a 413
+      before the API saw it, and the few-KB fixtures could not catch it (issue
+      #21). **Fixed**: `client_max_body_size 512m` with request buffering off,
+      uploads written to disk in blocks, and a 3 MB `large.pdf` fixture, which
+      is accepted and completes. A 2.7 MB random-text upload that got 413 before
+      the fix returned 202 and stored 3,048 chunks before the run was stopped;
+      ingest embeds about one chunk per second, so that file takes over an hour.
+      A 513 MB sparse file gets 413.*
 
 ### 10.2 Query
 
@@ -1830,6 +1841,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
+- [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
+      *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
+      is made. A 413 or other proxy error page is shown as a readable message
+      instead of a JSON parse error (issue #21).*
 
 ### 10.5 Infrastructure
 
