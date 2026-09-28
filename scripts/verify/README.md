@@ -41,9 +41,9 @@ drive the UI in a real browser.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
+| `overlap_chunks.py` | standalone inside disposable API: `python - < scripts/verify/overlap_chunks.py`; real parser/ingest/Weaviate overlap coverage and tail bounds on an owned collection |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
-| `overlap_chunks.py` | standalone inside disposable API: `python - < scripts/verify/overlap_chunks.py`; real parser/ingest/Weaviate overlap coverage and tail bounds on an owned collection |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 
