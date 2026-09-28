@@ -9,17 +9,47 @@ C="${PREFIX}Infra"
 
 section "§10.5 Infrastructure"
 
-# ── exactly one host-published port ──────────────────────────────────────────
-bindings=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Ports}}') \
-  | grep -o '0\.0\.0\.0:[0-9]*->[0-9]*/tcp' | sort -u)
-count=$(printf '%s\n' "$bindings" | grep -c . )
+# ── resolved configuration and live bindings ─────────────────────────────────
+# Inspect structured ports, including their host addresses. Matching only
+# 0.0.0.0 made a loopback deployment look as though it published no ports.
+(cd "$REPO_ROOT" && docker compose config --format json) > /tmp/vfy_compose.json
+python3 - <<'ENDPY'
+import json, sys
+services = json.load(open('/tmp/vfy_compose.json'))['services']
+ports = [(name, port) for name, service in services.items() for port in service.get('ports', [])]
+ok = (len(ports) == 1 and ports[0][0] == 'proxy'
+      and ports[0][1].get('host_ip') == '127.0.0.1'
+      and ports[0][1]['target'] == 80 and ports[0][1].get('protocol', 'tcp') == 'tcp')
+sys.exit(0 if ok else 1)
+ENDPY
+check "resolved Compose publishes only the proxy on host loopback" $?
+
+(cd "$REPO_ROOT" && python3 - <<'ENDPY'
+import json, subprocess
+ids = subprocess.check_output(['docker', 'compose', 'ps', '-q'], text=True).split()
+containers = json.loads(subprocess.check_output(['docker', 'inspect', *ids], text=True)) if ids else []
+bindings = [{'service': container['Config']['Labels']['com.docker.compose.service'],
+             'container_port': port, **binding}
+            for container in containers
+            for port, published in container['NetworkSettings']['Ports'].items()
+            for binding in (published or [])]
+print(json.dumps(bindings))
+ENDPY
+) > /tmp/vfy_bindings.json
+count=$(python3 -c "import json; print(len(json.load(open('/tmp/vfy_bindings.json'))))")
 check_eq "only one port is published to the host" "$count" "1"
-printf '%s' "$bindings" | grep -q -- '->80/tcp'
-check "that port maps to the proxy's port 80" $? "$bindings"
+python3 - <<'ENDPY'
+import json, sys
+bindings = json.load(open('/tmp/vfy_bindings.json'))
+ok = (len(bindings) == 1 and bindings[0]['service'] == 'proxy'
+      and bindings[0]['container_port'] == '80/tcp' and bindings[0]['HostIp'] == '127.0.0.1')
+sys.exit(0 if ok else 1)
+ENDPY
+check "the live proxy port is bound only to host loopback" $?
 
 for svc in api weaviate; do
   published=$( (cd "$REPO_ROOT" && docker compose ps --format "{{.Service}}|{{.Ports}}") \
-    | grep "^$svc|" | grep -c '0\.0\.0\.0' || true)
+    | grep "^$svc|" | grep -c -- '->[0-9]*/tcp' || true)
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
