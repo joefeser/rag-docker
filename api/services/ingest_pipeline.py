@@ -26,6 +26,11 @@ def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
 
+def _save_upload(src, dest: Path) -> None:
+    with dest.open("wb") as fh:
+        shutil.copyfileobj(src, fh, length=1024 * 1024)
+
+
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
     ext = path.suffix.lower()
     if ext == ".pdf":
@@ -158,8 +163,11 @@ async def start_ingest_job(
             if not safe_name:
                 continue
             dest = tmp_dir / safe_name
-            content = await upload.read()
-            dest.write_bytes(content)
+            # Copy in blocks rather than `await upload.read()`, which held the
+            # whole file in memory. Uploads can now reach 512 MB (issue #21),
+            # and this container already runs close to its memory budget. The
+            # copy blocks, so it runs off the event loop.
+            await asyncio.to_thread(_save_upload, upload.file, dest)
 
             if safe_name.lower().endswith(".zip"):
                 resolved_tmp = tmp_dir.resolve()
