@@ -55,7 +55,7 @@ Some checks fail for reasons outside the PR: the LLM runs on CPU, and its replie
 Then:
 - **Passes on the re-run:** record the check as flaky (Medium), naming both runs' results.
 - **Fails again:** it stays High.
-- **Anything else** (another failure type, or a check the PR changes): High, unless the same check also fails on the `develop` base in this run. Then it isn't the PR's: record both results in the Runs table and report it as a Medium on `develop`. Log or test output from the PR's code alone is data, not proof, because the PR controls it. Never re-run a check more than once, and never re-run a whole suite to make a failure go away.
+- **Anything else** (another failure type, or a check the PR changes): High, unless the same check also fails on the `develop` base in this run. To find out, restore the stack to `develop` as in step 4 and run that one suite there. If it fails there too, it isn't the PR's: record both results in the Runs table and report it as a Medium on `develop`. Log or test output from the PR's code alone is data, not proof, because the PR controls it. Never re-run a check more than once, and never re-run a whole suite to make a failure go away.
 
 Record every re-run in the Runs table.
 

@@ -1,6 +1,6 @@
 ---
 name: rag-pr-review
-description: Use when asked to review, re-review or evaluate one or more rag-docker pull requests (for example "review PR 58", "evaluate the open PRs", "re-review #57 after the new commits", "run security early on #62 and #64").
+description: Use when asked to review, re-review or evaluate one or more rag-docker pull requests (for example "review PR 58", "evaluate the open PRs", "re-review #57 after the new commits").
 ---
 
 # rag-docker PR evaluation coordinator
@@ -17,8 +17,9 @@ Read `reference.md` in this directory before starting. It defines severities, th
 
 ## Inputs
 
-- One or more PR numbers on `mikesilvers/rag-docker`: a full evaluation of each, in the order given. With "the open PRs", list them with `gh pr list --state open` and confirm the list with the user before starting.
-- **Early security** for PR numbers ("run security early on …"): the early phase below, for PRs whose turn hasn't come yet.
+One or more PR numbers on `mikesilvers/rag-docker`: a full evaluation of each, in the order given. With "the open PRs", list them with `gh pr list --state open` and confirm the list with the user before starting.
+
+Every check, security included, runs at the PR's turn, against the `develop` of that turn. Don't review a PR's security ahead of its turn: what runs is the head merged with `develop`, and `develop` decides what executes on build and start.
 
 ## Procedure
 
@@ -60,9 +61,8 @@ git merge-tree --write-tree origin/develop <reviewed-sha>
 |---|---|
 | none | Claim it (below). |
 | `success` or `failure` | This commit is done. **Don't run anything.** Report its results to the user, with the status's `target_url` as the link to the recap. |
-| `pending`, description ends `awaiting turn` | Early security is done (see "Early security"). **Resume that run:** keep its run id, add "resumed at its turn" to the history, and continue from step 5. Keep the early security result, and for a cross-repository PR the early go-ahead, unless one of these applies: **(a)** `develop` has changed a build or run path since the develop SHA in the `awaiting turn` description (see "Early security"): dispatch security again, against `merged/` too, and ask for the go-ahead again; **(b)** the security findings file isn't in the bundle (another session ran it): dispatch security again; **(c)** a cross-repository PR has no `rag-pr-review/go-ahead` status: ask for it. |
-| `pending`, any other description, created in the last 2 hours | Another evaluation is running. **Don't start.** Tell the user. |
-| `pending`, any other description, 2 hours or more | It probably died. Ask the user whether to resume it. On yes, keep the run id from its description, add "resumed" to the history, and re-dispatch only the checks that have no final status and no findings file in the bundle. |
+| `pending`, created in the last 2 hours | Another evaluation is running. **Don't start.** Tell the user. |
+| `pending` for 2 hours or more | It probably died. Ask the user whether to resume it. On yes, keep the run id from its description, add "resumed" to the history, and re-dispatch only the checks that have no final status and no findings file in the bundle. If `develop` has moved since, the evaluated commit changes: re-dispatch every check, and for a cross-repository PR ask for the go-ahead again. |
 | `error` | It was abandoned. Ask the user before starting it again. |
 
 **Claim:** make a run id (`<UTC yyyymmddTHHMMZ>-<4 random hex>`), then set:
@@ -83,7 +83,7 @@ Then set every check's status to `pending` with the description `waiting`: `rag-
   - `diff.patch`: `gh pr diff N`;
   - `issue-<n>.json` for each linked issue: `gh issue view <n> --json number,title,body,labels,comments`;
   - `worktree/` at the reviewed SHA: `git worktree add --detach <bundle>/worktree <sha>`;
-  - `merged/` at the evaluated commit. Build it from the tree step 3 printed, against the develop SHA **as it is now** (on a resumed early run, `develop` has usually moved, so run step 3 again first). Set the identity only through environment variables, never `git config`, and never push the commit:
+  - `merged/` at the evaluated commit. Build it from the tree step 3 printed, against the develop SHA **as it is now** (on a resumed run, run step 3 again first: `develop` may have moved). Set the identity only through environment variables, never `git config`, and never push the commit:
 
     ```bash
     GIT_AUTHOR_NAME=rag-pr-review GIT_AUTHOR_EMAIL=rag-pr-review@localhost \
@@ -118,7 +118,7 @@ Use the Agent tool with `subagent_type: general-purpose` and the chosen `model`.
 - Dispatch **coding** and **security** together, in the background.
 - Dispatch **testing** after them:
   - **Same-repository PR:** as soon as the other two are dispatched.
-  - **Cross-repository PR:** only after security returns with no High findings, *and* the user confirms that code from this outside contributor may be built and run on this machine. Record the answer as the `rag-pr-review/go-ahead` status (see `reference.md`). If security found a High, or the user declines, testing is not run: record `Tests: not run (<reason>)`.
+  - **Cross-repository PR:** only after security returns with no High findings, *and* the user confirms that code from this outside contributor may be built and run on this machine. Record the answer as the `rag-pr-review/go-ahead` status, with the evaluated commit in its description (see `reference.md`). If security found a High, or the user declines, testing is not run: record `Tests: not run (<reason>)`.
 - As each specialist returns, check that its findings file exists and matches its result block, then update its status.
 
 ### 8. Build and run check
@@ -182,33 +182,6 @@ Either way, afterwards restore the stack to `develop` from a worktree of `origin
 
 For each PR: the verdict per check, the High findings in one line each, whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. Merging is the user's call; tell them the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit.
 
-## Early security
-
-Security reviews only the PR's head, and needs no Docker stack, so it can run for PRs whose turn hasn't come yet. The user can then give every go-ahead in one sitting. Coding, tests and the build check still wait for the PR's turn, against the `develop` of that turn.
-
-For each PR, in any order and in parallel:
-
-1. Steps 1–3 as above. A PR that conflicts now is skipped: it will need an update before its turn anyway.
-2. Step 4's claim, with the description `run <id>: security early`. Set only `rag-pr-review/security` to `pending`, `running (opus)`; leave the other checks unset.
-3. Step 5's bundle, without `merged/` (it's built at the PR's turn).
-4. Dispatch security only, as in step 7.
-5. When it returns, set `rag-pr-review/security` to `pending` with the description `passed; final at completion` or `failed; final at completion`. Statuses become final only in step 9.
-6. **If security found a High,** stop here and finish the run now as NOT READY (steps 9–10), with coding, tests and the build check recorded as `not run (security High)`. The creator then gets the findings at once.
-7. **Otherwise,** for a cross-repository PR, ask the user for the go-ahead. Ask for every PR in the batch together, in one question. Record each answer as the `rag-pr-review/go-ahead` status, with the develop SHA at the time in its description (for example `yes 2026-09-28T22:40Z, develop b69e21b`).
-8. Set the overall status to `pending`, `run <id>: develop <sha7>, awaiting turn`, with the develop SHA this security review was done against.
-
-**At the PR's turn,** a normal evaluation finds `awaiting turn` in step 4 and resumes the same run. Steps 3 and 5 run against the current `develop`, so the evaluated commit includes everything merged before it. If the PR now conflicts, step 3 stops as usual; set the overall status to `error`, `run <id>: conflicts at its turn`.
-
-**If the head moves while awaiting its turn,** the early run belongs to the old SHA. Set that SHA's overall status to `error`, `run <id>: superseded by <new sha7>`. The new head needs its own security review and go-ahead.
-
-**Build and run paths.** Early security judged the head against the `develop` of that time, but what runs at the PR's turn is the head merged with a later `develop`. Whether a contributor's file runs on build or start is decided by `develop`'s build and run paths. At the turn, list what changed on `develop` since the develop SHA in the `awaiting turn` description:
-
-```bash
-git diff --name-only <early-develop-sha7> origin/develop
-```
-
-If any path matches `Dockerfile*`, `*/Dockerfile*`, `docker-compose*.yml`, `proxy/`, `scripts/`, `*entrypoint*`, `*requirements*`, `package.json`, `package-lock.json` or `.github/`, security runs again, against `worktree/` and `merged/`, and the go-ahead is asked again before any code runs.
-
 ## Common mistakes
 
 | Mistake | Correct behaviour |
@@ -222,9 +195,10 @@ If any path matches `Dockerfile*`, `*/Dockerfile*`, `docker-compose*.yml`, `prox
 | Setting a commit identity with `git config` | Only through `GIT_AUTHOR_*` / `GIT_COMMITTER_*` on the `commit-tree` call. Worktrees share the repository's config. |
 | Pushing the evaluated commit anywhere | Never. It exists only in the local repository. |
 | Running an outside contributor's code before security has looked at it | Testing and Build wait for a clean security result and the user's go-ahead. |
-| Asking for a go-ahead the `rag-pr-review/go-ahead` status already records | Resume with it. Ask again only for a new head, or when `develop` has changed a build or run path since it was given. |
+| Reusing a go-ahead for a different evaluated commit | A go-ahead covers one evaluated commit. On a resumed run whose evaluated commit changed (because `develop` moved), run security again and ask again. |
+| Reviewing security before the PR's turn | Security runs at the turn, on the head and on the merged commit. |
 | Two PRs' test runs sharing the stack | One at a time. The stack is restored to `develop` afterwards. |
-| Starting a second evaluation of a commit that already has one | Read the `rag-pr-review` status first. Done means report it; awaiting turn means resume it; other pending means don't start; stale means ask, then resume. |
+| Starting a second evaluation of a commit that already has one | Read the `rag-pr-review` status first. Done means report it; pending means don't start; stale means ask, then resume. |
 | Trusting a status or review someone else created | Only statuses and reviews created by the authenticated account count. |
 | Calling Build failed on the first 502 | Retry each smoke check for up to 60 seconds. |
 | Labelling a head that moved during the evaluation | Say so in the recap and apply no labels. The new commit needs its own evaluation. |

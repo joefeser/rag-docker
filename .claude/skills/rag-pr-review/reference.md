@@ -15,7 +15,7 @@ When every check has finished, the coordinator posts **one** recap review, and t
 | **Reviewed SHA** | The PR's head commit, as its author pushed it. Bundle folder `worktree/`. | Reading and citing the PR's code (`path:line`), inline comments, commit statuses, the recap and labels. The evaluation belongs to it. |
 | **Evaluated commit** | The reviewed SHA merged with `origin/develop`, made locally by the coordinator and never pushed. Bundle folder `merged/`. It's the reviewed SHA itself when the head already contains `develop`. | Running tests, and the build check. It's what `develop` would become if the PR merged now. |
 
-- The PR's own changes are the ones in `diff.patch`. Everything else in `merged/` is `develop`, which the maintainer already controls. But `develop` decides what runs: its Dockerfiles, compose files, entrypoints and scripts can execute a file the PR added. So security reads `merged/` wherever the PR's files meet those paths.
+- The PR's own changes are the ones in `diff.patch`. Everything else in `merged/` is `develop`, which the maintainer already controls. But `develop` decides what runs: its Dockerfiles, compose files, entrypoints and scripts can execute a file the PR added. So security reads `merged/` as well as the head, at the PR's turn.
 - Read `merged/` wherever the PR's code interacts with code that `develop` changed after the PR's base.
 - Never push the evaluated commit, and never change git config.
 
@@ -122,15 +122,7 @@ Commit statuses on the reviewed commit are the evaluation's claim and its live p
 |---|---|
 | `rag-pr-review` | The whole evaluation. `pending` = claimed or running; `success` = READY TO MERGE; `failure` = NOT READY; `error` = abandoned. |
 | `rag-pr-review/coding`, `/security`, `/tests`, `/build` | One check each. `pending` = waiting or running; `success` = passed; `failure` = failed; `error` = not run or not concluded. |
-| `rag-pr-review/go-ahead` | Cross-repository PRs only: the maintainer's answer on building and running this head. `success` = yes, `failure` = no. The description holds the UTC time of the answer and the develop SHA it was given against. Set it the moment the user answers; a resumed run reads it instead of asking again. |
-
-Overall `rag-pr-review` descriptions that other steps read:
-
-| Description ends with | Meaning |
-|---|---|
-| `security early` | The early security phase is running. |
-| `awaiting turn` | Early security (and any go-ahead) is done; the rest waits for the PR's turn. It's never stale. |
-| `conflicts at its turn` / `superseded by <sha7>` | With `error`: an early run that can't continue. |
+| `rag-pr-review/go-ahead` | Cross-repository PRs only: the maintainer's answer on building and running this PR's evaluated commit. `success` = yes, `failure` = no. The description holds the UTC time of the answer and the evaluated commit, for example `yes 2026-09-28T23:10Z, evaluated f48c0e3`. Set it the moment the user answers. A resumed run reuses it only if its evaluated commit is the same; otherwise security runs again and the user is asked again. |
 
 ```bash
 gh api repos/mikesilvers/rag-docker/statuses/<sha> --method POST \
