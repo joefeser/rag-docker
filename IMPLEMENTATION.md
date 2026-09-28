@@ -4317,6 +4317,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     Weaviate embeds during the staging insert. The final insert reuses those
     vectors verbatim, so the corpus is embedded once rather than twice.
     """
+    cutover_started = False
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
@@ -4325,7 +4326,6 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
     wc._create_collection_sync(staging, new_index, new_distance, hnsw)
-    cutover_started = False
     try:
         wc._insert_chunks_sync(staging, properties)
         staged = [
