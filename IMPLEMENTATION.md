@@ -8165,6 +8165,8 @@ tests would not have caught the defects this project actually produced.
 ````markdown
 # Verification suite
 
+Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
+
 Integration tests that run the acceptance criteria in `SPECIFICATIONS.md` §10
 and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a live stack.
 
@@ -8177,6 +8179,28 @@ bash scripts/verify/all.sh 02 04              # only the named suites
 ```
 
 Exits non-zero if any check fails.
+
+## Focused import validation regressions
+
+`scripts/tests/test_session_import.py` exercises the real package reader and
+evaluation persistence with disposable fixtures. Model and database mutation
+seams are mocked; this complements the live transfer suite and does not prove
+Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies:
+
+```bash
+docker compose run --rm --no-deps \
+  -v "$PWD/scripts/tests:/tests:ro" -e RAG_TEST_API_DIR=/app \
+  api python /tests/test_session_import.py
+```
+
+Alternatively, with `uv` on the host:
+
+```bash
+uv run --no-project --python 3.11 \
+  --with pydantic-settings==2.15.0 --with pydantic==2.13.5 \
+  --with httpx==0.28.1 --with weaviate-client==4.23.1 \
+  python scripts/tests/test_session_import.py
+```
 
 ## Why integration tests
 

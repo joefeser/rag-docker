@@ -8,12 +8,14 @@ ROOT = Path(__file__).resolve().parents[2]
 class SessionImplementationTests(unittest.TestCase):
     def test_service_examples_match_validated_implementation(self):
         implementation = (ROOT / 'IMPLEMENTATION.md').read_text()
-        for name in ['api/services/goldstandard.py', 'api/services/importer.py',
-                     'api/services/packager.py']:
+        for name, fence, language in [('api/services/goldstandard.py', '```', 'python'),
+                                      ('api/services/importer.py', '```', 'python'),
+                                      ('api/services/packager.py', '```', 'python'),
+                                      ('scripts/verify/README.md', '````', 'markdown')]:
             with self.subTest(path=name):
-                header = '### ' + name + '\n\n```python\n'
+                header = '### ' + name + '\n\n' + fence + language + '\n'
                 start = implementation.index(header) + len(header)
-                end = implementation.index('\n```\n', start)
+                end = implementation.index('\n' + fence + '\n', start)
                 self.assertEqual(implementation[start:end], (ROOT / name).read_text().rstrip('\n'))
 
 
