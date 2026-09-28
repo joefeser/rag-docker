@@ -118,6 +118,13 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(self.ingest_job.call_args.kwargs['min_chunk_size'],100)
         self.assertEqual(len(chunker.chunk('x'*169,'fixed',chunk_size=60,min_chunk_size=100)),1)
 
+    def test_small_target_with_omitted_strategy_keeps_default_overlap_validation(self):
+        for route in ('/tune/rechunk','/tune/reembed'):
+            self.assert_rejected_without_work(route,{'collection':'ReviewSettings','chunk_size':80})
+        response = self.client.post('/tune/reembed',json={'collection':'ReviewSettings','chunking_strategy':'fixed','chunk_size':80})
+        self.assertEqual(response.status_code,202,response.text)
+        self.assertEqual(self.tune_job.call_args.args[2]['chunking']['strategy'],'fixed')
+
     def test_saved_valid_ingest_and_retrieval_round_trips(self):
         ingest_body = {'collection': 'ReviewSettings', 'chunking_strategy': 'fixed', 'chunk_size': 150, 'min_chunk_size': 40}
         response = self.client.post('/ingest/config', json=ingest_body)
@@ -180,10 +187,11 @@ class ImplementationTests(unittest.TestCase):
         names = ['api/models/schemas.py', 'api/main.py', 'api/routers/ingest.py',
                  'api/services/chunker.py', 'api/services/ingest_pipeline.py',
                  'api/services/rag_pipeline.py', 'api/services/weaviate_client.py',
-                 'scripts/verify/settings_validation.py']
+                 'scripts/verify/settings_validation.py', 'scripts/verify/05_transfer.sh']
         for name in names:
             with self.subTest(file=name):
-                header = '### ' + name + '\n\n```python\n'
+                language = 'bash' if name.endswith('.sh') else 'python'
+                header = '### ' + name + '\n\n```' + language + '\n'
                 start = text.index(header) + len(header)
                 end = text.index('\n```\n', start)
                 self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))

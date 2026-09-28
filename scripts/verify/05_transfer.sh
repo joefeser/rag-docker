@@ -150,7 +150,8 @@ tjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_tj.json'))['job_id
 wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-chunking a chunks-only collection is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
-api_post "/tune/reembed" "{\"collection\":\"$SRCLESS\",\"chunk_size\":80}" > /tmp/vfy_tj.json
+# Use valid fixed settings so this tests source eligibility, not overlap validation.
+api_post "/tune/reembed" "{\"collection\":\"$SRCLESS\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80}" > /tmp/vfy_tj.json
 tjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_tj.json'))['job_id'])")
 wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-embedding a chunks-only collection with new chunking is refused" \
