@@ -1584,7 +1584,7 @@ page renders as one undifferentiated block.
 | `chunk_size` | 1000 | 200 | 16000 | In characters |
 | `chunk_overlap` | 200 | 0 | 2000 | In characters; must be < `chunk_size` |
 | `similarity_threshold` | 0.85 | 0.0 | 1.0 | Semantic chunking only |
-| `min_chunk_size` | 100 | 40 | 2000 | In characters; must be < `chunk_size` |
+| `min_chunk_size` | 100 | 0 | Unbounded | Soft merge preference in characters; may exceed the split target; UI slider uses 40–2000 |
 | `top_k` | 5 | 1 | 50 | API bounds |
 | `alpha` | 0.75 | 0.0 | 1.0 | Hybrid mode only |
 | `ef` | 64 | 16 | 512 | Physical HNSW setting; saved query override inactive |
