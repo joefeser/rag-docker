@@ -107,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.ob
             try:
                 tuning._rebuild(collection,[{'content':'Owned inert chunk','source_file':'inert.txt','chunk_index':0}],None,None,None)
                 raise AssertionError('Expected final-create fault')
-            except RuntimeError as error:
+            except Exception as error:  # Recovery-enabled rebuilds wrap this fault.
                 assert 'Owned synthetic final-create fault' in str(error),str(error)
         fault=client.get('/goldstandard/session/'+fault_id)
         assert fault.status_code==200 and fault.json()['stale'] and fault.json()['stale_at'],fault.text
