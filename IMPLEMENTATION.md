@@ -10114,6 +10114,12 @@ try:
     assert request('/retrieval/config/' + collection)[1] == saved_retrieval
     print('PASS rejected saved settings preserve prior configuration', flush=True)
 
+    expect('/ingest/config', {'collection': collection, 'chunking_strategy': 'fixed',
+                              'chunk_size': 60, 'min_chunk_size': 100}, 201)
+    status, minimum = request('/ingest/config/' + collection)
+    assert status == 200 and minimum['chunk_size'] == 60 and minimum['min_chunk_size'] == 100
+    print('PASS fixed minimum above split target saves and round trips', flush=True)
+
     for path, bad in (('/query', {'question': 'inert', 'retrieval_mode': 'invalid'}),
                       ('/query', {'question': 'inert', 'response_format': 'invalid'}),
                       ('/query', {'question': 'inert', 'top_k': True}),
