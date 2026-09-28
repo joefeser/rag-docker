@@ -641,6 +641,8 @@ GET /goldstandard/session/{session_id}
 }
 ```
 
+Every session response also carries `collection`, `stale`, `orphaned`, and each flag's nullable `_reason` and `_at` metadata. Flags default to false and metadata to null for legacy sessions. Stale means the retained pairs no longer describe current chunks; orphaned means the collection is gone. These warnings do not delete or remap historical pairs.
+
 `status` (session): `"generating"`, `"completed"`, `"failed"`.  
 `status` (pair): `"pending"`, `"approved"`, `"edited"`, `"rejected"`.
 
@@ -715,11 +717,15 @@ POST /goldstandard/save
 
 Saves reviewed pairs as a RAGAS-compatible JSON file. Only `approved` and `edited` pairs are included. `rejected` and `pending` pairs are excluded.
 
+Stale/orphaned sessions return **409 `HISTORICAL_SESSION`** before writing unless the caller explicitly supplies boolean `allow_historical: true` (default false; numeric/string substitutes are rejected). This permits historical inspection/export, not use as a current collection baseline. `historical` and `session_validity` in the response report the captured validity decision. The exported RAGAS array retains its four standard fields and does not embed validity warnings; consumers must retain the session metadata separately. This request-time check does not add persistence locking or a transactional snapshot; those are separate work.
+
+
 **Request body:**
 ```json
 {
   "session_id": "gs_abc123",
-  "filename": null
+  "filename": null,
+  "allow_historical": false
 }
 ```
 
@@ -733,7 +739,12 @@ Saves reviewed pairs as a RAGAS-compatible JSON file. Only `approved` and `edite
   "filename": "Documents_20260910_143022.json",
   "pairs_saved": 17,
   "pairs_excluded": 3,
-  "download_url": "/api/goldstandard/download/Documents_20260910_143022.json"
+  "download_url": "/api/goldstandard/download/Documents_20260910_143022.json",
+  "historical": false,
+  "session_validity": {
+    "stale": false, "stale_reason": null, "stale_at": null,
+    "orphaned": false, "orphaned_reason": null, "orphaned_at": null
+  }
 }
 ```
 
@@ -843,6 +854,7 @@ Standard error codes:
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
+| `HISTORICAL_SESSION` | 409 | Explicit historical export choice required for stale/orphaned session |
 
 ---
 
@@ -1489,6 +1501,8 @@ not part of the saved retrieval configuration.
 
 ### 7.7 Gold Standard Page
 
+A retained session can be loaded/refreshed by its session ID, including when its collection no longer exists. Its collection and ID remain visible. Stale/orphaned sessions show reasons and recorded timestamps above review/export; missing legacy metadata has clear defaults. Loading or receiving new validity metadata resets the historical-export checkbox. A new lookup clears the previous session and export controls before fetching, including when the lookup fails. Export shows a disabled progress state while its request is pending, and duplicate clicks cannot start another request.
+
 **Route:** `/goldstandard`  
 **Roles:** Engineer, Developer
 
@@ -1511,6 +1525,7 @@ not part of the saved retrieval configuration.
 
 **Phase 3 — Export:**
 - "Export Approved" button (disabled until at least 1 approved or edited pair exists).
+- Historical sessions use "Export Historical Approved" and additionally require an explicit checkbox acknowledging that the file omits validity warnings and is not a current baseline. The backend independently enforces the choice.
 - Filename field: pre-filled with `{collection}_{timestamp}`, editable.
 - Calls `POST /goldstandard/save` → on success, triggers download of the resulting JSON file.
 - Export summary shown: `17 pairs exported, 3 excluded (rejected/pending)`.
@@ -1778,6 +1793,9 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
 
 ### 10.3 Gold Standard
+
+- [x] Retained stale/orphaned session warnings reach the live API and browser, with reasons/timestamps and legacy defaults. Historical export requires explicit choice, keeps RAGAS compatibility and preserves the original session.
+      *Six controlled service/runtime groups plus one twelve-source documentation group cover validity/export and rebuild failure boundaries. Registered real backend/in-process HTTP checks cover actual stale/orphan markers, strict choices, missing sessions, empty history, compatible exports and a failed destructive cutover; browser fixtures cover empty history, failed lookup and duplicate export requests. An actual browser against the built UI and isolated real API shows legacy defaults, warning reasons/timestamps, reset consent after actual deletion, empty historical warnings and explicit four-field RAGAS download. Suite10 is called by05/all.sh; full suite is recorded separately.*
 
 - [x] Generate call returns `sample_size` pairs (or fewer if collection has fewer chunks).
       *Originally failed: sessions routinely lost pairs because the model returns

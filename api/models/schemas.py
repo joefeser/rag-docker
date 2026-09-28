@@ -366,7 +366,16 @@ class GoldPair(BaseModel):
     status: str
 
 
-class SessionResponse(BaseModel):
+class SessionValidity(BaseModel):
+    stale: bool = False
+    stale_reason: Optional[str] = None
+    stale_at: Optional[str] = None
+    orphaned: bool = False
+    orphaned_reason: Optional[str] = None
+    orphaned_at: Optional[str] = None
+
+
+class SessionResponse(SessionValidity):
     session_id: str
     status: str
     pairs_total: int
@@ -421,6 +430,14 @@ class RegenerateRequest(BaseModel):
 class SaveRequest(BaseModel):
     session_id: str
     filename: Optional[str] = None
+    allow_historical: bool = False
+
+    @field_validator("allow_historical", mode="before")
+    @classmethod
+    def _explicit_opt_in(cls, value):
+        if not isinstance(value, bool):
+            raise ValueError("allow_historical must be a boolean")
+        return value
 
 
 class SaveResponse(BaseModel):
@@ -428,6 +445,8 @@ class SaveResponse(BaseModel):
     pairs_saved: int
     pairs_excluded: int
     download_url: str
+    historical: bool = False
+    session_validity: SessionValidity = SessionValidity()
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
