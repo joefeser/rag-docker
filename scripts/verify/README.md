@@ -44,6 +44,7 @@ drive the UI in a real browser.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 
 ## Environment
@@ -85,4 +86,25 @@ the end. If a run is interrupted:
 curl -s localhost:8080/api/collections | python3 -c \
   "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
+```
+
+## Bundled-model integrity
+
+On a disposable stack with its embedding model already pulled, run:
+
+```bash
+docker compose exec -T api python - < scripts/verify/model_integrity.py
+```
+
+This verifies the real model's referenced bytes, copies them into a temporary
+package/store, checks valid install and unchanged reuse, and refuses ordinary
+mismatched bytes without changing the published manifest or healthy blobs.
+The actual shared model store is only read; temporary content is removed. It
+needs disk space for two copies of the embedding model and performs several
+streamed hash passes. It does not invoke a model parser or claim trusted model
+provenance. Controlled regression tests additionally cover digest grammar,
+containment, interrupted publication and concurrent blob publication:
+
+```bash
+python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
 ```

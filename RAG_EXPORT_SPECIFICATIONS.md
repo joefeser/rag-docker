@@ -382,9 +382,20 @@ remedies differ, so the errors must too.
 
 Blobs are written before the manifest. The manifest is what makes Ollama
 consider a model present, so writing it last means an interrupted install leaves
-unreferenced blobs rather than a model that cannot be served. A blob already
-present is skipped: the names are content addresses, so a matching name is a
-matching file.
+unreferenced blobs rather than a model that cannot be served. Each referenced
+address must be `sha256:` plus 64 lowercase hex digits. Import stream-hashes
+bundled bytes and existing shared bytes against that address before publishing
+any manifest. A matching filename alone is not evidence of matching bytes.
+Healthy existing blobs are reused without replacement. A mismatched existing
+blob is refused with an explicit integrity error; restoring that shared content
+is an owner action, because automatic replacement could affect other models.
+Model names and tags must be simple path components, and package/store paths
+must remain under their roots without symlink components. A copied blob is
+hashed again while writing a unique temporary file, then published atomically
+without replacing a concurrently published blob. The captured, validated
+manifest is written atomically last, after confirming every destination blob.
+The installed-model check also verifies referenced byte hashes. Hashes prove
+content consistency, not trusted model provenance or safe model parsing.
 
 Because models are content-addressed, a model that travels in a package and is
 installed on the target is **byte-identical** to the one that produced the
