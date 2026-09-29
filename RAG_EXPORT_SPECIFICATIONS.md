@@ -591,7 +591,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
-| `PACKAGE_CORRUPT` | digest mismatch; names the file |
+| `PACKAGE_CORRUPT` | digest mismatch or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |

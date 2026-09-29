@@ -117,9 +117,10 @@ def _sessions_on_disk() -> list[dict]:
             validate_session(data)
             if p != _session_path(data["session_id"]):
                 raise ValueError("Evaluation session filename does not match its identity.")
-        except (OSError, ValueError, RuntimeError):
-            log.warning("Skipping invalid evaluation session %s; file is unchanged", p,
-                        exc_info=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # ValidationError text can include document-derived field values.
+            log.warning("Skipping invalid evaluation session %s; file is unchanged (%s)",
+                        p.name, type(exc).__name__)
             continue
         sessions.append(data)
     return sessions
@@ -141,8 +142,9 @@ def sessions_for(collection: str) -> list[dict]:
             if sid != sess["session_id"]:
                 raise ValueError("Cached evaluation identity does not match its key.")
             _session_path(sid)
-        except (OSError, ValueError, RuntimeError):
-            log.warning("Skipping invalid cached evaluation session %s", sid, exc_info=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warning("Skipping invalid cached evaluation session %s (%s)",
+                        sid, type(exc).__name__)
             continue
         found[sid] = sess
     # A session written by an import may not be in memory yet.
@@ -278,12 +280,12 @@ async def _generate_pair(chunk: dict) -> dict:
 
     return {
         "pair_id": f"p_{uuid.uuid4().hex[:8]}",
-        "question": data.get("question", ""),
-        "answer": data.get("answer", ""),
+        "question": str(data.get("question", "")),
+        "answer": str(data.get("answer", "")),
         "contexts": [chunk["content"]],
-        "ground_truth": data.get("ground_truth", data.get("answer", "")),
+        "ground_truth": str(data.get("ground_truth", data.get("answer", ""))),
         "source_file": chunk.get("source_file", ""),
-        "chunk_index": chunk.get("chunk_index", 0),
+        "chunk_index": int(chunk.get("chunk_index", 0)),
         "status": "pending",
     }
 

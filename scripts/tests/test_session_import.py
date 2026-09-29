@@ -1,4 +1,5 @@
 """Import validation regressions; real modules, disposable files, no model/DB calls."""
+import asyncio
 import copy
 import json
 import os
@@ -285,6 +286,82 @@ class SessionImportTests(unittest.TestCase):
             gs.store_session(self.original)
         self.assertFalse(gs._sessions)
 
+
+    def _generate(self, reply, chunk_index=0):
+        """Run the app's own generator end to end with the model and DB mocked."""
+        chunks = [{'content': 'Context', 'source_file': 'source.txt', 'chunk_index': chunk_index}]
+
+        async def run():
+            async def sample(collection, limit):
+                return chunks
+
+            async def chat(system, user):
+                return reply
+            with patch.object(gs.wc, 'sample_chunks', side_effect=sample), \
+                 patch.object(gs.ollama, 'chat', side_effect=chat):
+                created = await gs.start_generation('Corpus', 1, None)
+                await asyncio.gather(*list(gs._tasks))
+            return created['session_id']
+        return asyncio.run(run())
+
+    def _assert_generated_session_is_usable(self, sid):
+        self.assertEqual(gs._sessions[sid]['status'], 'completed')
+        self.assertEqual(len(gs._sessions[sid]['pairs']), 1)
+        self.assertEqual([s['session_id'] for s in packager._goldstandard_sessions('Corpus')], [sid],
+                         'a session the app generated must be exported')
+        self.assertEqual(gs.mark_stale('Corpus', 'rechunked'), 1,
+                         'a session the app generated must be flagged stale after a rechunk')
+        gs._sessions.clear()
+        gs.load_sessions_from_disk()
+        self.assertIsNotNone(gs.get_session(sid), 'generated sessions must survive a reload')
+        self.assertEqual(gs.mark_orphaned('Corpus', 'deleted'), 1)
+        gs.validate_session(gs.get_session(sid))
+
+    def test_app_generated_session_passes_validation(self):
+        sid = self._generate('{"question": "Q?", "answer": "A", "ground_truth": "A"}')
+        self._assert_generated_session_is_usable(sid)
+
+    def test_app_generated_session_with_non_string_model_values_stays_usable(self):
+        # A model can answer "What year ...?" with a bare JSON number. The
+        # generator stores it as-is; strict validation must not then hide the
+        # session from export and stale/orphan flagging.
+        sid = self._generate('{"question": "Which year?", "answer": 1999, "ground_truth": 1999}')
+        self._assert_generated_session_is_usable(sid)
+
+    def test_null_model_fields_stay_usable(self):
+        sid = self._generate('{"question": null, "answer": null, "ground_truth": null}')
+        self._assert_generated_session_is_usable(sid)
+        self.assertEqual(gs.get_session(sid)['pairs'][0]['answer'], 'None')
+
+    def test_list_model_fields_stay_usable(self):
+        sid = self._generate('{"question": ["Q"], "answer": ["A"], "ground_truth": ["A"]}')
+        self._assert_generated_session_is_usable(sid)
+        self.assertEqual(gs.get_session(sid)['pairs'][0]['answer'], "['A']")
+
+    def test_numeric_question_and_ground_truth_fallback_stay_usable(self):
+        sid = self._generate('{"question": 42, "answer": 1999}')
+        self._assert_generated_session_is_usable(sid)
+        pair = gs.get_session(sid)['pairs'][0]
+        self.assertEqual((pair['question'], pair['answer'], pair['ground_truth']), ('42', '1999', '1999'))
+
+    def test_generated_chunk_index_is_normalized(self):
+        sid = self._generate('{"question": "Q?", "answer": "A"}', chunk_index='7')
+        self._assert_generated_session_is_usable(sid)
+        self.assertEqual(gs.get_session(sid)['pairs'][0]['chunk_index'], 7)
+
+    def test_validation_logs_do_not_include_pair_values(self):
+        data = copy.deepcopy(self.original)
+        data['pairs'][0]['answer'] = {'private': 'synthetic-sensitive-text'}
+        gs._sessions[data['session_id']] = data
+        directory = self.root / 'uploads' / 'goldstandard_sessions'
+        directory.mkdir()
+        (directory / (data['session_id'] + '.json')).write_text(json.dumps(data))
+        with self.assertLogs(gs.log, level='WARNING') as captured:
+            self.assertEqual(gs.sessions_for('Corpus'), [])
+        logged = '\n'.join(captured.output)
+        self.assertIn('ValidationError', logged)
+        self.assertNotIn('synthetic-sensitive-text', logged)
+        self.assertNotIn('input_value', logged)
 
 if __name__ == '__main__':
     unittest.main()

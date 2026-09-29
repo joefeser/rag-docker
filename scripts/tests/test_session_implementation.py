@@ -11,7 +11,8 @@ class SessionImplementationTests(unittest.TestCase):
         for name, fence, language in [('api/services/goldstandard.py', '```', 'python'),
                                       ('api/services/importer.py', '```', 'python'),
                                       ('api/services/packager.py', '```', 'python'),
-                                      ('scripts/verify/README.md', '````', 'markdown')]:
+                                      ('scripts/verify/README.md', '````', 'markdown'),
+                                      ('scripts/verify/05_transfer.sh', '```', 'bash')]:
             with self.subTest(path=name):
                 header = '### ' + name + '\n\n' + fence + language + '\n'
                 start = implementation.index(header) + len(header)

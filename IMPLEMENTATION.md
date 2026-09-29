@@ -152,7 +152,7 @@ services:
   proxy:
     image: nginx:1.27-alpine
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
     networks: [rag-internal]
@@ -2477,9 +2477,10 @@ def _sessions_on_disk() -> list[dict]:
             validate_session(data)
             if p != _session_path(data["session_id"]):
                 raise ValueError("Evaluation session filename does not match its identity.")
-        except (OSError, ValueError, RuntimeError):
-            log.warning("Skipping invalid evaluation session %s; file is unchanged", p,
-                        exc_info=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # ValidationError text can include document-derived field values.
+            log.warning("Skipping invalid evaluation session %s; file is unchanged (%s)",
+                        p.name, type(exc).__name__)
             continue
         sessions.append(data)
     return sessions
@@ -2501,8 +2502,9 @@ def sessions_for(collection: str) -> list[dict]:
             if sid != sess["session_id"]:
                 raise ValueError("Cached evaluation identity does not match its key.")
             _session_path(sid)
-        except (OSError, ValueError, RuntimeError):
-            log.warning("Skipping invalid cached evaluation session %s", sid, exc_info=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warning("Skipping invalid cached evaluation session %s (%s)",
+                        sid, type(exc).__name__)
             continue
         found[sid] = sess
     # A session written by an import may not be in memory yet.
@@ -2638,12 +2640,12 @@ async def _generate_pair(chunk: dict) -> dict:
 
     return {
         "pair_id": f"p_{uuid.uuid4().hex[:8]}",
-        "question": data.get("question", ""),
-        "answer": data.get("answer", ""),
+        "question": str(data.get("question", "")),
+        "answer": str(data.get("answer", "")),
         "contexts": [chunk["content"]],
-        "ground_truth": data.get("ground_truth", data.get("answer", "")),
+        "ground_truth": str(data.get("ground_truth", data.get("answer", ""))),
         "source_file": chunk.get("source_file", ""),
-        "chunk_index": chunk.get("chunk_index", 0),
+        "chunk_index": int(chunk.get("chunk_index", 0)),
         "status": "pending",
     }
 
@@ -8167,8 +8169,6 @@ tests would not have caught the defects this project actually produced.
 ````markdown
 # Verification suite
 
-Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
-
 Integration tests that run the acceptance criteria in `SPECIFICATIONS.md` §10
 and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a live stack.
 
@@ -8183,6 +8183,10 @@ bash scripts/verify/all.sh 02 04              # only the named suites
 Exits non-zero if any check fails.
 
 ## Focused import validation regressions
+
+Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
+
+`05_transfer.sh` registers both controlled regressions and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -8233,7 +8237,9 @@ drive the UI in a real browser.
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20 and E23; live metadata checks, controlled regressions and source drift |
+| `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
+| `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 
@@ -8241,6 +8247,7 @@ drive the UI in a real browser.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; use `18080` with a deliberate loopback test override |
 | `RAG_API` | `http://localhost:8080/api` | where the API is |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
 | `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks) |
@@ -8277,6 +8284,10 @@ curl -s localhost:8080/api/collections | python3 -c \
   "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
+
+The infrastructure suite requires Docker Engine 28.0.0+ and checks both resolved Compose and live Docker bindings for a single loopback proxy publication. When deploying an alternate host port for testing, set `RAG_EXPECTED_PROXY_PORT` to that port as well as `RAG_API`. Its inspection files are kept in a private temporary directory removed on exit. The local profile assumes standard bridge/NAT routing.
+
+Run `python3 scripts/tests/test_loopback_verification.py` from the repository root for the verifier's engine-version and adverse binding regressions. These exercise the actual assertion blocks and resolved default Compose; the live infrastructure suite still requires a running stack.
 ````
 
 ### scripts/verify/all.sh
@@ -8792,18 +8803,65 @@ require_stack
 C="${PREFIX}Infra"
 
 section "§10.5 Infrastructure"
+RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
+export RAG_INFRA_TMP
+trap 'rm -rf "$RAG_INFRA_TMP"' EXIT
+EXPECTED_PORT="${RAG_EXPECTED_PROXY_PORT:-8080}"
+export EXPECTED_PORT
+engine=$(docker version --format '{{.Server.Version}}')
+python3 - "$engine" <<'ENDPY'
+import re, sys
+version = sys.argv[1]
+match = re.match(r'^(\d+)\.(\d+)\.(\d+)', version)
+ok = bool(match and tuple(map(int, match.groups())) >= (28, 0, 0)
+          and not (version.startswith('28.0.0-') and any(x in version for x in ('alpha', 'beta', 'rc'))))
+sys.exit(0 if ok else 1)
+ENDPY
+check "Docker Engine is 28.0.0 or newer for localhost port isolation" $? "$engine"
 
-# ── exactly one host-published port ──────────────────────────────────────────
-bindings=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Ports}}') \
-  | grep -o '0\.0\.0\.0:[0-9]*->[0-9]*/tcp' | sort -u)
-count=$(printf '%s\n' "$bindings" | grep -c . )
+# ── resolved configuration and live bindings ─────────────────────────────────
+# Inspect structured ports, including their host addresses. Matching only
+# 0.0.0.0 made a loopback deployment look as though it published no ports.
+(cd "$REPO_ROOT" && docker compose config --format json) > "$RAG_INFRA_TMP/vfy_compose.json"
+python3 - <<'ENDPY'
+import json, sys, os
+services = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_compose.json'))['services']
+ports = [(name, port) for name, service in services.items() for port in service.get('ports', [])]
+ok = (len(ports) == 1 and ports[0][0] == 'proxy'
+      and ports[0][1].get('host_ip') == '127.0.0.1'
+      and str(ports[0][1]['published']) == os.environ['EXPECTED_PORT']
+      and ports[0][1]['target'] == 80 and ports[0][1].get('protocol', 'tcp') == 'tcp')
+sys.exit(0 if ok else 1)
+ENDPY
+check "resolved Compose publishes only the proxy on host loopback" $?
+
+(cd "$REPO_ROOT" && python3 - <<'ENDPY'
+import json, subprocess
+ids = subprocess.check_output(['docker', 'compose', 'ps', '-q'], text=True).split()
+containers = json.loads(subprocess.check_output(['docker', 'inspect', *ids], text=True)) if ids else []
+bindings = [{'service': container['Config']['Labels']['com.docker.compose.service'],
+             'container_port': port, **binding}
+            for container in containers
+            for port, published in container['NetworkSettings']['Ports'].items()
+            for binding in (published or [])]
+print(json.dumps(bindings))
+ENDPY
+) > "$RAG_INFRA_TMP/vfy_bindings.json"
+count=$(python3 -c "import json, os; print(len(json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_bindings.json'))))")
 check_eq "only one port is published to the host" "$count" "1"
-printf '%s' "$bindings" | grep -q -- '->80/tcp'
-check "that port maps to the proxy's port 80" $? "$bindings"
+python3 - <<'ENDPY'
+import json, sys, os
+bindings = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_bindings.json'))
+ok = (len(bindings) == 1 and bindings[0]['service'] == 'proxy'
+      and bindings[0]['container_port'] == '80/tcp' and bindings[0]['HostIp'] == '127.0.0.1'
+      and bindings[0]['HostPort'] == os.environ['EXPECTED_PORT'])
+sys.exit(0 if ok else 1)
+ENDPY
+check "the live proxy port is bound only to host loopback" $?
 
 for svc in api weaviate; do
   published=$( (cd "$REPO_ROOT" && docker compose ps --format "{{.Service}}|{{.Ports}}") \
-    | grep "^$svc|" | grep -c '0\.0\.0\.0' || true)
+    | grep "^$svc|" | grep -c -- '->[0-9]*/tcp' || true)
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
@@ -8814,10 +8872,10 @@ unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | gre
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
 # ── health endpoint reports each dependency ──────────────────────────────────
-api_get "/health" > /tmp/vfy_health.json
-check_eq "health status is ok" "$(jfield "['status']" < /tmp/vfy_health.json)" "ok"
+api_get "/health" > "$RAG_INFRA_TMP/vfy_health.json"
+check_eq "health status is ok" "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_health.json")" "ok"
 python3 -c "
-import json,sys; d=json.load(open('/tmp/vfy_health.json'))
+import json,sys,os; d=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))
 s=d['services']
 ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
       and s['ollama']['embed']['status']=='ok'
@@ -8830,9 +8888,9 @@ drop_collection "$C"; make_collection "$C"
 check_eq "a fresh collection reports is_default true" \
   "$(api_get "/ingest/config/$C" | jfield "['is_default']")" "True"
 api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"semantic\",\"chunk_size\":800,\"chunk_overlap\":150,\"similarity_threshold\":0.9,\"min_chunk_size\":80}" >/dev/null
-api_get "/ingest/config/$C" > /tmp/vfy_cfg.json
-check_eq "after saving, is_default is false" "$(jfield "['is_default']" < /tmp/vfy_cfg.json)" "False"
-check_eq "the saved strategy is returned" "$(jfield "['chunking_strategy']" < /tmp/vfy_cfg.json)" "semantic"
+api_get "/ingest/config/$C" > "$RAG_INFRA_TMP/vfy_cfg.json"
+check_eq "after saving, is_default is false" "$(jfield "['is_default']" < "$RAG_INFRA_TMP/vfy_cfg.json")" "False"
+check_eq "the saved strategy is returned" "$(jfield "['chunking_strategy']" < "$RAG_INFRA_TMP/vfy_cfg.json")" "semantic"
 
 # ── deleting a collection must take its configs with it ──────────────────────
 # Spec §8 rule 1. This was not happening for the ingest config, so a recreated
@@ -8850,25 +8908,25 @@ check_eq "a recreated collection does not inherit the retrieval config" \
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
-  api_get "/collections" > /tmp/vfy_before.json
+  api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
   (cd "$REPO_ROOT" && docker compose down >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1)
   for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
   elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
   [ "$elapsed" -le 120 ]
   check "restart reaches healthy within 120s" $? "took ${elapsed}s"
-  api_get "/collections" > /tmp/vfy_after.json
+  api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
-import json,sys
-b={c['name']:c for c in json.load(open('/tmp/vfy_before.json'))['collections']}
-a={c['name']:c for c in json.load(open('/tmp/vfy_after.json'))['collections']}
+import json,sys,os
+b={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_before.json'))['collections']}
+a={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_after.json'))['collections']}
 ok = set(b)==set(a) and all(b[k]['object_count']==a[k]['object_count'] for k in b)
 sys.exit(0 if ok else 1)"
   check "Weaviate data survives down/up" $?
   python3 -c "
-import json,sys
-b={c['name']:c for c in json.load(open('/tmp/vfy_before.json'))['collections']}
-a={c['name']:c for c in json.load(open('/tmp/vfy_after.json'))['collections']}
+import json,sys,os
+b={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_before.json'))['collections']}
+a={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_after.json'))['collections']}
 sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) else 1)"
   check "created_at is preserved across restart" $?
   check_eq "saved ingest config survives restart" \
@@ -9285,7 +9343,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -9295,6 +9353,11 @@ C="${PREFIX}Transfer"
 EXPORTS="$REPO_ROOT/exports"
 
 section "Export, import and tuning"
+
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
+check "evaluation import and generated-session regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
+check "embedded session/import verification sources match" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -9353,6 +9416,74 @@ import json,sys; d=json.load(sys.stdin)
 sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
 check "the corruption error names the offending file" $?
 rm -f "$EXPORTS/$CORRUPT"
+
+# ── evaluation metadata is validated before mutation (E23) ──────────────────
+# Add one evaluation sidecar to a copy of the package and re-sign the manifest,
+# so the archive is digest-valid and only the session metadata decides.
+GS_SID="gs_$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+make_gs_pkg() {   # make_gs_pkg <session-id> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$C" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, sid, suffix, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+session = {"session_id": sid, "collection": coll, "status": "completed",
+           "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
+           "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
+                      "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
+                      "chunk_index": 0, "status": "approved"}]}
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    (root / "goldstandard").mkdir(exist_ok=True)
+    side = root / "goldstandard" / "session.json"
+    side.write_text(json.dumps(session))
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["files"]["goldstandard/session.json"] = \
+        "sha256:" + hashlib.sha256(side.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+}
+count_of() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
+
+BADGS=$(make_gs_pkg "not-a-generated-id" badgs)
+api_post "/import" "{\"filename\":\"$BADGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+check_eq "E23: malformed evaluation metadata is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_gsjob.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
+sys.exit(0 if 'goldstandard/session.json' in json.dumps(d) else 1)"
+check "E23: the refusal names the offending sidecar" $?
+check_eq "E23: replace left the existing collection untouched" "$(count_of "$C")" "$chunks_before"
+code=$(api_code "$API/goldstandard/session/not-a-generated-id")
+check_eq "E23: no session was restored from the refused package" "$code" "404"
+rm -f "$EXPORTS/$BADGS"
+
+GOODGS=$(make_gs_pkg "$GS_SID" goodgs)
+api_post "/import" "{\"filename\":\"$GOODGS\",\"on_conflict\":\"rename\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 1800 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+read -r gstat gname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_gsjob.json')); print(d['status'], d['collection'])")"
+check_eq "E23: a package with valid evaluation metadata still imports" "$gstat" "completed"
+api_get "/goldstandard/session/$GS_SID" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+sys.exit(0 if d['collection']=='$gname' and d['pairs'][0]['status']=='approved' else 1)"
+check "E23: the valid session is restored against the imported collection" $? "session $GS_SID -> $gname"
+rm -f "$EXPORTS/$GOODGS"
+drop_collection "$gname"
+# The restored session file outlives its collection by design (spec §8 rule 4).
+(cd "$REPO_ROOT" && docker compose exec -T api \
+  rm -f "/app/uploads/goldstandard_sessions/$GS_SID.json") >/dev/null 2>&1 || true
 
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
