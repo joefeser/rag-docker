@@ -154,7 +154,7 @@ The health response must report Weaviate, the LLM and the embedding model as ok.
 - **Passed:** the config is valid, every image builds, every service is healthy within the timeout, and every smoke check returns 200 within its retry window.
 - **FAILED:** anything else. Keep the failing step, its last 30 lines of output, and `docker compose -p rag-docker logs <service> --tail 50` for any unhealthy service, for the recap.
 
-Either way, afterwards restore the stack to `develop` from a worktree of `origin/develop` (`docker compose -p rag-docker build`, then `up -d --force-recreate`), confirm it's healthy with the same smoke checks, and remove that worktree.
+Either way, afterwards restore the stack to `develop` as "Restoring the stack" in `reference.md` describes, and confirm it's healthy with the same smoke checks.
 
 ### 9. Finish the evaluation
 

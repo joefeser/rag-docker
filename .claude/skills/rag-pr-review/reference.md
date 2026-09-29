@@ -114,6 +114,17 @@ high_findings:
 notes: <anything the coordinator must know>
 ```
 
+## Restoring the stack
+
+The stack bind-mounts files from the folder it was started in: `./exports` (export packages), `proxy/nginx.conf` and `ollama/entrypoint.sh`. So it must always end up started from a folder that stays: the main checkout. A stack started from a bundle worktree that is then removed keeps running on deleted files, and exports land in a folder nobody will see.
+
+1. Check that the main checkout (the repository root this skill was loaded from) is on `develop`, clean, and at `origin/develop` after `git fetch origin develop`. If it isn't, stop and tell the user; don't switch its branch yourself.
+2. From the main checkout: `docker compose -p rag-docker build`, then `docker compose -p rag-docker up -d --force-recreate`.
+3. Check the mounts point at the main checkout: `docker inspect rag-docker-api-1 --format '{{range .Mounts}}{{.Source}} {{end}}'` must show its `exports` folder, not a bundle path.
+4. Only then remove bundle worktrees.
+
+While an evaluation is running, the maintainer's own work goes in a separate worktree, never on a branch in the main checkout.
+
 ## Commit statuses (coordinator only)
 
 Commit statuses on the reviewed commit are the evaluation's claim and its live progress. They appear in the PR's checks panel and belong to that exact commit, so a new commit starts clean. Only the coordinator sets them.
