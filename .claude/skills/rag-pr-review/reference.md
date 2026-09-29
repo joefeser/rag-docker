@@ -114,6 +114,33 @@ high_findings:
 notes: <anything the coordinator must know>
 ```
 
+## Restoring the stack
+
+The stack bind-mounts files from the folder it was started in: `./exports` (export packages), `proxy/nginx.conf` and `ollama/entrypoint.sh`. So it must always end up started from a folder that stays: the main checkout. A stack started from a bundle worktree that is then removed keeps running on deleted files, and exports land in a folder nobody will see.
+
+1. **Find the main checkout:** the first `worktree` line of `git worktree list --porcelain`.
+2. **Check it:** `git fetch origin develop`. It must be on `develop`, with `git status --porcelain` empty (untracked files count: a build copies them in). If it's behind `origin/develop` and not ahead, fast-forward it (`git merge --ff-only origin/develop`). If it's ahead or has diverged, that fails this step. Never switch its branch or discard anything yourself.
+3. **Restart from it:** `docker compose -p rag-docker build`, then `docker compose -p rag-docker up -d --force-recreate --remove-orphans`, then the smoke checks: `http://localhost:8080/api/health` and `http://localhost:8080/` must each return 200 within 60 seconds of retrying (the `smoke` function in the coordinator's step 8). `--remove-orphans` stops any service the evaluated commit added that `develop` doesn't have.
+4. **Check the mounts** of every container in the project. Each bind source must be under the main checkout (Docker Desktop may prefix it with `/host_mnt`), never a bundle path:
+
+   ```bash
+   docker ps -a --filter label=com.docker.compose.project=rag-docker --format '{{.Names}}' | while read -r c; do
+     docker inspect "$c" --format '{{range .Mounts}}{{if eq .Type "bind"}}{{$.Name}} {{.Source}}{{"\n"}}{{end}}{{end}}'
+   done
+   ```
+
+5. **Only then** remove worktrees, and only your own: the testing reviewer removes a `base/` worktree it created, never `worktree/` or `merged/`, which the coordinator still needs for the build check and removes itself in step 9.
+
+**If step 2, 3 or 4 fails** (the main checkout isn't a clean `develop` it can fast-forward, the build fails, or a mount points outside the main checkout), don't leave the evaluated code anywhere it could run again:
+
+1. Stop the stack: `docker compose -p rag-docker down --remove-orphans` (never `-v`: the volumes hold the data).
+2. Remove the images built from the evaluated commit: `docker image rm rag-docker-api:latest rag-docker-ui:latest`. Otherwise the next `docker compose up -d`, or `package-offline.sh`, would use them. The next `up` rebuilds them from whatever folder it runs in.
+3. Keep every bundle worktree, and tell the user the stack is stopped, why, and that it must be started again from the main checkout on `develop`.
+
+For a cross-repository PR, the evaluated code is the contributor's, and the go-ahead covered running it only for the evaluation.
+
+While an evaluation is running, the maintainer's own work goes in a separate worktree, never on a branch in the main checkout.
+
 ## Commit statuses (coordinator only)
 
 Commit statuses on the reviewed commit are the evaluation's claim and its live progress. They appear in the PR's checks panel and belong to that exact commit, so a new commit starts clean. Only the coordinator sets them.
