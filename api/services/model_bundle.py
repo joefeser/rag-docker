@@ -129,7 +129,13 @@ def installed_state(model: str) -> str:
     telling the user to pull a model they already have would send them the
     wrong way.
     """
-    mp = manifest_path(model)
+    split_ref(model)  # a name with no path here is the caller's to handle (supports_name)
+    try:
+        mp = manifest_path(model)
+    except ValueError:
+        # A path that leaves the store or passes through a symlink is not a
+        # model this store can vouch for.
+        return "corrupt"
     if not mp.is_file():
         return "absent"
     try:

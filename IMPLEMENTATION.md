@@ -3726,15 +3726,19 @@ def _probe_dimensions() -> int | None:
     return _probed_dimensions
 
 
-def _ollama_reports(model: str) -> bool:
-    """Whether Ollama lists the model, matching `name:tag` (tag defaults to latest)."""
+def _ollama_reports(model: str) -> bool | None:
+    """Whether Ollama lists the model, matching `name:tag` (tag defaults to latest).
+
+    None means Ollama couldn't be asked. That isn't "absent": saying the model is
+    missing would send the user to pull one they may already have.
+    """
     from services import ollama_client
     want = model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
     try:
         return want in asyncio.run(ollama_client.list_models())
     except Exception as exc:                      # noqa: BLE001
         _log.warning("Could not list Ollama models: %s", exc)
-        return False
+        return None
 
 
 def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
@@ -3761,10 +3765,22 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
             # `user/model` and the like have no path in the store layout that
             # bundles use. Refusing every import over the name would block
             # packages that don't bundle models at all, so defer to Ollama.
-            if _ollama_reports(model):
+            reported = _ollama_reports(model)
+            if reported:
                 notes.append(f"model '{model}' reported by Ollama; a namespaced "
                              "model's files can't be checked, so they weren't")
                 continue
+            if reported is None:
+                if not required:
+                    notes.append(f"model '{model}' wasn't checked: Ollama couldn't be "
+                                 "reached to confirm it is there")
+                    continue
+                raise PackageError(
+                    "IMPORT_FAILED",
+                    f"Couldn't reach Ollama to confirm the embedding model '{model}' is "
+                    f"there. A namespaced model can only be checked through Ollama. "
+                    f"Check that the ollama service is running, then import again.",
+                    {"model": model})
             if not required:
                 notes.append(f"model '{model}' is absent; a namespaced model can't be "
                              "installed from a package, so pull it before querying")
@@ -4223,7 +4239,13 @@ def installed_state(model: str) -> str:
     telling the user to pull a model they already have would send them the
     wrong way.
     """
-    mp = manifest_path(model)
+    split_ref(model)  # a name with no path here is the caller's to handle (supports_name)
+    try:
+        mp = manifest_path(model)
+    except ValueError:
+        # A path that leaves the store or passes through a symlink is not a
+        # model this store can vouch for.
+        return "corrupt"
     if not mp.is_file():
         return "absent"
     try:
@@ -5939,10 +5961,11 @@ fidelity for an older corpus.
 If the target machine has no embedding model at all, export with
 `include_models: true`. That bundles `@@EMBED_MODEL@@` and `@@LLM_MODEL@@` as
 Ollama's own manifest and blob files, taking the package from kilobytes to
-roughly 2.3 GB. On import a model already present is left alone, provided its files match their
-checksums; a missing one is installed from the package and checked before the
-collection is built. If the embedding model is present but damaged, the import
-fails with `MODEL_INTEGRITY_FAILED`: restore or re-pull it, then import again.
+roughly 2.3 GB. On import a model already present is left alone, provided its
+files match their checksums; a missing one is installed from the package and
+checked before the collection is built. If the embedding model is present but
+damaged, the import fails with `MODEL_INTEGRITY_FAILED`: restore or re-pull it,
+then import again.
 
 Without bundled models, importing into a machine that lacks the embedding model
 fails with `EMBEDDING_MODEL_MISSING` — a different error from a mismatch, because
