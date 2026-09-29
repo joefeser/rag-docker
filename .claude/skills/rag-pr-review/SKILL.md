@@ -182,7 +182,7 @@ Either way, afterwards restore the stack to `develop` from a worktree of `origin
 
 ### 10. Report to the user
 
-For each PR: the verdict per check, the High findings in one line each, whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. Merging is the user's call; tell them the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit.
+For each PR: the verdict per check, the High findings in one line each, whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. Merging is the user's call; tell them the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit. For a PR by `joefeser` with Medium or Low findings, also offer the follow-up issue once it merges (see "Maintainer follow-ups" in `reference.md`).
 
 ## Common mistakes
 

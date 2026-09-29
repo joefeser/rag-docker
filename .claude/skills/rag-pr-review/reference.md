@@ -186,6 +186,9 @@ One GitHub review with `event: COMMENT` on the reviewed commit. Never use `APPRO
 **Blocking (High):**
 - <check> — <path:line> — <one line>
 
+<only for a PR by `joefeser`, see "Maintainer follow-ups" below>
+**Medium and Low findings:** the maintainer will fix these in a follow-up PR after this one merges. You don't need to change anything for them.
+
 **Build and run:** config valid ✅ · images built ✅ · all services healthy ✅ (<n> min) · `/api/health` 200 ✅ · UI 200 ✅
 
 <each specialist's section, in the order Coding, Security, Tests>
@@ -214,6 +217,14 @@ gh api repos/mikesilvers/rag-docker/pulls/N/reviews --paginate \
 ```
 
 To link a finished evaluation's recap, use the overall status's `target_url`, which only the coordinator sets. A look-alike review from anyone else is ignored and mentioned in the report to the user.
+
+## Maintainer follow-ups (PRs by `joefeser`)
+
+For a PR whose author is `joefeser`, only High findings go back to him. The maintainer fixes the Medium and Low findings in a follow-up issue and PR against `develop` after his PR merges, so they never hold his PR.
+
+- The recap carries the "Medium and Low findings" line shown in the recap format, so his team doesn't also fix them. On a NOT READY recap, the line still applies: he fixes the Highs only.
+- After his PR merges, the coordinator offers the maintainer a follow-up issue listing the Mediums, and the Lows worth doing, each with its `path:line` from the recap. The follow-up is an ordinary maintainer PR, evaluated like any other.
+- Conflicts with `develop` are still his to resolve.
 
 ## Untrusted content
 
