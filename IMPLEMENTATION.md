@@ -1849,6 +1849,14 @@ async def chat(system: str, user: str) -> str:
         return resp.json()["message"]["content"]
 
 
+async def list_models() -> set[str]:
+    """Full names (`name:tag`) of the models Ollama reports."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{_BASE}/api/tags")
+        resp.raise_for_status()
+        return {m["name"] for m in resp.json().get("models", [])}
+
+
 async def check_health() -> dict:
     start = time.monotonic()
     try:
@@ -3677,12 +3685,25 @@ def _probe_dimensions() -> int | None:
     return _probed_dimensions
 
 
+def _ollama_reports(model: str) -> bool:
+    """Whether Ollama lists the model, matching `name:tag` (tag defaults to latest)."""
+    from services import ollama_client
+    want = model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+    try:
+        return want in asyncio.run(ollama_client.list_models())
+    except Exception as exc:                      # noqa: BLE001
+        _log.warning("Could not list Ollama models: %s", exc)
+        return False
+
+
 def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     """Spec §6.3. The embedding model is the one that decides the import.
 
-    Present by name  -> skip; an existing model is assumed deliberate.
-    Absent, bundled  -> install, then verify Ollama actually reports it.
-    Absent, unbundled-> EMBEDDING_MODEL_MISSING.
+    Present, bytes intact -> skip; an existing model is assumed deliberate.
+    Present, bytes differ -> MODEL_INTEGRITY_FAILED (embedding) or a note (LLM).
+    Absent, bundled       -> install, then verify Ollama actually reports it.
+    Absent, unbundled     -> EMBEDDING_MODEL_MISSING.
+    Namespaced name       -> ask Ollama; it can't be checked or installed here.
     """
     notes: list[str] = []
     if not model_bundle.store_available():
@@ -3695,10 +3716,44 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     bundled = model_bundle.bundled_models(pkg)
 
     for model, required in ((embed_model, True), (llm_model, False)):
+        if not model_bundle.supports_name(model):
+            # `user/model` and the like have no path in the store layout that
+            # bundles use. Refusing every import over the name would block
+            # packages that don't bundle models at all, so defer to Ollama.
+            if _ollama_reports(model):
+                notes.append(f"model '{model}' reported by Ollama; a namespaced "
+                             "model's files can't be checked, so they weren't")
+                continue
+            if not required:
+                notes.append(f"model '{model}' is absent; a namespaced model can't be "
+                             "installed from a package, so pull it before querying")
+                continue
+            pkg_model = (manifest.get("embedding") or {}).get("model")
+            raise PackageError(
+                "EMBEDDING_MODEL_MISSING",
+                f"This instance does not have the embedding model '{model}'. It is "
+                f"a namespaced model, which can't be installed from a package. Pull "
+                f"it with `docker compose exec ollama ollama pull {model}`.",
+                {"model": model, "package_model": pkg_model, "bundled": bundled})
+
         name = model_bundle.split_ref(model)[0]
-        if model_bundle.is_installed(model):
+        state = model_bundle.installed_state(model)
+        if state == "present":
             notes.append(f"model '{name}' already present; left untouched")
             continue
+        if state == "corrupt":
+            # Installing over it could break other models that share the
+            # blobs, so restoring it stays an owner action (§6.3).
+            if not required:
+                notes.append(f"model '{name}' is installed but its files don't match "
+                             "their checksums; restore or re-pull it before querying")
+                continue
+            raise PackageError(
+                "MODEL_INTEGRITY_FAILED",
+                f"The embedding model '{name}' is installed, but its files don't "
+                f"match their checksums. Restore it, or re-pull it with "
+                f"`docker compose exec ollama ollama pull {name}`, then import again.",
+                {"model": name})
         if name not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
@@ -4106,17 +4161,44 @@ def _check_blob(path: Path, digest: str) -> None:
         raise ValueError(f"Model blob bytes disagree with {digest}; restore the content before importing")
 
 
-def is_installed(model: str) -> bool:
-    """A model is installed only if its referenced bytes match their addresses."""
+def supports_name(model: str) -> bool:
+    """Whether the model has a path in this store layout.
+
+    Namespaced names (`user/model`, `hf.co/org/model`) don't: they can still be
+    pulled and served by Ollama, but they can't be checked or installed here.
+    """
     try:
-        mp = manifest_path(model)
-        if not mp.is_file():
-            return False
+        split_ref(model)
+    except ValueError:
+        return False
+    return True
+
+
+def installed_state(model: str) -> str:
+    """'present', 'absent' or 'corrupt'.
+
+    'corrupt' means a manifest exists but a referenced blob is missing or its
+    bytes disagree with its address. Import treats that as its own outcome:
+    telling the user to pull a model they already have would send them the
+    wrong way.
+    """
+    mp = manifest_path(model)
+    if not mp.is_file():
+        return "absent"
+    try:
         for digest in _digests(json.loads(mp.read_text())):
             _check_blob(blob_path(digest), digest)
     except (OSError, ValueError):
+        return "corrupt"
+    return "present"
+
+
+def is_installed(model: str) -> bool:
+    """A model is installed only if its referenced bytes match their addresses."""
+    try:
+        return installed_state(model) == "present"
+    except (OSError, ValueError):
         return False
-    return True
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
@@ -5816,8 +5898,10 @@ fidelity for an older corpus.
 If the target machine has no embedding model at all, export with
 `include_models: true`. That bundles `@@EMBED_MODEL@@` and `@@LLM_MODEL@@` as
 Ollama's own manifest and blob files, taking the package from kilobytes to
-roughly 2.3 GB. On import a model already present is left alone; a missing one is
-installed from the package and checked before the collection is built.
+roughly 2.3 GB. On import a model already present is left alone, provided its files match their
+checksums; a missing one is installed from the package and checked before the
+collection is built. If the embedding model is present but damaged, the import
+fails with `MODEL_INTEGRITY_FAILED`: restore or re-pull it, then import again.
 
 Without bundled models, importing into a machine that lacks the embedding model
 fails with `EMBEDDING_MODEL_MISSING` — a different error from a mismatch, because

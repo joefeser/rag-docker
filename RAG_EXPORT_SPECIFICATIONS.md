@@ -372,13 +372,17 @@ On import:
 
 | Target state | Behaviour |
 |---|---|
-| Model already present by name | skip; do not overwrite. A target's existing model is assumed deliberate |
+| Model present and its files match their checksums | skip; do not overwrite. A target's existing model is assumed deliberate |
+| Model present but a file is missing or doesn't match its checksum | embedding model: fail with `MODEL_INTEGRITY_FAILED`, naming the model and saying to restore or re-pull it. LLM: note it on the import and continue. Never overwrite it: blobs are shared, and replacing one could affect other models |
 | Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding |
 | Model absent, package does not bundle it | fail with `EMBEDDING_MODEL_MISSING`, naming the model and stating that it must be pulled or a `with-models` package used |
+| Namespaced model name (`user/model`) | it has no path in the model store, so it can't be checked or installed from a package. If Ollama reports it, note that its files weren't checked and continue. If not: the embedding model fails `EMBEDDING_MODEL_MISSING`, saying to pull it; the LLM gets a note |
 
 `EMBEDDING_MODEL_MISSING` is distinct from `EMBEDDING_MISMATCH` (§6.2): one means
 the target has nothing to embed with, the other means it has the wrong thing. The
-remedies differ, so the errors must too.
+remedies differ, so the errors must too. `MODEL_INTEGRITY_FAILED` is a third case:
+the model is there but damaged, so pulling a model the user already has is not the
+fix; restoring or re-pulling it is.
 
 Blobs are written before the manifest. The manifest is what makes Ollama
 consider a model present, so writing it last means an interrupted install leaves
@@ -585,6 +589,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `PACKAGE_CORRUPT` | digest mismatch; names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
+| `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
 | `SOURCES_REQUIRED` | tuning needs `with-sources`; package is `chunks-only` |
@@ -634,6 +639,8 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
+| E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
+| E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 
 ---
 

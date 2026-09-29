@@ -12,7 +12,7 @@ from config import settings
 from services import model_bundle as models
 
 
-class ModelBundleTests(unittest.TestCase):
+class BundleFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -38,6 +38,8 @@ class ModelBundleTests(unittest.TestCase):
         self.assertFalse(models.manifest_path(self.model).exists())
         self.assertFalse(list(self.store.rglob('*.partial')))
 
+
+class ModelBundleTests(BundleFixture):
     def test_valid_install_and_existing_content_are_byte_identical_and_unchanged(self):
         models.install_model(self.pkg, self.model)
         self.assertTrue(models.is_installed(self.model))
@@ -201,6 +203,137 @@ class ModelBundleTests(unittest.TestCase):
             notes = importer._ensure_models(self.pkg, {'embedding': {'model': self.model}})
         self.assertTrue(all('already present' in note for note in notes))
         self.assertEqual({path: path.stat().st_mtime_ns for path in paths}, stamps)
+
+
+class ImporterModelIntegrityTests(BundleFixture):
+    """The import route's handling of the new refusals (reviewer-added)."""
+
+    def ensure(self, llm_model=None, embed_model=None, ollama_reports=False):
+        from services import importer
+        (self.store / 'models').mkdir(parents=True, exist_ok=True)  # else: 'store is not mounted'
+        embed = embed_model or self.model
+        with patch.object(settings, 'embed_model', embed), \
+             patch.object(settings, 'llm_model', llm_model or self.model), \
+             patch.object(importer, '_ollama_reports', lambda model: ollama_reports):
+            return importer._ensure_models(self.pkg, {'embedding': {'model': embed}})
+
+    def install_then_corrupt(self):
+        models.install_model(self.pkg, self.model)
+        models.blob_path(self.digests[1]).write_bytes(b'corrupt installed inert bytes')
+
+    def test_corrupt_bundled_embedding_model_is_refused_as_missing_without_publishing(self):
+        from services.packager import PackageError
+        (self.src / 'blobs' / self.digests[1].replace(':', '-')).write_bytes(b'different inert bytes')
+        with self.assertRaises(PackageError) as caught: self.ensure()
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('disagree', str(caught.exception))
+        self.assert_unpublished()
+
+    def test_corrupt_existing_shared_blob_makes_import_report_restore(self):
+        from services.packager import PackageError
+        target = models.blob_path(self.digests[1]); target.parent.mkdir(parents=True)
+        target.write_bytes(b'corrupt existing inert bytes')
+        with self.assertRaises(PackageError) as caught: self.ensure()
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('restore', str(caught.exception))
+        self.assertEqual(target.read_bytes(), b'corrupt existing inert bytes')
+        self.assert_unpublished()
+
+    def test_valid_bundled_embedding_model_is_installed_through_the_importer(self):
+        notes = self.ensure()
+        self.assertTrue(any('installed from the package' in note for note in notes), notes)
+        self.assertTrue(models.is_installed(self.model))
+
+    # A namespaced model ('user/model') has no path in the store layout, so the
+    # store can't check or install it; import defers to Ollama instead (#81).
+    def test_namespaced_optional_llm_does_not_break_import(self):
+        notes = self.ensure(llm_model='someone/assistant:latest')
+        self.assertTrue(any("'someone/assistant:latest' is absent" in note for note in notes), notes)
+
+    def test_namespaced_embedding_model_reported_by_ollama_is_accepted(self):
+        notes = self.ensure(embed_model='someone/embedder', ollama_reports=True)
+        self.assertTrue(any("'someone/embedder' reported by Ollama" in note for note in notes), notes)
+
+    def test_namespaced_embedding_model_absent_is_missing_with_a_pull_hint(self):
+        from services.packager import PackageError
+        with self.assertRaises(PackageError) as caught:
+            self.ensure(embed_model='someone/embedder', ollama_reports=False)
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('namespaced', str(caught.exception))
+        self.assertIn('ollama pull someone/embedder', str(caught.exception))
+
+    # A present model whose bytes disagree with its digests is not "missing":
+    # telling the user to pull it would send them the wrong way (#81).
+    def test_present_but_corrupt_embedding_model_fails_integrity_not_missing(self):
+        from services.packager import PackageError
+        self.install_then_corrupt()
+        self.assertEqual(models.installed_state(self.model), 'corrupt')
+        with self.assertRaises(PackageError) as caught: self.ensure()
+        self.assertEqual(caught.exception.code, 'MODEL_INTEGRITY_FAILED')
+        self.assertIn("don't match their checksums", str(caught.exception))
+        self.assertEqual(models.blob_path(self.digests[1]).read_bytes(), b'corrupt installed inert bytes')
+
+    def test_present_but_corrupt_optional_llm_is_a_note(self):
+        from services import importer
+        self.install_then_corrupt()
+        good = 'good-embedder:latest'
+        # Only the LLM is corrupt; the embedding model is reported present.
+        real_state = models.installed_state
+        state = lambda model: 'present' if model == good else real_state(model)
+        (self.store / 'models').mkdir(parents=True, exist_ok=True)
+        with patch.object(importer.model_bundle, 'installed_state', state), \
+             patch.object(settings, 'embed_model', good), patch.object(settings, 'llm_model', self.model):
+            notes = importer._ensure_models(self.pkg, {'embedding': {'model': good}})
+        self.assertTrue(any("don't match their checksums" in note for note in notes), notes)
+
+    def test_installed_state_distinguishes_absent_present_and_corrupt(self):
+        self.assertEqual(models.installed_state(self.model), 'absent')
+        models.install_model(self.pkg, self.model)
+        self.assertEqual(models.installed_state(self.model), 'present')
+        models.blob_path(self.digests[0]).unlink()
+        self.assertEqual(models.installed_state(self.model), 'corrupt')
+        self.assertFalse(models.is_installed(self.model))
+        self.assertFalse(models.supports_name('someone/model'))
+        self.assertTrue(models.supports_name('phi3.5:3.8b'))
+
+
+class InterruptedPublicationTests(BundleFixture):
+    """A killed installer must not leave copies accumulating in the live blob store."""
+
+    def install_and_kill_before_link(self):
+        script = (
+            'import os, signal, sys\n'
+            'from pathlib import Path\n'
+            'from unittest.mock import patch\n'
+            'sys.path.insert(0, sys.argv[1])\n'
+            'from config import settings\n'
+            'from services import model_bundle as models\n'
+            'def die(*args):\n'
+            '    os.kill(os.getpid(), signal.SIGKILL)  # the blob copy is written; stop before it is published\n'
+            'with patch.object(settings, "ollama_models_dir", sys.argv[2]), \\\n'
+            '     patch.object(os, "link", die), patch.object(Path, "replace", die):\n'
+            '    models.install_model(Path(sys.argv[3]), sys.argv[4])\n')
+        api = os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api'))
+        import subprocess
+        result = subprocess.run([sys.executable, '-c', script, api, str(self.store), str(self.pkg), self.model])
+        self.assertEqual(result.returncode, -9)
+
+    def test_killed_install_is_not_activated(self):
+        self.install_and_kill_before_link()
+        self.assertFalse(models.manifest_path(self.model).exists())
+        self.assertFalse(models.is_installed(self.model))
+
+    # Security review Medium: each interrupted attempt leaves a uniquely named,
+    # full-size '<blob>.<random>.partial' in the live blobs folder, and nothing
+    # sweeps it. On develop a retry reused and replaced the one fixed-name
+    # '.partial'. Remove the decorator once stale partials are swept.
+    @unittest.expectedFailure
+    def test_retry_after_killed_install_leaves_no_partial_copies(self):
+        self.install_and_kill_before_link()
+        self.install_and_kill_before_link()
+        models.install_model(self.pkg, self.model)
+        self.assertTrue(models.is_installed(self.model))
+        self.assertEqual([p.name for p in self.store.rglob('*.partial')], [])
 
 
 class ImplementationTests(unittest.TestCase):
