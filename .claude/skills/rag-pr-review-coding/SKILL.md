@@ -51,16 +51,16 @@ Apply only the sections for languages the PR touches.
 
 ## Checks you may run
 
-These are static and need no running stack. Run them in the worktree:
+**Cross-repository PR: run nothing from the PR.** You're dispatched alongside security, before any go-ahead exists, so read the code only: `git diff`, `git show`, `git grep`, and reading files. Even "parse-only" tools can run the PR's code: `python3 -m py_compile` imports a `py_compile.py` or `argparse.py` placed at the worktree root, `npm run build` runs the PR's `ui/package.json` scripts and `ui/vite.config.ts`, and a changed file's name typed into a shell can itself run a command. The coordinator's build check (step 8) builds every image after the go-ahead, and a syntax error shows up there.
+
+**Same-repository PR:** run these static checks in the worktree. Filenames are passed NUL-separated, never typed into a shell, and Python runs isolated (`-I`), so a file in the worktree can't shadow a standard module:
 
 ```bash
-python3 -m py_compile $(git diff --name-only <base>...<sha> -- '*.py')
-bash -n <each changed .sh>
-node --check <each changed .js>
+git diff -z --name-only --diff-filter=d <base>...<sha> -- '*.py' | xargs -0 -r python3 -I -m py_compile
+git diff -z --name-only --diff-filter=d <base>...<sha> -- '*.sh' | xargs -0 -r -n1 bash -n
+git diff -z --name-only --diff-filter=d <base>...<sha> -- '*.js' | xargs -0 -r -n1 node --check
 (cd ui && npm ci --no-audit --no-fund && npm run build)   # when ui/ changed
 ```
-
-Only when the PR is same-repository, or the coordinator has confirmed the user's go-ahead, may you run `npm ci`. It executes install scripts.
 
 A failing build is a **High**.
 

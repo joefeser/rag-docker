@@ -15,7 +15,7 @@ When every check has finished, the coordinator posts **one** recap review, and t
 | **Reviewed SHA** | The PR's head commit, as its author pushed it. Bundle folder `worktree/`. | Reading and citing the PR's code (`path:line`), inline comments, commit statuses, the recap and labels. The evaluation belongs to it. |
 | **Evaluated commit** | The reviewed SHA merged with `origin/develop`, made locally by the coordinator and never pushed. Bundle folder `merged/`. It's the reviewed SHA itself when the head already contains `develop`. | Running tests, and the build check. It's what `develop` would become if the PR merged now. |
 
-- The PR's own changes are the ones in `diff.patch`. Everything else in `merged/` is `develop`, which the maintainer already controls.
+- The PR's own changes are the ones in `diff.patch`. Everything else in `merged/` is `develop`, which the maintainer already controls. But `develop` decides what runs: its Dockerfiles, compose files, entrypoints and scripts can execute a file the PR added. So security reads `merged/` as well as the head, at the PR's turn.
 - Read `merged/` wherever the PR's code interacts with code that `develop` changed after the PR's base.
 - Never push the evaluated commit, and never change git config.
 
@@ -122,15 +122,7 @@ Commit statuses on the reviewed commit are the evaluation's claim and its live p
 |---|---|
 | `rag-pr-review` | The whole evaluation. `pending` = claimed or running; `success` = READY TO MERGE; `failure` = NOT READY; `error` = abandoned. |
 | `rag-pr-review/coding`, `/security`, `/tests`, `/build` | One check each. `pending` = waiting or running; `success` = passed; `failure` = failed; `error` = not run or not concluded. |
-| `rag-pr-review/go-ahead` | Cross-repository PRs only: the maintainer's answer on building and running this head. `success` = yes, `failure` = no. The description holds the UTC time of the answer. Set it the moment the user answers; a resumed run reads it instead of asking again. |
-
-Overall `rag-pr-review` descriptions that other steps read:
-
-| Description ends with | Meaning |
-|---|---|
-| `security early` | The early security phase is running. |
-| `awaiting turn` | Early security (and any go-ahead) is done; the rest waits for the PR's turn. It's never stale. |
-| `conflicts at its turn` / `superseded by <sha7>` | With `error`: an early run that can't continue. |
+| `rag-pr-review/go-ahead` | Cross-repository PRs only: the maintainer's answer on building and running this PR's evaluated commit. `success` = yes, `failure` = no. It sits on the head, and its description holds the UTC time of the answer and the develop SHA the evaluated commit was built on, for example `yes 2026-09-28T23:10Z, develop b69e21b2c89a20087f20c8452dab038989e0e778` (the full SHA, compared as a string with `git rev-parse origin/develop`). Head plus develop SHA identify the evaluated tree (a rebuilt `commit-tree` commit gets a new SHA, but the same tree). Set it the moment the user answers. A resumed run reuses it only if `develop` is still at that SHA; otherwise security runs again and the user is asked again. |
 
 ```bash
 gh api repos/mikesilvers/rag-docker/statuses/<sha> --method POST \
@@ -179,10 +171,10 @@ gh pr edit N --add-label "Passed: Coding" --remove-label "FAILED: Coding"
 One GitHub review with `event: COMMENT` on the reviewed commit. Never use `APPROVE` or `REQUEST_CHANGES`: the labels and statuses carry the verdict, and GitHub doesn't allow either on your own PR. It holds every specialist's inline comments, each prefixed with the check name, and this body:
 
 ```markdown
-<!-- rag-pr-review:run:<reviewed sha> -->
+<!-- rag-pr-review:run:<reviewed-sha> -->
 ## PR evaluation — `<sha7>` — <READY TO MERGE | NOT READY>
 
-**Reviewed commit:** `<sha>` on `<branch>` · **Evaluated as:** merged with `develop` at `<develop sha7>` (local merge, not pushed) · **Issue:** #<n> · **Started:** <UTC> · **Finished:** <UTC>
+**Reviewed commit:** `<sha>` on `<branch>` · **Evaluated as:** merged with `develop` at `<develop-sha7>` (local merge, not pushed) · **Issue:** #<n> · **Started:** <UTC> · **Finished:** <UTC>
 
 | Check | Result | Model | Why this model | High | Medium | Low |
 |---|---|---|---|---|---|---|
@@ -210,9 +202,9 @@ _One evaluation per commit. A new commit gets its own evaluation. Ready to merge
 
 The status is `READY TO MERGE` only when all four checks passed and no High is open. It's `NOT READY` for any other outcome.
 
-If the PR's head moved during the evaluation, add under the heading: **"The PR's head is now `<new sha7>`. These results apply to `<sha7>` only; the new commit needs its own evaluation."** In that case apply no labels.
+If the PR's head moved during the evaluation, add under the heading: **"The PR's head is now `<new-sha7>`. These results apply to `<sha7>` only; the new commit needs its own evaluation."** In that case apply no labels.
 
-If `develop` moved during the evaluation, add under the heading: **"`develop` is now `<new sha7>`. These results are for this commit merged with `<develop sha7>`."**
+If `develop` moved during the evaluation, add under the heading: **"`develop` is now `<new-sha7>`. These results are for this commit merged with `<develop-sha7>`."**
 
 **Finding an existing recap.** A marker in a review proves nothing by itself: anyone who can comment can paste `<!-- rag-pr-review:run:<sha> -->` into a review. Count a review only when the authenticated account wrote it:
 
