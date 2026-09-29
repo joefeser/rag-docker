@@ -384,8 +384,10 @@ curl -X POST http://localhost:8080/api/export \
 
 That takes the package from roughly 80 KB to ~2.3 GB, because it carries the
 embedding model and the LLM as Ollama's own manifest and blob files. On import,
-a model already present is left alone; a missing one is installed from the
-package and verified before the collection is built. The models are
+a model already present is left alone, provided its files match their checksums;
+a missing one is installed from the package and verified before the collection
+is built. If the embedding model is present but damaged, the import fails
+`MODEL_INTEGRITY_FAILED`: restore or re-pull it, then import again. The models are
 content-addressed, so what lands on the target is byte-identical to what produced
 the vectors.
 

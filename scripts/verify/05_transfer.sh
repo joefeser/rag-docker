@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26, E27)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -183,6 +183,89 @@ check "re-export after import is byte-identical (uuids, vectors, properties)" $?
 rm -f "$EXPORTS/$PKG2"
 drop_collection "$iname"
 
+# ── models on import: damaged and namespaced (E26, E27) ──────────────────────
+# Runs the importer inside the API process with its settings patched. E26 copies
+# the embedding model into a temporary store and damages the copy; the live
+# model store is only read. E27 uses the live store and a namespaced LLM name.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PKG") > /tmp/vfy_models.json 2>/tmp/vfy_models.err <<'ENDPY'
+import json, shutil, sys, tempfile, uuid
+from pathlib import Path
+from unittest.mock import patch
+from config import settings
+from services import importer, model_bundle as models
+pkg, out = sys.argv[1], {}
+
+def run(conflict):
+    jid = "vfy" + uuid.uuid4().hex[:6]
+    importer._jobs[jid] = {"job_id": jid, "status": "queued", "filename": pkg,
+                           "on_conflict": conflict, "collection": None,
+                           "original_collection": None, "chunks_written": 0,
+                           "fidelity": None, "renamed": False, "notes": [],
+                           "error": None, "error_code": None, "error_detail": None}
+    importer._active.add(pkg)
+    importer._run(jid, pkg, conflict)
+    return importer._jobs.pop(jid)
+
+model = settings.embed_model
+name = models.split_ref(model)[0]
+out["live_intact"] = models.is_installed(model)
+live_manifest = models.manifest_path(model)
+digests = models._digests(json.loads(live_manifest.read_text()))
+live_blobs = {d: models.blob_path(d) for d in digests}
+live_stamps = {p: p.stat().st_mtime_ns for p in [live_manifest, *live_blobs.values()]}
+
+# E26: installed but damaged -> MODEL_INTEGRITY_FAILED, the copy left as it was
+with tempfile.TemporaryDirectory(prefix="vfy-model-", dir=settings.upload_dir) as td:
+    with patch.object(settings, "ollama_models_dir", str(Path(td) / "store")):
+        mp = models.manifest_path(model)
+        mp.parent.mkdir(parents=True)
+        shutil.copyfile(live_manifest, mp)
+        for d, src in live_blobs.items():
+            models.blob_path(d).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, models.blob_path(d))
+        out["copy_present"] = models.is_installed(model)
+        smallest = min(digests, key=lambda d: live_blobs[d].stat().st_size)
+        damaged = models.blob_path(smallest)
+        damaged.write_bytes(b"ordinary damaged review bytes")
+        manifest_before = mp.read_bytes()
+        job = run("rename")
+        out["e26_status"] = job["status"]
+        out["e26_code"] = job["error_code"]
+        out["e26_message"] = job["error"] or ""
+        out["e26_untouched"] = (damaged.read_bytes() == b"ordinary damaged review bytes"
+                                and mp.read_bytes() == manifest_before)
+
+# E27: a namespaced LLM that Ollama doesn't report -> import completes with a note
+ns = "vfy-namespace/absent-llm"
+reports = getattr(importer, "_ollama_reports", None)
+if reports:                                              # real /api/tags; tag defaults to latest
+    out["tags_have_embed"], out["ns_reported"] = reports(name), reports(ns)
+with patch.object(settings, "llm_model", ns):
+    job = run("rename")
+out["e27_status"] = job["status"]
+out["e27_error"] = f"{job['error_code']}: {job['error']}"
+out["e27_collection"] = job["collection"]
+out["e27_note"] = any(ns in n for n in job["notes"])
+out["live_untouched"] = all(p.stat().st_mtime_ns == s for p, s in live_stamps.items())
+print(json.dumps(out))
+ENDPY
+m() { python3 -c "import json,sys;print(json.load(open('/tmp/vfy_models.json'))[sys.argv[1]])" "$1" 2>/dev/null; }
+check_eq "the live embedding model's files match their checksums" "$(m live_intact)" "True"
+check_eq "the temporary copy of the embedding model starts intact" "$(m copy_present)" "True"
+check_eq "E26 a damaged installed embedding model fails the import" "$(m e26_status)" "failed"
+check_eq "E26 ... as MODEL_INTEGRITY_FAILED, not EMBEDDING_MODEL_MISSING" "$(m e26_code)" "MODEL_INTEGRITY_FAILED"
+m e26_message | grep -qi "re-pull"
+check "E26 the message says to restore or re-pull the model" $? "$(m e26_message)"
+check_eq "E26 the damaged model's files are left untouched" "$(m e26_untouched)" "True"
+check_eq "Ollama's /api/tags reports the embedding model by name (tag defaults to latest)" "$(m tags_have_embed)" "True"
+check_eq "a namespaced model Ollama doesn't have is not reported" "$(m ns_reported)" "False"
+check_eq "E27 with a namespaced LLM_MODEL, an import without bundled models completes" "$(m e27_status)" "completed"
+[ "$(m e27_status)" = completed ] || printf '      %s\n' "$(m e27_error)"
+check_eq "E27 the import notes the namespaced model" "$(m e27_note)" "True"
+check_eq "the live model store was only read" "$(m live_untouched)" "True"
+[ -s /tmp/vfy_models.json ] || sed 's/^/      /' /tmp/vfy_models.err | tail -5
+e27c=$(m e27_collection); [ -n "$e27c" ] && [ "$e27c" != "None" ] && [ "$e27c" != "$C" ] && drop_collection "$e27c"
+
 # ── tuning ───────────────────────────────────────────────────────────────────
 api_get "/tune/$C" > /tmp/vfy_tune.json
 check_eq "tune options report with-sources" "$(jfield "['fidelity']" < /tmp/vfy_tune.json)" "with-sources"
@@ -265,4 +348,6 @@ check "the help page has no unsubstituted placeholders" $?
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
+bash ./10_validity.sh
+check "retained-session validity acceptance suite" $?
 summary

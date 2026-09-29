@@ -114,6 +114,33 @@ high_findings:
 notes: <anything the coordinator must know>
 ```
 
+## Restoring the stack
+
+The stack bind-mounts files from the folder it was started in: `./exports` (export packages), `proxy/nginx.conf` and `ollama/entrypoint.sh`. So it must always end up started from a folder that stays: the main checkout. A stack started from a bundle worktree that is then removed keeps running on deleted files, and exports land in a folder nobody will see.
+
+1. **Find the main checkout:** the first `worktree` line of `git worktree list --porcelain`.
+2. **Check it:** `git fetch origin develop`. It must be on `develop`, with `git status --porcelain` empty (untracked files count: a build copies them in). If it's behind `origin/develop` and not ahead, fast-forward it (`git merge --ff-only origin/develop`). If it's ahead or has diverged, that fails this step. Never switch its branch or discard anything yourself.
+3. **Restart from it:** `docker compose -p rag-docker build`, then `docker compose -p rag-docker up -d --force-recreate --remove-orphans`, then the smoke checks: `http://localhost:8080/api/health` and `http://localhost:8080/` must each return 200 within 60 seconds of retrying (the `smoke` function in the coordinator's step 8). `--remove-orphans` stops any service the evaluated commit added that `develop` doesn't have.
+4. **Check the mounts** of every container in the project. Each bind source must be under the main checkout (Docker Desktop may prefix it with `/host_mnt`), never a bundle path:
+
+   ```bash
+   docker ps -a --filter label=com.docker.compose.project=rag-docker --format '{{.Names}}' | while read -r c; do
+     docker inspect "$c" --format '{{range .Mounts}}{{if eq .Type "bind"}}{{$.Name}} {{.Source}}{{"\n"}}{{end}}{{end}}'
+   done
+   ```
+
+5. **Only then** remove worktrees, and only your own: the testing reviewer removes a `base/` worktree it created, never `worktree/` or `merged/`, which the coordinator still needs for the build check and removes itself in step 9.
+
+**If step 2, 3 or 4 fails** (the main checkout isn't a clean `develop` it can fast-forward, the build fails, or a mount points outside the main checkout), don't leave the evaluated code anywhere it could run again:
+
+1. Stop the stack: `docker compose -p rag-docker down --remove-orphans` (never `-v`: the volumes hold the data).
+2. Remove the images built from the evaluated commit: `docker image rm rag-docker-api:latest rag-docker-ui:latest`. Otherwise the next `docker compose up -d`, or `package-offline.sh`, would use them. The next `up` rebuilds them from whatever folder it runs in.
+3. Keep every bundle worktree, and tell the user the stack is stopped, why, and that it must be started again from the main checkout on `develop`.
+
+For a cross-repository PR, the evaluated code is the contributor's, and the go-ahead covered running it only for the evaluation.
+
+While an evaluation is running, the maintainer's own work goes in a separate worktree, never on a branch in the main checkout.
+
 ## Commit statuses (coordinator only)
 
 Commit statuses on the reviewed commit are the evaluation's claim and its live progress. They appear in the PR's checks panel and belong to that exact commit, so a new commit starts clean. Only the coordinator sets them.
@@ -186,6 +213,9 @@ One GitHub review with `event: COMMENT` on the reviewed commit. Never use `APPRO
 **Blocking (High):**
 - <check> — <path:line> — <one line>
 
+<only for a PR by `joefeser`, see "Maintainer follow-ups" below>
+**Medium and Low findings:** the maintainer will fix these in a follow-up PR after this one merges. You don't need to change anything for them.
+
 **Build and run:** config valid ✅ · images built ✅ · all services healthy ✅ (<n> min) · `/api/health` 200 ✅ · UI 200 ✅
 
 <each specialist's section, in the order Coding, Security, Tests>
@@ -214,6 +244,15 @@ gh api repos/mikesilvers/rag-docker/pulls/N/reviews --paginate \
 ```
 
 To link a finished evaluation's recap, use the overall status's `target_url`, which only the coordinator sets. A look-alike review from anyone else is ignored and mentioned in the report to the user.
+
+## Maintainer follow-ups (PRs by `joefeser`)
+
+For a PR whose author is `joefeser`, only High findings go back to him. "Author" means the PR's `author.login` from the step 1 snapshot (`gh pr view --json author`), which GitHub sets and nobody can edit. Never go by commit authors, `Co-authored-by` trailers or anything written in the PR. The maintainer fixes the Medium and Low findings in a follow-up issue and PR against `develop` after his PR merges, so they never hold his PR.
+
+- The recap carries the "Medium and Low findings" line shown in the recap format, so his team doesn't also fix them. On a NOT READY recap, the line still applies: he fixes the Highs only.
+- After his PR merges, the coordinator offers the maintainer a follow-up issue listing the Mediums, and the Lows worth doing, each with its `path:line` from the recap. The follow-up is an ordinary maintainer PR, evaluated like any other.
+- Severities are graded exactly as for any other PR. The rule changes who fixes a Medium or Low, never what counts as High.
+- Conflicts with `develop` are still his to resolve.
 
 ## Untrusted content
 

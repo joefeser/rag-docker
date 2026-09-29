@@ -67,12 +67,20 @@ drive the UI in a real browser.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
+| `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
+| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20 and E23; live metadata checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23, E26 and E27; live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
+
+`10_validity.sh` is called by suite05 (and thus all.sh). It runs
+`session_validity.py` inside the disposable API, using an owned real collection,
+synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
+It checks warning metadata, actual deletion marking and explicit historical export.
 
 ## Environment
 
@@ -104,6 +112,27 @@ Two rules the hard way:
   strings passes and proves nothing. Several early versions of these tests
   passed vacuously — asserting on a selector that matched nothing, or comparing
   a count to itself.
+
+## Bundled-model integrity
+
+On a disposable stack with its embedding model already pulled, run:
+
+```bash
+docker compose exec -T api python - < scripts/verify/model_integrity.py
+```
+
+This verifies the real model's referenced bytes, copies them into a temporary
+package/store, checks valid install and unchanged reuse, and refuses ordinary
+mismatched bytes without changing the published manifest or healthy blobs.
+The actual shared model store is only read; temporary content is removed. It
+needs disk space for two copies of the embedding model and performs several
+streamed hash passes. It does not invoke a model parser or claim trusted model
+provenance. Controlled regression tests additionally cover digest grammar,
+containment, interrupted publication and concurrent blob publication:
+
+```bash
+python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
+```
 
 ## Cleaning up
 

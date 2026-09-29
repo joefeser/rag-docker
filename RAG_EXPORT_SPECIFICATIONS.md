@@ -392,19 +392,34 @@ On import:
 
 | Target state | Behaviour |
 |---|---|
-| Model already present by name | skip; do not overwrite. A target's existing model is assumed deliberate |
+| Model present and its files match their checksums | skip; do not overwrite. A target's existing model is assumed deliberate |
+| Model present but a file is missing or doesn't match its checksum | embedding model: fail with `MODEL_INTEGRITY_FAILED`, naming the model and saying to restore or re-pull it. LLM: note it on the import and continue. Never overwrite it: blobs are shared, and replacing one could affect other models |
 | Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding |
 | Model absent, package does not bundle it | fail with `EMBEDDING_MODEL_MISSING`, naming the model and stating that it must be pulled or a `with-models` package used |
+| Namespaced model name (`user/model`) | it has no path in the model store, so it can't be checked or installed from a package. If Ollama reports it, note that its files weren't checked and continue. If not: the embedding model fails `EMBEDDING_MODEL_MISSING`, saying to pull it; the LLM gets a note. If Ollama can't be reached, the embedding model fails `IMPORT_FAILED`, saying so rather than calling the model missing; the LLM gets a note |
 
 `EMBEDDING_MODEL_MISSING` is distinct from `EMBEDDING_MISMATCH` (§6.2): one means
 the target has nothing to embed with, the other means it has the wrong thing. The
-remedies differ, so the errors must too.
+remedies differ, so the errors must too. `MODEL_INTEGRITY_FAILED` is a third case:
+the model is there but damaged, so pulling a model the user already has is not the
+fix; restoring or re-pulling it is.
 
 Blobs are written before the manifest. The manifest is what makes Ollama
 consider a model present, so writing it last means an interrupted install leaves
-unreferenced blobs rather than a model that cannot be served. A blob already
-present is skipped: the names are content addresses, so a matching name is a
-matching file.
+unreferenced blobs rather than a model that cannot be served. Each referenced
+address must be `sha256:` plus 64 lowercase hex digits. Import stream-hashes
+bundled bytes and existing shared bytes against that address before publishing
+any manifest. A matching filename alone is not evidence of matching bytes.
+Healthy existing blobs are reused without replacement. A mismatched existing
+blob is refused with an explicit integrity error; restoring that shared content
+is an owner action, because automatic replacement could affect other models.
+Model names and tags must be simple path components, and package/store paths
+must remain under their roots without symlink components. A copied blob is
+hashed again while writing a unique temporary file, then published atomically
+without replacing a concurrently published blob. The captured, validated
+manifest is written atomically last, after confirming every destination blob.
+The installed-model check also verifies referenced byte hashes. Hashes prove
+content consistency, not trusted model provenance or safe model parsing.
 
 Because models are content-addressed, a model that travels in a package and is
 installed on the target is **byte-identical** to the one that produced the
@@ -517,6 +532,8 @@ collection `stale`, recording why and when. Sessions are not deleted and are not
 remapped: a wrong remap corrupts an evaluation baseline silently, which is worse
 than an honest stale flag.
 
+For identity-changing rebuilds, persist the flag after preparation succeeds but before deleting the live collection. A failure after cutover begins also marks history stale, including a failed reindex whose original collection may be missing or partial. A successful identity-preserving reindex keeps its existing validity semantics. This request-time validity barrier is separate from session persistence concurrency and durable collection recovery.
+
 Changing only the index type or distance metric does **not** change chunk
 identity, and MUST NOT mark sessions stale.
 
@@ -594,6 +611,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `PACKAGE_CORRUPT` | digest mismatch or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
+| `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
 | `SOURCES_REQUIRED` | tuning needs `with-sources`; package is `chunks-only` |
@@ -644,6 +662,8 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
 | E23 | A digest-valid package with malformed evaluation metadata fails `PACKAGE_CORRUPT` before model installation, collection mutation or sidecar restoration; existing review work remains unchanged |
+| E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
+| E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 
 ---
 

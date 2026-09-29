@@ -436,10 +436,22 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     out_path.write_text(json.dumps(ragas, indent=2))
 
 
-async def save_session(session_id: str, filename: str | None) -> dict | None:
+async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
         return None
+
+    from models.schemas import SessionValidity
+    if not isinstance(allow_historical, bool):
+        raise ValueError("allow_historical must be a boolean")
+    validity = SessionValidity.model_validate(session).model_dump()
+    historical = validity["stale"] or validity["orphaned"]
+    if historical and not allow_historical:
+        raise GoldStandardError(
+            "HISTORICAL_SESSION",
+            "This retained session is stale or orphaned and is not a current "
+            "collection baseline. Inspect its validity metadata and explicitly "
+            "set allow_historical=true to export historical pairs.", 409)
 
     approved = [p for p in session["pairs"] if p["status"] in ("approved", "edited")]
     excluded = len(session["pairs"]) - len(approved)
@@ -474,4 +486,6 @@ async def save_session(session_id: str, filename: str | None) -> dict | None:
         "pairs_saved": len(approved),
         "pairs_excluded": excluded,
         "download_url": f"/api/goldstandard/download/{filename}",
+        "historical": historical,
+        "session_validity": validity,
     }
