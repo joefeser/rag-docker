@@ -108,17 +108,44 @@ def _check_blob(path: Path, digest: str) -> None:
         raise ValueError(f"Model blob bytes disagree with {digest}; restore the content before importing")
 
 
-def is_installed(model: str) -> bool:
-    """A model is installed only if its referenced bytes match their addresses."""
+def supports_name(model: str) -> bool:
+    """Whether the model has a path in this store layout.
+
+    Namespaced names (`user/model`, `hf.co/org/model`) don't: they can still be
+    pulled and served by Ollama, but they can't be checked or installed here.
+    """
     try:
-        mp = manifest_path(model)
-        if not mp.is_file():
-            return False
+        split_ref(model)
+    except ValueError:
+        return False
+    return True
+
+
+def installed_state(model: str) -> str:
+    """'present', 'absent' or 'corrupt'.
+
+    'corrupt' means a manifest exists but a referenced blob is missing or its
+    bytes disagree with its address. Import treats that as its own outcome:
+    telling the user to pull a model they already have would send them the
+    wrong way.
+    """
+    mp = manifest_path(model)
+    if not mp.is_file():
+        return "absent"
+    try:
         for digest in _digests(json.loads(mp.read_text())):
             _check_blob(blob_path(digest), digest)
     except (OSError, ValueError):
+        return "corrupt"
+    return "present"
+
+
+def is_installed(model: str) -> bool:
+    """A model is installed only if its referenced bytes match their addresses."""
+    try:
+        return installed_state(model) == "present"
+    except (OSError, ValueError):
         return False
-    return True
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
