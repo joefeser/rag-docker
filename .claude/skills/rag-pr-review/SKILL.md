@@ -115,7 +115,7 @@ Use the Agent tool with `subagent_type: general-purpose` and the chosen `model`.
 
 > You are the {coding|security|testing} reviewer for rag-docker PR #N. Invoke the `rag-pr-review-{coding|security|tests}` skill with the Skill tool and follow it exactly. If the Skill tool can't find it, read `{skills}/rag-pr-review-{…}/SKILL.md` and `{skills}/rag-pr-review/reference.md` in full and follow them exactly. Wherever the skills say `.claude/skills/`, use `{skills}/`.
 > Reviewed SHA: {sha}. Evaluated commit: {evaluated-sha}, the reviewed SHA merged with `develop` at {develop-sha7}. Source-of-truth issue(s): #{n}{; Part of — deferred: …}. Context bundle: {path}. Worktree (reviewed SHA): {path}/worktree. Merged worktree (evaluated commit): {path}/merged. Cross-repository PR: {true|false}. Your model: {model}.
-> Write your findings file and return the result block, both as defined in `reference.md`. Post nothing on GitHub, apply no labels, and never change git config.
+> Write your findings file and return the result block, both as defined in `reference.md`. Post nothing on GitHub, apply no labels, and never change git config.{ For coding and security on a cross-repository PR: Run no command on the PR's files, not even `py_compile`, `bash -n` or `node --check`. Read them only.}
 
 - Dispatch **coding** and **security** together, in the background.
 - Dispatch **testing** after them:
