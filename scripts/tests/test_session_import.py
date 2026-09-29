@@ -292,7 +292,7 @@ class SessionImportTests(unittest.TestCase):
         chunks = [{'content': 'Context', 'source_file': 'source.txt', 'chunk_index': chunk_index}]
 
         async def run():
-            async def sample(collection, limit):
+            async def sample(collection, limit, seed=None):
                 return chunks
 
             async def chat(system, user):

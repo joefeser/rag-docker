@@ -959,6 +959,20 @@ class GenerateRequest(BaseModel):
     sample_size: int = 20
     seed: Optional[int] = None
 
+    @field_validator("sample_size", "seed", mode="before")
+    @classmethod
+    def _numeric(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Sampling settings cannot be booleans")
+        return value
+
+    @field_validator("sample_size")
+    @classmethod
+    def _sample_size(cls, value):
+        if not 1 <= value <= 100:
+            raise ValueError("sample_size must be between 1 and 100")
+        return value
+
 
 class GenerateResponse(BaseModel):
     session_id: str
@@ -1439,7 +1453,7 @@ import threading
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
-from weaviate.classes.query import MetadataQuery
+from weaviate.classes.query import MetadataQuery, Filter
 
 from config import settings
 from services import ingest_config
@@ -1807,25 +1821,30 @@ async def hybrid_query(
     return await asyncio.to_thread(_hybrid_query_sync, collection_name, query, alpha, top_k)
 
 
-def _sample_chunks_sync(collection_name: str, limit: int) -> list[dict]:
+def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    from models.schemas import GenerateRequest
+    from services.chunk_sampling import select_chunk_ids
+    request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.fetch_objects(
-        limit=limit,
-        return_properties=["content", "source_file", "chunk_index"],
-    )
-    return [
-        {
-            "content": obj.properties.get("content", ""),
-            "source_file": obj.properties.get("source_file", ""),
-            "chunk_index": obj.properties.get("chunk_index", 0),
-        }
-        for obj in result.objects
-    ]
+    objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
+    identities = select_chunk_ids(objects, request.sample_size, request.seed)
+    if not identities:
+        return []
+    payloads = coll.query.fetch_objects(
+        filters=Filter.by_id().contains_any(identities), limit=len(identities),
+        include_vector=False, return_properties=["content", "source_file", "chunk_index"],
+    ).objects
+    by_id = {str(obj.uuid): obj.properties for obj in payloads}
+    # Concurrent deletion can remove a winner between the UUID and payload passes.
+    return [{"object_id": identity, "content": by_id[identity].get("content", ""),
+             "source_file": by_id[identity].get("source_file", ""),
+             "chunk_index": by_id[identity].get("chunk_index", 0)}
+            for identity in identities if identity in by_id]
 
 
-async def sample_chunks(collection_name: str, limit: int) -> list[dict]:
-    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit)
+async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit, seed)
 ```
 
 ### api/services/ollama_client.py
@@ -2423,6 +2442,51 @@ async def run_query(
     }
 ```
 
+### api/services/chunk_sampling.py
+
+```python
+"""Order-independent selection of stable chunk UUIDs."""
+import hashlib
+import heapq
+import secrets
+from uuid import UUID
+
+MAX_SAMPLE_SIZE = 100
+
+
+def select_chunk_ids(objects, limit: int, seed: int | None = None) -> list[str]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_SAMPLE_SIZE:
+        raise ValueError("sample_size must be an integer between 1 and 100")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("seed must be an integer or null")
+    domain = b"rag-evaluation-sample-v1\0"
+    prefix = (domain + b"seed\0" + str(seed).encode("ascii") + b"\0" if seed is not None
+              else domain + b"nonce\0" + secrets.token_bytes(32) + b"\0")
+    base = hashlib.sha256(prefix)
+    heap = []
+    selected = set()
+    for obj in objects:
+        identity = UUID(str(obj.uuid))
+        if identity in selected:
+            continue
+        digest = base.copy()
+        digest.update(identity.bytes)
+        priority = int.from_bytes(digest.digest(), "big")
+        # Negated scores make the heap root the worst retained candidate.
+        key = (-priority, -identity.int)
+        if len(heap) == limit and key <= heap[0][:2]:
+            continue
+        entry = (*key, identity)
+        if len(heap) == limit:
+            removed = heapq.heapreplace(heap, entry)
+            selected.remove(removed[2])
+        else:
+            heapq.heappush(heap, entry)
+        selected.add(identity)
+    # The UUID tie-breaker also fixes output order if priorities collide.
+    return [str(entry[2]) for entry in sorted(heap, key=lambda entry: (-entry[0], -entry[1]))]
+```
+
 ### api/services/goldstandard.py
 
 ```python
@@ -2767,7 +2831,9 @@ async def start_generation(
     sample_size: int,
     seed: int | None,
 ) -> dict:
-    all_chunks = await wc.sample_chunks(collection, limit=sample_size)
+    from models.schemas import GenerateRequest
+    request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
+    all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
     actual_size = len(all_chunks)
 
     session_id = f"gs_{uuid.uuid4().hex[:8]}"
@@ -8668,6 +8734,8 @@ drive the UI in a real browser.
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
+| `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
+| `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 
 `10_validity.sh` is called by suite05 (and thus all.sh). It runs
 `session_validity.py` inside the disposable API, using an owned real collection,
@@ -9754,6 +9822,90 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/09_sampling.sh
+
+```bash
+#!/usr/bin/env bash
+# UUID selection through the real SDK; owned fixtures and supplied vectors.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Evaluation sampling across iterator pages"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/chunk_sampling.py)
+check "seeded selection, iterator paging, bounds and owned-fixture cleanup" $?
+section "Generation request validation before backend/model work"
+for body in \
+  '{"collection":"MissingSamplingFixture","sample_size":0}' \
+  '{"collection":"MissingSamplingFixture","sample_size":101}' \
+  '{"collection":"MissingSamplingFixture","sample_size":true}' \
+  '{"collection":"MissingSamplingFixture","sample_size":1.5}' \
+  '{"collection":"MissingSamplingFixture","seed":false}' \
+  '{"collection":"MissingSamplingFixture","seed":1.5}' \
+  '{"collection":"MissingSamplingFixture","seed":NaN}' \
+  '{"collection":"MissingSamplingFixture","sample_size":Infinity}'
+do
+  code=$(api_post_code /goldstandard/generate "$body")
+  check_eq "invalid sampling request rejected with422: $body" "$code" "422"
+done
+summary
+```
+
+### scripts/verify/chunk_sampling.py
+
+```python
+"""Real SDK sampling checks; owned synthetic objects with supplied vectors.
+
+Run inside a disposable API: python - < scripts/verify/chunk_sampling.py
+Does not call embedding or language models. UUID selection, not answer output,
+is the reproducibility contract. Deletes only its unique collection/config.
+"""
+import uuid
+import os
+from services import weaviate_client as wc
+from services.chunk_sampling import select_chunk_ids
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Sampling'+uuid.uuid4().hex[:12]
+creation_attempted=False
+try:
+    assert not wc._collection_exists_sync(collection)
+    creation_attempted=True
+    wc._create_collection_sync(collection,'hnsw','cosine',{})
+    coll=wc.get_client().collections.get(collection)
+    for i in range(1,161):
+        coll.data.insert(uuid=uuid.UUID(int=i),properties={
+            'content':f'Inert sampling fixture {i}', 'source_file':'sampling.txt',
+            'chunk_index':i},vector=[0.1]*768)
+    assert coll.aggregate.over_all(total_count=True).total_count==160
+    print('PASS created 160 owned synthetic objects with supplied vectors',flush=True)
+    first=wc._sample_chunks_sync(collection,5,7)
+    assert len(first)==5 and len({r['object_id'] for r in first})==5
+    assert any(uuid.UUID(r['object_id']).int>100 for r in first)
+    print('PASS seeded sample reaches beyond the first 100-object iterator page',flush=True)
+    assert wc._sample_chunks_sync(collection,5,7)==first
+    print('PASS repeated seed preserves UUIDs and ordered payloads',flush=True)
+    snapshot=list(coll.iterator(include_vector=False,return_properties=[],cache_size=100))
+    assert len(snapshot)==160 and all(not obj.properties for obj in snapshot)
+    assert all(row['source_file']=='sampling.txt' and row['content']==f"Inert sampling fixture {uuid.UUID(row['object_id']).int}" for row in first)
+    assert select_chunk_ids(reversed(snapshot),5,7)==[row['object_id'] for row in first]
+    print('PASS UUID-only SDK scan and reversed order preserve selected payloads',flush=True)
+    maximum=wc._sample_chunks_sync(collection,100,7)
+    assert len(maximum)==100 and len({r['object_id'] for r in maximum})==100
+    print('PASS maximum request is bounded across multiple iterator pages',flush=True)
+    for i in range(61,161): coll.data.delete_by_id(uuid.UUID(int=i))
+    rows=wc._sample_chunks_sync(collection,100,7)
+    assert len(rows)==60 and {r['object_id'] for r in rows}=={str(uuid.UUID(int=i)) for i in range(1,61)}
+    print('PASS oversize request returns all available unique objects',flush=True)
+    unseeded=wc._sample_chunks_sync(collection,5,None)
+    assert len(unseeded)==5 and all(1<=uuid.UUID(r['object_id']).int<=60 for r in unseeded)
+    print('PASS null seed produces a bounded valid sample',flush=True)
+finally:
+    if creation_attempted and wc._collection_exists_sync(collection): wc._delete_collection_sync(collection)
+    wc.close_client()
+assert not wc._collection_exists_sync(collection)
+wc.close_client()
+print('PASS owned collection and configuration removed',flush=True)
+```
+
 ### scripts/verify/04_goldstandard.sh
 
 ```bash
@@ -9771,8 +9923,12 @@ C="${PREFIX}Gold"
 
 section "§10.3 Gold Standard"
 
+# Selection needs the backend but no LLM work; include it even in slow-skip runs.
+bash ./09_sampling.sh
+check "UUID sampling acceptance" $?
+
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.3 entirely" "every check needs LLM generation"
+  skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
 fi
 
@@ -10072,6 +10228,63 @@ check_eq "E23: replace left the existing collection untouched" "$(count_of "$C")
 code=$(api_code "$API/goldstandard/session/not-a-generated-id")
 check_eq "E23: no session was restored from the refused package" "$code" "404"
 rm -f "$EXPORTS/$BADGS"
+
+# A refused package must change no live state at all. A replace from this
+# package would restore the same chunks, so the count above can't tell; the
+# retrieval setting and the earlier, valid sidecar can.
+MIX_SID="gs_$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+MIXGS=$(python3 - "$EXPORTS/$PKG" "$MIX_SID" "$C" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, sid, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+def session(i, **over):
+    s = {"session_id": i, "collection": coll, "status": "completed",
+         "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
+         "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
+                    "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
+                    "chunk_index": 0, "status": "approved"}]}
+    s.update(over); return s
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    gold = root / "goldstandard"; gold.mkdir(exist_ok=True)
+    manifest = json.loads((root / "manifest.json").read_text())
+    # a_valid sorts first: a restore that isn't preflighted writes it before
+    # it reaches the bad one.
+    for name, body in (("a_valid.json", session(sid)),
+                       ("b_bad.json", session("gs_0000beef", pairs_total="many"))):
+        (gold / name).write_text(json.dumps(body))
+        manifest["files"][f"goldstandard/{name}"] = \
+            "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+)
+api_post "/import" "{\"filename\":\"$MIXGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+check_eq "E23: a schema-invalid sidecar after a valid one is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_gsjob.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
+sys.exit(0 if 'goldstandard/b_bad.json' in json.dumps(d) else 1)"
+check "E23: the refusal names the invalid sidecar, not the valid one" $?
+code=$(api_code "$API/goldstandard/session/$MIX_SID")
+check_eq "E23: the valid sidecar in a refused package is not restored" "$code" "404"
+topk=$(api_get "/retrieval/config/$C" | jfield "['top_k']")
+check_eq "E23: a refused replace leaves the live retrieval settings alone" "$topk" "7"
+check_eq "E23: ... and the collection's chunk count" "$(count_of "$C")" "$chunks_before"
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+rm -f "$EXPORTS/$MIXGS"
+(cd "$REPO_ROOT" && docker compose exec -T api rm -f \
+  "/app/uploads/goldstandard_sessions/$MIX_SID.json" \
+  "/app/uploads/goldstandard_sessions/gs_0000beef.json") >/dev/null 2>&1 || true
 
 GOODGS=$(make_gs_pkg "$GS_SID" goodgs)
 api_post "/import" "{\"filename\":\"$GOODGS\",\"on_conflict\":\"rename\"}" > /tmp/vfy_imp.json

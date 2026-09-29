@@ -123,6 +123,63 @@ code=$(api_code "$API/goldstandard/session/not-a-generated-id")
 check_eq "E23: no session was restored from the refused package" "$code" "404"
 rm -f "$EXPORTS/$BADGS"
 
+# A refused package must change no live state at all. A replace from this
+# package would restore the same chunks, so the count above can't tell; the
+# retrieval setting and the earlier, valid sidecar can.
+MIX_SID="gs_$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+MIXGS=$(python3 - "$EXPORTS/$PKG" "$MIX_SID" "$C" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, sid, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+def session(i, **over):
+    s = {"session_id": i, "collection": coll, "status": "completed",
+         "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
+         "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
+                    "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
+                    "chunk_index": 0, "status": "approved"}]}
+    s.update(over); return s
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    gold = root / "goldstandard"; gold.mkdir(exist_ok=True)
+    manifest = json.loads((root / "manifest.json").read_text())
+    # a_valid sorts first: a restore that isn't preflighted writes it before
+    # it reaches the bad one.
+    for name, body in (("a_valid.json", session(sid)),
+                       ("b_bad.json", session("gs_0000beef", pairs_total="many"))):
+        (gold / name).write_text(json.dumps(body))
+        manifest["files"][f"goldstandard/{name}"] = \
+            "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+)
+api_post "/import" "{\"filename\":\"$MIXGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+check_eq "E23: a schema-invalid sidecar after a valid one is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_gsjob.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
+sys.exit(0 if 'goldstandard/b_bad.json' in json.dumps(d) else 1)"
+check "E23: the refusal names the invalid sidecar, not the valid one" $?
+code=$(api_code "$API/goldstandard/session/$MIX_SID")
+check_eq "E23: the valid sidecar in a refused package is not restored" "$code" "404"
+topk=$(api_get "/retrieval/config/$C" | jfield "['top_k']")
+check_eq "E23: a refused replace leaves the live retrieval settings alone" "$topk" "7"
+check_eq "E23: ... and the collection's chunk count" "$(count_of "$C")" "$chunks_before"
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+rm -f "$EXPORTS/$MIXGS"
+(cd "$REPO_ROOT" && docker compose exec -T api rm -f \
+  "/app/uploads/goldstandard_sessions/$MIX_SID.json" \
+  "/app/uploads/goldstandard_sessions/gs_0000beef.json") >/dev/null 2>&1 || true
+
 GOODGS=$(make_gs_pkg "$GS_SID" goodgs)
 api_post "/import" "{\"filename\":\"$GOODGS\",\"on_conflict\":\"rename\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
