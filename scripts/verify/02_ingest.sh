@@ -8,6 +8,9 @@ FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
+# Run the independent text-storage window acceptance without model work.
+bash ./08_overlap.sh
+check "bounded overlap text-storage acceptance" $?
 C="${PREFIX}Ingest"
 
 # Uploads a set of files and echoes the finished job document to a file.

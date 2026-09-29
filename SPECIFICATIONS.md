@@ -1208,9 +1208,25 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 - Behavior: splits on character count with no intentional overlap. Sentence boundaries not respected.
 
 #### Fixed Size with Overlap (`overlap`)
-- Splitter: `CharacterTextSplitter`
+- Splitter: explicit character windows, independent of paragraph/word separators
 - Parameters: `chunk_size`, `chunk_overlap`, `min_chunk_size`
-- Behavior: each chunk shares `chunk_overlap` characters with the next chunk.
+- Per-file pre-merge output limits: at most 10,000 windows and 10,000,000 total window characters, including repeated overlap. Count and total payload are computed before allocating windows. Excess fails that file with a clear ingest-job error; other files can continue. These are candidate/payload character bounds, not parser or encoded-byte limits. The optional final-tail merge does not relax the pre-allocation limits.
+- Behavior: consecutive windows share exactly `chunk_overlap` characters. Nonblank
+  text is covered in order, including internal and boundary whitespace; blank-only
+  input yields no chunks. Python character counts, rather than encoded byte counts,
+  determine window sizes. Long tokens and single-newline parser text remain bounded.
+- Window size must be positive, `0 <= chunk_overlap < chunk_size`, and
+  `min_chunk_size >= 0`; impossible size/overlap values are rejected.
+- The final undersized window is merged by appending only its new suffix, removing
+  duplicated overlap without adding a separator. All other windows are at most
+  `chunk_size`; the final output is at most
+  `chunk_size + max(0, min(chunk_size, min_chunk_size - 1) - chunk_overlap)`
+  characters. With defaults
+  (size 1000, overlap 200, minimum 100), every chunk is at most 1000 characters. A whole
+  document shorter than the minimum remains one short chunk; no text is fabricated.
+  Minimum size applies to the final-window merge preference. A minimum above the
+  target does not combine every full window; the final output is still bounded by
+  at most two windows minus their overlap.
 
 #### Language-Based (`language`)
 - Splitter: `RecursiveCharacterTextSplitter`
@@ -1230,7 +1246,13 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 
 ### 5.3 Minimum Chunk Enforcement
 
-After splitting, any chunk with character count below `min_chunk_size` is merged into the preceding chunk. If it is the first chunk, it is merged into the following chunk. All size parameters throughout the pipeline are in characters.
+Overlap uses the final-window policy and size bound in §5.2. Other strategies
+use a shared merge pass: a chunk below `min_chunk_size` is appended to its
+predecessor with a space when a predecessor exists. A short initial chunk can
+remain short. That shared pass can extend a preceding chunk beyond `chunk_size`;
+context-aware tables and semantic chunks also have no hard size cap. Those
+algorithms are outside the overlap size guarantee. All size parameters throughout
+the pipeline are in characters.
 
 ### 5.4 Embedding and Storage
 
@@ -1763,6 +1785,9 @@ now lives once, in `api/services/ingest_config.py`.
       the fix returned 202 and stored 3,048 chunks before the run was stopped;
       ingest embeds about one chunk per second, so that file takes over an hour.
       A 513 MB sparse file gets 413.*
+
+- [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
+      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
 ### 10.2 Query
 
