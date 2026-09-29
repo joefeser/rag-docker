@@ -982,7 +982,16 @@ class GoldPair(BaseModel):
     status: str
 
 
-class SessionResponse(BaseModel):
+class SessionValidity(BaseModel):
+    stale: bool = False
+    stale_reason: Optional[str] = None
+    stale_at: Optional[str] = None
+    orphaned: bool = False
+    orphaned_reason: Optional[str] = None
+    orphaned_at: Optional[str] = None
+
+
+class SessionResponse(SessionValidity):
     session_id: str
     status: str
     pairs_total: int
@@ -1037,6 +1046,14 @@ class RegenerateRequest(BaseModel):
 class SaveRequest(BaseModel):
     session_id: str
     filename: Optional[str] = None
+    allow_historical: bool = False
+
+    @field_validator("allow_historical", mode="before")
+    @classmethod
+    def _explicit_opt_in(cls, value):
+        if not isinstance(value, bool):
+            raise ValueError("allow_historical must be a boolean")
+        return value
 
 
 class SaveResponse(BaseModel):
@@ -1044,6 +1061,8 @@ class SaveResponse(BaseModel):
     pairs_saved: int
     pairs_excluded: int
     download_url: str
+    historical: bool = False
+    session_validity: SessionValidity = SessionValidity()
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -2772,10 +2791,22 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     out_path.write_text(json.dumps(ragas, indent=2))
 
 
-async def save_session(session_id: str, filename: str | None) -> dict | None:
+async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
         return None
+
+    from models.schemas import SessionValidity
+    if not isinstance(allow_historical, bool):
+        raise ValueError("allow_historical must be a boolean")
+    validity = SessionValidity.model_validate(session).model_dump()
+    historical = validity["stale"] or validity["orphaned"]
+    if historical and not allow_historical:
+        raise GoldStandardError(
+            "HISTORICAL_SESSION",
+            "This retained session is stale or orphaned and is not a current "
+            "collection baseline. Inspect its validity metadata and explicitly "
+            "set allow_historical=true to export historical pairs.", 409)
 
     approved = [p for p in session["pairs"] if p["status"] in ("approved", "edited")]
     excluded = len(session["pairs"]) - len(approved)
@@ -2810,6 +2841,8 @@ async def save_session(session_id: str, filename: str | None) -> dict | None:
         "pairs_saved": len(approved),
         "pairs_excluded": excluded,
         "download_url": f"/api/goldstandard/download/{filename}",
+        "historical": historical,
+        "session_validity": validity,
     }
 ```
 
@@ -4377,8 +4410,10 @@ or vector width changes and Weaviate cannot alter either in place.
 **Safety.** Each rebuild is staged: the new chunks are built into a temporary
 collection first, and the live one is replaced only once that succeeds. Weaviate
 has no rename (see `importer.py`), so the final step copies vectors out of the
-staging collection rather than re-embedding — one embedding pass, not two. A
-failure at any point leaves the original collection untouched.
+staging collection rather than re-embedding — one embedding pass, not two.
+Preparation failures leave the original collection untouched. A failure after
+replacement begins can leave it missing or partial. Identity-changing operations
+flag retained evaluations before replacement; any failed cutover flags them too.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -4497,12 +4532,13 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress) -> int:
+             distance_metric: str | None, progress, before_replace=None) -> int:
     """Stage the new chunks, then swap them into place.
 
     Weaviate embeds during the staging insert. The final insert reuses those
     vectors verbatim, so the corpus is embedded once rather than twice.
     """
+    cutover_started = False
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
@@ -4525,8 +4561,13 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         if progress:
             progress(len(staged))
 
-        # Past this point the original is replaced. Everything that could fail
-        # has already run against the staging collection.
+        # Past this point the original is replaced. Preparation has succeeded,
+        # but deletion, creation or final writes can still fail.
+        # Persist the warning before deletion, so a failed replacement cannot
+        # leave retained pairs claiming to be a current baseline.
+        if before_replace:
+            before_replace()
+        cutover_started = True
         client.collections.delete(collection)
         wc._create_collection_sync(collection, new_index, new_distance, hnsw)
         target = client.collections.get(collection)
@@ -4538,6 +4579,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 raise RuntimeError(
                     f"{batch.number_errors} error(s) writing the rebuilt collection")
         return len(staged)
+    except Exception:
+        if cutover_started:
+            goldstandard.mark_stale(collection, "collection replacement failed after cutover began; retained pairs require historical review")
+        raise
     finally:
         try:
             client.collections.delete(staging)
@@ -4598,7 +4643,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
         job["chunks_total"] = len(properties)
         written = _rebuild(collection, properties,
                            params.get("index_type"), params.get("distance_metric"),
-                           progress)
+                           progress, before_replace=(lambda: goldstandard.mark_stale(collection, reason)) if reason else None)
 
         notes = []
         if reason:
@@ -5316,6 +5361,7 @@ from models.schemas import (
     SaveRequest,
     SaveResponse,
     SessionResponse,
+    SessionValidity,
 )
 from services import goldstandard as gs
 from services import weaviate_client as wc
@@ -5358,6 +5404,7 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        **SessionValidity.model_validate(session).model_dump(),
     )
 
 
@@ -5383,7 +5430,10 @@ async def regenerate(body: RegenerateRequest):
 
 @router.post("/save", response_model=SaveResponse)
 async def save(body: SaveRequest):
-    result = await gs.save_session(body.session_id, body.filename)
+    try:
+        result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if result is None:
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{body.session_id}' not found.")
     return SaveResponse(**result)
@@ -6022,6 +6072,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from utils import api_error
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -6064,6 +6116,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(request, exc):
+    # Invalid settings can include non-finite JSON numbers. Echoing their raw
+    # values in a JSONResponse would raise a serialization error instead of 422.
+    errors = [{key: value for key, value in error.items() if key not in ("input", "ctx")}
+              for error in exc.errors()]
+    return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
 app.add_middleware(
     CORSMiddleware,
@@ -6517,6 +6578,21 @@ export function useQueryConfig() {
 ```typescript
 const BASE = '/api'
 
+// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// It covers a whole request, so a multi-file upload counts every file. Kept
+// here only so the Import page can warn before sending; nginx enforces it.
+// Change both together.
+export const MAX_UPLOAD_MB = 512
+export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+// Errors the proxy answers itself, before the API sees the request. Those
+// arrive as nginx's HTML error pages, not the API's JSON error shape.
+const PROXY_ERRORS: Record<number, string> = {
+  413: `The upload is larger than the ${MAX_UPLOAD_MB} MB limit. Split it into smaller batches.`,
+  502: 'The API is not responding. It may still be starting; try again in a minute.',
+  504: 'The API took too long to respond.',
+}
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -6524,8 +6600,15 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
     headers,
     body: isFormData ? (body as FormData) : body !== undefined ? JSON.stringify(body) : undefined,
   })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data?.error?.message ?? `HTTP ${res.status}`)
+  // Read as text first: calling res.json() on an nginx error page threw a
+  // JSON syntax error, which is what the user saw instead of the real problem.
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
 }
 
@@ -6547,10 +6630,10 @@ export const api = {
   query: (body: QueryBody) => request<QueryResult>('POST', '/query', body),
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
-  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${sessionId}`),
-  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${sessionId}/pair/${pairId}`, body),
+  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
-  saveSession: (body: { session_id: string; filename?: string }) => request<SaveResult>('POST', '/goldstandard/save', body),
+  saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
   downloadUrl: (filename: string) => `${BASE}/goldstandard/download/${filename}`,
 
   // Transfer
@@ -6605,12 +6688,16 @@ export interface GenerateResult { session_id: string; status: string; pairs_tota
 export interface GoldPair {
   pair_id: string; question: string; answer: string; contexts: string[]; ground_truth: string; source_file: string; chunk_index: number; status: string
 }
-export interface Session {
+export interface SessionValidity {
+  stale?: boolean; stale_reason?: string | null; stale_at?: string | null
+  orphaned?: boolean; orphaned_reason?: string | null; orphaned_at?: string | null
+}
+export interface Session extends SessionValidity {
   session_id: string; status: string; pairs_total: number; pairs_attempted?: number
   pairs_completed: number; pairs_failed?: number; pairs: GoldPair[]; collection: string; errors?: string[]
 }
 export interface PatchPairBody { status: string; question?: string; answer?: string; ground_truth?: string }
-export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string }
+export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string; historical?: boolean; session_validity?: SessionValidity }
 export interface LatencyStats { p50: number; p95: number; p99: number }
 export interface LatencyRecord {
   timestamp: string
@@ -7520,7 +7607,12 @@ export default function GoldStandardPage() {
   const [sampleSize, setSampleSize] = useState(20)
   const [session, setSession] = useState<Session | null>(null)
   const [sessionId, setSessionId] = useState('')
+  const [sessionLookup, setSessionLookup] = useState('')
+  const [allowHistorical, setAllowHistorical] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [exportPending, setExportPending] = useState(false)
+  const exportPendingRef = useRef(false)
+  const activeSessionRef = useRef('')
   const [error, setError] = useState('')
   const [filename, setFilename] = useState('')
   const [saveResult, setSaveResult] = useState('')
@@ -7539,26 +7631,50 @@ export default function GoldStandardPage() {
 
   useEffect(() => {
     if (!sessionId) return
+    let active = true
     pollRef.current = setInterval(async () => {
       try {
         const s = await api.getSession(sessionId)
+        if (!active || activeSessionRef.current !== sessionId) return
         setSession(s)
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
         }
       } catch { /* ignore */ }
     }, 2000)
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+    return () => { active = false; if (pollRef.current) clearInterval(pollRef.current) }
   }, [sessionId])
 
+  useEffect(() => {
+    setAllowHistorical(false)
+  }, [sessionId, session?.stale, session?.orphaned, session?.stale_at, session?.orphaned_at])
+
+  async function loadSession() {
+    const id = sessionLookup.trim()
+    if (!id || exportPendingRef.current) return
+    activeSessionRef.current = ''
+    setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
+    setError(''); setSaveResult(''); setLoading(true)
+    try {
+      const loaded = await api.getSession(id)
+      activeSessionRef.current = loaded.session_id
+      setSessionId(loaded.session_id); setSession(loaded); setAllowHistorical(false)
+      setFilename('')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally { setLoading(false) }
+  }
+
   async function generate() {
-    if (session && !confirm('This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?')) return
+    if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
     setLoading(true)
     setSaveResult('')
     try {
       const res = await api.generateGoldStandard({ collection, sample_size: sampleSize })
+      activeSessionRef.current = res.session_id
       setSessionId(res.session_id)
+      setSessionLookup(res.session_id)
       setSession(null)
       const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
       setFilename(`${collection}_${ts}.json`)
@@ -7591,14 +7707,15 @@ export default function GoldStandardPage() {
   }
 
   async function saveExport() {
-    if (!sessionId) return
+    if (!sessionId || exportPendingRef.current || loading) return
+    exportPendingRef.current = true; setExportPending(true); setError(''); setSaveResult('')
     try {
-      const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined })
-      setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.`)
+      const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined, allow_historical: allowHistorical })
+      setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.${res.historical ? " Historical data; not a current collection baseline." : ""}`)
       window.open(api.downloadUrl(res.filename), '_blank')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
-    }
+    } finally { exportPendingRef.current = false; setExportPending(false) }
   }
 
   function openEdit(pair: GoldPair) {
@@ -7622,7 +7739,8 @@ export default function GoldStandardPage() {
   const edited = session?.pairs.filter(p => p.status === 'edited').length ?? 0
   const rejected = session?.pairs.filter(p => p.status === 'rejected').length ?? 0
   const pending = session?.pairs.filter(p => p.status === 'pending').length ?? 0
-  const canExport = approved + edited > 0
+  const historical = Boolean(session?.stale || session?.orphaned)
+  const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -7641,7 +7759,7 @@ export default function GoldStandardPage() {
             <label className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
             <input type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
           </div>
-          <button onClick={generate} disabled={loading} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
+          <button onClick={generate} disabled={loading || exportPending} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
             Generate Pairs
           </button>
         </div>
@@ -7656,7 +7774,25 @@ export default function GoldStandardPage() {
         )}
       </div>
 
+      <div className="bg-white border rounded p-4 mb-6">
+        <label htmlFor="retained-session" className="block text-sm font-semibold mb-2">Inspect a retained session</label>
+        <div className="flex gap-3">
+          <input id="retained-session" disabled={exportPending} value={sessionLookup} onChange={e => setSessionLookup(e.target.value)} placeholder="Session ID" className="border rounded px-3 py-2 text-sm flex-1" />
+          <button onClick={loadSession} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
+        </div>
+        {session && <p className="text-xs text-gray-500 mt-2">Session {session.session_id} · Collection {session.collection}</p>}
+      </div>
+
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
+      {session && historical && (
+        <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
+          <h2 className="font-semibold">Historical evaluation data</h2>
+          <p className="text-sm">These retained pairs are not a current collection baseline. Review them as historical data.</p>
+          {session.stale && <p className="text-sm mt-2">Stale: {session.stale_reason || 'No reason was recorded.'} {session.stale_at && <span>Recorded {session.stale_at}</span>}</p>}
+          {session.orphaned && <p className="text-sm mt-2">Orphaned: {session.orphaned_reason || 'No reason was recorded.'} {session.orphaned_at && <span>Recorded {session.orphaned_at}</span>}</p>}
+        </div>
+      )}
+
 
       {session && session.pairs.length > 0 && (
         <div className="bg-white border rounded p-4 mb-6">
@@ -7695,10 +7831,15 @@ export default function GoldStandardPage() {
       {session && session.pairs.length > 0 && (
         <div className="bg-white border rounded p-4">
           <h2 className="font-semibold mb-3">Phase 3 — Export</h2>
+          {historical && <label className="flex gap-2 items-start text-sm mb-3">
+            <input type="checkbox" checked={allowHistorical} onChange={e => setAllowHistorical(e.target.checked)} />
+            <span>I want to export historical pairs. The RAGAS file does not carry these validity warnings and must not be treated as a current baseline.</span>
+          </label>}
+
           <div className="flex gap-3 items-center">
             <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="filename.json" className="border rounded px-3 py-2 text-sm flex-1" />
-            <button onClick={saveExport} disabled={!canExport} className="bg-green-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-green-700">
-              Export Approved
+            <button onClick={saveExport} disabled={!canExport || exportPending || loading} className="bg-green-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-green-700">
+              {exportPending ? "Exporting…" : historical ? "Export Historical Approved" : "Export Approved"}
             </button>
           </div>
           {saveResult && <p className="text-sm text-green-600 mt-2">{saveResult}</p>}
@@ -8393,6 +8534,11 @@ drive the UI in a real browser.
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
+
+`10_validity.sh` is called by suite05 (and thus all.sh). It runs
+`session_validity.py` inside the disposable API, using an owned real collection,
+synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
+It checks warning metadata, actual deletion marking and explicit historical export.
 
 ## Environment
 
@@ -9651,6 +9797,20 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/10_validity.sh
+
+```bash
+#!/usr/bin/env bash
+# Retained-session validity and explicit historical export, without model calls.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Retained evaluation validity and historical export"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_validity.py)
+check "legacy defaults, real stale/orphan markers, export guard and historical file" $?
+summary
+```
+
 ### scripts/verify/05_transfer.sh
 
 ```bash
@@ -9931,6 +10091,8 @@ check "the help page has no unsubstituted placeholders" $?
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
+bash ./10_validity.sh
+check "retained-session validity acceptance suite" $?
 summary
 ```
 
@@ -9973,6 +10135,146 @@ rc=$?
 drop_collection "$C"
 cleanup_prefixed
 exit $rc
+```
+
+### scripts/verify/session_validity.py
+
+```python
+"""Real backend/session marking and in-process HTTP validity/export acceptance.
+
+Run inside a disposable API: python - < scripts/verify/session_validity.py
+Uses a unique real collection, synthetic pairs and temporary local files. No
+startup sweep or model calls. Only its own collection/session/files are removed.
+"""
+import copy
+import os
+import tempfile
+import uuid
+from unittest.mock import patch
+from fastapi.testclient import TestClient
+from config import settings
+from main import app
+from services import goldstandard as gs, weaviate_client as wc, tuning
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Validity'+uuid.uuid4().hex[:12]
+session_id='gs_'+uuid.uuid4().hex[:8]
+client=TestClient(app)  # Do not run global startup sweeps alongside other tests.
+creation_attempted=False
+with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.object(settings,'upload_dir',directory):
+    try:
+        creation_attempted=True
+        response=client.post('/collections',json={'name':collection})
+        assert response.status_code==201,response.text
+        print('PASS unique real backend collection created',flush=True)
+        pairs=[{'pair_id':'validity_pair','question':'Inert question','answer':'Inert answer',
+            'contexts':['Inert retained context'],'ground_truth':'Inert truth','source_file':'inert.txt',
+            'chunk_index':0,'status':'approved'}]
+        session={'session_id':session_id,'collection':collection,'status':'completed',
+            'pairs_total':1,'pairs_completed':1,'pairs':pairs}
+        gs.store_session(session)
+        response=client.get('/goldstandard/session/'+session_id)
+        assert response.status_code==200,response.text
+        assert not response.json()['stale'] and not response.json()['orphaned']
+        assert response.json()['pairs']==pairs
+        print('PASS legacy defaults and retained pairs reach HTTP response',flush=True)
+        for option in ({},{'allow_historical':False},{'allow_historical':True}):
+            response=client.post('/goldstandard/save',json={'session_id':session_id,'filename':'current.json',**option})
+            assert response.status_code==200 and not response.json()['historical'],response.text
+        print('PASS current/legacy export keeps default and explicit choices',flush=True)
+        for value in (1,0,'true','false',None,[],{}):
+            response=client.post('/goldstandard/save',json={'session_id':session_id,'allow_historical':value})
+            assert response.status_code==422,response.text
+        for value in ('NaN','Infinity','-Infinity'):
+            response=client.post('/goldstandard/save',content='{"session_id":"'+session_id+'","allow_historical":'+value+'}',headers={'Content-Type':'application/json'})
+            assert response.status_code==422 and response.json()['error']['code']=='INVALID_PARAMETER',response.text
+        print('PASS live HTTP choices reject bool coercion and nonfinite inputs',flush=True)
+        assert client.get('/goldstandard/session/gs_00000000').status_code==404
+        assert client.post('/goldstandard/save',json={'session_id':'gs_00000000','allow_historical':True}).status_code==404
+        print('PASS unknown lookup/export remain404',flush=True)
+        assert gs.mark_stale(collection,'Synthetic chunk-identity change')==1
+        response=client.get('/goldstandard/session/'+session_id)
+        assert response.json()['stale'] and response.json()['stale_reason']=='Synthetic chunk-identity change'
+        assert response.json()['stale_at']
+        print('PASS real persistence marker reason/timestamp reach HTTP response',flush=True)
+        response=client.post('/goldstandard/save',json={'session_id':session_id})
+        assert response.status_code==409 and response.json()['error']['code']=='HISTORICAL_SESSION',response.text
+        print('PASS stale export is refused without explicit choice',flush=True)
+        empty_id='gs_'+uuid.uuid4().hex[:8]
+        empty={**session,'session_id':empty_id,'pairs':[],'pairs_total':0,'pairs_completed':0,
+               'stale':True,'stale_reason':'Synthetic empty historical fixture','stale_at':gs.get_session(session_id)['stale_at']}
+        gs.store_session(empty)
+        response=client.get('/goldstandard/session/'+empty_id)
+        assert response.status_code==200 and response.json()['stale'] and response.json()['pairs']==[],response.text
+        print('PASS empty retained history carries warning metadata through HTTP',flush=True)
+        response=client.delete('/collections/'+collection+'?confirm=true')
+        assert response.status_code==200,response.text
+        creation_attempted=False
+        response=client.get('/goldstandard/session/'+session_id)
+        historical=response.json()
+        assert response.status_code==200 and historical['orphaned'] and historical['orphaned_reason'] and historical['orphaned_at']
+        assert historical['stale'] and historical['pairs']==pairs
+        refused=client.post('/goldstandard/save',json={'session_id':session_id,'allow_historical':False})
+        assert refused.status_code==409 and refused.json()['error']['code']=='HISTORICAL_SESSION',refused.text
+        print('PASS actual collection deletion forwards orphan warning without deleting history',flush=True)
+        before=copy.deepcopy(gs.get_session(session_id))
+        response=client.post('/goldstandard/save',json={'session_id':session_id,'allow_historical':True,'filename':'historical.json'})
+        assert response.status_code==200,response.text
+        exported=response.json()
+        assert exported['historical'] and exported['session_validity']['stale'] and exported['session_validity']['orphaned']
+        download=client.get('/goldstandard/download/'+exported['filename'])
+        assert download.status_code==200,download.text
+        rows=download.json()
+        assert len(rows)==1 and set(rows[0])=={'question','answer','contexts','ground_truth'}
+        assert gs.get_session(session_id)==before
+        print('PASS explicit historical export retains RAGAS fields and original history',flush=True)
+        # Exercise the real destructive boundary with supplied vectors and an
+        # injected final-create fault. No model contact or global fixture sweep.
+        response=client.post('/collections',json={'name':collection})
+        assert response.status_code==201,response.text
+        creation_attempted=True
+        fault_id='gs_'+uuid.uuid4().hex[:8]
+        gs.store_session({'session_id':fault_id,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':copy.deepcopy(pairs)})
+        assert not client.get('/goldstandard/session/'+fault_id).json()['stale']
+        real_create=wc._create_collection_sync
+        def fail_final_create(name,*args,**kwargs):
+            if name==collection:
+                assert not wc._collection_exists_sync(collection)
+                raise RuntimeError('Owned synthetic final-create fault')
+            return real_create(name,*args,**kwargs)
+        def insert_supplied(name,properties):
+            target=wc.get_client().collections.get(name)
+            for properties_row in properties:
+                target.data.insert(properties=properties_row,vector=[0.125]*768)
+        with patch.object(wc,'_create_collection_sync',side_effect=fail_final_create), patch.object(wc,'_insert_chunks_sync',side_effect=insert_supplied):
+            try:
+                tuning._rebuild(collection,[{'content':'Owned inert chunk','source_file':'inert.txt','chunk_index':0}],None,None,None)
+                raise AssertionError('Expected final-create fault')
+            except Exception as error:  # Recovery-enabled rebuilds wrap this fault.
+                assert 'Owned synthetic final-create fault' in str(error),str(error)
+        fault=client.get('/goldstandard/session/'+fault_id)
+        assert fault.status_code==200 and fault.json()['stale'] and fault.json()['stale_at'],fault.text
+        assert 'cutover' in fault.json()['stale_reason']
+        refused=client.post('/goldstandard/save',json={'session_id':fault_id})
+        assert refused.status_code==409 and refused.json()['error']['code']=='HISTORICAL_SESSION',refused.text
+        print('PASS actual failed reindex cutover marks retained history and blocks default export',flush=True)
+        creation_attempted=False
+
+    finally:
+        if creation_attempted and wc._collection_exists_sync(collection):
+            response=client.delete('/collections/'+collection+'?confirm=true')
+            assert response.status_code==200,response.text
+        # Recovery-enabled source combinations may retain a verified stage.
+        # Only this helper's unique collection prefix authorizes its cleanup.
+        for name in wc.get_client().collections.list_all(simple=True):
+            if name.startswith(collection+'__'):
+                wc.get_client().collections.delete(name)
+        gs._sessions.pop(session_id,None)
+        if 'empty_id' in locals():gs._sessions.pop(empty_id,None)
+        if 'fault_id' in locals():gs._sessions.pop(fault_id,None)
+        wc.close_client()
+assert not wc._collection_exists_sync(collection)
+wc.close_client()
+print('PASS owned collection/session/files removed',flush=True)
 ```
 
 ### scripts/verify/browser/Dockerfile
@@ -10106,6 +10408,56 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── owned historical UI fixtures (no persistent backend state) ────────────
+  r.section('retained-session UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const suffix = require('crypto').randomBytes(4).toString('hex');
+    const emptyId = 'gs_' + suffix, currentId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const missingId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const common = { collection: 'OwnedHistoricalBrowserFixture', status: 'completed', pairs_total: 0, pairs_completed: 0, pairs: [] };
+    let exports = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/goldstandard/session/' + emptyId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: emptyId, stale: true, stale_reason: 'Synthetic empty history', stale_at: '2026-09-28T00:00:00+00:00', orphaned: true, orphaned_reason: 'Synthetic deleted fixture', orphaned_at: '2026-09-28T00:01:00+00:00' }) });
+      }
+      if (path === '/api/goldstandard/session/' + currentId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: currentId, pairs_total: 1, pairs_completed: 1, pairs: [{ pair_id: 'fixture', question: 'Owned synthetic question', answer: 'Inert', contexts: ['Inert'], ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: 0, status: 'approved' }] }) });
+      }
+      if (path === '/api/goldstandard/session/' + missingId) {
+        return request.respond({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SESSION_NOT_FOUND', message: 'Unknown fixture session.' } }) });
+      }
+      if (path === '/api/goldstandard/save') {
+        exports++; await sleep(500);
+        return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Synthetic export failure.' } }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/goldstandard', { waitUntil: 'networkidle2' });
+      async function load(id) {
+        await s.page.evaluate(value => { const input = document.getElementById('retained-session'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value); input.dispatchEvent(new Event('input', { bubbles: true })); }, id);
+        await sleep(100); await clickByText(s.page, 'Load / refresh session'); await sleep(200);
+      }
+      await load(emptyId);
+      const empty = await bodyText(s.page);
+      r.check('empty historical session keeps stale/orphaned reasons and timestamps visible', /Historical evaluation data/.test(empty) && /Synthetic empty history/.test(empty) && /Synthetic deleted fixture/.test(empty) && /2026-09-28T00:00/.test(empty));
+      r.check('empty historical session has no pair-dependent export button', await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b => /Export.*Approved/.test(b.textContent))));
+      await load(currentId);
+      r.check('legacy current fixture remains exportable without warning', await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && !document.querySelector('[role=alert]'); }));
+      await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); b.click(); b.click(); });
+      await sleep(100);
+      r.check('an export in flight indicates progress and is disabled', await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Exporting…'); return b && b.disabled; }));
+      await sleep(700);
+      r.check('duplicate clicks issue one export and failure clears pending state', exports===1 && await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && document.body.innerText.includes('Synthetic export failure.'); }));
+      await load(missingId);
+      r.check('a failed retained lookup clears prior pairs and export controls', /Unknown fixture session/.test(await bodyText(s.page)) && await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b=>/Export.*Approved/.test(b.textContent)) && !document.body.innerText.includes('Owned synthetic question')));
+      r.check('historical UI fixtures cause no React page errors', !s.errors.some(error=>error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); } // All synthetic responses/context owned here.
+  }
+
   // ── role gating ────────────────────────────────────────────────────────────
   r.section('§10.4 role gating');
   {
@@ -10191,6 +10543,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       r.check('a wrong name sends no DELETE',
               s.api.filter(x => x.method === 'DELETE').length === before);
     }
+    await s.ctx.close();
+  }
+
+  // ── upload size limit ──────────────────────────────────────────────────────
+  // The Import page refuses a selection over the proxy's limit before sending.
+  // The file is sparse: it reports 513 MB but occupies no disk, and the check
+  // must stop it before the browser ever reads it. See issue #21.
+  r.section('upload size limit');
+  {
+    const fs = require('fs');
+    const big = '/tmp/vfy-oversize-upload.txt';
+    fs.closeSync(fs.openSync(big, 'w'));
+    fs.truncateSync(big, 513 * 1024 * 1024);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const hint = await bodyText(s.page);
+    r.check('the drop zone states the upload limit', hint.includes('up to 512 MB per upload'));
+    const input = await s.page.$('#file-input');
+    await input.uploadFile(big);
+    await sleep(500);
+    const posts = () => s.api.filter(x => x.method === 'POST' && x.url.includes('/ingest/upload')).length;
+    const before = posts();
+    const clicked = await clickByText(s.page, 'Start Ingest');
+    await sleep(900);
+    const text = await bodyText(s.page);
+    r.check('an oversize selection is refused with the limit named',
+            clicked && text.includes('one upload can be at most 512 MB'),
+            clicked ? text.slice(0, 160) : 'Start Ingest button not found');
+    r.check('an oversize selection sends no upload', posts() === before);
+    r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    fs.unlinkSync(big);
     await s.ctx.close();
   }
 

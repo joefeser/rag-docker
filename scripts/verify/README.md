@@ -49,6 +49,11 @@ drive the UI in a real browser.
 | `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 
+`10_validity.sh` is called by suite05 (and thus all.sh). It runs
+`session_validity.py` inside the disposable API, using an owned real collection,
+synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
+It checks warning metadata, actual deletion marking and explicit historical export.
+
 ## Environment
 
 | Variable | Default | Effect |

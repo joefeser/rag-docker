@@ -275,4 +275,6 @@ check "the help page has no unsubstituted placeholders" $?
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
+bash ./10_validity.sh
+check "retained-session validity acceptance suite" $?
 summary

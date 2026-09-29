@@ -512,6 +512,8 @@ collection `stale`, recording why and when. Sessions are not deleted and are not
 remapped: a wrong remap corrupts an evaluation baseline silently, which is worse
 than an honest stale flag.
 
+For identity-changing rebuilds, persist the flag after preparation succeeds but before deleting the live collection. A failure after cutover begins also marks history stale, including a failed reindex whose original collection may be missing or partial. A successful identity-preserving reindex keeps its existing validity semantics. This request-time validity barrier is separate from session persistence concurrency and durable collection recovery.
+
 Changing only the index type or distance metric does **not** change chunk
 identity, and MUST NOT mark sessions stale.
 
