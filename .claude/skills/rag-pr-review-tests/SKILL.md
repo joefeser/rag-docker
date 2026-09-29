@@ -31,7 +31,7 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
    - Run the suites for the changed areas, then `bash scripts/verify/all.sh`. Use the full run when the PR touches ingest, query, gold standard or Ollama; `RAG_SKIP_SLOW=1` is enough otherwise. Add `RAG_ALLOW_RESTART=1` when the issue concerns restart behaviour.
    - For a bug fix, run the new tests on the base as well, to show they fail there. The base is `develop` at the develop SHA the coordinator gave you: `git worktree add --detach <bundle>/base <develop-sha>`, build and start the stack from it as above. Restore the stack (below) before you remove that worktree.
    - A check that fails may be re-run once; see "Flaky failures" below.
-   - **Always** restore the stack to `develop` afterwards, as "Restoring the stack" in `reference.md` describes, and confirm every service is healthy. Only then remove any worktree the stack ran from.
+   - **Always** restore the stack to `develop` afterwards, as "Restoring the stack" in `reference.md` describes, and confirm every service is healthy. Only then remove a `base/` worktree you created. Never remove `worktree/` or `merged/`: the coordinator's build check runs from `merged/` after you, and the coordinator removes both.
 5. **Loop.** Follow the review loop in `reference.md` until every T is covered and has been run.
 
 ## Severity guidance

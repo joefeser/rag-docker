@@ -178,7 +178,7 @@ Either way, afterwards restore the stack to `develop` as "Restoring the stack" i
    | not run / not concluded | `error` |
 
    Then set the overall `rag-pr-review` status to `success` for READY TO MERGE or `failure` for NOT READY, with `-f target_url=<recap review URL>`.
-5. **Clean up:** remove both worktrees with `git worktree remove --force <bundle>/worktree` and `git worktree remove --force <bundle>/merged`. The evaluated commit was never on a branch, so git discards it in time.
+5. **Clean up,** only if the restore's mount check passed ("Restoring the stack" in `reference.md`): remove both worktrees with `git worktree remove --force <bundle>/worktree` and `git worktree remove --force <bundle>/merged`. The evaluated commit was never on a branch, so git discards it in time. If the restore failed, the stack is stopped and the worktrees stay.
 
 ### 10. Report to the user
 

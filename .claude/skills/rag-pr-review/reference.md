@@ -118,10 +118,18 @@ notes: <anything the coordinator must know>
 
 The stack bind-mounts files from the folder it was started in: `./exports` (export packages), `proxy/nginx.conf` and `ollama/entrypoint.sh`. So it must always end up started from a folder that stays: the main checkout. A stack started from a bundle worktree that is then removed keeps running on deleted files, and exports land in a folder nobody will see.
 
-1. Check that the main checkout (the repository root this skill was loaded from) is on `develop`, clean, and at `origin/develop` after `git fetch origin develop`. If it isn't, stop and tell the user; don't switch its branch yourself.
-2. From the main checkout: `docker compose -p rag-docker build`, then `docker compose -p rag-docker up -d --force-recreate`.
-3. Check the mounts point at the main checkout: `docker inspect rag-docker-api-1 --format '{{range .Mounts}}{{.Source}} {{end}}'` must show its `exports` folder, not a bundle path.
-4. Only then remove bundle worktrees.
+1. **Find the main checkout:** the first `worktree` line of `git worktree list --porcelain`.
+2. **Check it:** `git fetch origin develop`. It must be on `develop` with no uncommitted changes. If it's only behind `origin/develop`, fast-forward it (`git merge --ff-only origin/develop`). Never switch its branch or discard changes yourself.
+3. **Restart from it:** `docker compose -p rag-docker build`, then `docker compose -p rag-docker up -d --force-recreate`, then the smoke checks.
+4. **Check the mounts** of all three containers that bind-mount files. Each source must be under the main checkout (Docker Desktop may prefix it with `/host_mnt`), never a bundle path:
+
+   ```bash
+   for c in api proxy ollama; do docker inspect rag-docker-$c-1 --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}'; done
+   ```
+
+5. **Only then** remove worktrees, and only your own: the testing reviewer removes a `base/` worktree it created, never `worktree/` or `merged/`, which the coordinator still needs for the build check and removes itself in step 9.
+
+**If step 2, 3 or 4 fails** (the main checkout is on another branch or has changes, the build fails, or a mount points outside the main checkout), don't leave the evaluated code running: stop the stack with `docker compose -p rag-docker down` (never `-v`: the volumes hold the data), tell the user the stack is stopped and why, and keep every bundle worktree. For a cross-repository PR, the evaluated code is the contributor's, and the go-ahead covered running it only for the evaluation.
 
 While an evaluation is running, the maintainer's own work goes in a separate worktree, never on a branch in the main checkout.
 
