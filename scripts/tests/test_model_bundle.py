@@ -296,6 +296,92 @@ class ImporterModelIntegrityTests(BundleFixture):
         self.assertFalse(models.supports_name('someone/model'))
         self.assertTrue(models.supports_name('phi3.5:3.8b'))
 
+    # The two #81 scenarios exactly as the issue states them, patching only what
+    # exists on develop too, so each fails there for the reported reason.
+    def unbundled_package(self):
+        pkg = self.root / 'unbundled'
+        pkg.mkdir()
+        return pkg
+
+    def ensure_real(self, pkg, llm_model, tags=frozenset(), tags_error=None):
+        from services import importer, ollama_client
+        (self.store / 'models').mkdir(parents=True, exist_ok=True)
+
+        async def list_models():
+            if tags_error:
+                raise tags_error
+            return set(tags)
+        with patch.object(settings, 'embed_model', self.model), \
+             patch.object(settings, 'llm_model', llm_model), \
+             patch.object(ollama_client, 'list_models', list_models, create=True):
+            return importer._ensure_models(pkg, {'embedding': {'model': self.model}})
+
+    def test_namespaced_llm_with_unbundled_package_completes_with_a_note(self):
+        models.install_model(self.pkg, self.model)
+        notes = self.ensure_real(self.unbundled_package(), 'someone/assistant')
+        self.assertTrue(any("'someone/assistant' is absent" in note for note in notes), notes)
+        self.assertTrue(any('already present' in note for note in notes), notes)
+
+    def test_corrupt_installed_embedding_with_unbundled_package_is_integrity_failure(self):
+        from services.packager import PackageError
+        self.install_then_corrupt()
+        manifest = models.manifest_path(self.model).read_bytes()
+        with self.assertRaises(PackageError) as caught:
+            self.ensure_real(self.unbundled_package(), self.model)
+        self.assertEqual(caught.exception.code, 'MODEL_INTEGRITY_FAILED')
+        self.assertIn('re-pull', str(caught.exception))
+        self.assertEqual(caught.exception.detail, {'model': 'review-model'})
+        self.assertEqual(models.manifest_path(self.model).read_bytes(), manifest)
+        self.assertEqual(models.blob_path(self.digests[1]).read_bytes(), b'corrupt installed inert bytes')
+
+    def test_ollama_reports_defaults_the_tag_and_matches_exactly(self):
+        from services import importer, ollama_client
+        tags = {'someone/embedder:latest', 'hf.co/org/model:Q4_K_M', 'registry:5000/team/m:latest'}
+
+        async def list_models():
+            return tags
+        with patch.object(ollama_client, 'list_models', list_models):
+            self.assertTrue(importer._ollama_reports('someone/embedder'))
+            self.assertTrue(importer._ollama_reports('someone/embedder:latest'))
+            self.assertTrue(importer._ollama_reports('hf.co/org/model:Q4_K_M'))
+            self.assertTrue(importer._ollama_reports('registry:5000/team/m'))
+            self.assertFalse(importer._ollama_reports('someone/embedder:v2'))
+            self.assertFalse(importer._ollama_reports('hf.co/org/model'))
+
+    def test_namespaced_embedding_when_ollama_is_unreachable_says_so(self):
+        from services.packager import PackageError
+        from services import importer
+        models.install_model(self.pkg, self.model)
+        with self.assertRaises(PackageError) as caught, \
+             patch.object(settings, 'embed_model', 'someone/embedder'), \
+             patch.object(settings, 'llm_model', self.model):
+            from services import ollama_client
+
+            async def down():
+                raise OSError('connection refused')
+            (self.store / 'models').mkdir(parents=True, exist_ok=True)
+            with patch.object(ollama_client, 'list_models', down):
+                importer._ensure_models(self.unbundled_package(), {'embedding': {'model': 'someone/embedder'}})
+        # Not EMBEDDING_MODEL_MISSING: the model may well be there (#85).
+        self.assertEqual(caught.exception.code, 'IMPORT_FAILED')
+        self.assertIn("Couldn't reach Ollama", str(caught.exception))
+        self.assertIn('someone/embedder', str(caught.exception))
+
+    def test_symlinked_manifest_path_is_corrupt_not_an_import_error(self):
+        models.install_model(self.pkg, self.model)
+        mp = models.manifest_path(self.model)
+        elsewhere = self.root / 'elsewhere'
+        mp.rename(elsewhere)
+        mp.symlink_to(elsewhere)
+        self.assertEqual(models.installed_state(self.model), 'corrupt')
+        self.assertFalse(models.is_installed(self.model))
+
+    def test_unreadable_installed_manifest_is_corrupt_not_absent(self):
+        models.install_model(self.pkg, self.model)
+        models.manifest_path(self.model).write_text('{not json')
+        self.assertEqual(models.installed_state(self.model), 'corrupt')
+        self.assertFalse(models.is_installed(self.model))
+
 
 class InterruptedPublicationTests(BundleFixture):
     """A killed installer must not leave copies accumulating in the live blob store."""
