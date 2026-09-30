@@ -18,6 +18,8 @@ trap cleanup EXIT
 # Borrow lib.sh's check/check_eq/skip/section/summary helpers without taking
 # the real lock: point RAG_VERIFY_LOCK at a scratch path first, then drop what
 # sourcing it acquired so the tests below start from a clean slate.
+# The lock a real verify run uses; T5 takes it.
+REAL_LOCK="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}"
 export RAG_VERIFY_LOCK="$TESTLOCK_HOME/harness.lock"
 # shellcheck disable=SC1091
 . "$VERIFY/lib.sh"
@@ -93,24 +95,30 @@ check "T4: the pid file is rewritten with the new holder's pid" "$?" "old=$dead_
 # --- T5: 01_infrastructure.sh sets its own EXIT trap after lock.sh's, so it
 # releases the lock itself; a standalone run must leave no lock behind, and a
 # next run must go ahead. Needs a live stack, and runs the real 01 (which
-# drops Vfy* collections), so it's skipped while a real verify run holds
-# /tmp/rag-verify.lock.
+# drops Vfy* collections), so it holds the real verify lock throughout: it is
+# skipped while a real verify run holds it, and a run started during T5 waits
+# for it instead of losing its collections.
 section "verify/lock.sh vs. 01_infrastructure.sh's own EXIT trap"
 API="${RAG_API:-http://localhost:8080/api}"
 health_code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
-real_holder=$(cat /tmp/rag-verify.lock/pid 2>/dev/null || true)
+L5="$TESTLOCK_HOME/t5.lock"
+T5_OUT="$TESTLOCK_HOME/t5.out"
 if [ "$health_code" != "200" ]; then
   skip "T5: 01_infrastructure.sh EXIT-trap interaction" "no live stack at $API (HTTP $health_code)"
-elif [ -n "$real_holder" ] && kill -0 "$real_holder" 2>/dev/null; then
-  skip "T5: 01_infrastructure.sh EXIT-trap interaction" "a real verify run (pid $real_holder) is using the stack"
 else
-  L5="$TESTLOCK_HOME/t5.lock"
-  T5_OUT="$TESTLOCK_HOME/t5.out"
-  # 01 inspects the stack's containers through compose, which would otherwise
-  # name the project after whatever folder this checkout is in.
-  RAG_VERIFY_LOCK="$L5" RAG_API="$API" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-rag-docker}" \
-    bash "$VERIFY/01_infrastructure.sh" >"$T5_OUT" 2>&1
-  rc5=$?
+  # The outer shell takes the real lock, then runs 01 as a standalone suite on
+  # its own scratch lock. 01 inspects the stack's containers through compose,
+  # which would otherwise name the project after whatever folder this is in.
+  held5=$(RAG_VERIFY_LOCK="$REAL_LOCK" RAG_API="$API" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-rag-docker}" \
+    bash -c '. "'"$VERIFY"'/lock.sh" 2>/dev/null
+      echo held
+      env -u RAG_VERIFY_LOCK_HELD RAG_VERIFY_LOCK="'"$L5"'" bash "'"$VERIFY"'/01_infrastructure.sh" >"'"$T5_OUT"'" 2>&1
+      echo "rc=$?"')
+fi
+if [ "$health_code" = "200" ] && [ "$held5" = "${held5#held}" ]; then
+  skip "T5: 01_infrastructure.sh EXIT-trap interaction" "a real verify run holds $REAL_LOCK"
+elif [ "$health_code" = "200" ]; then
+  rc5=${held5##*rc=}
   [ "$rc5" = 0 ]
   check "T5: 01_infrastructure.sh run standalone completes" "$?" "exit $rc5; see $T5_OUT"
   [ ! -e "$L5" ]
@@ -236,5 +244,42 @@ RAG_VERIFY_LOCK="$L11" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' >/dev/null 2>
 check_eq "T11: a non-numeric pid is refused with exit 3" "$?" "3"
 [ "$(cat "$L11/pid" 2>/dev/null)" = "not-a-pid" ]
 check "T11: and the lock is left as it was" "$?"
+
+# --- T12: a lock whose pid can't be written is removed and refused. -------
+# umask 222 makes the just-created lock directory unwritable to its own owner,
+# so the pid write fails without racing anything. (Written by the #105
+# testing reviewer.)
+L12="$TESTLOCK_HOME/t12.lock"
+out12=$(umask 222; RAG_VERIFY_LOCK="$L12" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' 2>&1)
+rc12=$?
+check_eq "T12: a lock whose pid can't be written exits 3" "$rc12" "3"
+case "$out12" in *ran*) leaked12=1 ;; *) leaked12=0 ;; esac
+check "T12: the run is refused, never proceeds" "$leaked12" "output: $out12"
+[ ! -e "$L12" ]
+check "T12: the unwritable lock directory is removed, not left pid-less" "$?" "expected $L12 to be gone"
+
+# --- T13: an earlier EXIT trap whose command contains quotes still runs. ---
+# T9's trap text has no quote in it; here the stored command itself does, and
+# the path has a space, which is why such traps quote it.
+L13="$TESTLOCK_HOME/t13.lock"; M13="$TESTLOCK_HOME/t13 marker"
+out13=$(RAG_VERIFY_LOCK="$L13" M13="$M13" bash -c 'trap "touch '\''$M13'\''; echo \"it'\''s done\"" EXIT; . "'"$VERIFY"'/lock.sh"; echo "args:$*"' _ one two 2>&1)
+[ -e "$M13" ]
+check "T13: an earlier EXIT trap with quotes in its command still runs" "$?" "output: $out13"
+case "$out13" in *"it's done"*) ok13=0 ;; *) ok13=1 ;; esac
+check "T13: all of that trap's command runs" "$ok13" "output: $out13"
+case "$out13" in *"args:one two"*) args13=0 ;; *) args13=1 ;; esac
+check "T13: the sourcing script's own arguments are left alone" "$args13" "output: $out13"
+[ ! -e "$L13" ]
+check "T13: and the lock is still released" "$?"
+
+# --- T14: a pid-less lock younger than a minute is waited on, not taken. ---
+# (The same age check is repeated under the takeover mutex, for a fresh lock
+# made in place of an old one between the two checks; that race isn't
+# reproducible here without a test hook in lock.sh.)
+L14="$TESTLOCK_HOME/t14.lock"; mkdir "$L14"
+RAG_VERIFY_LOCK="$L14" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' >/dev/null 2>&1
+rc14=$?
+[ "$rc14" != 0 ] && [ -d "$L14" ] && [ ! -e "$L14/pid" ]
+check "T14: a fresh pid-less lock is left alone" "$?" "exit $rc14"
 
 summary
