@@ -8611,6 +8611,7 @@ drive the UI in a real browser.
 |---|---|
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
+| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
@@ -8719,6 +8720,8 @@ Run `python3 scripts/tests/test_loopback_verification.py` from the repository ro
 set -uo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
+# One run at a time: the fixtures rebuilt below are shared (#95).
+. ./lock.sh
 
 API="${RAG_API:-http://localhost:8080/api}"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -8791,6 +8794,9 @@ exit "$overall"
 # more than once.
 
 set -uo pipefail
+
+# One verify run at a time; see lock.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lock.sh"
 
 API="${RAG_API:-http://localhost:8080/api}"
 # Collections and packages created by the suites all carry this prefix so
@@ -8889,6 +8895,90 @@ summary() {
   fi
   return 0
 }
+```
+
+### scripts/verify/lock.sh
+
+```bash
+#!/usr/bin/env bash
+# One verify run at a time against a stack.
+#
+# Sourced by all.sh and lib.sh, never executed. Every run shares the $PREFIX
+# collection names, the /tmp/vfy_*.json scratch files and the fixtures folder,
+# which all.sh deletes and rebuilds when it starts. Two runs at once overwrite
+# each other: one run's upload finds its fixture gone, or its chunks land in the
+# other run's recreated collection (#95).
+#
+# The first script to source this holds the lock for its whole process tree:
+# it exports RAG_VERIFY_LOCK_HELD, so the suites all.sh starts don't try again.
+#
+# The lock is a directory holding a pid file. mkdir is atomic, so only one run
+# can create it. A lock whose holder has died is taken over, but only under a
+# second mutex ($lock.takeover, also a mkdir) and only if the pid is still the
+# dead one, so of several runs that find the same stale lock, exactly one clears
+# it and the rest retry. A lock with no pid file yet is treated as held: its
+# owner is between mkdir and writing the pid.
+# The lock is only ever removed file by file (pid, then rmdir), never with
+# rm -rf, because its path can come from the environment.
+
+_rag_lock_release() {
+  [ -n "${RAG_VERIFY_LOCK:-}" ] || return 0
+  [ "$(cat "$RAG_VERIFY_LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$RAG_VERIFY_LOCK/pid"
+  rmdir "$RAG_VERIFY_LOCK" 2>/dev/null || true
+}
+
+_rag_lock_acquire() {
+  local lock="$1" holder stale tries=0
+  if [ -L "$lock" ]; then
+    printf '\nThe verify lock %s is a symlink; refusing to use it.\n\n' "$lock" >&2
+    return 3
+  fi
+  while [ "$tries" -lt 50 ]; do
+    tries=$((tries + 1))
+    if mkdir "$lock" 2>/dev/null; then
+      echo $$ > "$lock/pid.$$" && mv "$lock/pid.$$" "$lock/pid"
+      return 0
+    fi
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    if [ -z "$holder" ]; then
+      # Just created by another run that hasn't written its pid yet.
+      sleep 0.1; continue
+    fi
+    if kill -0 "$holder" 2>/dev/null; then
+      printf '\nAnother verify run (pid %s) is using this machine. Wait for it to finish.\n\n' "$holder" >&2
+      return 3
+    fi
+    # Stale. Only one run may take it over, so take a second, short-lived
+    # mutex first, and re-read the pid under it: another run may already have
+    # replaced the stale lock with a live one.
+    if mkdir "$lock.takeover" 2>/dev/null; then
+      if [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$holder" ]; then
+        rm -f "$lock/pid" "$lock"/pid.* 2>/dev/null
+        rmdir "$lock" 2>/dev/null || true
+      fi
+      rmdir "$lock.takeover" 2>/dev/null || true
+    else
+      # Another run is taking it over. A takeover mutex older than a minute
+      # belongs to a run that died mid-takeover.
+      if [ -n "$(find "$lock.takeover" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        rmdir "$lock.takeover" 2>/dev/null || true
+      fi
+      sleep 0.1
+    fi
+  done
+  printf '\nCould not take the verify lock %s.\n\n' "$lock" >&2
+  return 3
+}
+
+if [ -z "${RAG_VERIFY_LOCK_HELD:-}" ]; then
+  RAG_VERIFY_LOCK="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}"
+  _rag_lock_acquire "$RAG_VERIFY_LOCK" || exit 3
+  export RAG_VERIFY_LOCK_HELD=1
+  # Released on exit. A suite that sets its own EXIT trap replaces this one;
+  # the lock is then taken over by the next run, because its pid is gone.
+  trap _rag_lock_release EXIT
+fi
 ```
 
 ### scripts/verify/08_overlap.sh
