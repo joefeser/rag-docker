@@ -16,6 +16,8 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
+# One run at a time: the fixtures rebuilt below are shared (#95).
+. ./lock.sh
 
 API="${RAG_API:-http://localhost:8080/api}"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
