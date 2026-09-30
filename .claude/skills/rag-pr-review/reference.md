@@ -213,6 +213,10 @@ One GitHub review with `event: COMMENT` on the reviewed commit. Never use `APPRO
 **Blocking (High):**
 - <check> — <path:line> — <one line>
 
+<only when Tests scored a check as flaky or environmental>
+**Failed here, scored as flaky or environmental (the maintainer can overrule):**
+- <check> — <path:line> — <failed once, passed on re-run | failed twice, passed on `develop`>
+
 <only for a PR by `joefeser`, see "Maintainer follow-ups" below>
 **Medium and Low findings:** the maintainer will fix these in a follow-up PR after this one merges. You don't need to change anything for them.
 
