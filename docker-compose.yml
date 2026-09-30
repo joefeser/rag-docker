@@ -75,7 +75,7 @@ services:
       OLLAMA_MODELS_DIR: /ollama
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
-      RECOMMENDED_MEMORY_GB: 10
+      RECOMMENDED_MEMORY_GB: 12
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.
