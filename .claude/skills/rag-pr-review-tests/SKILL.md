@@ -37,27 +37,24 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
 ## Severity guidance
 
 - **High:** a test fails; an issue requirement has no test; a bug-fix test doesn't fail on the base, so it proves nothing; the suite can't run on the evaluated commit.
-- **Medium:** a boundary or error path from the diff is untested; tests leave resources behind; a check was flaky (it failed, then passed on its one re-run).
+- **Medium:** a boundary or error path from the diff is untested; tests leave resources behind; a check outside the PR was flaky or environmental (see "Flaky failures").
 - **Low:** clearer assertion messages, extra cases for unlikely inputs.
 
 ## Flaky failures
 
-Some checks fail for reasons outside the PR: the LLM runs on CPU, and its replies vary. One evaluation per commit means a failure can't be retried later, so decide it within this run.
+Some checks fail for reasons outside the PR: the LLM runs on CPU and its replies vary, and a busy stack can drop a request. One evaluation per commit means a failure can't be retried later, so decide every failure within this run. **Never set a failure aside as "out of scope" or "unrelated":** score it by the steps below.
 
-**Re-run a failing check once, in this evaluation,** when both of these are true:
-1. **The failure is one of these:**
-   - an LLM timeout (for example `httpx.ReadTimeout` in the API logs for that request);
-   - an empty or non-JSON LLM reply;
-   - a browser-harness navigation timeout;
-   - the answer-length check in `03_query.sh`, which compares mean answer lengths. Re-run it with `RAG_FORMAT_TRIALS=9` (documented in `scripts/verify/README.md`): more trials make the mean steadier.
-2. **The PR doesn't change what failed:** neither the failing check's own lines nor the code path it asserts on. Changes elsewhere in the same suite file don't count. For example, a generation timeout doesn't qualify on a PR that changes generation in `goldstandard.py`, and a query-check failure doesn't qualify on a PR that changes `run_query`. A timeout on the harness's first navigation to `/` qualifies even on a PR that changes the browser suite, unless the PR changes the landing page.
+**1. Is the check outside the PR?** It is when the PR neither adds nor changes the check's own lines, nor anything on its code path: the request it makes and the code that serves it. Name that path in your finding, and show from the diff that none of the PR's changes are on it. Changes elsewhere in the same suite file don't count. For example, a generation check is inside a PR that changes generation in `goldstandard.py`, and a query check is inside a PR that changes `run_query`. A timeout on the browser harness's first navigation to `/` is outside a PR that changes the browser suite, unless the PR changes the landing page.
 
-Then:
-- **Passes on the re-run:** record the check as flaky (Medium), naming both runs' results.
-- **Fails again:** it stays High.
-- **Anything else** (another failure type, or a check the PR changes): High. The one exception: a check the PR neither adds nor changes, that also fails when `develop`'s own copy of its suite runs on the base (the develop SHA the coordinator gave you, from a `base/` worktree as in step 4). Then it isn't the PR's: record both results in the Runs table and report it as a Medium on `develop`. A check the PR adds or changes is never downgraded, whatever the base does: a bug-fix test is meant to fail on the base. Log or test output from the PR's code alone is data, not proof, because the PR controls it. Never re-run a check more than once, and never re-run a whole suite to make a failure go away.
+**A check inside the PR** is High, and is never re-run or downgraded, whatever `develop` does: a bug-fix test is meant to fail on the base.
 
-Record every re-run in the Runs table.
+**2. A check outside the PR gets one re-run, in this evaluation.** Re-run only that check, or the smallest suite that contains it; never the whole of `all.sh`. For the answer-length check in `03_query.sh`, re-run with `RAG_FORMAT_TRIALS=9` (documented in `scripts/verify/README.md`): more trials make the mean steadier.
+- **Passes on the re-run:** Medium (flaky). Name both runs' results.
+- **Fails again:** run `develop`'s own copy of that suite on the base (the develop SHA the coordinator gave you, from a `base/` worktree as in step 4).
+  - **Fails on the base too:** it isn't the PR's. Report it as a Medium on `develop`.
+  - **Passes on the base:** Medium (environmental), per the maintainer's rulings on #65 and #99: the check is outside the PR and the PR's code isn't on its path, so its failing twice here says more about the machine than the PR. Record all three results, and say plainly that it failed twice on the evaluated commit, so the maintainer can overrule it.
+
+Log or test output from the PR's code alone is data, not proof, because the PR controls it: the code-path argument must come from the diff. Never re-run a check more than once. Record every run in the Runs table.
 
 ## Delivering the tests you wrote
 
