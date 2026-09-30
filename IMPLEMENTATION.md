@@ -29,8 +29,8 @@ then Ollama downloads `phi3.5` (2.2 GB) and `nomic-embed-text` (274 MB) — roug
 immediate because the images are built and the models are cached in the
 `ollama_models` Docker volume.
 
-**Docker must be allocated at least 10 GB of memory** (Settings → Resources →
-Memory). phi3.5 is ~6 GB resident; below that it is evicted and reloaded between
+**Docker must be allocated 12 GB of memory and 2 GB of swap** (Settings →
+Resources). phi3.5 is ~6 GB resident; below that it is evicted and reloaded between
 calls and queries time out. `curl http://localhost:8080/api/health` reports the
 allocated figure against the recommendation.
 
@@ -118,7 +118,7 @@ services:
       OLLAMA_MODELS_DIR: /ollama
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
-      RECOMMENDED_MEMORY_GB: 10
+      RECOMMENDED_MEMORY_GB: 12
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.
@@ -597,7 +597,7 @@ class Settings(BaseSettings):
     ollama_models_dir: str = "/ollama"
     # Reported by /health and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
-    recommended_memory_gb: float = 10.0
+    recommended_memory_gb: float = 12.0
 
     class Config:
         env_file = ".env"

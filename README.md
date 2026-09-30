@@ -15,7 +15,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 ## Prerequisites
 
 - **Docker Desktop with Engine 28.0.0 or newer** (or Docker Engine 28.0.0+ with Compose v2) — [install](https://docs.docker.com/get-docker/)
-- **10 GB RAM allocated to Docker** (Docker Desktop → Settings → Resources → Memory). phi3.5 alone is ~6 GB resident; below 10 GB it is repeatedly evicted and reloaded and queries time out. Allocate more if you have it — `/health` reports what Docker actually has against this recommendation
+- **12 GB RAM and 2 GB swap allocated to Docker** (Docker Desktop → Settings → Resources → Memory and Swap). phi3.5 alone is ~6 GB resident; at 10 GB, full verification runs still hit Ollama timeouts under memory pressure, and below that the model is repeatedly evicted and reloaded and queries time out. Swap turns a short spike into a slowdown instead of a failure. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling. `/health` reports what Docker actually has against this recommendation
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
 - Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
 
@@ -176,7 +176,7 @@ provides against the recommended minimum:
 
 `allocated_gb` reads `MemTotal` inside the container, which on Docker Desktop is
 the VM's total memory. It reads a little **below** the figure configured in
-Docker Desktop — 10240 MiB configured shows as 9.7 GB, about 5% lost to VM
+Docker Desktop — 12288 MiB configured shows as 11.7 GB, about 5% lost to VM
 overhead — so the comparison allows a 5% margin rather than flagging a correctly
 sized allocation as too small.
 
@@ -236,7 +236,7 @@ All API settings are environment variables in `docker-compose.yml`:
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
 | `UPLOAD_DIR` | `/app/uploads` | Container path for uploads and session data |
-| `RECOMMENDED_MEMORY_GB` | `10` | Memory recommendation reported by `/health`. Raise it if you allocate more to Docker; no rebuild needed |
+| `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health`. Raise it if you allocate more to Docker; no rebuild needed |
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 
@@ -523,7 +523,7 @@ so it does not depend on its own executable bit.
 | Hardware | Apple Silicon (arm64) |
 | Docker Desktop | installed and running, Engine 28.0.0+ |
 | Docker disk | 20 GB minimum, 32 GB recommended |
-| Docker memory | 10 GB minimum (phi3.5 is ~6 GB resident) |
+| Docker memory | 12 GB, plus 2 GB swap (phi3.5 is ~6 GB resident) |
 | Free host port | 8080 |
 | Network | ~8–10 GB downloaded on first run |
 
@@ -678,7 +678,7 @@ This discards ingested documents; re-ingest after it comes back up. The `ollama_
 docker compose exec <service> sh -c 'command -v curl wget'
 ```
 
-**Queries time out, or `httpx.ReadTimeout` appears in the api log** — Almost always memory. phi3.5 is ~6 GB resident, so on a Docker allocation below 10 GB the model is evicted and reloaded between calls and generation never completes. Note the Ollama healthcheck cannot detect this: it runs `ollama list`, which succeeds while generation is wedged.
+**Queries time out, or `httpx.ReadTimeout` appears in the api log** — Almost always memory. phi3.5 is ~6 GB resident, so on a Docker allocation below the recommended 12 GB the model can be evicted and reloaded between calls and generation never completes. Note the Ollama healthcheck cannot detect this: it runs `ollama list`, which succeeds while generation is wedged.
 
 Check what Docker actually has, and what is loaded:
 

@@ -91,7 +91,7 @@ services:
       OLLAMA_MODELS_DIR: /ollama
       # Reported by /health and compared against the memory Docker actually
       # provides. Raise it if you allocate more to Docker Desktop; no rebuild.
-      RECOMMENDED_MEMORY_GB: 10
+      RECOMMENDED_MEMORY_GB: 12
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.
@@ -241,12 +241,12 @@ hung connect cannot stall past the container healthcheck's own 5 s limit.
 | Field | Meaning |
 |---|---|
 | `allocated_gb` | `MemTotal` from `/proc/meminfo`, which on Docker Desktop is the VM's total memory |
-| `recommended_minimum_gb` | From `RECOMMENDED_MEMORY_GB` (default 10) |
+| `recommended_minimum_gb` | From `RECOMMENDED_MEMORY_GB` (default 12) |
 | `status` | `ok`, `below_recommended`, or `unknown` if `/proc/meminfo` is unreadable |
 | `note` | Present only when below recommended; states what to change |
 
 The guest always sees slightly less than the figure configured in Docker Desktop
-— 10240 MiB configured reads as 9.7 GB, roughly 5% lost to VM overhead — so the
+— 12288 MiB configured reads as 11.7 GB, roughly 5% lost to VM overhead — so the
 comparison allows a 5% margin. Without it a correctly sized allocation would
 report itself as too small.
 
@@ -1928,11 +1928,11 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 |---|---|---|
 | Hardware | Apple Silicon (arm64) | All images resolve arm64 natively; torch is installed from the CPU index, which publishes linux/aarch64 wheels |
 | Docker Desktop | installed and running, Engine 28.0.0+ | The only host dependency. No Python, Node or compiler is required |
-| **Docker memory** | **10 GB minimum** | phi3.5 is ~6 GB resident. Below this it is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout` |
+| **Docker memory** | **12 GB, plus 2 GB swap** | phi3.5 is ~6 GB resident. At 10 GB, full verification runs still hit Ollama timeouts under memory pressure; below that the model is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout`. Swap absorbs short spikes |
 | Docker disk | 20 GB minimum, 32 GB recommended | ~6.5 GB images + ~2.5 GB model weights + build cache |
 | Free host port | 8080 | `proxy` publishes `127.0.0.1:8080:80` |
 
-Memory is set in **Docker Desktop → Settings → Resources → Memory**, not in
+Memory and swap are set in **Docker Desktop → Settings → Resources**, not in
 `docker-compose.yml`; a compose `mem_limit` caps a container and cannot raise the
 VM ceiling. `/health` reports the allocated figure against
 `RECOMMENDED_MEMORY_GB` (§3.1.1) so a misconfigured host is visible rather than
