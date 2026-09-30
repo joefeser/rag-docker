@@ -15,7 +15,7 @@ from config import settings
 from main import app
 from models.schemas import CreateCollectionRequest, HnswConfig, IngestConfig, QueryRequest, RechunkRequest, ReembedRequest, SaveRetrievalConfigBody
 from routers import collections, ingest, tuning as tuning_router, query, retrieval_config as retrieval_router
-from services import weaviate_client as wc, chunker, rag_pipeline, ingest_config, retrieval_config, ingest_pipeline
+from services import weaviate_client as wc, chunker, rag_pipeline, ingest_config, retrieval_config, ingest_pipeline, packager
 
 
 class SettingsTests(unittest.TestCase):
@@ -153,6 +153,15 @@ class SettingsTests(unittest.TestCase):
         for route in ('/tune/rechunk','/tune/reembed'):
             self.assertEqual(self.client.post(route,json=legacy).status_code,422)
         self.tune_job.assert_not_called()
+
+    def test_saved_config_from_before_the_bounds_exports_unclamped(self):
+        # Decision (#53): "export still packages them, never clamped" -- the
+        # packager reads the saved config the same way the GET route does,
+        # with no revalidation against the new chunk_size/min_chunk_size bounds.
+        legacy={'collection':'ReviewSettings','chunking_strategy':'overlap','chunk_size':16000,
+                'chunk_overlap':200,'similarity_threshold':None,'min_chunk_size':8000}
+        ingest_config.save(legacy)
+        self.assertEqual(packager._ingest_config('ReviewSettings'), legacy)
 
     def test_saved_valid_ingest_and_retrieval_round_trips(self):
         ingest_body = {'collection': 'ReviewSettings', 'chunking_strategy': 'fixed', 'chunk_size': 150, 'min_chunk_size': 40}

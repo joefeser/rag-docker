@@ -370,8 +370,9 @@ Accepts one or more files. For ZIP uploads, extracts and processes all supported
 | `min_chunk_size` | int | No | Default: 100 (characters). Chunks smaller than this are merged with adjacent chunk. |
 
 Direct upload, saved ingest configuration and optional tuning chunking settings
-share validation. `chunk_size` must be a positive integer; overlap and minimum
-size must be nonnegative integers. For `overlap`/`language`, overlap must be
+share validation. `chunk_size` must be an integer from 50 to 6000, and
+`min_chunk_size` an integer from 0 to 6000 (§8); overlap must be a nonnegative
+integer. For `overlap`/`language`, overlap must be
 smaller than chunk size. Minimum size is a merge preference and may exceed the
 split target; for example, fixed size 60/minimum 100 preserves the existing
 acceptance case by merging small chunks.
@@ -1815,6 +1816,8 @@ now lives once, in `api/services/ingest_config.py`.
 
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
       *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
+- [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).
+      *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
 
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted

@@ -79,7 +79,11 @@ try:
     for bad in ({'chunk_size':49}, {'chunk_size':6001}, {'min_chunk_size':6001}):
         expect('/ingest/config', {'collection':collection,'chunking_strategy':'fixed','chunk_size':50, **bad},422)
     assert request('/ingest/config/' + collection)[1] == smallest
-    print('PASS chunk bounds (50-6000, minimum 0-6000) reject the neighbours of the edges and preserve settings',flush=True)
+    expect('/ingest/config', {'collection': collection, 'chunking_strategy':'fixed',
+                              'chunk_size':6000, 'min_chunk_size':6000}, 201)
+    status, largest = request('/ingest/config/' + collection)
+    assert status == 200 and largest['chunk_size'] == 6000 and largest['min_chunk_size'] == 6000
+    print('PASS chunk bounds (50-6000, minimum 0-6000) accept both edges, reject their neighbours and preserve settings',flush=True)
 
     for path, bad in (('/query', {'question': 'inert', 'retrieval_mode': 'invalid'}),
                       ('/query', {'question': 'inert', 'response_format': 'invalid'}),

@@ -16,11 +16,12 @@ ResponseFormat = Literal["end_user", "engineer"]
 ChunkingStrategy = Literal["fixed", "overlap", "language", "context_aware", "semantic"]
 PositiveSize = Annotated[int, BeforeValidator(_numeric), Field(ge=1)]
 NonnegativeSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0)]
-# Chunk bounds (#53): at least 50 characters, so a request can't flood a
-# collection with one-character chunks; at most 6,000, about the 1,500 tokens
-# the embedding model reads, so no chunk is silently truncated. They apply to
-# settings being saved or used; a saved configuration from before them is
-# still served and exported as it is.
+# Chunk bounds (#53): at least 50 characters, so a size-driven strategy can't
+# be asked for one-character chunks; at most 6,000, about the 1,500 tokens the
+# embedding model reads. `semantic` splits by similarity and ignores
+# chunk_size, so these don't bound its chunks. They apply to settings being
+# saved or used; a saved configuration from before them is still served and
+# exported as it is.
 ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
 MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
