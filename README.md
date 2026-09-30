@@ -165,8 +165,8 @@ provides against the recommended minimum:
   "resources": {
     "memory": {
       "status": "ok",
-      "allocated_gb": 9.7,
-      "recommended_minimum_gb": 10.0
+      "allocated_gb": 11.67,
+      "recommended_minimum_gb": 12.0
     }
   }
 }

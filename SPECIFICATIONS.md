@@ -220,8 +220,8 @@ GET /health
   "resources": {
     "memory": {
       "status": "ok",
-      "allocated_gb": 9.7,
-      "recommended_minimum_gb": 10.0
+      "allocated_gb": 11.67,
+      "recommended_minimum_gb": 12.0
     }
   }
 }
@@ -1928,7 +1928,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 |---|---|---|
 | Hardware | Apple Silicon (arm64) | All images resolve arm64 natively; torch is installed from the CPU index, which publishes linux/aarch64 wheels |
 | Docker Desktop | installed and running, Engine 28.0.0+ | The only host dependency. No Python, Node or compiler is required |
-| **Docker memory** | **12 GB, plus 2 GB swap** | phi3.5 is ~6 GB resident. At 10 GB, full verification runs still hit Ollama timeouts under memory pressure; below that the model is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout`. Swap absorbs short spikes |
+| **Docker memory** | **12 GB, plus 2 GB swap** | phi3.5 is ~6 GB resident. At 10 GB, full verification runs still hit Ollama timeouts under memory pressure; below that the model is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout`. Swap absorbs short spikes. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling |
 | Docker disk | 20 GB minimum, 32 GB recommended | ~6.5 GB images + ~2.5 GB model weights + build cache |
 | Free host port | 8080 | `proxy` publishes `127.0.0.1:8080:80` |
 

@@ -30,7 +30,7 @@ immediate because the images are built and the models are cached in the
 `ollama_models` Docker volume.
 
 **Docker must be allocated 12 GB of memory and 2 GB of swap** (Settings →
-Resources). phi3.5 is ~6 GB resident; below that it is evicted and reloaded between
+Resources); on a 16 GB Mac that is the practical ceiling, leaving macOS about 4 GB. phi3.5 is ~6 GB resident; below that it is evicted and reloaded between
 calls and queries time out. `curl http://localhost:8080/api/health` reports the
 allocated figure against the recommendation.
 
