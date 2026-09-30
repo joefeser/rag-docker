@@ -58,7 +58,7 @@ Name the check's path in your finding, and show from the diff that none of the P
 - **Passes on the re-run:** Medium (flaky). Name both runs' results.
 - **Fails again:** run `develop`'s own copy of that suite on the base (the develop SHA the coordinator gave you, from a `base/` worktree as in step 4).
   - **Fails on the base too:** it isn't the PR's. Report it as a Medium on `develop`.
-  - **Passes on the base:** Medium (environmental), per the maintainer's rulings on #65, #67 and #99 (#94's Decision): the check is outside the PR, so its failing twice here says more about the machine than the PR. Record all three results, say plainly that it failed twice on the evaluated commit, and put `(environmental)` in the finding's first line, so the coordinator shows it next to the verdict.
+  - **Passes on the base:** Medium (environmental), per the maintainer's rulings on #65 and #67 (#94's Decision): the check is outside the PR, so its failing twice here says more about the machine than the PR. Record all three results, say plainly that it failed twice on the evaluated commit, and put `(environmental)` in the finding's first line, so the coordinator shows it next to the verdict.
 
 Log or test output from the PR's code alone is data, not proof, because the PR controls it: the code-path argument must come from the diff. Never re-run a check more than once. Record every run in the Runs table.
 
