@@ -1450,6 +1450,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
@@ -1720,14 +1721,35 @@ async def get_collection_config(name: str) -> dict:
     return await asyncio.to_thread(_collection_config_sync, name)
 
 
+# Just after a collection is created under a name that was dropped moments
+# earlier, Weaviate can reject writes with "could not find index for class ...
+# It might have been deleted in the meantime" until the new index is loaded.
+# The verify suite hit this when it recreated a collection between checks (#95).
+_INDEX_NOT_READY = "could not find index"
+_INSERT_ATTEMPTS = 3
+_INSERT_RETRY_DELAY = 1.0
+
+
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
-    with coll.batch.dynamic() as batch:
-        for chunk in chunks:
-            batch.add_object(properties=chunk)
-        if batch.number_errors > 0:
-            raise RuntimeError(f"{batch.number_errors} batch error(s) inserting into '{collection_name}'")
+    pending = list(chunks)
+    for attempt in range(1, _INSERT_ATTEMPTS + 1):
+        with coll.batch.dynamic() as batch:
+            for chunk in pending:
+                batch.add_object(properties=chunk)
+        # Read failures only after the batch has flushed on exit. Checking
+        # inside the block missed them, so a job could report 'completed'
+        # with nothing stored.
+        failed = coll.batch.failed_objects
+        if not failed:
+            return
+        if attempt < _INSERT_ATTEMPTS and all(_INDEX_NOT_READY in f.message for f in failed):
+            pending = [f.object_.properties for f in failed]
+            time.sleep(_INSERT_RETRY_DELAY)
+            continue
+        raise RuntimeError(
+            f"{len(failed)} batch error(s) inserting into '{collection_name}': {failed[0].message}")
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
