@@ -9396,6 +9396,39 @@ ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
 sys.exit(0 if ok else 1)"
 check "per-service status and latency are reported" $?
 
+# ── memory resource reporting (Issue #98) ────────────────────────────────────
+# Advisory only (see the comment in api/routers/health.py), so it never
+# affects overall_ok, but the report itself must be right: the configured
+# recommendation, and a flip to below_recommended -- with a note -- once the
+# recommendation exceeds what's actually allocated.
+check_eq "the recommended minimum defaults to 12.0 GB" \
+  "$(jfield "['resources']['memory']['recommended_minimum_gb']" < "$RAG_INFRA_TMP/vfy_health.json")" "12.0"
+# Whether this machine meets it depends on its Docker allocation, so check the
+# status agrees with the allocation /health reports, not that it is 'ok'.
+python3 -c "
+import json, os
+m = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['resources']['memory']
+want = 'ok' if m['allocated_gb'] >= m['recommended_minimum_gb'] * 0.95 else 'below_recommended'
+raise SystemExit(0 if m['status'] == want else 1)"
+check "the memory status agrees with the reported allocation" $?
+
+# Raise the recommendation past the actual allocation (in-process only --
+# neither the running server nor docker-compose.yml is touched) and confirm
+# the status flips and a note is attached.
+(cd "$REPO_ROOT" && docker compose exec -T api env RECOMMENDED_MEMORY_GB=13 python3 -c "
+import json
+from config import Settings
+from services import system_info
+print(json.dumps(system_info.memory_info(Settings().recommended_memory_gb)))
+") > "$RAG_INFRA_TMP/vfy_mem_override.json"
+check_eq "a recommendation above the allocation reports below_recommended" \
+  "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_mem_override.json")" "below_recommended"
+python3 -c "
+import json, os
+d = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_mem_override.json'))
+raise SystemExit(0 if d.get('note') and 'recommended' in d['note'] else 1)"
+check "the below-recommended report includes an explanatory note" $?
+
 # ── ingest config defaults ───────────────────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 check_eq "a fresh collection reports is_default true" \
