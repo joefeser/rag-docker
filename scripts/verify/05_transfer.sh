@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E26, E27)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26, E27)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -9,6 +9,11 @@ C="${PREFIX}Transfer"
 EXPORTS="$REPO_ROOT/exports"
 
 section "Export, import and tuning"
+
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
+check "evaluation import and generated-session regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
+check "embedded session/import verification sources match" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -67,6 +72,131 @@ import json,sys; d=json.load(sys.stdin)
 sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
 check "the corruption error names the offending file" $?
 rm -f "$EXPORTS/$CORRUPT"
+
+# ── evaluation metadata is validated before mutation (E23) ──────────────────
+# Add one evaluation sidecar to a copy of the package and re-sign the manifest,
+# so the archive is digest-valid and only the session metadata decides.
+GS_SID="gs_$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+make_gs_pkg() {   # make_gs_pkg <session-id> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$C" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, sid, suffix, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+session = {"session_id": sid, "collection": coll, "status": "completed",
+           "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
+           "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
+                      "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
+                      "chunk_index": 0, "status": "approved"}]}
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    (root / "goldstandard").mkdir(exist_ok=True)
+    side = root / "goldstandard" / "session.json"
+    side.write_text(json.dumps(session))
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["files"]["goldstandard/session.json"] = \
+        "sha256:" + hashlib.sha256(side.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+}
+count_of() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
+
+BADGS=$(make_gs_pkg "not-a-generated-id" badgs)
+api_post "/import" "{\"filename\":\"$BADGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+check_eq "E23: malformed evaluation metadata is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_gsjob.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
+sys.exit(0 if 'goldstandard/session.json' in json.dumps(d) else 1)"
+check "E23: the refusal names the offending sidecar" $?
+check_eq "E23: replace left the existing collection untouched" "$(count_of "$C")" "$chunks_before"
+code=$(api_code "$API/goldstandard/session/not-a-generated-id")
+check_eq "E23: no session was restored from the refused package" "$code" "404"
+rm -f "$EXPORTS/$BADGS"
+
+# A refused package must change no live state at all. A replace from this
+# package would restore the same chunks, so the count above can't tell; the
+# retrieval setting and the earlier, valid sidecar can.
+MIX_SID="gs_$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+MIXGS=$(python3 - "$EXPORTS/$PKG" "$MIX_SID" "$C" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, sid, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+def session(i, **over):
+    s = {"session_id": i, "collection": coll, "status": "completed",
+         "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
+         "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
+                    "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
+                    "chunk_index": 0, "status": "approved"}]}
+    s.update(over); return s
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    gold = root / "goldstandard"; gold.mkdir(exist_ok=True)
+    manifest = json.loads((root / "manifest.json").read_text())
+    # a_valid sorts first: a restore that isn't preflighted writes it before
+    # it reaches the bad one.
+    for name, body in (("a_valid.json", session(sid)),
+                       ("b_bad.json", session("gs_0000beef", pairs_total="many"))):
+        (gold / name).write_text(json.dumps(body))
+        manifest["files"][f"goldstandard/{name}"] = \
+            "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+)
+api_post "/import" "{\"filename\":\"$MIXGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+check_eq "E23: a schema-invalid sidecar after a valid one is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_gsjob.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
+sys.exit(0 if 'goldstandard/b_bad.json' in json.dumps(d) else 1)"
+check "E23: the refusal names the invalid sidecar, not the valid one" $?
+code=$(api_code "$API/goldstandard/session/$MIX_SID")
+check_eq "E23: the valid sidecar in a refused package is not restored" "$code" "404"
+topk=$(api_get "/retrieval/config/$C" | jfield "['top_k']")
+check_eq "E23: a refused replace leaves the live retrieval settings alone" "$topk" "7"
+check_eq "E23: ... and the collection's chunk count" "$(count_of "$C")" "$chunks_before"
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+rm -f "$EXPORTS/$MIXGS"
+(cd "$REPO_ROOT" && docker compose exec -T api rm -f \
+  "/app/uploads/goldstandard_sessions/$MIX_SID.json" \
+  "/app/uploads/goldstandard_sessions/gs_0000beef.json") >/dev/null 2>&1 || true
+
+GOODGS=$(make_gs_pkg "$GS_SID" goodgs)
+api_post "/import" "{\"filename\":\"$GOODGS\",\"on_conflict\":\"rename\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 1800 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+read -r gstat gname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_gsjob.json')); print(d['status'], d['collection'])")"
+check_eq "E23: a package with valid evaluation metadata still imports" "$gstat" "completed"
+api_get "/goldstandard/session/$GS_SID" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+sys.exit(0 if d['collection']=='$gname' and d['pairs'][0]['status']=='approved' else 1)"
+check "E23: the valid session is restored against the imported collection" $? "session $GS_SID -> $gname"
+rm -f "$EXPORTS/$GOODGS"
+drop_collection "$gname"
+# The restored session file outlives its collection by design (spec §8 rule 4).
+(cd "$REPO_ROOT" && docker compose exec -T api \
+  rm -f "/app/uploads/goldstandard_sessions/$GS_SID.json") >/dev/null 2>&1 || true
 
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json

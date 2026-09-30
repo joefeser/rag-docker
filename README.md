@@ -365,6 +365,10 @@ be readable, the format understood, every digest must match, and the embedding
 model must be the one this instance runs. Chunk UUIDs are preserved, so
 gold-standard sessions keep pointing at the right chunks after the move.
 
+Evaluation-session metadata is also validated before importing models or
+changing a collection. Invalid session JSON, identities or schemas fail the
+import with `PACKAGE_CORRUPT`, naming the sidecar; they are not silently skipped.
+
 ### Carrying the models too
 
 By default a package assumes the target machine already runs the same embedding

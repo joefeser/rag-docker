@@ -166,6 +166,8 @@ ragpkg-.../
 └── models/                 present only when models are bundled
 ```
 
+Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
+
 ### 4.3 Fidelity
 
 | Value | Meaning |
@@ -322,7 +324,25 @@ Checks run in this order and stop at the first failure:
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
+| 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; its resolved storage destination is contained | `PACKAGE_CORRUPT`, naming the sidecar |
 | 5 | Collection name collision | resolved per `on_conflict` |
+
+Check 4a runs before bundled-model installation, collection creation/deletion,
+or restoring any sidecar. All sessions MUST be preflighted together, including
+later files, and the validated snapshots used for restoration. Invalid JSON or
+metadata is a refusal, not a skipped session. Session IDs use the locally
+generated `gs_[0-9a-f]{8}` grammar; malformed IDs are never rewritten. The
+persistence boundary also enforces resolved-path containment and refuses
+redirected storage directories and non-regular destinations. Archive extraction
+accepts only regular files and directories, so special members cannot block a
+later metadata read. Existing review work remains unchanged on validation
+failure, including `replace`. Optional legacy progress fields retain their
+existing defaults, and historical validity metadata is preserved.
+
+Startup loading, collection flagging and export use the same session-record
+validation. Invalid legacy files (including filename/identity mismatch) remain
+untouched on disk with diagnostics and are excluded from the active cache and
+exports. They MUST NOT abort flagging after a collection has been deleted.
 
 Check 4 is a refusal, not a warning. Vectors from a different model are
 meaningless rather than merely different, and a collection built from them
@@ -588,7 +608,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
-| `PACKAGE_CORRUPT` | digest mismatch; names the file |
+| `PACKAGE_CORRUPT` | digest mismatch or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
@@ -641,6 +661,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
+| E23 | A digest-valid package with malformed evaluation metadata fails `PACKAGE_CORRUPT` before model installation, collection mutation or sidecar restoration; existing review work remains unchanged |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 

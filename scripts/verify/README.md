@@ -13,6 +13,32 @@ bash scripts/verify/all.sh 02 04              # only the named suites
 
 Exits non-zero if any check fails.
 
+## Focused import validation regressions
+
+Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
+
+`05_transfer.sh` registers both controlled regressions and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename.
+
+`scripts/tests/test_session_import.py` exercises the real package reader and
+evaluation persistence with disposable fixtures. Model and database mutation
+seams are mocked; this complements the live transfer suite and does not prove
+Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies:
+
+```bash
+docker compose run --rm --no-deps \
+  -v "$PWD/scripts/tests:/tests:ro" -e RAG_TEST_API_DIR=/app \
+  api python /tests/test_session_import.py
+```
+
+Alternatively, with `uv` on the host:
+
+```bash
+uv run --no-project --python 3.11 \
+  --with pydantic-settings==2.15.0 --with pydantic==2.13.5 \
+  --with httpx==0.28.1 --with weaviate-client==4.23.1 \
+  python scripts/tests/test_session_import.py
+```
+
 ## Why integration tests
 
 Every defect this project has actually produced was invisible to a unit test of
@@ -45,7 +71,9 @@ drive the UI in a real browser.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23, E26 and E27; live metadata and model checks, controlled regressions and source drift |
+| `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
+| `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
