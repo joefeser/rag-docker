@@ -1660,12 +1660,14 @@ page renders as one undifferentiated block.
 
 The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
 
+The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are saved (`POST /ingest/config`) or used (`POST /ingest/upload`, `POST /tune/rechunk`, `POST /tune/reembed`). A saved or imported configuration from before the bounds is still returned by `GET /ingest/config/{collection}` and exported as it is, never clamped; saving it again, or using its values, requires them to be within the bounds.
+
 | Parameter | Default | Min | Max | Notes |
 |---|---|---|---|---|
-| `chunk_size` | 1000 | 1 | Unbounded | Positive characters; UI slider uses 200–16000 |
+| `chunk_size` | 1000 | 50 | 6000 | Characters. The minimum stops a flood of tiny chunks; the maximum keeps a chunk within what the embedding model reads (about 1,500 tokens), so nothing is silently truncated |
 | `chunk_overlap` | 200 | 0 | Strategy-dependent | Repeated characters between adjacent chunks; must be less than `chunk_size` for overlap/language, ignored by other strategies |
 | `similarity_threshold` | 0.85 | 0.0 | 1.0 | Semantic chunking only |
-| `min_chunk_size` | 100 | 0 | Unbounded | Soft merge preference in characters; may exceed the split target; UI slider uses 40–2000 |
+| `min_chunk_size` | 100 | 0 | 6000 | Soft merge preference in characters; may exceed the split target |
 | `top_k` | 5 | 1 | 50 | API bounds |
 | `alpha` | 0.75 | 0.0 | 1.0 | Hybrid mode only |
 | `ef` | 64 | 16 | 512 | HNSW query param |

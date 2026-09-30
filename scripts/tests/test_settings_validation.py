@@ -64,6 +64,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_chunking_errors_on_saved_and_tuning_surfaces_precede_work(self):
         for update in ({'chunking_strategy': 'unknown'}, {'chunk_size': 0}, {'chunk_size': -1},
+                       {'chunk_size': 49}, {'chunk_size': 6001}, {'min_chunk_size': 6001},
                        {'chunk_overlap': -1}, {'chunk_overlap': 1000}, {'min_chunk_size': -1},
                        {'similarity_threshold': -0.1}, {'similarity_threshold': 1.1},
                        {'chunk_size': True}, {'similarity_threshold': False}):
@@ -71,7 +72,8 @@ class SettingsTests(unittest.TestCase):
                 with self.subTest(route=route, update=update): self.assert_rejected_without_work(route, {'collection': 'ReviewSettings', **update})
 
     def test_multipart_invalid_chunking_precedes_collection_lookup_and_file_staging(self):
-        for update in ({'strategy': 'unknown'}, {'chunk_size': '0'}, {'chunk_overlap': '-1'},
+        for update in ({'strategy': 'unknown'}, {'chunk_size': '0'}, {'chunk_size': '49'},
+                       {'chunk_size': '6001'}, {'min_chunk_size': '6001'}, {'chunk_overlap': '-1'},
                        {'chunk_overlap': '1000'}, {'similarity_threshold': 'nan'}, {'min_chunk_size': '-1'}):
             self.exists.reset_mock(); self.ingest_job.reset_mock()
             response = self.client.post('/ingest/upload', data={'collection': 'ReviewSettings', **update}, files={'files': ('source.txt', b'inert synthetic text')})
@@ -126,16 +128,31 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(response.status_code,202,response.text)
         self.assertEqual(self.tune_job.call_args.args[2]['chunking']['strategy'],'fixed')
 
-    def test_exact_smallest_chunk_target_roundtrips_and_zero_is_rejected(self):
-        body={'collection':'ReviewSettings','chunking_strategy':'fixed','chunk_size':1,'min_chunk_size':0}
-        self.assertEqual(self.client.post('/ingest/config',json=body).status_code,201)
-        saved=self.client.get('/ingest/config/ReviewSettings').json()
-        self.assertEqual(saved['chunk_size'],1)
-        self.assertEqual(saved['min_chunk_size'],0)
-        response=self.client.post('/ingest/config',json={**body,'chunk_size':0})
-        self.assertEqual(response.status_code,422)
-        self.assertEqual(response.json()['error']['code'],'INVALID_PARAMETER')
-        self.assertEqual(self.client.get('/ingest/config/ReviewSettings').json(),saved)
+    def test_chunk_bounds_roundtrip_and_neighbors_are_rejected(self):
+        # #53's Decision: chunk_size 50-6000, min_chunk_size 0-6000.
+        for size, minimum in ((50, 0), (6000, 6000)):
+            body={'collection':'ReviewSettings','chunking_strategy':'fixed','chunk_size':size,'min_chunk_size':minimum}
+            self.assertEqual(self.client.post('/ingest/config',json=body).status_code,201)
+            saved=self.client.get('/ingest/config/ReviewSettings').json()
+            self.assertEqual((saved['chunk_size'],saved['min_chunk_size']),(size,minimum))
+            for bad in ({'chunk_size':49} if size == 50 else {'chunk_size':6001}, {'min_chunk_size':6001}):
+                response=self.client.post('/ingest/config',json={**body,**bad})
+                self.assertEqual(response.status_code,422)
+                self.assertEqual(response.json()['error']['code'],'INVALID_PARAMETER')
+                self.assertEqual(self.client.get('/ingest/config/ReviewSettings').json(),saved)
+
+    def test_saved_config_from_before_the_bounds_is_served_until_saved_again(self):
+        legacy={'collection':'ReviewSettings','chunking_strategy':'overlap','chunk_size':16000,
+                'chunk_overlap':200,'similarity_threshold':None,'min_chunk_size':8000}
+        ingest_config.save(legacy)
+        response=self.client.get('/ingest/config/ReviewSettings')
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual((response.json()['chunk_size'],response.json()['min_chunk_size']),(16000,8000))
+        self.assertEqual(self.client.post('/ingest/config',json=legacy).status_code,422)
+        self.assertEqual(ingest_config.load('ReviewSettings')['chunk_size'],16000)
+        for route in ('/tune/rechunk','/tune/reembed'):
+            self.assertEqual(self.client.post(route,json=legacy).status_code,422)
+        self.tune_job.assert_not_called()
 
     def test_saved_valid_ingest_and_retrieval_round_trips(self):
         ingest_body = {'collection': 'ReviewSettings', 'chunking_strategy': 'fixed', 'chunk_size': 150, 'min_chunk_size': 40}

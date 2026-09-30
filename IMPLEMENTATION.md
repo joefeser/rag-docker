@@ -632,6 +632,13 @@ ResponseFormat = Literal["end_user", "engineer"]
 ChunkingStrategy = Literal["fixed", "overlap", "language", "context_aware", "semantic"]
 PositiveSize = Annotated[int, BeforeValidator(_numeric), Field(ge=1)]
 NonnegativeSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0)]
+# Chunk bounds (#53): at least 50 characters, so a request can't flood a
+# collection with one-character chunks; at most 6,000, about the 1,500 tokens
+# the embedding model reads, so no chunk is silently truncated. They apply to
+# settings being saved or used; a saved configuration from before them is
+# still served and exported as it is.
+ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
+MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
@@ -708,10 +715,10 @@ class JobStatusResponse(BaseModel):
 
 class IngestConfig(BaseModel):
     chunking_strategy: ChunkingStrategy = "overlap"
-    chunk_size: PositiveSize = 1000
+    chunk_size: ChunkSize = 1000
     chunk_overlap: NonnegativeSize = 200
     similarity_threshold: Optional[UnitInterval] = None
-    min_chunk_size: NonnegativeSize = 100
+    min_chunk_size: MinChunkSize = 100
 
     @model_validator(mode="after")
     def _relationships(self):
@@ -848,10 +855,10 @@ CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semanti
 
 class _ChunkingFields(BaseModel):
     chunking_strategy: Optional[ChunkingStrategy] = None
-    chunk_size: Optional[PositiveSize] = None
+    chunk_size: Optional[ChunkSize] = None
     chunk_overlap: Optional[NonnegativeSize] = None
     similarity_threshold: Optional[UnitInterval] = None
-    min_chunk_size: Optional[NonnegativeSize] = None
+    min_chunk_size: Optional[MinChunkSize] = None
 
     @model_validator(mode="after")
     def _relationships(self):
@@ -7366,7 +7373,7 @@ export default function QAPage() {
 
 ```typescript
 import { useState, useEffect } from 'react'
-import { api, CollectionInfo, JobStatus } from '../api/client'
+import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
@@ -7439,6 +7446,14 @@ export default function ImportPage() {
   async function startIngest() {
     if (!files.length || !collection) return
     setError('')
+    // Refuse before sending: the proxy would reject it anyway, but only after
+    // the browser had started pushing hundreds of MB, and a connection the
+    // proxy closes mid-upload can surface as a bare network error.
+    const total = files.reduce((n, f) => n + f.size, 0)
+    if (total > MAX_UPLOAD_BYTES) {
+      setError(`These files total ${(total / 1024 / 1024).toFixed(0)} MB; one upload can be at most ${MAX_UPLOAD_MB} MB. Split them into smaller batches.`)
+      return
+    }
     const form = new FormData()
     files.forEach(f => form.append('files', f))
     form.append('collection', collection)
@@ -7468,7 +7483,7 @@ export default function ImportPage() {
         onClick={() => document.getElementById('file-input')?.click()}
       >
         <p className="text-gray-500">Drop files here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP</p>
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
         <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
@@ -7505,7 +7520,7 @@ export default function ImportPage() {
       <div className="grid grid-cols-2 gap-4 mt-4 mb-4">
         <div>
           <label className="block text-xs text-gray-600 mb-1">Chunk Size: {chunkSize}</label>
-          <input type="range" min={200} max={16000} step={100} value={chunkSize} onChange={e => setChunkSize(+e.target.value)} className="w-full" />
+          <input type="range" min={50} max={6000} step={50} value={chunkSize} onChange={e => setChunkSize(+e.target.value)} className="w-full" />
         </div>
         {showOverlap && (
           <div>
@@ -7515,7 +7530,7 @@ export default function ImportPage() {
         )}
         <div>
           <label className="block text-xs text-gray-600 mb-1">Min Chunk Size: {minChunkSize}</label>
-          <input type="range" min={40} max={2000} step={10} value={minChunkSize} onChange={e => setMinChunkSize(+e.target.value)} className="w-full" />
+          <input type="range" min={0} max={6000} step={10} value={minChunkSize} onChange={e => setMinChunkSize(+e.target.value)} className="w-full" />
         </div>
         {showSimilarity && (
           <div>
@@ -7627,7 +7642,7 @@ export default function ChunkingPage() {
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
               <label className="block text-xs text-gray-600 mb-1">Chunk Size: {config.chunk_size}</label>
-              <input type="range" min={200} max={16000} step={100} value={config.chunk_size} onChange={e => setConfig({ ...config, chunk_size: +e.target.value })} className="w-full" />
+              <input type="range" min={50} max={6000} step={50} value={config.chunk_size} onChange={e => setConfig({ ...config, chunk_size: +e.target.value })} className="w-full" />
             </div>
             {showOverlap && (
               <div>
@@ -7637,7 +7652,7 @@ export default function ChunkingPage() {
             )}
             <div>
               <label className="block text-xs text-gray-600 mb-1">Min Chunk Size: {config.min_chunk_size}</label>
-              <input type="range" min={40} max={2000} step={10} value={config.min_chunk_size} onChange={e => setConfig({ ...config, min_chunk_size: +e.target.value })} className="w-full" />
+              <input type="range" min={0} max={6000} step={10} value={config.min_chunk_size} onChange={e => setConfig({ ...config, min_chunk_size: +e.target.value })} className="w-full" />
             </div>
             {showSimilarity && (
               <div>
@@ -11710,12 +11725,13 @@ try:
     print('PASS fixed minimum above split target saves and round trips', flush=True)
 
     expect('/ingest/config', {'collection': collection, 'chunking_strategy':'fixed',
-                              'chunk_size':1, 'min_chunk_size':0}, 201)
+                              'chunk_size':50, 'min_chunk_size':0}, 201)
     status, smallest = request('/ingest/config/' + collection)
-    assert status == 200 and smallest['chunk_size'] == 1 and smallest['min_chunk_size'] == 0
-    expect('/ingest/config', {'collection':collection,'chunking_strategy':'fixed','chunk_size':0},422)
+    assert status == 200 and smallest['chunk_size'] == 50 and smallest['min_chunk_size'] == 0
+    for bad in ({'chunk_size':49}, {'chunk_size':6001}, {'min_chunk_size':6001}):
+        expect('/ingest/config', {'collection':collection,'chunking_strategy':'fixed','chunk_size':50, **bad},422)
     assert request('/ingest/config/' + collection)[1] == smallest
-    print('PASS smallest accepted chunk target and neighboring rejection preserve settings',flush=True)
+    print('PASS chunk bounds (50-6000, minimum 0-6000) reject the neighbours of the edges and preserve settings',flush=True)
 
     for path, bad in (('/query', {'question': 'inert', 'retrieval_mode': 'invalid'}),
                       ('/query', {'question': 'inert', 'response_format': 'invalid'}),
