@@ -9,6 +9,24 @@ from services import weaviate_client as wc,rag_pipeline as rag,retrieval_config 
 from weaviate.classes.config import VectorDistances
 
 class ReportingTests(unittest.TestCase):
+    def test_unrecognized_index_does_not_break_collection_listing(self):
+        dynamic = type('ObservedDynamic', (), {'distance_metric': VectorDistances.COSINE})()
+        collections = {}
+        for name, config in [('NamedVectors', None), ('Dynamic', dynamic)]:
+            coll = MagicMock()
+            coll.config.get.return_value = SimpleNamespace(vector_index_config=config)
+            coll.aggregate.over_all.return_value = SimpleNamespace(total_count=1)
+            collections[name] = coll
+        client = MagicMock()
+        client.collections.list_all.return_value = collections
+        client.collections.get.side_effect = collections.__getitem__
+        with patch.object(wc, 'get_client', return_value=client):
+            rows = wc._get_collections_sync()
+        self.assertEqual([row['name'] for row in rows], ['NamedVectors', 'Dynamic'])
+        self.assertEqual([row['index_type'] for row in rows], ['unknown', 'dynamic'])
+        self.assertEqual([row['distance_metric'] for row in rows], ['unknown', 'cosine'])
+        self.assertTrue(all(row['hnsw_config'] is None for row in rows))
+
     def test_backend_values_reach_list_without_default_substitution(self):
         hnsw=type('ObservedHNSW',(),{'ef':-1,'ef_construction':1000,'max_connections':256,'distance_metric':VectorDistances.DOT})()
         flat=type('ObservedFlat',(),{'distance_metric':VectorDistances.L2_SQUARED})()
