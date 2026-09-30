@@ -45,17 +45,17 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
 Some checks fail for reasons outside the PR: the LLM runs on CPU and its replies vary, and a busy stack can drop a request. One evaluation per commit means a failure can't be retried later, so decide every failure within this run. **Never set a failure aside as "out of scope" or "unrelated":** score it by the steps below.
 
 **1. Is the check outside the PR?** It is only when the PR changes none of these:
-- the check's own lines (changes elsewhere in the same suite file don't count);
+- the check's own lines, and in its suite file anything else it depends on: the file's helpers (for example `ingest()` in `02_ingest.sh`), its setup, and every check or suite that runs before it in the same run and could leave state it reads. Only a change confined to other checks' own assertions doesn't count;
 - its code path: the request it makes and the code that serves it;
 - anything that every check depends on: `docker-compose*.yml`, any `Dockerfile`, dependency files (`api/requirements*`, `ui/package*.json`), `proxy/nginx.conf`, `ollama/entrypoint.sh`, API startup and settings (`api/main.py`, `api/config.py`), and the shared verify files (`scripts/verify/lib.sh`, `lock.sh`, `all.sh`, `fixtures.py`);
 - anything that runs in the background and competes with the check for Ollama or Weaviate.
 
-Name the check's path in your finding, and show from the diff that none of the PR's changes are on it. **When in doubt, it's inside.** For example, a generation check is inside a PR that changes generation in `goldstandard.py`, and a query check is inside a PR that changes `run_query`. A timeout on the browser harness's first navigation to `/` is outside a PR that changes only the browser suite, unless the PR changes the landing page.
+Name the check's path in your finding, and show from the diff that none of the PR's changes are on it. **When in doubt, it's inside.** For example, a generation check is inside a PR that changes generation in `goldstandard.py`, and a query check is inside a PR that changes `run_query`. Every browser check runs through the harness's shared navigation in `ui_criteria.js`, so any change to the browser suite puts every browser check inside the PR.
 
 **2. A check inside the PR** is High, and is never re-run or downgraded, whatever `develop` does: a bug-fix test is meant to fail on the base.
 
 **3. A check outside the PR gets one re-run, in this evaluation.** Re-run only that check, or the smallest suite that contains it; never the whole of `all.sh`. For the answer-length check in `03_query.sh`, re-run with `RAG_FORMAT_TRIALS=9` (documented in `scripts/verify/README.md`): more trials make the mean steadier.
-- **Passes on the re-run:** Medium (flaky). Name both runs' results.
+- **Passes on the re-run:** Medium (flaky). Name both runs' results, and put `(flaky)` in the finding's first line, so the coordinator shows it next to the verdict.
 - **Fails again:** run `develop`'s own copy of that suite on the base (the develop SHA the coordinator gave you, from a `base/` worktree as in step 4).
   - **Fails on the base too:** it isn't the PR's. Report it as a Medium on `develop`.
   - **Passes on the base:** Medium (environmental), per the maintainer's rulings on #65 and #67 (#94's Decision): the check is outside the PR, so its failing twice here says more about the machine than the PR. Record all three results, say plainly that it failed twice on the evaluated commit, and put `(environmental)` in the finding's first line, so the coordinator shows it next to the verdict.

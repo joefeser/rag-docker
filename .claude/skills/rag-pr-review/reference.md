@@ -218,7 +218,7 @@ One GitHub review with `event: COMMENT` on the reviewed commit. Never use `APPRO
 - <check> — <path:line> — <failed once, passed on re-run | failed twice, passed on `develop`>
 
 <only for a PR by `joefeser`, see "Maintainer follow-ups" below>
-**Medium and Low findings:** the maintainer will fix these in a follow-up PR after this one merges. You don't need to change anything for them.
+**Medium and Low findings:** the maintainer will fix these in a follow-up PR after this one merges. You don't need to change anything for them. Checks listed above as flaky or environmental are for your information: they aren't follow-up work, and they aren't yours to fix.
 
 **Build and run:** config valid ✅ · images built ✅ · all services healthy ✅ (<n> min) · `/api/health` 200 ✅ · UI 200 ✅
 
