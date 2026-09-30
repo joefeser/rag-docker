@@ -35,15 +35,31 @@ _rag_lock_acquire() {
   while [ "$tries" -lt 50 ]; do
     tries=$((tries + 1))
     if mkdir "$lock" 2>/dev/null; then
-      echo $$ > "$lock/pid.$$" && mv "$lock/pid.$$" "$lock/pid"
-      return 0
+      if echo $$ > "$lock/pid.$$" 2>/dev/null && mv "$lock/pid.$$" "$lock/pid" 2>/dev/null; then
+        return 0
+      fi
+      # Couldn't record our pid (a full /tmp, say). Don't leave a lock that
+      # nothing could ever recognise as stale.
+      rm -f "$lock/pid.$$" 2>/dev/null; rmdir "$lock" 2>/dev/null || true
+      printf '\nCould not write the verify lock %s.\n\n' "$lock" >&2
+      return 3
     fi
     holder=$(cat "$lock/pid" 2>/dev/null || true)
     if [ -z "$holder" ]; then
-      # Just created by another run that hasn't written its pid yet.
-      sleep 0.1; continue
+      # Normally another run between mkdir and writing its pid, so wait. A
+      # pid-less lock older than a minute belongs to a run that died there.
+      if [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        sleep 0.1; continue
+      fi
+      holder="none"
     fi
-    if kill -0 "$holder" 2>/dev/null; then
+    case "$holder" in
+      none) ;;
+      *[!0-9]*)
+        printf '\nThe verify lock %s holds %s, not a pid; remove it by hand if no run is using it.\n\n' "$lock" "$holder" >&2
+        return 3 ;;
+    esac
+    if [ "$holder" != none ] && kill -0 "$holder" 2>/dev/null; then
       printf '\nAnother verify run (pid %s) is using this machine. Wait for it to finish.\n\n' "$holder" >&2
       return 3
     fi
@@ -51,7 +67,9 @@ _rag_lock_acquire() {
     # mutex first, and re-read the pid under it: another run may already have
     # replaced the stale lock with a live one.
     if mkdir "$lock.takeover" 2>/dev/null; then
-      if [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$holder" ]; then
+      local now
+      now=$(cat "$lock/pid" 2>/dev/null || true)
+      if [ ! -L "$lock" ] && { [ "$now" = "$holder" ] || { [ "$holder" = none ] && [ -z "$now" ]; }; }; then
         rm -f "$lock/pid" "$lock"/pid.* 2>/dev/null
         rmdir "$lock" 2>/dev/null || true
       fi
@@ -73,7 +91,12 @@ if [ -z "${RAG_VERIFY_LOCK_HELD:-}" ]; then
   RAG_VERIFY_LOCK="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}"
   _rag_lock_acquire "$RAG_VERIFY_LOCK" || exit 3
   export RAG_VERIFY_LOCK_HELD=1
-  # Released on exit. A suite that sets its own EXIT trap replaces this one;
-  # the lock is then taken over by the next run, because its pid is gone.
-  trap _rag_lock_release EXIT
+  # Released on exit, after any EXIT trap already set (bash traps replace
+  # rather than chain, so keep the earlier one). A suite that sets its own
+  # EXIT trap later should call _rag_lock_release in it; if it doesn't, the
+  # next run takes the lock over once this pid is gone.
+  _rag_prev_exit=$(trap -p EXIT)
+  _rag_prev_exit=${_rag_prev_exit#"trap -- '"}
+  _rag_prev_exit=${_rag_prev_exit%"' EXIT"}
+  trap "_rag_lock_release; ${_rag_prev_exit:-:}" EXIT
 fi

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests scripts/verify/lock.sh's mutual-exclusion behaviour (#95, #97).
 #
-# T1-T4 need no stack: they exercise lock.sh directly through a scratch
+# T1-T4, T6-T8 need no stack: they exercise lock.sh directly through a scratch
 # RAG_VERIFY_LOCK path, never the real /tmp/rag-verify.lock. T5 needs a live
 # stack (01_infrastructure.sh calls require_stack) and is skipped without one.
 #
@@ -90,16 +90,19 @@ new_pid=$(printf '%s\n' "$out4" | tail -n1)
 [ "$new_pid" != "$dead_pid" ] && [ -n "$new_pid" ]
 check "T4: the pid file is rewritten with the new holder's pid" "$?" "old=$dead_pid new=$new_pid"
 
-# --- T5: 01_infrastructure.sh sets its own EXIT trap, which replaces ------
-# lock.sh's cleanup trap (bash's `trap ... EXIT` does not chain), so a
-# standalone run leaves the lock directory behind with a now-dead pid; the
-# next run must still take it over rather than being refused. Needs a live
-# stack, since 01_infrastructure.sh calls require_stack.
+# --- T5: 01_infrastructure.sh sets its own EXIT trap after lock.sh's, so it
+# releases the lock itself; a standalone run must leave no lock behind, and a
+# next run must go ahead. Needs a live stack, and runs the real 01 (which
+# drops Vfy* collections), so it's skipped while a real verify run holds
+# /tmp/rag-verify.lock.
 section "verify/lock.sh vs. 01_infrastructure.sh's own EXIT trap"
 API="${RAG_API:-http://localhost:8080/api}"
 health_code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
+real_holder=$(cat /tmp/rag-verify.lock/pid 2>/dev/null || true)
 if [ "$health_code" != "200" ]; then
   skip "T5: 01_infrastructure.sh EXIT-trap interaction" "no live stack at $API (HTTP $health_code)"
+elif [ -n "$real_holder" ] && kill -0 "$real_holder" 2>/dev/null; then
+  skip "T5: 01_infrastructure.sh EXIT-trap interaction" "a real verify run (pid $real_holder) is using the stack"
 else
   L5="$TESTLOCK_HOME/t5.lock"
   T5_OUT="$TESTLOCK_HOME/t5.out"
@@ -110,20 +113,128 @@ else
   rc5=$?
   [ "$rc5" = 0 ]
   check "T5: 01_infrastructure.sh run standalone completes" "$?" "exit $rc5; see $T5_OUT"
-  [ -d "$L5" ]
-  check "T5: its own EXIT trap replaces lock.sh's, so the lock dir is left behind" "$?" "expected $L5 to still exist"
-  # (Its pid is expected to be dead by now, since the run above already
-  # finished; not asserted directly, since a long run gives the OS time to
-  # recycle the pid and that would flake the test. T5's real assertion is the
-  # next one: the stale lock still gets taken over, never refused.)
+  [ ! -e "$L5" ]
+  check "T5: 01's own EXIT trap releases the lock" "$?" "expected $L5 to be gone"
   out5=$(RAG_VERIFY_LOCK="$L5" bash -c '. "'"$VERIFY"'/lock.sh"; echo second-run-ok' 2>&1)
   rc5b=$?
-  check_eq "T5: a second run afterwards still succeeds (stale takeover, not refusal)" "$rc5b" "0"
+  check_eq "T5: a second run afterwards succeeds" "$rc5b" "0"
   case "$out5" in
     *second-run-ok*) ok5=0 ;;
     *) ok5=1 ;;
   esac
   check "T5: the second run actually proceeds" "$ok5" "output: $out5"
 fi
+
+# --- T6: a symlinked lock path is refused, and never followed or removed. --
+# The PR's security fix for "rm -rf on a path from the environment": the lock
+# is never deleted wholesale, and a symlink at RAG_VERIFY_LOCK is refused
+# outright rather than mkdir/rm-ing through it.
+section "verify/lock.sh — symlink and pre-existing-folder refusal"
+L6_TARGET="$TESTLOCK_HOME/t6_target"
+mkdir "$L6_TARGET"
+echo sentinel >"$L6_TARGET/keepme"
+L6="$TESTLOCK_HOME/t6.lock"
+ln -s "$L6_TARGET" "$L6"
+out6=$(RAG_VERIFY_LOCK="$L6" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' 2>&1)
+rc6=$?
+check_eq "T6: sourcing lock.sh against a symlinked lock path exits 3" "$rc6" "3"
+case "$out6" in
+  *ran*) leaked6=1 ;;
+  *) leaked6=0 ;;
+esac
+check "T6: the second run's own commands never execute" "$leaked6" "output: $out6"
+[ -L "$L6" ] && [ -f "$L6_TARGET/keepme" ]
+check "T6: the symlink and its target are left untouched (no rm -rf through it)" "$?" "symlink or target file missing"
+
+# --- T7: an existing non-lock folder (files, no pid) is refused, not wiped. -
+L7="$TESTLOCK_HOME/t7_existing"
+mkdir "$L7"
+echo important-data >"$L7/dont-delete-me"
+out7=$(RAG_VERIFY_LOCK="$L7" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' 2>&1)
+rc7=$?
+check_eq "T7: sourcing lock.sh against an existing folder with no pid file exits 3" "$rc7" "3"
+case "$out7" in
+  *ran*) leaked7=1 ;;
+  *) leaked7=0 ;;
+esac
+check "T7: the run is refused, never proceeds" "$leaked7" "output: $out7"
+[ -f "$L7/dont-delete-me" ]
+check "T7: the folder's own file is left untouched" "$?" "expected $L7/dont-delete-me to survive"
+
+# --- T8: many racers over one stale lock — exactly one wins the takeover. --
+# The PR's fix for "two runs could take over the same stale lock" relies on a
+# second mutex ($lock.takeover); this exercises it under real contention
+# instead of trusting the one-at-a-time scenarios in T1-T5.
+section "verify/lock.sh — concurrent stale-lock takeover"
+RACERS=12
+ROUNDS=3
+race_bad=0
+for round in $(seq 1 "$ROUNDS"); do
+  L8="$TESTLOCK_HOME/t8_round$round.lock"
+  mkdir "$L8"
+  bash -c 'exit 0' &
+  dead8=$!
+  wait "$dead8" 2>/dev/null
+  echo "$dead8" >"$L8/pid"
+
+  WIN8="$TESTLOCK_HOME/t8_win.$round"
+  ERR8="$TESTLOCK_HOME/t8_err.$round"
+  : >"$WIN8"; : >"$ERR8"
+  racer_pids=()
+  for i in $(seq 1 "$RACERS"); do
+    (
+      # The winner must hold the lock past the other racers' attempts, or a
+      # racer still cycling through its retry loop can win it fresh *after*
+      # the first winner already released it — a second, legitimate,
+      # sequential acquisition, not a broken mutex. Without this hold this
+      # test cannot tell "two winners of one contended instant" (a real bug)
+      # apart from "one winner, then another after the first let go" (not a
+      # bug at all).
+      racer_out=$(RAG_VERIFY_LOCK="$L8" bash -c '. "'"$VERIFY"'/lock.sh"; echo won; sleep 0.4' 2>&1)
+      racer_rc=$?
+      oneline=$(printf '%s' "$racer_out" | tr '\n' ' ')
+      if [ "$racer_rc" = 0 ]; then
+        printf '%s\n' "$oneline" >>"$WIN8"
+      else
+        printf '%s\n' "$oneline" >>"$ERR8"
+      fi
+    ) &
+    racer_pids+=($!)
+  done
+  for p in "${racer_pids[@]}"; do wait "$p"; done
+
+  winners=$(wc -l <"$WIN8" | tr -d ' ')
+  refused=$(wc -l <"$ERR8" | tr -d ' ')
+  if [ "$winners" != "1" ] || [ "$((winners + refused))" != "$RACERS" ] || [ -d "$L8.takeover" ]; then
+    race_bad=1
+    printf '    round %s: winners=%s refused=%s total=%s/%s takeover_leaked=%s\n' \
+      "$round" "$winners" "$refused" "$((winners + refused))" "$RACERS" "$([ -d "$L8.takeover" ] && echo yes || echo no)" >&2
+  fi
+done
+check "T8: every round of $RACERS racers on one stale lock had exactly one winner, all accounted for, no leaked takeover mutex ($ROUNDS rounds)" "$race_bad" "see stderr for the failing round(s)"
+
+
+# --- T9: an EXIT trap set before lock.sh is sourced still runs. -----------
+section "verify/lock.sh — EXIT trap chaining and pid-less locks"
+L9="$TESTLOCK_HOME/t9.lock"; M9="$TESTLOCK_HOME/t9.marker"
+RAG_VERIFY_LOCK="$L9" bash -c 'trap "touch '"$M9"'" EXIT; . "'"$VERIFY"'/lock.sh"; true'
+[ -e "$M9" ]
+check "T9: an earlier EXIT trap still runs after lock.sh sets its own" "$?"
+[ ! -e "$L9" ]
+check "T9: and the lock is still released" "$?"
+
+# --- T10: a pid-less lock older than a minute is taken over. --------------
+L10="$TESTLOCK_HOME/t10.lock"; mkdir "$L10"
+touch -t "$(date -v-5M +%Y%m%d%H%M 2>/dev/null || date -d '-5 min' +%Y%m%d%H%M)" "$L10"
+out10=$(RAG_VERIFY_LOCK="$L10" bash -c '. "'"$VERIFY"'/lock.sh"; echo t10-ok' 2>&1)
+case "$out10" in *t10-ok*) ok10=0 ;; *) ok10=1 ;; esac
+check "T10: a pid-less lock older than a minute is taken over" "$ok10" "output: $out10"
+
+# --- T11: a lock whose pid file isn't a number is refused, not taken over. -
+L11="$TESTLOCK_HOME/t11.lock"; mkdir "$L11"; echo "not-a-pid" > "$L11/pid"
+RAG_VERIFY_LOCK="$L11" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' >/dev/null 2>&1
+check_eq "T11: a non-numeric pid is refused with exit 3" "$?" "3"
+[ "$(cat "$L11/pid" 2>/dev/null)" = "not-a-pid" ]
+check "T11: and the lock is left as it was" "$?"
 
 summary
