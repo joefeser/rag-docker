@@ -10,7 +10,8 @@ C="${PREFIX}Infra"
 section "§10.5 Infrastructure"
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
-trap 'rm -rf "$RAG_INFRA_TMP"' EXIT
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$RAG_INFRA_TMP"; _rag_lock_release 2>/dev/null || true' EXIT
 EXPECTED_PORT="${RAG_EXPECTED_PROXY_PORT:-8080}"
 export EXPECTED_PORT
 engine=$(docker version --format '{{.Server.Version}}')
