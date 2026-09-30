@@ -16,6 +16,14 @@ ResponseFormat = Literal["end_user", "engineer"]
 ChunkingStrategy = Literal["fixed", "overlap", "language", "context_aware", "semantic"]
 PositiveSize = Annotated[int, BeforeValidator(_numeric), Field(ge=1)]
 NonnegativeSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0)]
+# Chunk bounds (#53): at least 50 characters, so a size-driven strategy can't
+# be asked for one-character chunks; at most 6,000, about the 1,500 tokens the
+# embedding model reads. `semantic` splits by similarity and ignores
+# chunk_size, so these don't bound its chunks. They apply to settings being
+# saved or used; a saved configuration from before them is still served and
+# exported as it is.
+ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
+MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
@@ -93,10 +101,10 @@ class JobStatusResponse(BaseModel):
 
 class IngestConfig(BaseModel):
     chunking_strategy: ChunkingStrategy = "overlap"
-    chunk_size: PositiveSize = 1000
+    chunk_size: ChunkSize = 1000
     chunk_overlap: NonnegativeSize = 200
     similarity_threshold: Optional[UnitInterval] = None
-    min_chunk_size: NonnegativeSize = 100
+    min_chunk_size: MinChunkSize = 100
 
     @model_validator(mode="after")
     def _relationships(self):
@@ -233,10 +241,10 @@ CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semanti
 
 class _ChunkingFields(BaseModel):
     chunking_strategy: Optional[ChunkingStrategy] = None
-    chunk_size: Optional[PositiveSize] = None
+    chunk_size: Optional[ChunkSize] = None
     chunk_overlap: Optional[NonnegativeSize] = None
     similarity_threshold: Optional[UnitInterval] = None
-    min_chunk_size: Optional[NonnegativeSize] = None
+    min_chunk_size: Optional[MinChunkSize] = None
 
     @model_validator(mode="after")
     def _relationships(self):

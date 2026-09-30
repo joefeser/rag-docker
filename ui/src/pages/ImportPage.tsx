@@ -146,7 +146,7 @@ export default function ImportPage() {
       <div className="grid grid-cols-2 gap-4 mt-4 mb-4">
         <div>
           <label className="block text-xs text-gray-600 mb-1">Chunk Size: {chunkSize}</label>
-          <input type="range" min={200} max={16000} step={100} value={chunkSize} onChange={e => setChunkSize(+e.target.value)} className="w-full" />
+          <input type="range" min={50} max={6000} step={50} value={chunkSize} onChange={e => setChunkSize(+e.target.value)} className="w-full" />
         </div>
         {showOverlap && (
           <div>
@@ -156,7 +156,7 @@ export default function ImportPage() {
         )}
         <div>
           <label className="block text-xs text-gray-600 mb-1">Min Chunk Size: {minChunkSize}</label>
-          <input type="range" min={40} max={2000} step={10} value={minChunkSize} onChange={e => setMinChunkSize(+e.target.value)} className="w-full" />
+          <input type="range" min={0} max={6000} step={10} value={minChunkSize} onChange={e => setMinChunkSize(+e.target.value)} className="w-full" />
         </div>
         {showSimilarity && (
           <div>

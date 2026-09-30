@@ -73,12 +73,17 @@ try:
     print('PASS fixed minimum above split target saves and round trips', flush=True)
 
     expect('/ingest/config', {'collection': collection, 'chunking_strategy':'fixed',
-                              'chunk_size':1, 'min_chunk_size':0}, 201)
+                              'chunk_size':50, 'min_chunk_size':0}, 201)
     status, smallest = request('/ingest/config/' + collection)
-    assert status == 200 and smallest['chunk_size'] == 1 and smallest['min_chunk_size'] == 0
-    expect('/ingest/config', {'collection':collection,'chunking_strategy':'fixed','chunk_size':0},422)
+    assert status == 200 and smallest['chunk_size'] == 50 and smallest['min_chunk_size'] == 0
+    for bad in ({'chunk_size':49}, {'chunk_size':6001}, {'min_chunk_size':6001}):
+        expect('/ingest/config', {'collection':collection,'chunking_strategy':'fixed','chunk_size':50, **bad},422)
     assert request('/ingest/config/' + collection)[1] == smallest
-    print('PASS smallest accepted chunk target and neighboring rejection preserve settings',flush=True)
+    expect('/ingest/config', {'collection': collection, 'chunking_strategy':'fixed',
+                              'chunk_size':6000, 'min_chunk_size':6000}, 201)
+    status, largest = request('/ingest/config/' + collection)
+    assert status == 200 and largest['chunk_size'] == 6000 and largest['min_chunk_size'] == 6000
+    print('PASS chunk bounds (50-6000, minimum 0-6000) accept both edges, reject their neighbours and preserve settings',flush=True)
 
     for path, bad in (('/query', {'question': 'inert', 'retrieval_mode': 'invalid'}),
                       ('/query', {'question': 'inert', 'response_format': 'invalid'}),
