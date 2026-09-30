@@ -307,6 +307,11 @@ Creates a new Weaviate collection.
 `distance_metric`: `"cosine"` (default), `"dot"`, `"l2-squared"`. This is a **collection-level** setting — it cannot be changed after creation.  
 `hnsw_config` is ignored when `index_type` is `"flat"`. All HNSW field names use camelCase to match the Weaviate v4 client API.
 
+Invalid index/distance values or HNSW settings receive **422 before backend
+lookup or creation**. HNSW numeric bounds are §4.3: `efConstruction` 64–512,
+`maxConnections` 16–128 and `ef` 16–512. Defaults remain 128/64/64; flat indexes
+ignore valid HNSW settings.
+
 **Response 201:**
 ```json
 { "name": "Documents", "status": "created" }
@@ -363,6 +368,23 @@ Accepts one or more files. For ZIP uploads, extracts and processes all supported
 | `chunk_overlap` | int | No | Default: 200 (characters). Ignored by `semantic` and `context_aware`. |
 | `similarity_threshold` | float | No | Default: 0.85. Used by `semantic` only. Range: 0.0–1.0. |
 | `min_chunk_size` | int | No | Default: 100 (characters). Chunks smaller than this are merged with adjacent chunk. |
+
+Direct upload, saved ingest configuration and optional tuning chunking settings
+share validation. `chunk_size` must be a positive integer; overlap and minimum
+size must be nonnegative integers. For `overlap`/`language`, overlap must be
+smaller than chunk size. Minimum size is a merge preference and may exceed the
+split target; for example, fixed size 60/minimum 100 preserves the existing
+acceptance case by merging small chunks.
+`similarity_threshold` is finite and in 0.0–1.0, or `null` where saved/optional
+configuration permits it (the effective semantic default is 0.85). Boolean
+values are not numeric settings. Strategies must be one of the documented five.
+Ignored overlap settings remain ignored for fixed/context-aware/semantic; the
+context-aware fallback uses language splitting with zero overlap.
+
+Invalid multipart settings return **422 `INVALID_SETTINGS` before collection
+lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
+sanitized field errors in `error.detail`. Raw input/error-context values are omitted from validation replies
+so non-finite input also produces a serializable 422. Defaults remain unchanged.
 
 **Response 202 (accepted, async):**
 ```json
@@ -479,9 +501,18 @@ POST /query
 | `collection` | string | required | Weaviate collection to query |
 | `retrieval_mode` | string | `"hnsw"` | One of: `"hnsw"`, `"flat"`, `"hybrid"`, `"semantic"` |
 | `top_k` | int | 5 | Number of chunks to retrieve |
+
 | `alpha` | float | 0.75 | Hybrid mode only: 0.0 = pure BM25, 1.0 = pure vector |
 | `include_citations` | bool | false | Whether to return source document citations |
 | `response_format` | string | `"end_user"` | `"end_user"` (plain language) or `"engineer"` (verbose, with chunk details) |
+
+Direct query and saved retrieval settings share enums and bounds: retrieval mode
+is `hnsw`, `flat`, `hybrid` or `semantic`; response format is `end_user` or
+`engineer`; `top_k` is an integer 1–50; `alpha` is finite and in 0.0–1.0.
+Invalid settings receive 422 before collection lookup, retrieval or LLM work.
+Internal collection creation, ingestion, chunking and query entry points also
+validate their supported settings before starting backend/model/staging work;
+unknown values do not silently select a default implementation.
 
 Note: distance metric is a collection-level property set at creation, not a per-query parameter.
 
@@ -571,7 +602,7 @@ carries the settings it was tuned with.
 | `top_k` | integer, 1–50 |
 | `alpha` | float, 0.0–1.0 |
 | `response_format` | one of `end_user`, `engineer` |
-| `ef` | integer or `null` |
+| `ef` | integer 16–512 or `null`; see §4.3 |
 
 **Response 201:** the saved configuration, with `is_default: false`.
 
@@ -854,6 +885,7 @@ Standard error codes:
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
 | `INVALID_PARAMETER` | 422 | Request parameter out of range or invalid |
+| `INVALID_SETTINGS` | 422 | Multipart chunking settings invalid before ingest work |
 | `SESSION_NOT_FOUND` | 404 | Gold standard session ID not found |
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
@@ -1626,13 +1658,15 @@ page renders as one undifferentiated block.
 
 ## 8. Configuration Defaults and Constraints
 
+The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
+
 | Parameter | Default | Min | Max | Notes |
 |---|---|---|---|---|
-| `chunk_size` | 1000 | 200 | 16000 | In characters |
-| `chunk_overlap` | 200 | 0 | 2000 | In characters; must be < `chunk_size` |
+| `chunk_size` | 1000 | 1 | Unbounded | Positive characters; UI slider uses 200–16000 |
+| `chunk_overlap` | 200 | 0 | Strategy-dependent | Repeated characters between adjacent chunks; must be less than `chunk_size` for overlap/language, ignored by other strategies |
 | `similarity_threshold` | 0.85 | 0.0 | 1.0 | Semantic chunking only |
-| `min_chunk_size` | 100 | 40 | 2000 | In characters; must be < `chunk_size` |
-| `top_k` | 5 | 1 | 20 | |
+| `min_chunk_size` | 100 | 0 | Unbounded | Soft merge preference in characters; may exceed the split target; UI slider uses 40–2000 |
+| `top_k` | 5 | 1 | 50 | API bounds |
 | `alpha` | 0.75 | 0.0 | 1.0 | Hybrid mode only |
 | `ef` | 64 | 16 | 512 | HNSW query param |
 | `efConstruction` | 128 | 64 | 512 | HNSW build param |
@@ -1777,6 +1811,9 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
+- [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
+      *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
+
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the
@@ -1809,6 +1846,9 @@ now lives once, in `api/services/ingest_config.py`.
       *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
 ### 10.2 Query
+
+- [x] Invalid query enums, bounds and non-finite values return a serializable 422 before retrieval or model work.
+      *Controlled tests assert no backend/model calls; `07_settings.sh` exercises real HTTP errors. The full valid-query suite passes nine checks.*
 
 - [x] A question against an ingested collection returns a non-empty answer.
 - [x] All four retrieval modes return results without error.

@@ -352,6 +352,7 @@ def _create_from_package(name: str, pkg: Path) -> None:
         cfg.get("index_type", "hnsw"),
         cfg.get("distance_metric", "cosine"),
         cfg.get("hnsw_config") or {},
+        preserve_hnsw=True,
     )
 
 

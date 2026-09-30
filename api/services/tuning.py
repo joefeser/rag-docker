@@ -142,7 +142,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
 
     staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw)
+    wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
     try:
         wc._insert_chunks_sync(staging, properties)
         staged = [
@@ -165,7 +165,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             before_replace()
         cutover_started = True
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
         target = client.collections.get(collection)
         with target.batch.dynamic() as batch:
             for record in staged:
