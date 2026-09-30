@@ -4,6 +4,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./11_retrieval.sh
+check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
@@ -19,7 +21,7 @@ ask() {  # ask <mode> <format> <citations> -> writes /tmp/vfy_ans.json
 }
 
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.2 entirely" "every check needs an LLM call"
+  skip "LLM query assertions" "set RAG_SKIP_SLOW=0 to include model calls"
   summary; exit $?
 fi
 

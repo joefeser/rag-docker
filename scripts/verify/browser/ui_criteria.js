@@ -36,6 +36,56 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── owned historical UI fixtures (no persistent backend state) ────────────
+  r.section('retained-session UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const suffix = require('crypto').randomBytes(4).toString('hex');
+    const emptyId = 'gs_' + suffix, currentId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const missingId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const common = { collection: 'OwnedHistoricalBrowserFixture', status: 'completed', pairs_total: 0, pairs_completed: 0, pairs: [] };
+    let exports = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/goldstandard/session/' + emptyId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: emptyId, stale: true, stale_reason: 'Synthetic empty history', stale_at: '2026-09-28T00:00:00+00:00', orphaned: true, orphaned_reason: 'Synthetic deleted fixture', orphaned_at: '2026-09-28T00:01:00+00:00' }) });
+      }
+      if (path === '/api/goldstandard/session/' + currentId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: currentId, pairs_total: 1, pairs_completed: 1, pairs: [{ pair_id: 'fixture', question: 'Owned synthetic question', answer: 'Inert', contexts: ['Inert'], ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: 0, status: 'approved' }] }) });
+      }
+      if (path === '/api/goldstandard/session/' + missingId) {
+        return request.respond({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SESSION_NOT_FOUND', message: 'Unknown fixture session.' } }) });
+      }
+      if (path === '/api/goldstandard/save') {
+        exports++; await sleep(500);
+        return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Synthetic export failure.' } }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/goldstandard', { waitUntil: 'networkidle2' });
+      async function load(id) {
+        await s.page.evaluate(value => { const input = document.getElementById('retained-session'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value); input.dispatchEvent(new Event('input', { bubbles: true })); }, id);
+        await sleep(100); await clickByText(s.page, 'Load / refresh session'); await sleep(200);
+      }
+      await load(emptyId);
+      const empty = await bodyText(s.page);
+      r.check('empty historical session keeps stale/orphaned reasons and timestamps visible', /Historical evaluation data/.test(empty) && /Synthetic empty history/.test(empty) && /Synthetic deleted fixture/.test(empty) && /2026-09-28T00:00/.test(empty));
+      r.check('empty historical session has no pair-dependent export button', await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b => /Export.*Approved/.test(b.textContent))));
+      await load(currentId);
+      r.check('legacy current fixture remains exportable without warning', await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && !document.querySelector('[role=alert]'); }));
+      await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); b.click(); b.click(); });
+      await sleep(100);
+      r.check('an export in flight indicates progress and is disabled', await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Exporting…'); return b && b.disabled; }));
+      await sleep(700);
+      r.check('duplicate clicks issue one export and failure clears pending state', exports===1 && await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && document.body.innerText.includes('Synthetic export failure.'); }));
+      await load(missingId);
+      r.check('a failed retained lookup clears prior pairs and export controls', /Unknown fixture session/.test(await bodyText(s.page)) && await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b=>/Export.*Approved/.test(b.textContent)) && !document.body.innerText.includes('Owned synthetic question')));
+      r.check('historical UI fixtures cause no React page errors', !s.errors.some(error=>error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); } // All synthetic responses/context owned here.
+  }
+
   // ── role gating ────────────────────────────────────────────────────────────
   r.section('§10.4 role gating');
   {
@@ -84,6 +134,74 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
             options.length > 1 && new Set(seen).size === options.length, `${new Set(seen).size} distinct`);
     r.check('no page reload occurs', reloads === 0, `${reloads} navigations`);
     await s.ctx.close();
+  }
+
+  // ── owned retrieval HTTP fixtures; no backend writes/model calls ───────────
+  r.section('effective retrieval UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedRetrievalBrowserFixture';
+    const row = { name, object_count: 10, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 72, efConstruction: 160, maxConnections: 32 } };
+    let lists = 0, failRefresh = false;
+    const saves = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        lists++;
+        return request.respond({ status: lists === 1 || failRefresh ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lists === 1 || failRefresh ? { error: { message: 'Synthetic index read failure.' } } : { collections: [row] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.25, ef: 96, response_format: 'engineer', is_default: false }) });
+      }
+      if (path === '/api/retrieval/config' && request.method() === 'POST') {
+        const body = JSON.parse(request.postData()); saves.push(body);
+        return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ ...body, is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
+      r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      await clickByText(s.page, 'Refresh index details'); await sleep(500);
+      const refreshed = await bodyText(s.page);
+      r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
+      r.check('three query methods replace inactive build controls and show legacy ef warning', await s.page.evaluate(() => document.querySelectorAll('input[name=mode]').length === 3 && document.querySelectorAll('input[type=range]').length === 1 && document.querySelector('input[value=hnsw]').checked && document.body.innerText.includes('legacy saved ef override (96) is inactive')));
+      for (const limit of [1, 50]) {
+        await s.page.evaluate(value => { const input = document.querySelector('input[type=range]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(value)); input.dispatchEvent(new Event('input', { bubbles: true })); }, limit);
+        await sleep(100); await clickByText(s.page, 'Save for this collection'); await sleep(300);
+        r.check('Top-K ' + limit + ' is selected and sent when saving', saves.at(-1)?.top_k === limit && (await bodyText(s.page)).includes('Top-K Results: ' + limit));
+      }
+      r.check('saving normalizes legacy vector alias and clears inactive ef without changing observed index', saves.length === 2 && saves.every(save => save.retrieval_mode === 'hnsw' && save.ef === null) && /ef: 72/.test(await bodyText(s.page)));
+      failRefresh = true;
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      r.check('failed refresh keeps prior physical details with an explicit warning', /displayed details are from the prior read/.test(await bodyText(s.page)) && /ef: 72/.test(await bodyText(s.page)));
+      r.check('retrieval fixture causes no React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+  for (const lateFailure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    let initial, count = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/collections') {
+        count++;
+        if (count === 1) { initial = request; return; }
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 191, efConstruction: 170, maxConnections: 40 } }] }) });
+      }
+      if (new URL(request.url()).pathname.startsWith('/api/retrieval/config/')) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: 'OwnedLatestIndexFixture', retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
+      if (!initial) throw new Error('Initial metadata request was not observed');
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      const freshVisible = /ef: 191/.test(await bodyText(s.page));
+      await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
+      await sleep(300);
+      const after = await bodyText(s.page);
+      r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
   }
 
   // ── delete confirmation ────────────────────────────────────────────────────

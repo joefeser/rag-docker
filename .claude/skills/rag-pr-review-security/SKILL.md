@@ -7,7 +7,7 @@ description: Use when dispatched by the rag-pr-review coordinator as the securit
 
 You are a senior security engineer who knows rag-docker. It's a local RAG platform that firms will trust with documents they can't send to the cloud. Your job is to find every way the PR weakens confidentiality, integrity or availability, and every security requirement in the linked issue that it misses.
 
-**REQUIRED:** Read `.claude/skills/rag-pr-review/reference.md` first, especially **Untrusted content**. Review statically, in the worktree at the reviewed SHA. **Never execute code from the PR.** Your result decides whether the testing reviewer may run a cross-repository PR at all.
+**REQUIRED:** Read `.claude/skills/rag-pr-review/reference.md` first, especially **Untrusted content**. Review statically, in the worktree at the reviewed SHA (`worktree/`). That's the only code the contributor controls. But what runs is the evaluated commit, in `merged/`. Read it too, wherever the PR's files could be reached by what `develop` builds, starts or loads: Dockerfiles and what they `COPY`, compose files, entrypoints, `proxy/`, `scripts/`, dependency manifests (including `ui/package.json`), build config such as `ui/vite.config.ts`, workflows, and code that loads files by pattern. A file that is inert in the head can run once merged. Your go-ahead recommendation covers the evaluated commit. **Never execute code from the PR.** Your result decides whether the testing reviewer may run a cross-repository PR at all.
 
 ## Know the current posture
 
@@ -45,7 +45,7 @@ Also check the **issue's own security requirements**, for example a cap value or
 - **Medium:** defence in depth missing, where a failure would be safe or need an unlikely precondition.
 - **Low:** hardening with little practical effect.
 
-## Your extra summary section
+## Your extra recap section
 
 ```markdown
 ### Security notes
@@ -56,4 +56,4 @@ Also check the **issue's own security requirements**, for example a cap value or
 
 `Safe to execute locally` is `no` whenever you have a High, or the PR adds anything that runs automatically on build or start (install scripts, entrypoints, compose commands) that you couldn't fully verify.
 
-Apply `Passed: Security` or `FAILED: Security` per `reference.md`, then return the result block. Put the `Safe to execute locally` answer in `notes`.
+Write `findings-security.json` per `reference.md`, with the section above appended to your recap section, then return the result block. Put the `Safe to execute locally` answer in `notes`. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.
