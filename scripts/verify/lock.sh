@@ -57,7 +57,9 @@ _rag_lock_acquire() {
     case "$holder" in
       none) ;;
       *[!0-9]*)
-        printf '\nThe verify lock %s holds %s, not a pid; remove it by hand if no run is using it.\n\n' "$lock" "$holder" >&2
+        # Shown, not trusted: printable characters only, and not much of them.
+        holder=$(printf '%s' "$holder" | LC_ALL=C tr -cd '[:print:]' | cut -c1-40)
+        printf '\nThe verify lock %s holds "%s", not a pid; remove it by hand if no run is using it.\n\n' "$lock" "$holder" >&2
         return 3 ;;
     esac
     if [ "$holder" != none ] && kill -0 "$holder" 2>/dev/null; then

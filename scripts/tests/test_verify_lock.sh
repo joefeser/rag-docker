@@ -282,4 +282,77 @@ rc14=$?
 [ "$rc14" != 0 ] && [ -d "$L14" ] && [ ! -e "$L14/pid" ]
 check "T14: a fresh pid-less lock is left alone" "$?" "exit $rc14"
 
+# --- T15: a symlink swapped in for the lock during the takeover mutex is ---
+# caught by the recheck and never removed through. Unlike T14's race, this
+# one needs no hook in lock.sh: overriding the shell's own `mkdir` for the
+# takeover path lets the swap happen exactly when lock.sh holds the mutex,
+# right where the recheck runs. The forged target's pid file matches the
+# stale lock's own dead pid, so the pre-recheck comparison alone would have
+# accepted it. (Written by the #105 testing reviewer.)
+section "verify/lock.sh — symlink swapped in under the takeover mutex"
+L15="$TESTLOCK_HOME/t15.lock"
+L15_TARGET="$TESTLOCK_HOME/t15_target"
+mkdir "$L15_TARGET"
+bash -c 'exit 0' &
+dead15=$!
+wait "$dead15" 2>/dev/null
+mkdir "$L15"
+echo "$dead15" >"$L15/pid"
+# The forged target's own "pid" matches the dead holder, so a takeover check
+# that only compares pids (no symlink recheck) would treat it as still-stale
+# and remove through the symlink.
+echo "$dead15" >"$L15_TARGET/pid"
+out15=$(T15_LOCK="$L15" T15_TARGET="$L15_TARGET" T15_TAKEOVER="$L15.takeover" \
+  RAG_VERIFY_LOCK="$L15" bash -c '
+    mkdir() {
+      if [ "$1" = "$T15_TAKEOVER" ]; then
+        command mkdir "$1" || return 1
+        rm -rf "$T15_LOCK"
+        ln -s "$T15_TARGET" "$T15_LOCK"
+        return 0
+      fi
+      command mkdir "$@"
+    }
+    . "'"$VERIFY"'/lock.sh"
+    echo ran
+  ' 2>&1)
+rc15=$?
+case "$out15" in *ran*) leaked15=1 ;; *) leaked15=0 ;; esac
+check "T15: the run never proceeds against a lock swapped for a symlink" "$leaked15" "exit $rc15; output: $out15"
+[ -f "$L15_TARGET/pid" ] && [ "$(cat "$L15_TARGET/pid" 2>/dev/null)" = "$dead15" ]
+check "T15: the swapped-in symlink's target is left untouched (no rm through it)" "$?" "expected $L15_TARGET/pid to survive with $dead15"
+[ -L "$L15" ]
+check "T15: the lock path is left as the swapped-in symlink, not removed" "$?" "expected $L15 to still be a symlink"
+
+
+# --- T16: an earlier EXIT trap whose command spans two lines still runs. ---
+section "verify/lock.sh — EXIT trap edge cases and refusal output"
+L16="$TESTLOCK_HOME/t16.lock"; M16a="$TESTLOCK_HOME/t16a"; M16b="$TESTLOCK_HOME/t16b"
+RAG_VERIFY_LOCK="$L16" M16a="$M16a" M16b="$M16b" bash -c 'trap "touch \"\$M16a\"
+touch \"\$M16b\"" EXIT; . "'"$VERIFY"'/lock.sh"; true'
+[ -e "$M16a" ] && [ -e "$M16b" ]
+check "T16: both lines of an earlier two-line EXIT trap still run" "$?"
+[ ! -e "$L16" ]
+check "T16: and the lock is still released" "$?"
+
+# --- T17: an earlier empty EXIT trap (trap '' EXIT) doesn't break the chain.
+L17="$TESTLOCK_HOME/t17.lock"
+out17=$(RAG_VERIFY_LOCK="$L17" bash -c "trap '' EXIT; . \"$VERIFY/lock.sh\"; echo t17-ran" 2>&1)
+case "$out17" in *t17-ran*) ok17=0 ;; *) ok17=1 ;; esac
+check "T17: a run with an earlier empty EXIT trap proceeds" "$ok17" "output: $out17"
+[ ! -e "$L17" ]
+check "T17: and the lock is released at exit" "$?" "output: $out17"
+
+# --- T18: a non-pid holder is shown with control characters removed. ------
+L18="$TESTLOCK_HOME/t18.lock"; mkdir "$L18"
+printf 'bad\033[31mred\nsecond-line-%s' "$(printf 'x%.0s' $(seq 1 80))" > "$L18/pid"
+out18=$(RAG_VERIFY_LOCK="$L18" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' 2>&1)
+rc18=$?
+check_eq "T18: a non-pid holder is still refused with exit 3" "$rc18" "3"
+case "$out18" in *$'\033'*) esc18=1 ;; *) esc18=0 ;; esac
+check "T18: the refusal message carries no escape characters" "$esc18" "output: $out18"
+shown18=$(printf '%s' "$out18" | sed -n 's/.*holds "\(.*\)", not a pid.*/\1/p')
+[ -n "$shown18" ] && [ "${#shown18}" -le 40 ]
+check "T18: the shown holder is at most 40 characters" "$?" "shown: $shown18"
+
 summary
