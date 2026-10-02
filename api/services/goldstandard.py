@@ -305,6 +305,8 @@ def _update_session_sync(session_id: str, change):
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
+    """Retain the historical guard in memory if a completed mutation cannot persist it."""
+    global _store_revision
     sessions = sessions_for(collection)
     now = datetime.now(timezone.utc).isoformat()
     marked = 0
@@ -318,8 +320,17 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
             marked += 1
         except (GoldStandardError, OSError, ValueError, RuntimeError):
             # The primary collection mutation already happened. Preserve the
-            # failed-write diagnostic and continue other markers; never turn a
-            # completed delete/rebuild into a fictitious primary failure.
+            # failed-write diagnostic. Publish the marker in the process cache
+            # even when disk still holds the prior snapshot, so a completed
+            # delete/rebuild cannot export this session as a current baseline.
+            # A later successful session write will persist the marker.
+            with _state_lock:
+                current = _sessions.get(session["session_id"])
+                if current is not None:
+                    snapshot = copy.deepcopy(current)
+                    change(snapshot)
+                    _sessions[session["session_id"]] = snapshot
+                    _store_revision += 1
             log.exception("Could not durably mark session %s %s", session["session_id"], flag)
     return marked
 

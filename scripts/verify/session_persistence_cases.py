@@ -5,7 +5,9 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock,MagicMock,patch
 sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+import httpx
 from config import settings
+from main import app
 from services import goldstandard as gs
 
 
@@ -15,7 +17,9 @@ def fixture():
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
-        for obj,key,value in [(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{}),(gs,'_diagnostics',{})]:
+        patches=[(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{})]
+        if hasattr(gs,'_diagnostics'):patches.append((gs,'_diagnostics',{}))
+        for obj,key,value in patches:
             change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
         self.data=fixture();gs.store_session(self.data)
 
@@ -30,6 +34,32 @@ class PersistenceTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=16) as pool:results=list(pool.map(edit,range(16)))
         self.assertTrue(all(results));state=self.restart()
         for i in range(16):self.assertEqual(state['pairs'][i//2]['question' if i%2==0 else 'answer'],str(i))
+
+    def test_slow_first_write_cannot_replace_later_acknowledged_edit(self):
+        path=gs._session_path(self.data['session_id'])
+        entered=threading.Event();calls=0
+        original_write=Path.write_text;original_replace=os.replace
+        def pause_first_write():
+            nonlocal calls
+            calls+=1
+            if calls==1:
+                entered.set();time.sleep(0.8)
+        def write_text(target,*args,**kwargs):
+            if Path(target)==path:pause_first_write()
+            return original_write(target,*args,**kwargs)
+        def replace(src,dst):
+            if Path(dst)==path:pause_first_write()
+            return original_replace(src,dst)
+        async def run():
+            with patch.object(Path,'write_text',write_text),patch.object(os,'replace',side_effect=replace):
+                first=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'question':'First acknowledged'}))
+                self.assertTrue(await asyncio.to_thread(entered.wait,5))
+                second=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Second acknowledged'}))
+                return await asyncio.gather(first,second)
+        results=asyncio.run(run())
+        self.assertEqual(len(results),2)
+        pair=self.restart()['pairs'][0]
+        self.assertEqual((pair['question'],pair['answer']),('First acknowledged','Second acknowledged'))
 
     def test_replace_failure_leaves_previous_snapshot_and_reports_failure(self):
         path=gs._session_path(self.data['session_id']);before=path.read_bytes()
@@ -204,9 +234,21 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
             return original(src,dst)
         with patch.object(gs.os,'replace',side_effect=replace):
             self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),1)
-        self.assertNotIn('orphaned',gs.get_session(self.data['session_id']))
+        self.assertTrue(gs.get_session(self.data['session_id'])['orphaned'])
+        self.assertNotIn('orphaned',json.loads(gs._session_path(self.data['session_id']).read_text()))
         self.assertTrue(gs.get_session(second['session_id'])['orphaned'])
         self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    def test_failed_orphan_marker_refuses_current_export(self):
+        with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        async def request():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+                return await client.post('/goldstandard/save',json={'session_id':self.data['session_id'],'filename':'owned-review.json'})
+        response=asyncio.run(request())
+        self.assertEqual(response.status_code,409,response.text)
+        self.assertEqual(response.json()['error']['code'],'HISTORICAL_SESSION')
+        self.assertFalse((Path(self.tmp.name)/'owned-review.json').exists())
 
     def test_generation_commit_failure_retains_code_after_followup_status_writes(self):
         async def run():
