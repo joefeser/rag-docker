@@ -178,6 +178,7 @@ class ExpectedRecords:
 
     def verify(self, collection, *, exact: bool) -> int:
         self.db.execute("UPDATE expected SET seen=0")
+        vectorless_allowed = None
 
         def stored_objects():
             if exact:
@@ -199,10 +200,20 @@ class ExpectedRecords:
                 raise BatchVerificationError(f"Duplicate stored object {key}")
             if _property_digest(obj.properties or {}) != properties:
                 raise BatchVerificationError(f"Stored properties differ for {key}")
-            try:
-                actual_vector = _vector_digest((obj.vector or {}).get("default"))
-            except ValueError as exc:
-                raise BatchVerificationError(f"Stored vector is missing or invalid for {key}") from exc
+            stored_vector = (obj.vector or {}).get("default")
+            if stored_vector is None and vector is None:
+                if vectorless_allowed is None:
+                    config = getattr(collection, "config", None)
+                    vectorizer = config.get().vectorizer if config is not None else None
+                    vectorless_allowed = getattr(vectorizer, "value", None) == "none"
+                if not vectorless_allowed:
+                    raise BatchVerificationError(f"Stored vector is missing or invalid for {key}")
+                actual_vector = None
+            else:
+                try:
+                    actual_vector = _vector_digest(stored_vector)
+                except ValueError as exc:
+                    raise BatchVerificationError(f"Stored vector is missing or invalid for {key}") from exc
             if vector is not None and vector != actual_vector:
                 raise BatchVerificationError(f"Stored float32 vector differs for {key}")
             self.db.execute("UPDATE expected SET seen=1 WHERE id=?", (key,))
@@ -248,7 +259,10 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
                     raise ValueError("Record stream changed after preflight")
             failed = collection.batch.failed_objects
             if failed:
-                raise RuntimeError(f"Weaviate rejected {len(failed)} batch object(s)")
+                detail = getattr(failed[0], "message", None)
+                raise RuntimeError(
+                    f"Weaviate rejected {len(failed)} batch object(s)"
+                    + (f": {detail}" if detail else ""))
             return expected.verify(collection, exact=exact)
         except Exception as original:
             if cleanup_owned:

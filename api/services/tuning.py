@@ -9,6 +9,8 @@ has no rename (see `importer.py`), so the final step copies vectors out of the
 staging collection rather than re-embedding — one embedding pass, not two. A
 failure before replacement leaves the original untouched. After replacement
 starts, a verified recovery copy and its sidecars survive failure and restart.
+Identity-changing operations flag retained evaluations before replacement;
+failed cutovers flag them too.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -128,12 +130,13 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress) -> int:
+             distance_metric: str | None, progress, before_replace=None) -> int:
     """Stage the new chunks, then swap them into place.
 
     Weaviate embeds during the staging insert. The final insert reuses those
     vectors verbatim, so the corpus is embedded once rather than twice.
     """
+    cutover_started = False
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
@@ -144,7 +147,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     staging = ownership["staging"]
     completed = False
     try:
-        wc._create_collection_sync(staging, new_index, new_distance, hnsw)
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
         wc._insert_chunks_sync(staging, properties)
         def staged():
             return (
@@ -160,8 +163,11 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         collection_recovery.retain(ownership)
         # The final create, write and verification can still fail. Durable
         # recovery ownership must precede deletion, including on a hard kill.
+        if before_replace:
+            before_replace()
+        cutover_started = True
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
         target = client.collections.get(collection)
         written = batch_write.insert(target, staged, expected_count=len(properties))
         if progress:
@@ -169,6 +175,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         completed = True
         return written
     except Exception as exc:
+        if cutover_started:
+            goldstandard.mark_stale(collection, "collection replacement failed after cutover began; retained pairs require historical review")
         if ownership["state"] == "recovery":
             raise PackageError(
                 "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified rebuilt data "
@@ -236,7 +244,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
         job["chunks_total"] = len(properties)
         written = _rebuild(collection, properties,
                            params.get("index_type"), params.get("distance_metric"),
-                           progress)
+                           progress, before_replace=(lambda: goldstandard.mark_stale(collection, reason)) if reason else None)
 
         notes = []
         if reason:

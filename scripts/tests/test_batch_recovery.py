@@ -158,6 +158,21 @@ class WriterTests(unittest.TestCase):
         batch_write.insert(col, [{'properties': {'content': 'new'}}], exact=False)
         self.assertEqual(len(col.rows), 2)
 
+    def test_vectorless_storage_is_accepted_only_for_vectorizer_none(self):
+        class VectorlessBatch(Batch):
+            def add_object(self, properties, uuid, vector=None):
+                self.pending.append(dict(id=str(uuid), properties=copy.deepcopy(properties),
+                                         vector=None))
+
+        col = Collection('TextOnly')
+        col.batch = VectorlessBatch(col)
+        row = [{'properties': {'content': 'inert text'}}]
+        with self.assertRaises(batch_write.BatchVerificationError):
+            batch_write.insert(col, row, exact=False)
+        col.config = SimpleNamespace(get=lambda: SimpleNamespace(
+            vectorizer=SimpleNamespace(value='none')))
+        self.assertEqual(batch_write.insert(col, row, exact=False), 1)
+
     def test_ingestion_uses_completed_batch_verification(self):
         col = Collection('Corpus', 'reject')
         client = SimpleNamespace(collections=SimpleNamespace(get=lambda name: col))
@@ -220,7 +235,7 @@ class RecoveryTests(unittest.TestCase):
         batch_write.insert(self.cols.get('Corpus'), self.original)
         self.client = SimpleNamespace(collections=self.cols)
         self.stack.enter_context(patch.object(wc, 'get_client', return_value=self.client))
-        self.stack.enter_context(patch.object(wc, '_create_collection_sync', side_effect=lambda name, *args: self.cols.create(name)))
+        self.stack.enter_context(patch.object(wc, '_create_collection_sync', side_effect=lambda name, *args, **kwargs: self.cols.create(name)))
         self.stack.enter_context(patch.object(wc, '_collection_config_sync', return_value={'index_type': 'hnsw', 'distance_metric': 'cosine'}))
         self.stack.enter_context(patch.dict(importer._jobs, {}, clear=True))
         self.stack.enter_context(patch.dict(tuning._jobs, {}, clear=True))
@@ -345,7 +360,13 @@ class RecoveryTests(unittest.TestCase):
             (pkg / f'{kind}_config.json').write_text(json.dumps({'collection': 'Corpus', 'setting': kind}))
         gold = pkg / 'goldstandard'
         gold.mkdir(exist_ok=True)
-        (gold / 'gs_0123abcd.json').write_text(json.dumps({'collection': 'Corpus', 'pairs': ['preserve']}))
+        (gold / 'gs_0123abcd.json').write_text(json.dumps({
+            'session_id': 'gs_0123abcd', 'collection': 'Corpus', 'status': 'completed',
+            'pairs_total': 1, 'pairs_completed': 1,
+            'pairs': [{'pair_id': 'p_0123abcd', 'question': 'Question?',
+                       'answer': 'Answer', 'ground_truth': 'Answer',
+                       'contexts': ['Context'], 'source_file': 'source.txt',
+                       'chunk_index': 0, 'status': 'approved'}]}))
         manifest = {'package_format': 1, 'collection': {'name': 'Corpus', 'chunk_count': 2},
                     'embedding': {'dimensions': 2, 'model': settings.embed_model}}
         (pkg / 'manifest.json').write_text(json.dumps(manifest))
@@ -436,6 +457,9 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(snapshot.exists())
 
     def import_new_target(self, pkg, manifest):
+        # These cases exercise chunk preflight, not evaluation sidecar identity.
+        for sidecar in (pkg / 'goldstandard').glob('*.json'):
+            sidecar.unlink()
         importer._jobs['preflight'] = {'chunks_written': 0}
         with patch.object(importer.packager, 'open_package', return_value=(pkg, manifest)), \
                 patch.object(importer.packager, 'verify_digests'), \
@@ -481,7 +505,7 @@ class RecoveryTests(unittest.TestCase):
         pkg, manifest = self.package()
         importer._jobs['job'] = {'chunks_written': 0}
         actual_delete = self.cols.delete
-        def create_rejected(name, *args):
+        def create_rejected(name, *args, **kwargs):
             self.cols.create(name)
             self.cols.get(name).fault = 'reject'
         def fail_partial_delete(name):
