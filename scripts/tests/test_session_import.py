@@ -47,6 +47,8 @@ class SessionImportTests(unittest.TestCase):
         (self.pkg / 'goldstandard' / name).write_text(json.dumps(data))
 
     def archive(self):
+        # Even a zero-chunk package carries the chunk stream for recovery preflight.
+        (self.pkg / 'chunks.jsonl').touch()
         files = {str(p.relative_to(self.pkg)): 'sha256:' + packager.sha256_file(p)
                  for p in self.pkg.rglob('*.json') if p.name != 'manifest.json'}
         manifest = {'package_format': 1, 'collection': {'name': 'Corpus', 'chunk_count': 0},

@@ -217,12 +217,25 @@ check_eq "rename imports alongside the original" "$istat" "completed"
 check "the renamed collection has a new name" $? "imported as $iname"
 check_eq "every chunk is imported" "$iwritten" "$chunks_before"
 
+# A successful destructive replace must be exercised as well as abort/rename.
+api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
+rjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace.json'))['job_id'])")
+rstatus=$(wait_for_job "/import/job/$rjob" 1800)
+check_eq "replace completes after verified final writes" "$rstatus" "completed"
+check_eq "replace reports confirmed target objects" "$(api_get "/import/job/$rjob" | jfield "['chunks_written']")" "$chunks_before"
+api_post "/export" "{\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
+rejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace_exp.json'))['job_id'])")
+wait_for_job "/export/job/$rejob" 1800 >/dev/null
+RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
+[ "$RPKG" != "$PKG" ]
+check "replace fidelity compares an independent re-export" $?
+
 # ── import is lossless ───────────────────────────────────────────────────────
 api_post "/export" "{\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
 ejob2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp2.json'))['job_id'])")
 wait_for_job "/export/job/$ejob2" 1800 >/dev/null
 PKG2=$(api_get "/export/job/$ejob2" | jfield "['filename']")
-python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" <<'ENDPY'
+python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" "$EXPORTS/$RPKG" <<'ENDPY'
 import json, sys, tarfile, tempfile, pathlib
 def chunks(path):
     with tempfile.TemporaryDirectory() as td:
@@ -231,13 +244,15 @@ def chunks(path):
         root = next(p for p in pathlib.Path(td).iterdir() if p.is_dir())
         return {r["id"]: r for r in
                 (json.loads(l) for l in (root / "chunks.jsonl").read_text().splitlines() if l.strip())}
-a, b = chunks(sys.argv[1]), chunks(sys.argv[2])
-same = set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
+a = chunks(sys.argv[1])
+comparisons = [chunks(path) for path in sys.argv[2:]]
+same = all(set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
                                 and a[k]["properties"] == b[k]["properties"] for k in a)
+           for b in comparisons)
 sys.exit(0 if same else 1)
 ENDPY
-check "re-export after import is byte-identical (uuids, vectors, properties)" $?
-rm -f "$EXPORTS/$PKG2"
+check "rename and replace preserve exported uuids, vectors and properties" $?
+rm -f "$EXPORTS/$PKG2" "$EXPORTS/$RPKG"
 drop_collection "$iname"
 
 # ── models on import: damaged and namespaced (E26, E27) ──────────────────────
@@ -402,6 +417,26 @@ import json,re,sys
 m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
+
+# ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  RP="${PREFIX}BatchRecovery"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
+  check "batch faults fail truthfully and retain verified recovery" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_prepare.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose restart api) >/dev/null 2>&1
+  for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+  (cd "$REPO_ROOT" && docker compose exec -T api python - check --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_check.log 2>&1
+  check "recovery survives restart; owned scratch swept, unowned names kept" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_check.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
+  check "recovery acceptance fixtures are removed" $?
+else
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
 
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"

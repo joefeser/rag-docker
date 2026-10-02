@@ -57,6 +57,34 @@ the same code:
 These tests talk to the running API, the real Weaviate and the real model, and
 drive the UI in a real browser.
 
+## Batch faults and recovery across restart
+
+Run the controlled regressions with the API dependencies installed:
+
+```bash
+python -m unittest discover -s scripts/tests -p 'test_batch*.py'
+```
+
+For a **disposable stack**, the following fault acceptance uses real Weaviate,
+synthetic `VfyBatchRecovery*` collections and the real embedding model. It injects
+final-create failures into the test process, retains import/tuning recovery,
+restarts the API, then verifies exact UUIDs, properties, vectors and sources.
+It also checks real completed-batch rejection/partial acceptance, ingestion UUID
+rollback after a post-write read fault, resumption of metadata cleanup after backend
+deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack.
+
+```bash
+docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
+docker compose restart api
+# Wait for /api/health to report healthy before the next phase.
+docker compose exec -T api python - check < scripts/verify/batch_recovery.py
+docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
+```
+
+If interrupted, keep the recorded fixtures and run `check` after restarting; run
+`cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
+live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
+
 ## Layout
 
 | File | Covers |
@@ -73,7 +101,7 @@ drive the UI in a real browser.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23, E26 and E27; live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23, E26 and E27; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |

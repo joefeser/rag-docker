@@ -6,10 +6,11 @@ or vector width changes and Weaviate cannot alter either in place.
 **Safety.** Each rebuild is staged: the new chunks are built into a temporary
 collection first, and the live one is replaced only once that succeeds. Weaviate
 has no rename (see `importer.py`), so the final step copies vectors out of the
-staging collection rather than re-embedding — one embedding pass, not two.
-Preparation failures leave the original collection untouched. A failure after
-replacement begins can leave it missing or partial. Identity-changing operations
-flag retained evaluations before replacement; any failed cutover flags them too.
+staging collection rather than re-embedding — one embedding pass, not two. A
+failure before replacement leaves the original untouched. After replacement
+starts, a verified recovery copy and its sidecars survive failure and restart.
+Identity-changing operations flag retained evaluations before replacement;
+failed cutovers flag them too.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -31,6 +32,7 @@ from config import settings
 from services import goldstandard
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
 from services.ingest_pipeline import _parse_file
 from services.packager import PackageError
@@ -140,50 +142,53 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
 
-    staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
+    ownership = collection_recovery.begin(collection, "tune", client)
+    staging = ownership["staging"]
+    completed = False
     try:
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
         wc._insert_chunks_sync(staging, properties)
-        staged = [
-            {"id": str(o.uuid),
-             "vector": (o.vector or {}).get("default"),
-             "properties": dict(o.properties or {})}
-            for o in client.collections.get(staging).iterator(include_vector=True)
-        ]
-        if len(staged) != len(properties):
+        def staged():
+            return (
+                {"id": str(o.uuid),
+                 "vector": (o.vector or {}).get("default"),
+                 "properties": dict(o.properties or {})}
+                for o in client.collections.get(staging).iterator(include_vector=True)
+            )
+        staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+        if staged_count != len(properties):
             raise RuntimeError(
-                f"staged {len(staged)} chunks but expected {len(properties)}")
-        if progress:
-            progress(len(staged))
-
-        # Past this point the original is replaced. Preparation has succeeded,
-        # but deletion, creation or final writes can still fail.
-        # Persist the warning before deletion, so a failed replacement cannot
-        # leave retained pairs claiming to be a current baseline.
+                f"staged {staged_count} chunks but expected {len(properties)}")
+        collection_recovery.retain(ownership)
+        # The final create, write and verification can still fail. Durable
+        # recovery ownership must precede deletion, including on a hard kill.
         if before_replace:
             before_replace()
         cutover_started = True
         client.collections.delete(collection)
         wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
         target = client.collections.get(collection)
-        with target.batch.dynamic() as batch:
-            for record in staged:
-                batch.add_object(properties=record["properties"],
-                                 uuid=record["id"], vector=record["vector"])
-            if batch.number_errors > 0:
-                raise RuntimeError(
-                    f"{batch.number_errors} error(s) writing the rebuilt collection")
-        return len(staged)
-    except Exception:
+        written = batch_write.insert(target, staged, expected_count=len(properties))
+        if progress:
+            progress(written)
+        completed = True
+        return written
+    except Exception as exc:
         if cutover_started:
             goldstandard.mark_stale(collection, "collection replacement failed after cutover began; retained pairs require historical review")
+        if ownership["state"] == "recovery":
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified rebuilt data "
+                f"is retained as '{staging}'.",
+                {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
         raise
     finally:
-        try:
-            client.collections.delete(staging)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove staging collection %r", staging)
+        if completed or ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, client)
+            except Exception:                         # noqa: BLE001
+                _log.exception("Could not remove owned staging collection %r", staging)
 
 
 def _run(job_id: str, collection: str, operation: str, params: dict) -> None:

@@ -74,9 +74,8 @@ class ValidityServiceTests(unittest.TestCase):
             client=MagicMock();stage=MagicMock();target=MagicMock()
             obj=SimpleNamespace(uuid='00000000-0000-0000-0000-000000000001',vector={'default':[0.1]},properties={'content':'Inert'})
             stage.iterator.return_value=[obj];stage.aggregate.over_all.return_value=SimpleNamespace(total_count=1)
+            ownership={'staging':'ValidityFixture__test','state':'scratch','operation_id':'test'}
             client.collections.get.side_effect=lambda name:target if name=='ValidityFixture' else stage
-            batch=target.batch.dynamic.return_value.__enter__.return_value;batch.number_errors=0
-            if failure=='write':batch.add_object.side_effect=RuntimeError('write fault')
             def delete(name):
                 if name=='ValidityFixture':
                     self.assertTrue(self.data['stale'])
@@ -89,7 +88,11 @@ class ValidityServiceTests(unittest.TestCase):
             with patch.object(tuning.wc,'get_client',return_value=client), \
                  patch.object(tuning.wc,'_collection_config_sync',return_value={'index_type':'hnsw','distance_metric':'cosine','hnsw_config':{}}), \
                  patch.object(tuning.wc,'_create_collection_sync',side_effect=create), \
-                 patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert):
+                 patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert), \
+                 patch.object(tuning.collection_recovery,'begin',return_value=ownership), \
+                 patch.object(tuning.collection_recovery,'retain',side_effect=lambda owner:owner.update(state='recovery')), \
+                 patch.object(tuning.collection_recovery,'discard'), \
+                 patch.object(tuning.batch_write,'insert',side_effect=RuntimeError('write fault') if failure=='write' else None):
                 with self.assertRaises(Exception):tuning._rebuild('ValidityFixture',[{'content':'Inert'}],None,None,None,before_replace=lambda:gs.mark_stale('ValidityFixture','Synthetic replacement'))
             self.assertEqual(bool(self.data.get('stale')),failure!='stage')
             if failure!='stage':self.assertTrue(self.data['stale_at'])
