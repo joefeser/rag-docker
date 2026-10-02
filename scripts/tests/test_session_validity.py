@@ -35,12 +35,13 @@ class ValidityServiceTests(unittest.TestCase):
         self.assertFalse(response.stale);self.assertFalse(response.orphaned)
         self.assertEqual(gs.mark_stale('ValidityFixture','Synthetic rechunk'),1)
         self.assertEqual(gs.mark_orphaned('ValidityFixture','Synthetic deletion'),1)
-        expected=copy.deepcopy(self.data);gs._sessions={};gs.load_sessions_from_disk()
+        expected=gs.get_session(self.data['session_id']);gs._sessions={};gs.load_sessions_from_disk()
         self.assertEqual(gs.get_session(self.data['session_id']),expected)
 
     def test_historical_guard_rejects_before_export_writes(self):
         for flags in ({'stale':True},{'orphaned':True},{'stale':True,'orphaned':True}):
             self.data.pop('stale',None);self.data.pop('orphaned',None);self.data.update(flags)
+            gs.store_session(self.data)
             before=copy.deepcopy(self.data)
             with patch.object(gs,'_save_export_sync') as write:
                 with self.assertRaises(gs.GoldStandardError) as error:
@@ -51,6 +52,7 @@ class ValidityServiceTests(unittest.TestCase):
 
     def test_explicit_service_export_reports_metadata_without_mutating_history(self):
         self.data.update(stale=True,stale_reason='Synthetic stale',stale_at='2026-09-28T00:00:00+00:00')
+        gs.store_session(self.data)
         before=copy.deepcopy(self.data)
         result=asyncio.run(gs.save_session(self.data['session_id'],'historical.json',True))
         self.assertTrue(result['historical']);self.assertEqual((result['pairs_saved'],result['pairs_excluded']),(2,2))
@@ -71,6 +73,7 @@ class ValidityServiceTests(unittest.TestCase):
         from unittest.mock import MagicMock
         for failure in ('stage','delete','create','write'):
             self.data.pop('stale',None);self.data.pop('stale_reason',None);self.data.pop('stale_at',None)
+            gs.store_session(self.data)
             client=MagicMock();stage=MagicMock();target=MagicMock()
             obj=SimpleNamespace(uuid='00000000-0000-0000-0000-000000000001',vector={'default':[0.1]},properties={'content':'Inert'})
             stage.iterator.return_value=[obj];stage.aggregate.over_all.return_value=SimpleNamespace(total_count=1)
@@ -78,7 +81,7 @@ class ValidityServiceTests(unittest.TestCase):
             client.collections.get.side_effect=lambda name:target if name=='ValidityFixture' else stage
             def delete(name):
                 if name=='ValidityFixture':
-                    self.assertTrue(self.data['stale'])
+                    self.assertTrue(gs.get_session(self.data['session_id'])['stale'])
                     with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.save_session(self.data['session_id'],'guard.json'))
                     if failure=='delete':raise RuntimeError('delete fault')
             client.collections.delete.side_effect=delete
@@ -94,8 +97,9 @@ class ValidityServiceTests(unittest.TestCase):
                  patch.object(tuning.collection_recovery,'discard'), \
                  patch.object(tuning.batch_write,'insert',side_effect=RuntimeError('write fault') if failure=='write' else None):
                 with self.assertRaises(Exception):tuning._rebuild('ValidityFixture',[{'content':'Inert'}],None,None,None,before_replace=lambda:gs.mark_stale('ValidityFixture','Synthetic replacement'))
-            self.assertEqual(bool(self.data.get('stale')),failure!='stage')
-            if failure!='stage':self.assertTrue(self.data['stale_at'])
+            current=gs.get_session(self.data['session_id'])
+            self.assertEqual(bool(current.get('stale')),failure!='stage')
+            if failure!='stage':self.assertTrue(current['stale_at'])
 
     def test_successful_identity_preserving_reindex_keeps_validity_semantics(self):
         from services import tuning

@@ -692,7 +692,11 @@ The `pairs` array contains only pairs whose generation has completed so far. Dur
 { "error": { "code": "SESSION_NOT_FOUND", "message": "Session 'gs_abc123' not found.", "detail": null } }
 ```
 
-**Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. The API loads existing session files on startup into an in-memory dict.
+**Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. The API loads existing session files on startup into an in-memory dict. The local deployment uses one API process. A process-wide reentrant lock serializes each session mutation, snapshot and durable write across generation, review, regeneration, import storage and history markers. Files use unique temporary names, file fsync, atomic replacement and directory fsync. Readers receive independent snapshots; no lock is held across model calls. Concurrent edits to distinct fields retain each acknowledged change; edits to the same field follow the serialized commit order. Review during generation remains supported.
+
+Regeneration compares the target pair after the model call. If the target changed, it returns 409 `PAIR_CHANGED_DURING_REGENERATION` and preserves the acknowledged edit; updates to other pairs and validity flags are retained. A write failure before replacement returns 503 `SESSION_WRITE_FAILED`, leaving the prior cache/disk snapshot intact. A directory fsync failure after replacement returns 503 `SESSION_DURABILITY_UNCERTAIN`: cache reflects the replacement, but the caller must refresh and inspect storage before retrying. These errors are not acknowledged edits.
+
+`GET /goldstandard/diagnostics` returns `{"issues": [{"filename": "...", "code": "...", "message": "..."}]}`. Unreadable/invalid session files are preserved and reported as `SESSION_READ_FAILED`, rather than silently omitted. An unavailable or unreadable storage directory is reported as `SESSION_STORAGE_UNAVAILABLE` without aborting startup or erasing the cached last valid state. Recovery scans do not create a missing directory. Owned unpublished temporary snapshots left by interruption are preserved and reported as `SESSION_INTERRUPTED_WRITE`; the final JSON remains authoritative. A valid restored file needs API restart to reload its cache. Health displays diagnostic filenames, codes and recovery messages, plus a warning if diagnostics cannot refresh. Diagnostic issues do not change dependency health. Pending refreshes label retained results as previous; failed refreshes clear them, and responses from older refresh requests cannot overwrite newer results. Removed unreadable files or inspected temporary snapshots clear their file-read diagnostics on the next successful scan. Write failures keep their separate successful-write recovery policy; failed generation persists its original code/reason and keeps its warning through status updates and restart. File inspection occurs outside the writer lock; a scan that races a durable commit is discarded. Session marker write failures are individually reported without aborting the already completed primary delete/import/tuning operation; marker counts include only durably acknowledged updates. This is a single-process session-store contract, not cross-process locking, import identity allocation (#46), historical-export policy (#47), or a collection-wide export snapshot.
 
 ---
 
@@ -890,6 +894,9 @@ Standard error codes:
 | `INVALID_PARAMETER` | 422 | Request parameter out of range or invalid |
 | `INVALID_SETTINGS` | 422 | Multipart chunking settings invalid before ingest work |
 | `SESSION_NOT_FOUND` | 404 | Gold standard session ID not found |
+| `PAIR_CHANGED_DURING_REGENERATION` | 409 | Target changed during model generation; acknowledged edit retained |
+| `SESSION_WRITE_FAILED` | 503 | Failure before replacement; prior session snapshot unchanged |
+| `SESSION_DURABILITY_UNCERTAIN` | 503 | Replacement published but directory durability uncertain; refresh before retry |
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
@@ -1901,6 +1908,12 @@ now lives once, in `api/services/ingest_config.py`.
       under a status saying otherwise. **Fixed**: a model validator requires
       `status="edited"` whenever content fields are present.*
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`).
+- [x] Concurrent edits survive generation, independent-field updates and restart; write faults are not acknowledged, and changed regeneration targets are rejected.
+      *Registered `12_persistence.sh` runs owned concurrency, interruption and failure-path cases plus real backend/HTTP/fresh-process checks. Exact counts and initial full-suite failures are retained in the PR; this is single-process acceptance.*
+- [x] Recovery diagnostics preserve unreadable bytes, clear removed-file warnings, retain generation failure codes, and do not hold the writer lock while reading the archive.
+      *Registered cases pause an archive read while an edit commits, inject failed pair writes and later status updates, and remove inspected fixtures. Health browser fixtures exercise pending, failed and out-of-order refreshes.*
+- [x] Secondary session marker write failures do not misreport a completed collection deletion/import/rebuild or prevent later session markers.
+      *Registered live HTTP deletion checks physical absence and registry removal under an owned marker failure; isolated import/tuning paths and two-session marker cases verify bounded continuation.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.
       *2 approved + 1 edited saved; 1 rejected + 1 pending excluded.*
 - [x] Exported file is valid JSON and each pair matches the RAGAS schema.

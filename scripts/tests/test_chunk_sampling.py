@@ -159,7 +159,7 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             sampler.assert_awaited_once_with('Inert',limit=20,seed=7)
             self.assertEqual(result['pairs_total'],3)
-            self.assertEqual(gs._sessions[result['session_id']]['pairs_total'],3)
+            self.assertEqual(save.await_args.args[0]['pairs_total'],3)
             save.assert_awaited_once()
             generate.assert_awaited_once_with(result['session_id'],chosen)
 

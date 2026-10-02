@@ -2,6 +2,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import copy
+import os
+import tempfile
+import threading
 
 import httpx
 import re
@@ -39,6 +43,10 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
+_state_lock = threading.RLock()
+_diagnostics: dict[str, dict] = {}
+_scan_lock = threading.Lock()
+_store_revision = 0
 _SESSION_ID = re.compile(r"gs_[0-9a-f]{8}")
 
 
@@ -67,7 +75,10 @@ def _session_storage_root() -> Path:
 
 def _sessions_dir() -> Path:
     p = _session_storage_root()
+    created = not p.exists()
     p.mkdir(parents=True, exist_ok=True)
+    if created:
+        _sync_directory(p.parent)
     return p
 
 
@@ -87,121 +98,254 @@ def _session_path(session_id: str) -> Path:
     return target
 
 
+def _record_issue(path: Path, code: str) -> None:
+    changed = _diagnostics.get(str(path), {}).get("code") != code
+    messages = {
+        "SESSION_STORAGE_UNAVAILABLE": "Session storage could not be inspected. Existing files are preserved; inspect local storage and restart after recovery.",
+        "SESSION_READ_FAILED": "Session file could not be loaded. Original bytes are preserved; restore a valid copy and restart the API.",
+        "SESSION_INTERRUPTED_WRITE": "An interrupted write left an unpublished temporary snapshot. The final JSON file remains authoritative; inspect the temporary file before removing it.",
+        "SESSION_WRITE_FAILED": "Update failed before replacement; the previous snapshot remains authoritative. Check local storage before retrying.",
+        "SESSION_DURABILITY_UNCERTAIN": "Replacement occurred but directory durability could not be confirmed. Refresh the session and inspect local storage before retrying.",
+    }
+    _diagnostics[str(path)] = {"filename": path.name, "code": code, "message": messages[code]}
+    if changed:
+        log.error("Session persistence issue %s for %s", code, path.name)
+
+
+def _sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _save_session_sync(session: dict) -> None:
-    path = _session_path(session["session_id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(session, indent=2))
+    """Publish one immutable snapshot under the single-process writer lock.
+
+    Before replace, errors leave both the prior disk snapshot and cache intact.
+    After replace, cache reflects disk even if directory fsync reports an
+    uncertain durability outcome. Neither failure is acknowledged as success.
+    """
+    global _store_revision
+    with _state_lock:
+        snapshot = copy.deepcopy(session)
+        try:
+            path = _session_path(snapshot["session_id"])
+            _sessions_dir()
+        except OSError as exc:
+            _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (str(snapshot["session_id"]) + ".json"), "SESSION_WRITE_FAILED")
+            raise GoldStandardError("SESSION_WRITE_FAILED", "Session directory could not be prepared. The previous snapshot is unchanged.", 503) from exc
+        temporary = None
+        replaced = False
+        try:
+            payload = json.dumps(snapshot, indent=2, allow_nan=False)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                    prefix="." + path.stem + "-", suffix=".tmp", delete=False) as output:
+                temporary = Path(output.name)
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            replaced = True
+            _sessions[snapshot["session_id"]] = snapshot
+            _store_revision += 1
+            _sync_directory(path.parent)
+            if snapshot.get("persistence_error"):
+                _record_issue(path, snapshot["persistence_error"]["code"])
+            else:
+                _diagnostics.pop(str(path), None)
+        except (OSError, ValueError, TypeError) as exc:
+            code = "SESSION_DURABILITY_UNCERTAIN" if replaced else "SESSION_WRITE_FAILED"
+            _record_issue(path, code)
+            message = ("Session replacement occurred but durability could not be confirmed. Refresh the session and inspect diagnostics before retrying."
+                       if replaced else "Session update could not be persisted. The previous snapshot is unchanged.")
+            raise GoldStandardError(code, message, 503) from exc
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    log.exception("Could not remove owned session temporary file %s", temporary.name)
 
 
 async def _save_session(session: dict) -> None:
-    await asyncio.to_thread(_save_session_sync, session)
+    await asyncio.to_thread(store_session, session)
+
+
+def _scan_sessions() -> None:
+    """Inspect disk without blocking writers, then publish only a current scan."""
+    global _store_revision
+    with _scan_lock:
+        with _state_lock:
+            revision = _store_revision
+        storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
+        loaded = {}
+        issues = {}
+        try:
+            root = _session_storage_root()
+            with os.scandir(root) as entries:
+                paths = [Path(entry.path) for entry in entries]
+        except FileNotFoundError:
+            paths = []
+        except (OSError, ValueError, RuntimeError):
+            with _state_lock:
+                if revision == _store_revision:
+                    _record_issue(storage_label, "SESSION_STORAGE_UNAVAILABLE")
+            return
+        for path in paths:
+            if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", path.name):
+                issues[path] = "SESSION_INTERRUPTED_WRITE"
+            elif path.name.endswith(".json"):
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError("Evaluation session must be a regular file.")
+                    data = json.loads(path.read_text())
+                    validate_session(data)
+                    if path != _session_path(data["session_id"]):
+                        raise ValueError("Evaluation session filename does not match its identity.")
+                    loaded[data["session_id"]] = data
+                    retained_error = data.get("persistence_error")
+                    if isinstance(retained_error, dict) and retained_error.get("code") in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
+                        issues[path] = retained_error["code"]
+                except (OSError, ValueError, TypeError):
+                    issues[path] = "SESSION_READ_FAILED"
+        with _state_lock:
+            # A concurrent durable commit wins over an older inspection, including
+            # its cache and write-failure diagnostics. The next refresh rescans.
+            if revision != _store_revision:
+                return
+            _diagnostics.pop(str(storage_label), None)
+            present = {str(path) for path in paths}
+            for key, issue in list(_diagnostics.items()):
+                if issue["code"] in ("SESSION_READ_FAILED", "SESSION_INTERRUPTED_WRITE") and Path(key).parent == root and (key not in present or Path(key) not in issues):
+                    _diagnostics.pop(key, None)
+            for sid, data in loaded.items():
+                if sid not in _sessions:
+                    _sessions[sid] = data
+                    _store_revision += 1
+            for path, code in issues.items():
+                # Preserve the independent failed-write policy at the same path.
+                if _diagnostics.get(str(path), {}).get("code") not in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
+                    _record_issue(path, code)
+
+
+def load_sessions_from_disk() -> None:
+    _scan_sessions()
 
 
 def _sessions_on_disk() -> list[dict]:
-    """Leave invalid legacy files untouched and reported, outside the cache.
-
-    A previously accepted ID must not make post-deletion flagging raise after
-    the collection has already gone. Every disk reader uses this same boundary.
-    """
+    """Return detached, validated files for export without changing the cache."""
     try:
         paths = sorted(_session_storage_root().glob("*.json"))
     except (OSError, ValueError, RuntimeError):
         log.exception("Cannot read evaluation session storage; existing files are unchanged")
         return []
     sessions = []
-    for p in paths:
+    for path in paths:
         try:
-            if p.is_symlink() or not p.is_file():
+            if path.is_symlink() or not path.is_file():
                 raise ValueError("Evaluation session must be a regular file.")
-            data = json.loads(p.read_text())
+            data = json.loads(path.read_text())
             validate_session(data)
-            if p != _session_path(data["session_id"]):
+            if path != _session_path(data["session_id"]):
                 raise ValueError("Evaluation session filename does not match its identity.")
         except (OSError, ValueError, RuntimeError) as exc:
-            # ValidationError text can include document-derived field values.
             log.warning("Skipping invalid evaluation session %s; file is unchanged (%s)",
-                        p.name, type(exc).__name__)
+                        path.name, type(exc).__name__)
             continue
         sessions.append(data)
     return sessions
 
 
-def load_sessions_from_disk() -> None:
-    for data in _sessions_on_disk():
-        _sessions[data["session_id"]] = data
+def session_diagnostics() -> list[dict]:
+    _scan_sessions()
+    with _state_lock:
+        return copy.deepcopy([_diagnostics[key] for key in sorted(_diagnostics)])
 
 
 def sessions_for(collection: str) -> list[dict]:
-    """Every session generated against a collection, in-memory and on disk."""
-    found = {}
-    for sid, sess in list(_sessions.items()):
-        if sess.get("collection") != collection:
-            continue
-        try:
-            validate_session(sess)
-            if sid != sess["session_id"]:
-                raise ValueError("Cached evaluation identity does not match its key.")
-            _session_path(sid)
-        except (OSError, ValueError, RuntimeError) as exc:
-            log.warning("Skipping invalid cached evaluation session %s (%s)",
-                        sid, type(exc).__name__)
-            continue
-        found[sid] = sess
-    # A session written by an import may not be in memory yet.
-    for data in _sessions_on_disk():
-        if data.get("collection") == collection and data["session_id"] not in found:
-            found[data["session_id"]] = data
-            _sessions[data["session_id"]] = data
-    return list(found.values())
+    _scan_sessions()
+    with _state_lock:
+        found = []
+        for sid, session in _sessions.items():
+            if session.get("collection") != collection:
+                continue
+            try:
+                from models.schemas import SessionResponse
+                validate_session(session)
+                if sid != session.get("session_id"):
+                    raise ValueError("Cached session key does not match identity")
+                _session_path(sid)
+            except (OSError, ValueError, RuntimeError) as exc:
+                log.warning("Skipping invalid cached evaluation session %s (%s)",
+                            sid, type(exc).__name__)
+                _record_issue(Path(str(sid) + ".json"), "SESSION_READ_FAILED")
+                continue
+            found.append(session)
+        return copy.deepcopy(found)
 
 
 def store_session(session: dict) -> None:
-    """Write a session to disk *and* into the in-memory cache.
-
-    Anything outside this module that writes a session file directly will be
-    silently undone: the cache still holds the previous version, and the next
-    flagging pass writes that back over the file. Import learned this the hard
-    way — a restored session reverted to its pre-import orphaned state.
-    """
+    """Explicit whole-session storage; publishes cache only after replacement."""
     validate_session(session)
     _save_session_sync(session)
-    _sessions[session["session_id"]] = session
+
+
+def _update_session_sync(session_id: str, change):
+    with _state_lock:
+        current = _sessions.get(session_id)
+        if current is None:
+            return None
+        snapshot = copy.deepcopy(current)
+        result = change(snapshot)
+        if snapshot != current:
+            _save_session_sync(snapshot)
+        return copy.deepcopy(result)
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
-    """Mark every session for a collection, on disk and in memory.
-
-    Sessions are never deleted and never remapped. A remap that guesses which
-    new chunk replaces an old one corrupts an evaluation baseline silently,
-    which is worse than an honest flag the user can act on.
-    """
+    """Retain the historical guard in memory if a completed mutation cannot persist it."""
+    global _store_revision
+    sessions = sessions_for(collection)
     now = datetime.now(timezone.utc).isoformat()
     marked = 0
-    for session in sessions_for(collection):
-        session[flag] = True
-        session[f"{flag}_reason"] = reason
-        session[f"{flag}_at"] = now
+    for session in sessions:
+        def change(current):
+            current[flag] = True
+            current[f"{flag}_reason"] = reason
+            current[f"{flag}_at"] = now
         try:
-            _save_session_sync(session)
-        except (OSError, ValueError, RuntimeError):
-            log.exception("Could not flag gold-standard session %s", session["session_id"])
-            continue
-        marked += 1
+            _update_session_sync(session["session_id"], change)
+            marked += 1
+        except (GoldStandardError, OSError, ValueError, RuntimeError):
+            # The primary collection mutation already happened. Preserve the
+            # failed-write diagnostic. Publish the marker in the process cache
+            # even when disk still holds the prior snapshot, so a completed
+            # delete/rebuild cannot export this session as a current baseline.
+            # A later successful session write will persist the marker.
+            with _state_lock:
+                current = _sessions.get(session["session_id"])
+                if current is not None:
+                    snapshot = copy.deepcopy(current)
+                    change(snapshot)
+                    _sessions[session["session_id"]] = snapshot
+                    _store_revision += 1
+            log.exception("Could not durably mark session %s %s", session["session_id"], flag)
     return marked
 
 
 def mark_stale(collection: str, reason: str) -> int:
-    """Chunk identity changed, so the pairs no longer describe what is stored."""
     return _flag_sessions(collection, "stale", reason)
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
-    """The collection is gone. Retained rather than deleted — see spec §8 rule 4."""
     return _flag_sessions(collection, "orphaned", reason)
 
 
 def get_session(session_id: str) -> dict | None:
-    return _sessions.get(session_id)
+    with _state_lock:
+        return copy.deepcopy(_sessions.get(session_id))
 
 
 def _parse_gs_json(text: str) -> dict:
@@ -290,48 +434,64 @@ async def _generate_pair(chunk: dict) -> dict:
     }
 
 
+def _failed_generation(current: dict, exc: Exception) -> None:
+    current["status"] = "failed"
+    reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
+              else f"{type(exc).__name__}: {exc}")
+    errors = current.setdefault("errors", [])
+    if reason not in errors:
+        errors.append(reason)
+    if isinstance(exc, GoldStandardError):
+        current["persistence_error"] = {"code": exc.code, "message": exc.message}
+
+
+async def _record_generation_failure(session_id: str, exc: Exception) -> None:
+    try:
+        await asyncio.to_thread(_update_session_sync, session_id,
+                                lambda current: _failed_generation(current, exc))
+    except Exception:
+        log.exception("Could not durably report failed generation for %s", session_id)
+
+
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
-    session = _sessions[session_id]
     cancelled = False
+    persistence_failure = None
     try:
         for chunk in chunks:
             try:
                 pair = await _generate_pair(chunk)
-                session["pairs"].append(pair)
-                session["pairs_completed"] += 1
-                await _save_session(session)
             except asyncio.CancelledError:
                 cancelled = True
                 raise
             except Exception as exc:
-                # Some of these carry an empty str(), which produced sessions
-                # whose only record of a lost pair was an empty string.
                 reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 log.warning("Gold-standard pair generation failed: %s", reason, exc_info=True)
-                session["pairs_failed"] = session.get("pairs_failed", 0) + 1
-                session.setdefault("errors", []).append(reason)
-                try:
-                    await _save_session(session)
-                except Exception:
-                    pass
-            finally:
-                if not cancelled:
-                    session["pairs_attempted"] = session.get("pairs_attempted", 0) + 1
+                def failed(current):
+                    current["pairs_failed"] = current.get("pairs_failed", 0) + 1
+                    current.setdefault("errors", []).append(reason)
+                    current["pairs_attempted"] = current.get("pairs_attempted", 0) + 1
+                await asyncio.to_thread(_update_session_sync, session_id, failed)
+            else:
+                def completed(current):
+                    current["pairs"].append(pair)
+                    current["pairs_completed"] += 1
+                    current["pairs_attempted"] = current.get("pairs_attempted", 0) + 1
+                await asyncio.to_thread(_update_session_sync, session_id, completed)
+    except GoldStandardError as exc:
+        persistence_failure = exc
+        raise
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
-        if cancelled:
-            if session.get("status") == "generating":
-                session["status"] = "cancelled"
-                _save_session_sync(session)
-        else:
-            if session.get("status") == "generating":
-                if not session["pairs"] and session.get("errors"):
-                    session["status"] = "failed"
-                else:
-                    session["status"] = "completed"
-            try:
-                await _save_session(session)
-            except Exception:
-                _save_session_sync(session)
+        def finish(current):
+            if persistence_failure is not None:
+                _failed_generation(current, persistence_failure)
+                return
+            if current.get("status") == "generating":
+                current["status"] = ("cancelled" if cancelled else
+                    "failed" if not current["pairs"] and current.get("errors") else "completed")
+        await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
 async def start_generation(
@@ -358,7 +518,6 @@ async def start_generation(
         "pairs_failed": 0,
         "pairs": [],
     }
-    _sessions[session_id] = session
     await _save_session(session)
 
     task = asyncio.create_task(_run_generation(session_id, all_chunks))
@@ -368,11 +527,9 @@ async def start_generation(
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            s = _sessions.get(session_id)
-            if s and s.get("status") == "generating":
-                s["status"] = "failed"
-                s.setdefault("errors", []).append(str(exc))
-                _save_session_sync(s)
+            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            _tasks.add(reporter)
+            reporter.add_done_callback(_tasks.discard)
 
     task.add_done_callback(_on_task_done)
 
@@ -385,19 +542,17 @@ async def start_generation(
 
 
 async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | None:
-    session = _sessions.get(session_id)
-    if session is None:
+    def change(current):
+        for pair in current["pairs"]:
+            if pair["pair_id"] == pair_id:
+                pair.update({key: value for key, value in updates.items() if value is not None})
+                return pair
         return None
-    for pair in session["pairs"]:
-        if pair["pair_id"] == pair_id:
-            pair.update({k: v for k, v in updates.items() if v is not None})
-            await _save_session(session)
-            return pair
-    return None
+    return await asyncio.to_thread(_update_session_sync, session_id, change)
 
 
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
-    session = _sessions.get(session_id)
+    session = get_session(session_id)
     if session is None:
         return None
     if session.get("status") == "generating":
@@ -428,12 +583,21 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
                     f"The model did not return a usable question/answer pair "
                     f"({reason}). The existing pair is unchanged; try again.", 502) from exc
             new_pair["pair_id"] = pair_id
-            session["pairs"][i] = new_pair
-            await _save_session(session)
-            return new_pair
+            def replace(current):
+                for position, existing in enumerate(current["pairs"]):
+                    if existing["pair_id"] == pair_id:
+                        if existing != pair or current.get("status") == "generating":
+                            raise GoldStandardError("PAIR_CHANGED_DURING_REGENERATION",
+                                "The pair changed while regeneration was running. Its acknowledged edits are preserved; refresh before retrying.", 409)
+                        current["pairs"][position] = new_pair
+                        return new_pair
+                return None
+            return await asyncio.to_thread(_update_session_sync, session_id, replace)
     return None
 
 
+# Published cache snapshots are immutable. Export captures one stable reference
+# and never mutates or exposes it; later commits publish a different object.
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     out_path.write_text(json.dumps(ragas, indent=2))
 

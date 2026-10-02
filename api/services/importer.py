@@ -614,7 +614,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                 # legitimate operation over data the user may not care about.
                 replace_notes.append(
                     f"{orphaned} gold-standard session(s) from the replaced "
-                    "collection were kept and marked orphaned")
+                    "collection were kept; inspect session recovery diagnostics "
+                    "if an orphan marker could not be persisted")
 
         expected = manifest.get("collection", {}).get("chunk_count", -1)
         _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
