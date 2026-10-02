@@ -89,10 +89,10 @@ def prepare(prefix, state_path):
     tune_name = collection('Tune')
     sources.store(tune_name, 'synthetic.txt', b'synthetic retained source')
     real_create = wc._create_collection_sync
-    def fail_create(name, *args):
+    def fail_create(name, *args, **kwargs):
         if name == tune_name:
             raise RuntimeError('controlled final-create fault')
-        return real_create(name, *args)
+        return real_create(name, *args, **kwargs)
     with patch.object(wc, '_create_collection_sync', side_effect=fail_create):
         try:
             tuning._rebuild(tune_name, [row['properties'] for row in rows], None, None, None)
@@ -119,10 +119,10 @@ def prepare(prefix, state_path):
     save()
     with tarfile.open(archive, 'w:gz') as tar:
         tar.add(package, arcname='package')
-    def fail_import_create(name, *args):
+    def fail_import_create(name, *args, **kwargs):
         if name == import_name:
             raise RuntimeError('controlled final-create fault')
-        return real_create(name, *args)
+        return real_create(name, *args, **kwargs)
     importer._jobs['live-acceptance'] = {'chunks_written': 0}
     with patch.object(wc, '_create_collection_sync', side_effect=fail_import_create):
         importer._run('live-acceptance', archive.name, 'replace')

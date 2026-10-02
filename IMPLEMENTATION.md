@@ -11455,6 +11455,26 @@ m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
+# ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  RP="${PREFIX}BatchRecovery"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
+  check "batch faults fail truthfully and retain verified recovery" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_prepare.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose restart api) >/dev/null 2>&1
+  for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+  (cd "$REPO_ROOT" && docker compose exec -T api python - check --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_check.log 2>&1
+  check "recovery survives restart; owned scratch swept, unowned names kept" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_check.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
+  check "recovery acceptance fixtures are removed" $?
+else
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
@@ -11557,10 +11577,10 @@ def prepare(prefix, state_path):
     tune_name = collection('Tune')
     sources.store(tune_name, 'synthetic.txt', b'synthetic retained source')
     real_create = wc._create_collection_sync
-    def fail_create(name, *args):
+    def fail_create(name, *args, **kwargs):
         if name == tune_name:
             raise RuntimeError('controlled final-create fault')
-        return real_create(name, *args)
+        return real_create(name, *args, **kwargs)
     with patch.object(wc, '_create_collection_sync', side_effect=fail_create):
         try:
             tuning._rebuild(tune_name, [row['properties'] for row in rows], None, None, None)
@@ -11587,10 +11607,10 @@ def prepare(prefix, state_path):
     save()
     with tarfile.open(archive, 'w:gz') as tar:
         tar.add(package, arcname='package')
-    def fail_import_create(name, *args):
+    def fail_import_create(name, *args, **kwargs):
         if name == import_name:
             raise RuntimeError('controlled final-create fault')
-        return real_create(name, *args)
+        return real_create(name, *args, **kwargs)
     importer._jobs['live-acceptance'] = {'chunks_written': 0}
     with patch.object(wc, '_create_collection_sync', side_effect=fail_import_create):
         importer._run('live-acceptance', archive.name, 'replace')

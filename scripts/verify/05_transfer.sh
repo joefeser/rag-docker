@@ -418,6 +418,26 @@ m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
+# ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  RP="${PREFIX}BatchRecovery"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
+  check "batch faults fail truthfully and retain verified recovery" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_prepare.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose restart api) >/dev/null 2>&1
+  for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+  (cd "$REPO_ROOT" && docker compose exec -T api python - check --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_check.log 2>&1
+  check "recovery survives restart; owned scratch swept, unowned names kept" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_check.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
+  check "recovery acceptance fixtures are removed" $?
+else
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
