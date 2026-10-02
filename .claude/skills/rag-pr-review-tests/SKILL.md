@@ -39,9 +39,20 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
 
 A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Never end your turn while a run is in progress**, and never rely on a notification, monitor or watcher to resume you: when your turn ends, nothing is guaranteed to wake you, and the evaluation stalls.
 
-1. Start the run in the background with its output going to a file in the bundle, for example `bash scripts/verify/all.sh > <bundle>/verify-all.log 2>&1 &`.
-2. Wait with foreground calls, each under about 9 minutes: a loop that checks every 30–60 seconds whether the run is still going (`pgrep -f "bash all.sh"`, or the `/tmp/rag-verify.lock` directory) and returns when it has ended. Repeat the call until it has.
-3. Read the finished log yourself (`tail`, `grep`), then carry on.
+1. Start the run in the background, with its output going to a file in the bundle and its process id saved next to it:
+
+   ```bash
+   bash scripts/verify/all.sh > <bundle>/verify-all.log 2>&1 & echo $! > <bundle>/verify-all.pid
+   ```
+
+2. Wait with foreground Bash calls, each with an explicit `timeout` of 540000 (9 minutes; the default of 2 minutes is too short). Each call loops until the run's process has exited or the time is nearly up:
+
+   ```bash
+   P=$(cat <bundle>/verify-all.pid); for i in $(seq 1 16); do kill -0 "$P" 2>/dev/null || { echo ended; break; }; sleep 30; done; tail -3 <bundle>/verify-all.log
+   ```
+
+   If it didn't print `ended`, make the same call again. Never check for the run by process name: `pgrep -f "bash all.sh"` doesn't match `bash scripts/verify/all.sh`, and would report a running suite as finished.
+3. Read the finished log yourself (`tail`, `grep`). `all.sh` ends with `All suites passed.` or `At least one suite failed.`; a log without either line means the run died, which is a failure to report, not a pass. Then carry on with the remaining steps.
 
 ## Severity guidance
 
