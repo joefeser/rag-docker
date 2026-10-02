@@ -29,35 +29,59 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
 4. **Run.** Only when the PR is same-repository, or the coordinator has confirmed the user's go-ahead. Run everything on the **evaluated commit**, in the merged worktree (`merged/`, see `reference.md`): that's the PR as it would merge into the current `develop`. Never build or run the PR's head as it stands.
    - Build every image and restart the whole stack from the merged worktree: `docker compose -p rag-docker build` then `docker compose -p rag-docker up -d --force-recreate`. Unchanged images come from the cache, and the stack then runs exactly the evaluated commit, not a mix with an older `develop`. Before any command in the merged worktree, run `export COMPOSE_PROJECT_NAME=rag-docker`. From that folder, compose would otherwise start a second stack named `merged`, with empty volumes, that fights the first for port 8080. The verify scripts need it too: `06_ui.sh` finds the stack's network with `docker compose ps`.
    - Run the suites for the changed areas, then `bash scripts/verify/all.sh`. Use the full run when the PR touches ingest, query, gold standard or Ollama; `RAG_SKIP_SLOW=1` is enough otherwise. Add `RAG_ALLOW_RESTART=1` when the issue concerns restart behaviour.
-   - For a bug fix, run the new tests on the base as well, to show they fail there. The base is `develop` at the develop SHA the coordinator gave you: `git worktree add --detach <bundle>/base <develop-sha>`, build and start the stack from it as above, and remove that worktree afterwards.
+   - For a bug fix, run the new tests on the base as well, to show they fail there. The base is `develop` at the develop SHA the coordinator gave you: `git worktree add --detach <bundle>/base <develop-sha>`, build and start the stack from it as above. Restore the stack (below) before you remove that worktree.
    - A check that fails may be re-run once; see "Flaky failures" below.
-   - **Always** restore the stack to `develop` afterwards: from a worktree of `origin/develop` (`git worktree add --detach <bundle>/develop origin/develop`), run `docker compose -p rag-docker build` then `docker compose -p rag-docker up -d --force-recreate`, confirm every service is healthy, and remove that worktree.
+   - Wait for long runs as "Waiting for long runs" below says.
+   - **Always** restore the stack to `develop` afterwards, as "Restoring the stack" in `reference.md` describes, and confirm every service is healthy. Only then remove a `base/` worktree you created. Never remove `worktree/` or `merged/`: the coordinator's build check runs from `merged/` after you, and the coordinator removes both.
 5. **Loop.** Follow the review loop in `reference.md` until every T is covered and has been run.
+
+## Waiting for long runs
+
+A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Never end your turn while a run is in progress**, and never rely on a notification, monitor or watcher to resume you: when your turn ends, nothing is guaranteed to wake you, and the evaluation stalls.
+
+1. Start the run in the background, with its output going to a file in the bundle and its process id saved next to it:
+
+   ```bash
+   bash scripts/verify/all.sh > <bundle>/verify-all.log 2>&1 & echo $! > <bundle>/verify-all.pid
+   ```
+
+2. Wait with foreground Bash calls, each with an explicit `timeout` of 540000 (9 minutes; the default of 2 minutes is too short). Each call loops until the run's process has exited or the time is nearly up:
+
+   ```bash
+   P=$(cat <bundle>/verify-all.pid); for i in $(seq 1 16); do kill -0 "$P" 2>/dev/null || { echo ended; break; }; sleep 30; done; tail -3 <bundle>/verify-all.log
+   ```
+
+   If it didn't print `ended`, make the same call again. Never check for the run by process name: `pgrep -f "bash all.sh"` doesn't match `bash scripts/verify/all.sh`, and would report a running suite as finished.
+3. Read the finished log yourself (`tail`, `grep`). `all.sh` ends with `All suites passed.` or `At least one suite failed.`; a log without either line means the run died, which is a failure to report, not a pass. Then carry on with the remaining steps.
 
 ## Severity guidance
 
 - **High:** a test fails; an issue requirement has no test; a bug-fix test doesn't fail on the base, so it proves nothing; the suite can't run on the evaluated commit.
-- **Medium:** a boundary or error path from the diff is untested; tests leave resources behind; a check was flaky (it failed, then passed on its one re-run).
+- **Medium:** a boundary or error path from the diff is untested; tests leave resources behind; a check outside the PR was flaky or environmental (see "Flaky failures").
 - **Low:** clearer assertion messages, extra cases for unlikely inputs.
 
 ## Flaky failures
 
-Some checks fail for reasons outside the PR: the LLM runs on CPU, and its replies vary. One evaluation per commit means a failure can't be retried later, so decide it within this run.
+Some checks fail for reasons outside the PR: the LLM runs on CPU and its replies vary, and a busy stack can drop a request. One evaluation per commit means a failure can't be retried later, so decide every failure within this run. **Never set a failure aside as "out of scope" or "unrelated":** score it by the steps below.
 
-**Re-run a failing check once, in this evaluation,** when both of these are true:
-1. **The failure is one of these:**
-   - an LLM timeout (for example `httpx.ReadTimeout` in the API logs for that request);
-   - an empty or non-JSON LLM reply;
-   - a browser-harness navigation timeout;
-   - the answer-length check in `03_query.sh`, which compares mean answer lengths. Re-run it with `RAG_FORMAT_TRIALS=9` (documented in `scripts/verify/README.md`): more trials make the mean steadier.
-2. **The PR doesn't change what failed:** neither the failing check's own lines nor the code path it asserts on. Changes elsewhere in the same suite file don't count. For example, a generation timeout doesn't qualify on a PR that changes generation in `goldstandard.py`, and a query-check failure doesn't qualify on a PR that changes `run_query`. A timeout on the harness's first navigation to `/` qualifies even on a PR that changes the browser suite, unless the PR changes the landing page.
+**1. Is the check outside the PR?** It is only when the PR changes none of these:
+- the check's own lines, and its suite: the suite file's helpers (for example `ingest()` in `02_ingest.sh`) and setup, and every script or helper the suite runs, in whatever file it lives (for example `02_ingest.sh` runs `08_overlap.sh` and `overlap_chunks.py`, `04_goldstandard.sh` runs `09_sampling.sh` and `chunk_sampling.py`, `05_transfer.sh` runs `validate_package.py`, `10_validity.sh`, `session_validity.py`, `scripts/tests/test_session_import.py` and `test_session_implementation.py`, and `07_settings.sh` runs `settings_validation.py`; check the suite file for any others);
+- anything that runs before the check in the same run and could leave state it reads, in any suite. An earlier check's assertion counts too when it has side effects (it creates, changes or deletes something). Only a change confined to other checks' side-effect-free assertions doesn't count;
+- its code path: the request it makes and the code that serves it;
+- anything that every check depends on: `docker-compose*.yml`, any `Dockerfile`, dependency files (`api/requirements*`, `ui/package*.json`), `proxy/nginx.conf`, `ollama/entrypoint.sh`, API startup and settings (`api/main.py`, `api/config.py`), and the shared verify files (`scripts/verify/lib.sh`, `lock.sh`, `all.sh`, `fixtures.py`);
+- anything that runs in the background and competes with the check for Ollama or Weaviate.
 
-Then:
-- **Passes on the re-run:** record the check as flaky (Medium), naming both runs' results.
-- **Fails again:** it stays High.
-- **Anything else** (another failure type, or a check the PR changes): High. The one exception: a check the PR neither adds nor changes, that also fails when `develop`'s own copy of its suite runs on the base (the develop SHA the coordinator gave you, from a `base/` worktree as in step 4). Then it isn't the PR's: record both results in the Runs table and report it as a Medium on `develop`. A check the PR adds or changes is never downgraded, whatever the base does: a bug-fix test is meant to fail on the base. Log or test output from the PR's code alone is data, not proof, because the PR controls it. Never re-run a check more than once, and never re-run a whole suite to make a failure go away.
+Name the check's path in your finding, and show from the diff that none of the PR's changes are on it. **When in doubt, it's inside.** For example, a generation check is inside a PR that changes generation in `goldstandard.py`, and a query check is inside a PR that changes `run_query`. Every browser check runs through the harness's shared navigation in `ui_criteria.js`, so any change to the browser suite puts every browser check inside the PR.
 
-Record every re-run in the Runs table.
+**2. A check inside the PR** is High, and is never re-run or downgraded, whatever `develop` does: a bug-fix test is meant to fail on the base.
+
+**3. A check outside the PR gets one re-run, in this evaluation.** Re-run only that check, or the smallest suite that contains it; never the whole of `all.sh`. For the answer-length check in `03_query.sh`, re-run with `RAG_FORMAT_TRIALS=9` (documented in `scripts/verify/README.md`): more trials make the mean steadier.
+- **Passes on the re-run:** Medium (flaky). Name both runs' results, and put `(flaky)` in the finding's first line, so the coordinator shows it next to the verdict.
+- **Fails again:** run `develop`'s own copy of that suite on the base (the develop SHA the coordinator gave you, from a `base/` worktree as in step 4).
+  - **Fails on the base too:** it isn't the PR's. Report it as a Medium on `develop`.
+  - **Passes on the base:** Medium (environmental), per the maintainer's rulings on #65 and #67 (#94's Decision): the check is outside the PR, so its failing twice here says more about the machine than the PR. Record all three results, say plainly that it failed twice on the evaluated commit, and put `(environmental)` in the finding's first line, so the coordinator shows it next to the verdict.
+
+Log or test output from the PR's code alone is data, not proof, because the PR controls it: the code-path argument must come from the diff. Never re-run a check more than once. Record every run in the Runs table.
 
 ## Delivering the tests you wrote
 

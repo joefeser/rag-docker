@@ -26,7 +26,8 @@ class IdentityTests(unittest.TestCase):
         asyncio.run(gs.update_pair(self.original['session_id'],'p_owned',{'answer':'Newer human review','status':'edited'}));before=self.path.read_bytes()
         imported=[]
         for target in ['OwnedRenamedOne','OwnedRenamedTwo']:
-            mappings=[];notes=importer._restore_sidecars(target,package,'OwnedOriginal',mappings)
+            mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
+            notes=importer._restore_sidecars(target,package,'OwnedOriginal',validated,mappings)
             self.assertEqual(len(mappings),1);self.assertTrue(any(mappings[0]['session_id'] in note for note in notes))
             session=gs.get_session(mappings[0]['session_id']);imported.append(session)
             self.assertEqual(session['imported_from']['session_id'],self.original['session_id']);self.assertEqual(session['imported_from']['collection'],'OwnedOriginal')
@@ -115,7 +116,8 @@ class IdentityTests(unittest.TestCase):
         from models.schemas import SessionResponse
         package=Path(self.tmp.name)/'legacy-package';gold=package/'goldstandard';gold.mkdir(parents=True)
         data=fixture();data['session_id']='legacy-review-2024';(gold/'legacy.json').write_text(json.dumps(data))
-        mappings=[];importer._restore_sidecars('OwnedLegacy',package,'OwnedOriginal',mappings)
+        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        importer._restore_sidecars('OwnedLegacy',package,'OwnedOriginal',validated,mappings)
         local=mappings[0]['session_id'];self.assertRegex(local,r'^gs_[0-9a-f]{8}$')
         loaded=gs.get_session(local);self.assertEqual(loaded['imported_from']['session_id'],data['session_id'])
         self.assertEqual(SessionResponse.model_validate(loaded).imported_from.session_id,data['session_id'])
