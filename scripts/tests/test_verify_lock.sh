@@ -11,7 +11,7 @@ cd "$(dirname "$0")/../.." || exit 2
 REPO_ROOT="$(pwd)"
 VERIFY="$REPO_ROOT/scripts/verify"
 
-TESTLOCK_HOME=$(mktemp -d "${TMPDIR:-/tmp}/rag-lock-test.XXXXXX")
+TESTLOCK_HOME=$(mktemp -d "${TMPDIR:-/tmp}/rag-lock-test.XXXXXX") || exit 2
 cleanup() { rm -rf "$TESTLOCK_HOME"; }
 trap cleanup EXIT
 
@@ -354,5 +354,14 @@ check "T18: the refusal message carries no escape characters" "$esc18" "output: 
 shown18=$(printf '%s' "$out18" | sed -n 's/.*holds "\(.*\)", not a pid.*/\1/p')
 [ -n "$shown18" ] && [ "${#shown18}" -le 40 ]
 check "T18: the shown holder is at most 40 characters" "$?" "shown: $shown18"
+
+
+# --- T19: the shown holder is cut at exactly 40 characters, without quotes.
+L19="$TESTLOCK_HOME/t19.lock"; mkdir "$L19"
+printf '"%s"' "$(printf 'y%.0s' $(seq 1 41))" > "$L19/pid"
+out19=$(RAG_VERIFY_LOCK="$L19" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' 2>&1)
+shown19=$(printf '%s' "$out19" | sed -n 's/.*holds "\(.*\)", not a pid.*/\1/p')
+[ "$shown19" = "$(printf 'y%.0s' $(seq 1 40))" ]
+check "T19: a 41-character holder in quotes is shown as its first 40 characters, quotes removed" "$?" "shown: $shown19"
 
 summary
