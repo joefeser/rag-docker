@@ -122,6 +122,7 @@ Use the Agent tool with `subagent_type: general-purpose` and the chosen `model`.
   - **Same-repository PR:** as soon as the other two are dispatched.
   - **Cross-repository PR:** only after security returns with no High findings, *and* the user confirms that code from this outside contributor may be built and run on this machine. Record the answer as the `rag-pr-review/go-ahead` status, with the develop SHA in its description (see `reference.md`). If security found a High, or the user declines, testing is not run: record `Tests: not run (<reason>)`.
 - As each specialist returns, check that its findings file exists and matches its result block, then update its status.
+- **A testing reviewer that returns without a result block** (it says it is waiting for a run to finish) has stalled: it won't resume on its own. Check whether its run is still going (`pgrep -f "bash all.sh"`, `/tmp/rag-verify.lock`); when the run has ended, send it a message to read the log, finish and return its result block. The tests skill's "Waiting for long runs" is meant to prevent this.
 
 ### 8. Build and run check
 
