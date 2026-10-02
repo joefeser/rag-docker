@@ -56,6 +56,7 @@ async def list_collections():
             index_type=c["index_type"],
             distance_metric=c["distance_metric"],
             created_at=registry.get(c["name"]),
+            hnsw_config=c.get("hnsw_config"),
         )
         for c in raw
     ]
