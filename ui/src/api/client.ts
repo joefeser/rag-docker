@@ -52,10 +52,10 @@ export const api = {
   query: (body: QueryBody) => request<QueryResult>('POST', '/query', body),
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
-  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${sessionId}`),
-  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${sessionId}/pair/${pairId}`, body),
+  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
-  saveSession: (body: { session_id: string; filename?: string }) => request<SaveResult>('POST', '/goldstandard/save', body),
+  saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
   downloadUrl: (filename: string) => `${BASE}/goldstandard/download/${filename}`,
 
   // Transfer
@@ -75,6 +75,7 @@ export const api = {
 // Types
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
+  hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
@@ -111,12 +112,16 @@ export interface GenerateResult { session_id: string; status: string; pairs_tota
 export interface GoldPair {
   pair_id: string; question: string; answer: string; contexts: string[]; ground_truth: string; source_file: string; chunk_index: number; status: string
 }
-export interface Session {
+export interface SessionValidity {
+  stale?: boolean; stale_reason?: string | null; stale_at?: string | null
+  orphaned?: boolean; orphaned_reason?: string | null; orphaned_at?: string | null
+}
+export interface Session extends SessionValidity {
   session_id: string; status: string; pairs_total: number; pairs_attempted?: number
   pairs_completed: number; pairs_failed?: number; pairs: GoldPair[]; collection: string; errors?: string[]
 }
 export interface PatchPairBody { status: string; question?: string; answer?: string; ground_truth?: string }
-export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string }
+export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string; historical?: boolean; session_validity?: SessionValidity }
 export interface LatencyStats { p50: number; p95: number; p99: number }
 export interface LatencyRecord {
   timestamp: string

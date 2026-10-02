@@ -16,7 +16,7 @@ depending on whether there is anything to protect:
 * `replace` builds into a temporary collection first, to prove the package
   inserts cleanly, and only then deletes the existing collection and builds the
   real one. That costs a second insert pass, which is the price of a
-  non-destructive replace in a database that cannot rename. If the second pass
+  staged replace with a recoverable failure path in a database that cannot rename. If the second pass
   fails, the temporary collection is *kept* and named in the error, so the data
   is recoverable rather than lost.
 """
@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -39,6 +40,7 @@ from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
@@ -76,23 +78,66 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str) -> None:
-    _marker_path(collection).write_text(json.dumps({
-        "collection": collection,
-        "expected_chunks": expected_chunks,
-        "job_id": job_id,
-    }, indent=2))
+def _read_marker(path: Path) -> tuple[dict, Path]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
+    data = json.loads(path.read_text())
+    collection, count = data["collection"], data["expected_chunks"]
+    snapshot = data["expected_snapshot"]
+    if (type(data.get("version")) is not int or data["version"] != 3
+            or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
+            or path.name != f"{collection}.json" or type(count) is not int or count < 0
+            or data["state"] not in ("building", "cleanup")
+            or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
+        raise ValueError("Invalid import ownership")
+    return data, _markers_dir() / snapshot["file"]
+
+
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> None:
+    snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
+    try:
+        with batch_write.ExpectedRecords() as expected:
+            try:
+                expected.capture(records, expected_chunks)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
+            expected.snapshot(snapshot)
+        with snapshot.open("rb") as data:
+            os.fsync(data.fileno())
+        collection_recovery._sync_dir(_markers_dir())
+        collection_recovery._sync_dir(Path(settings.upload_dir))
+        collection_recovery.atomic_json(_marker_path(collection), {
+            "version": 3, "collection": collection, "expected_chunks": expected_chunks,
+            "job_id": job_id, "state": "building",
+            "expected_snapshot": {"file": snapshot.name, "sha256": packager.sha256_file(snapshot)},
+        })
+    except Exception:
+        try:
+            snapshot.unlink(missing_ok=True)
+        except OSError:
+            _log.exception("Could not remove unpublished expectation snapshot %s", snapshot)
+        raise
 
 
 def _mark_finished(collection: str) -> None:
-    _marker_path(collection).unlink(missing_ok=True)
+    marker = _marker_path(collection)
+    if not marker.exists():
+        return
+    record, snapshot = _read_marker(marker)
+    if record["state"] != "cleanup":
+        record["state"] = "cleanup"
+        collection_recovery.atomic_json(marker, record)
+    snapshot.unlink(missing_ok=True)
+    marker.unlink()
+    collection_recovery._sync_dir(_markers_dir())
 
 
 # Extraction workspaces created by an import or a re-chunk. Both remove their
 # own directory in a `finally`, which a hard kill skips -- twelve of these were
 # found holding 152 MB after the kill tests, and a with-models package would
 # leave 2.3 GB behind each time.
-_WORKDIR_PREFIXES = ("import-", "rechunk-")
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -117,30 +162,34 @@ def sweep_stale_workdirs() -> list[str]:
 def sweep_interrupted_imports() -> list[str]:
     """Remove collections left half-built by a killed import.
 
-    The expected chunk count is compared rather than trusting the marker alone:
-    a marker that outlived a *successful* import — a failed unlink, a disk
-    error — must not cost the user a complete collection.
+    Compare the expected identities, properties and vectors, not just count.
+    Unreadable or legacy ownership cannot authorize destructive cleanup.
     """
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
         try:
-            data = json.loads(marker.read_text())
+            data, snapshot = _read_marker(marker)
             collection = data["collection"]
-            expected = int(data.get("expected_chunks", -1))
-        except (OSError, ValueError, KeyError):
-            marker.unlink(missing_ok=True)
+            if data["state"] == "building":
+                if snapshot.is_symlink() or not snapshot.is_file():
+                    raise ValueError("Expected-record snapshot is not a regular file")
+                if packager.sha256_file(snapshot) != data["expected_snapshot"]["sha256"]:
+                    raise ValueError("Expected-record snapshot integrity mismatch")
+                with batch_write.ExpectedRecords() as expected:
+                    expected.load_snapshot(snapshot, data["expected_chunks"])
+                    if wc._collection_exists_sync(collection):
+                        col = wc.get_client().collections.get(collection)
+                        try:
+                            expected.verify(col, exact=True)
+                        except batch_write.BatchVerificationError:
+                            wc.get_client().collections.delete(collection)
+                            removed.append(f"{collection} (persisted records did not match import)")
+            # Cleanup is an explicit durable phase: failure here never converts
+            # a verified target back into a candidate for backend deletion.
+            _mark_finished(collection)
+        except Exception:
+            _log.exception("Could not resolve import ownership %s; preserved", marker)
             continue
-        try:
-            if wc._collection_exists_sync(collection):
-                col = wc.get_client().collections.get(collection)
-                actual = col.aggregate.over_all(total_count=True).total_count or 0
-                if expected < 0 or actual != expected:
-                    wc.get_client().collections.delete(collection)
-                    removed.append(f"{collection} ({actual} of {expected} chunks)")
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not resolve interrupted import of %r", collection)
-            continue
-        marker.unlink(missing_ok=True)
     return removed
 
 
@@ -227,12 +276,29 @@ def _probe_dimensions() -> int | None:
     return _probed_dimensions
 
 
+def _ollama_reports(model: str) -> bool | None:
+    """Whether Ollama lists the model, matching `name:tag` (tag defaults to latest).
+
+    None means Ollama couldn't be asked. That isn't "absent": saying the model is
+    missing would send the user to pull one they may already have.
+    """
+    from services import ollama_client
+    want = model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+    try:
+        return want in asyncio.run(ollama_client.list_models())
+    except Exception as exc:                      # noqa: BLE001
+        _log.warning("Could not list Ollama models: %s", exc)
+        return None
+
+
 def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     """Spec §6.3. The embedding model is the one that decides the import.
 
-    Present by name  -> skip; an existing model is assumed deliberate.
-    Absent, bundled  -> install, then verify Ollama actually reports it.
-    Absent, unbundled-> EMBEDDING_MODEL_MISSING.
+    Present, bytes intact -> skip; an existing model is assumed deliberate.
+    Present, bytes differ -> MODEL_INTEGRITY_FAILED (embedding) or a note (LLM).
+    Absent, bundled       -> install, then verify Ollama actually reports it.
+    Absent, unbundled     -> EMBEDDING_MODEL_MISSING.
+    Namespaced name       -> ask Ollama; it can't be checked or installed here.
     """
     notes: list[str] = []
     if not model_bundle.store_available():
@@ -245,10 +311,56 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     bundled = model_bundle.bundled_models(pkg)
 
     for model, required in ((embed_model, True), (llm_model, False)):
+        if not model_bundle.supports_name(model):
+            # `user/model` and the like have no path in the store layout that
+            # bundles use. Refusing every import over the name would block
+            # packages that don't bundle models at all, so defer to Ollama.
+            reported = _ollama_reports(model)
+            if reported:
+                notes.append(f"model '{model}' reported by Ollama; a namespaced "
+                             "model's files can't be checked, so they weren't")
+                continue
+            if reported is None:
+                if not required:
+                    notes.append(f"model '{model}' wasn't checked: Ollama couldn't be "
+                                 "reached to confirm it is there")
+                    continue
+                raise PackageError(
+                    "IMPORT_FAILED",
+                    f"Couldn't reach Ollama to confirm the embedding model '{model}' is "
+                    f"there. A namespaced model can only be checked through Ollama. "
+                    f"Check that the ollama service is running, then import again.",
+                    {"model": model})
+            if not required:
+                notes.append(f"model '{model}' is absent; a namespaced model can't be "
+                             "installed from a package, so pull it before querying")
+                continue
+            pkg_model = (manifest.get("embedding") or {}).get("model")
+            raise PackageError(
+                "EMBEDDING_MODEL_MISSING",
+                f"This instance does not have the embedding model '{model}'. It is "
+                f"a namespaced model, which can't be installed from a package. Pull "
+                f"it with `docker compose exec ollama ollama pull {model}`.",
+                {"model": model, "package_model": pkg_model, "bundled": bundled})
+
         name = model_bundle.split_ref(model)[0]
-        if model_bundle.is_installed(model):
+        state = model_bundle.installed_state(model)
+        if state == "present":
             notes.append(f"model '{name}' already present; left untouched")
             continue
+        if state == "corrupt":
+            # Installing over it could break other models that share the
+            # blobs, so restoring it stays an owner action (§6.3).
+            if not required:
+                notes.append(f"model '{name}' is installed but its files don't match "
+                             "their checksums; restore or re-pull it before querying")
+                continue
+            raise PackageError(
+                "MODEL_INTEGRITY_FAILED",
+                f"The embedding model '{name}' is installed, but its files don't "
+                f"match their checksums. Restore it, or re-pull it with "
+                f"`docker compose exec ollama ollama pull {name}`, then import again.",
+                {"model": name})
         if name not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
@@ -289,11 +401,29 @@ def _create_from_package(name: str, pkg: Path) -> None:
         cfg.get("index_type", "hnsw"),
         cfg.get("distance_metric", "cosine"),
         cfg.get("hnsw_config") or {},
+        preserve_hnsw=True,
     )
 
 
-def _insert_chunks(name: str, pkg: Path, manifest: dict,
-                   progress) -> int:
+def _package_records(pkg: Path, manifest: dict):
+    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
+    for record in packager.iter_chunks_file(pkg):
+        try:
+            uuid.UUID(record["id"])
+            if not isinstance(record["properties"], dict):
+                raise ValueError("Chunk properties must be an object")
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise PackageError("PACKAGE_CORRUPT", f"Invalid chunk identity or properties: {exc}",
+                               {"file": "chunks.jsonl"}) from exc
+        vector = record.get("vector")
+        if not batch_write._valid_vector(vector):
+            raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has no valid vector.")
+        if expected_dims and len(vector) != expected_dims:
+            raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has the wrong vector width.")
+        yield record
+
+
+def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     """Insert every chunk with its original uuid and vector.
 
     The uuid is preserved deliberately: gold-standard sessions reference chunks
@@ -301,38 +431,55 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict,
     """
     client = wc.get_client()
     col = client.collections.get(name)
-    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
-    written = 0
-    with col.batch.dynamic() as batch:
-        for record in packager.iter_chunks_file(pkg):
-            vector = record.get("vector")
-            if not isinstance(vector, list) or not vector:
-                raise PackageError("PACKAGE_CORRUPT",
-                                   f"Chunk {record.get('id')} has no vector.",
-                                   {"file": "chunks.jsonl", "id": record.get("id")})
-            if expected_dims and len(vector) != expected_dims:
-                raise PackageError(
-                    "PACKAGE_CORRUPT",
-                    f"Chunk {record.get('id')} has {len(vector)} dimensions but the "
-                    f"manifest declares {expected_dims}.",
-                    {"file": "chunks.jsonl", "id": record.get("id")})
-            batch.add_object(properties=record["properties"],
-                             uuid=record["id"],
-                             vector=vector)
-            written += 1
-            if progress and written % 500 == 0:
-                progress(written)
-        if batch.number_errors > 0:
-            raise PackageError(
-                "PACKAGE_CORRUPT",
-                f"Weaviate rejected {batch.number_errors} object(s) while importing.",
-                {"errors": batch.number_errors})
+    try:
+        written = batch_write.insert(col, lambda: _package_records(pkg, manifest),
+                                     expected_count=manifest["collection"]["chunk_count"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
     if progress:
         progress(written)
     return written
 
 
-def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
+def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
+    """Preflight every evaluation sidecar before touching live state.
+
+    A valid archive and matching digests prove neither metadata validity nor
+    safe persistence destinations. Retain these parsed snapshots so restoration
+    cannot discover an invalid later session after a replacement has begun.
+    """
+    gold = pkg / "goldstandard"
+    if not gold.exists():
+        return []
+    if not gold.is_dir():
+        raise PackageError("PACKAGE_CORRUPT", "goldstandard must be a directory.",
+                           {"file": "goldstandard"})
+    sessions: list[dict] = []
+    identities: set[str] = set()
+    for path in sorted(gold.glob("*.json")):
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("Evaluation session must be a regular file.")
+            data = json.loads(path.read_text())
+            goldstandard.validate_session(data)
+            if canonical(data["collection"]) != canonical(original):
+                raise ValueError("Evaluation session belongs to a different collection.")
+            if data["session_id"] in identities:
+                raise ValueError("Duplicate evaluation session identity.")
+            # Check the live write boundary too, before any collection/model
+            # mutation. This catches pre-existing redirected destinations.
+            goldstandard._session_path(data["session_id"])
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise PackageError(
+                "PACKAGE_CORRUPT", "Invalid evaluation session metadata.",
+                {"file": f"goldstandard/{path.name}"}) from exc
+        identities.add(data["session_id"])
+        sessions.append(data)
+    return sessions
+
+
+def _restore_sidecars(target: str, pkg: Path, original: str,
+                      validated_sessions: list[dict]) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -361,16 +508,10 @@ def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
         except Exception as exc:                      # noqa: BLE001
             notes.append(f"retrieval settings could not be restored: {exc}")
 
-    gold = pkg / "goldstandard"
-    if gold.is_dir():
-        (Path(settings.upload_dir) / "goldstandard_sessions").mkdir(parents=True, exist_ok=True)
+    if validated_sessions:
         restored = 0
-        for session_file in sorted(gold.glob("*.json")):
-            try:
-                data = json.loads(session_file.read_text())
-            except ValueError:
-                notes.append(f"gold-standard session {session_file.name} was unreadable")
-                continue
+        for session in validated_sessions:
+            data = dict(session)
             # The session points at the collection by name; after a rename that
             # name is different, and a session pointing at nothing is worse than
             # no session.
@@ -397,12 +538,14 @@ def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
     _create_from_package(target, pkg)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
-    except Exception:
+    except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
             wc.get_client().collections.delete(target)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove partial collection %r", target)
+        except Exception as cleanup:
+            raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
+                               f"partial target cleanup failed ({cleanup})",
+                               {"collection": target, "cleanup_pending": True}) from original
         raise
 
 
@@ -416,6 +559,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     # _build deletes its own collection on failure, so temp_collection being
     # set is not by itself evidence that anything survived to recover.
     staged = False
+    ownership: dict | None = None
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -438,6 +582,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                f"'{original}' is not a usable collection name.",
                                {"name": original})
 
+        validated_sessions = _read_goldstandard_sessions(pkg, original)
+
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
         exists = wc._collection_exists_sync(target)                 # check 5
@@ -453,12 +599,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         if exists and on_conflict == "replace":
             # Prove the package inserts cleanly before destroying anything.
-            temp_collection = f"{canonical(original)}__importing_{id8}"
-            if wc._collection_exists_sync(temp_collection):
-                wc.get_client().collections.delete(temp_collection)
+            ownership = collection_recovery.begin(target, "import", wc.get_client())
+            temp_collection = ownership["staging"]
             _build(temp_collection, pkg, manifest, progress)
-            staged = True
             job["chunks_written"] = 0
+            collection_recovery.retain(ownership, package=pkg)
+            staged = True
             # Counted before the delete, because the delete is what orphans them.
             orphaned = len(goldstandard.sessions_for(target))
             wc._delete_collection_sync(target)   # also drops its sources + config
@@ -472,16 +618,17 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     "if an orphan marker could not be persisted")
 
         expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id)
+        _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
         marked = target
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
         marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+        notes = model_notes + replace_notes + _restore_sidecars(
+            target, pkg, original, validated_sessions)
 
         if staged and temp_collection:
             try:
-                wc.get_client().collections.delete(temp_collection)
+                collection_recovery.discard(ownership, wc.get_client())
             except Exception:                         # noqa: BLE001
                 _log.exception("Could not remove staging collection %r", temp_collection)
             staged = False
@@ -498,7 +645,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # staging collection means the data is recoverable, not lost.
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection}
+            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -506,13 +654,22 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {"recovered_as": temp_collection}
+            job["error_detail"] = {"recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
         # behind, which is the case the startup sweep exists for.
-        if marked:
-            _mark_finished(marked)
+        if marked and not (job.get("error_detail") or {}).get("cleanup_pending"):
+            try:
+                _mark_finished(marked)
+            except Exception:
+                _log.exception("Could not finish import marker for %r; startup will retry", marked)
+        if ownership and ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, wc.get_client())
+            except Exception:
+                _log.exception("Could not remove owned scratch collection %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
         with _lock:
             _active.discard(filename)

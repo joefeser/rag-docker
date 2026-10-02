@@ -29,8 +29,8 @@ then Ollama downloads `phi3.5` (2.2 GB) and `nomic-embed-text` (274 MB) — roug
 immediate because the images are built and the models are cached in the
 `ollama_models` Docker volume.
 
-**Docker must be allocated at least 10 GB of memory** (Settings → Resources →
-Memory). phi3.5 is ~6 GB resident; below that it is evicted and reloaded between
+**Docker must be allocated 12 GB of memory and 2 GB of swap** (Settings →
+Resources); on a 16 GB Mac that is the practical ceiling, leaving macOS about 4 GB. phi3.5 is ~6 GB resident; below that it is evicted and reloaded between
 calls and queries time out. `curl http://localhost:8080/api/health` reports the
 allocated figure against the recommendation.
 
@@ -45,7 +45,7 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
-    image: semitechnologies/weaviate:1.39.4
+    image: semitechnologies/weaviate:1.39.6
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
@@ -118,7 +118,7 @@ services:
       OLLAMA_MODELS_DIR: /ollama
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
-      RECOMMENDED_MEMORY_GB: 10
+      RECOMMENDED_MEMORY_GB: 12
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.
@@ -150,9 +150,10 @@ services:
       api: { condition: service_healthy }
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.29-alpine
     ports:
-      - "8080:80"
+      # This unauthenticated workbench is local to the host by default.
+      - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
     networks: [rag-internal]
@@ -250,6 +251,19 @@ http {
         listen 80;
 
         location /api/ {
+            # nginx's default request-body limit is 1 MB, which rejected most
+            # real PDFs with a 413 before the API saw them (issue #21). 512 MB
+            # covers a ZIP of a firm's documents in one upload. It is the limit
+            # for the whole request, so a multi-file upload counts every file.
+            # ui/src/api/client.ts holds the same number to warn before sending;
+            # change both together.
+            client_max_body_size 512m;
+            # Stream uploads straight to the API instead of spooling each one to
+            # nginx's temp directory first. Buffering would write up to 512 MB
+            # into the container's writable layer, on Docker's often-small
+            # virtual disk, before the API even starts reading. The limit above
+            # still applies: nginx checks Content-Length up front.
+            proxy_request_buffering off;
             proxy_pass http://api/;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
@@ -597,7 +611,7 @@ class Settings(BaseSettings):
     ollama_models_dir: str = "/ollama"
     # Reported by /health and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
-    recommended_memory_gb: float = 10.0
+    recommended_memory_gb: float = 12.0
 
     class Config:
         env_file = ".env"
@@ -615,23 +629,69 @@ settings = Settings()
 
 ```python
 from __future__ import annotations
-from typing import Any, Optional
-from pydantic import BaseModel, field_validator, model_validator
+from typing import Any, Optional, Annotated, Literal
+from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+
+
+def _numeric(value):
+    if isinstance(value, bool):
+        raise ValueError("A numeric setting cannot be a boolean")
+    return value
+
+
+IndexType = Literal["hnsw", "flat"]
+DistanceMetric = Literal["cosine", "dot", "l2-squared"]
+RetrievalMode = Literal["hnsw", "flat", "hybrid", "semantic"]
+ResponseFormat = Literal["end_user", "engineer"]
+ChunkingStrategy = Literal["fixed", "overlap", "language", "context_aware", "semantic"]
+PositiveSize = Annotated[int, BeforeValidator(_numeric), Field(ge=1)]
+NonnegativeSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0)]
+# Chunk bounds (#53): at least 50 characters, so a size-driven strategy can't
+# be asked for one-character chunks; at most 6,000, about the 1,500 tokens the
+# embedding model reads. `semantic` splits by similarity and ignores
+# chunk_size, so these don't bound its chunks. They apply to settings being
+# saved or used; a saved configuration from before them is still served and
+# exported as it is.
+ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
+MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
+UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
+TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
+SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
 
 class HnswConfig(BaseModel):
-    efConstruction: int = 128
-    maxConnections: int = 64
-    ef: int = 64
+    efConstruction: Annotated[int, BeforeValidator(_numeric), Field(ge=64, le=512)] = 128
+    maxConnections: Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=128)] = 64
+    ef: SearchEf = 64
 
 
 class CreateCollectionRequest(BaseModel):
     name: str
-    index_type: str = "hnsw"
-    distance_metric: str = "cosine"
+    index_type: IndexType = "hnsw"
+    distance_metric: DistanceMetric = "cosine"
     hnsw_config: HnswConfig = HnswConfig()
+
+
+class StoredHnswConfig(BaseModel):
+    # Existing SDK/server settings may exceed the workbench's new-request UI
+    # ranges. Preserve them during import/rebuild without accepting booleans,
+    # zero/negative sizes or unsupported index/distance names.
+    efConstruction: PositiveSize = 128
+    maxConnections: PositiveSize = 64
+    ef: Annotated[int, BeforeValidator(_numeric), Field(ge=-1)] = 64
+
+    @field_validator("ef")
+    @classmethod
+    def _nonzero_ef(cls, value):
+        if value == 0:
+            raise ValueError("Stored ef must be -1 (dynamic) or positive")
+        return value
+
+
+class StoredCollectionRequest(CreateCollectionRequest):
+    hnsw_config: StoredHnswConfig = StoredHnswConfig()
 
 
 class CollectionInfo(BaseModel):
@@ -640,6 +700,7 @@ class CollectionInfo(BaseModel):
     index_type: str
     distance_metric: str
     created_at: Optional[str]
+    hnsw_config: Optional[dict[str, int]] = None
 
 
 class CollectionsResponse(BaseModel):
@@ -669,11 +730,17 @@ class JobStatusResponse(BaseModel):
 
 
 class IngestConfig(BaseModel):
-    chunking_strategy: str = "overlap"
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    similarity_threshold: Optional[float] = None
-    min_chunk_size: int = 100
+    chunking_strategy: ChunkingStrategy = "overlap"
+    chunk_size: ChunkSize = 1000
+    chunk_overlap: NonnegativeSize = 200
+    similarity_threshold: Optional[UnitInterval] = None
+    min_chunk_size: MinChunkSize = 100
+
+    @model_validator(mode="after")
+    def _relationships(self):
+        if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+        return self
 
 
 class IngestConfigResponse(BaseModel):
@@ -690,43 +757,11 @@ class IngestConfigResponse(BaseModel):
 
 class SaveRetrievalConfigBody(BaseModel):
     collection: str
-    retrieval_mode: str = "hnsw"
-    top_k: int = 5
-    alpha: float = 0.75
-    ef: Optional[int] = None
-    response_format: str = "end_user"
-
-    @field_validator("retrieval_mode")
-    @classmethod
-    def _mode(cls, v: str) -> str:
-        # "semantic" routes to Weaviate near_text in rag_pipeline.run_query;
-        # it is offered on the Retrieval page, so the stored config must accept it.
-        allowed = ("hnsw", "flat", "hybrid", "semantic")
-        if v not in allowed:
-            raise ValueError(f"retrieval_mode must be one of {allowed}, got {v!r}")
-        return v
-
-    @field_validator("response_format")
-    @classmethod
-    def _fmt(cls, v: str) -> str:
-        allowed = ("end_user", "engineer")
-        if v not in allowed:
-            raise ValueError(f"response_format must be one of {allowed}, got {v!r}")
-        return v
-
-    @field_validator("top_k")
-    @classmethod
-    def _top_k(cls, v: int) -> int:
-        if not 1 <= v <= 50:
-            raise ValueError("top_k must be between 1 and 50")
-        return v
-
-    @field_validator("alpha")
-    @classmethod
-    def _alpha(cls, v: float) -> float:
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("alpha must be between 0 and 1")
-        return v
+    retrieval_mode: RetrievalMode = "hnsw"
+    top_k: TopK = 5
+    alpha: UnitInterval = 0.75
+    ef: Optional[SearchEf] = None
+    response_format: ResponseFormat = "end_user"
 
 
 class RetrievalConfigResponse(BaseModel):
@@ -835,18 +870,17 @@ CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semanti
 
 
 class _ChunkingFields(BaseModel):
-    chunking_strategy: Optional[str] = None
-    chunk_size: Optional[int] = None
-    chunk_overlap: Optional[int] = None
-    similarity_threshold: Optional[float] = None
-    min_chunk_size: Optional[int] = None
+    chunking_strategy: Optional[ChunkingStrategy] = None
+    chunk_size: Optional[ChunkSize] = None
+    chunk_overlap: Optional[NonnegativeSize] = None
+    similarity_threshold: Optional[UnitInterval] = None
+    min_chunk_size: Optional[MinChunkSize] = None
 
-    @field_validator("chunking_strategy")
-    @classmethod
-    def _strategy(cls, v):
-        if v is not None and v not in CHUNKING_STRATEGIES:
-            raise ValueError(f"chunking_strategy must be one of {CHUNKING_STRATEGIES}, got {v!r}")
-        return v
+    @model_validator(mode="after")
+    def _relationships(self):
+        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                        if getattr(self, name) is not None})
+        return self
 
     def has_chunking(self) -> bool:
         return any(getattr(self, f) is not None for f in
@@ -876,23 +910,8 @@ class ReembedRequest(_ChunkingFields):
 
 class ReindexRequest(BaseModel):
     collection: str
-    index_type: Optional[str] = None
-    distance_metric: Optional[str] = None
-
-    @field_validator("index_type")
-    @classmethod
-    def _index(cls, v):
-        if v is not None and v not in ("hnsw", "flat"):
-            raise ValueError(f"index_type must be 'hnsw' or 'flat', got {v!r}")
-        return v
-
-    @field_validator("distance_metric")
-    @classmethod
-    def _distance(cls, v):
-        allowed = ("cosine", "dot", "l2-squared")
-        if v is not None and v not in allowed:
-            raise ValueError(f"distance_metric must be one of {allowed}, got {v!r}")
-        return v
+    index_type: Optional[IndexType] = None
+    distance_metric: Optional[DistanceMetric] = None
 
 
 class TuneStartResponse(BaseModel):
@@ -930,11 +949,11 @@ class TuneOptionsResponse(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     collection: str
-    retrieval_mode: str = "hnsw"
-    top_k: int = 5
-    alpha: float = 0.75
+    retrieval_mode: RetrievalMode = "hnsw"
+    top_k: TopK = 5
+    alpha: UnitInterval = 0.75
     include_citations: bool = False
-    response_format: str = "end_user"
+    response_format: ResponseFormat = "end_user"
 
 
 class Citation(BaseModel):
@@ -959,6 +978,20 @@ class GenerateRequest(BaseModel):
     sample_size: int = 20
     seed: Optional[int] = None
 
+    @field_validator("sample_size", "seed", mode="before")
+    @classmethod
+    def _numeric(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Sampling settings cannot be booleans")
+        return value
+
+    @field_validator("sample_size")
+    @classmethod
+    def _sample_size(cls, value):
+        if not 1 <= value <= 100:
+            raise ValueError("sample_size must be between 1 and 100")
+        return value
+
 
 class GenerateResponse(BaseModel):
     session_id: str
@@ -982,7 +1015,16 @@ class GoldPair(BaseModel):
     status: str
 
 
-class SessionResponse(BaseModel):
+class SessionValidity(BaseModel):
+    stale: bool = False
+    stale_reason: Optional[str] = None
+    stale_at: Optional[str] = None
+    orphaned: bool = False
+    orphaned_reason: Optional[str] = None
+    orphaned_at: Optional[str] = None
+
+
+class SessionResponse(SessionValidity):
     session_id: str
     status: str
     pairs_total: int
@@ -1037,6 +1079,14 @@ class RegenerateRequest(BaseModel):
 class SaveRequest(BaseModel):
     session_id: str
     filename: Optional[str] = None
+    allow_historical: bool = False
+
+    @field_validator("allow_historical", mode="before")
+    @classmethod
+    def _explicit_opt_in(cls, value):
+        if not isinstance(value, bool):
+            raise ValueError("allow_historical must be a boolean")
+        return value
 
 
 class SaveResponse(BaseModel):
@@ -1044,6 +1094,8 @@ class SaveResponse(BaseModel):
     pairs_saved: int
     pairs_excluded: int
     download_url: str
+    historical: bool = False
+    session_validity: SessionValidity = SessionValidity()
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -1410,6 +1462,466 @@ def delete(collection: str) -> None:
     _path(collection).unlink(missing_ok=True)
 ```
 
+### api/services/batch_write.py
+
+```python
+"""Completed-batch checks with bounded, disk-backed record expectations."""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import sqlite3
+import struct
+import tempfile
+import uuid
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+from weaviate.classes.query import Filter
+from config import settings
+
+log = logging.getLogger(__name__)
+LOOKUP_SIZE = 100
+
+
+class BatchVerificationError(RuntimeError):
+    """A completed read proved that stored records differ from expectations."""
+
+
+class BatchCleanupError(RuntimeError):
+    def __init__(self, original: Exception, cleanup: Exception):
+        self.original = original
+        self.cleanup = cleanup
+        super().__init__(f"{type(original).__name__}: {original}; ingestion cleanup "
+                         f"could not be confirmed ({type(cleanup).__name__}: {cleanup}). "
+                         "Accepted chunks may remain; resolve cleanup before retrying.")
+
+
+def _properties(value):
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, dict):
+        return {key: _properties(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_properties(item) for item in value]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _record_properties(value: dict) -> dict:
+    value = dict(value)
+    if isinstance(value.get("created_at"), str):
+        value["created_at"] = datetime.fromisoformat(value["created_at"].replace("Z", "+00:00"))
+    return _properties(value)
+
+
+def _valid_vector(vector) -> bool:
+    return isinstance(vector, list) and bool(vector) and all(
+        isinstance(n, (int, float)) and not isinstance(n, bool) and math.isfinite(n)
+        for n in vector)
+
+
+def _property_digest(properties: dict) -> bytes:
+    return hashlib.sha256(json.dumps(_record_properties(properties), sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False).encode()).digest()
+
+
+def _vector_digest(vector) -> bytes:
+    if not _valid_vector(vector):
+        raise ValueError("Missing or invalid vector")
+    digest = hashlib.sha256()
+    for number in vector:
+        try:
+            encoded = struct.pack("<f", number)
+        except (OverflowError, struct.error) as exc:
+            raise ValueError("Vector exceeds finite float32 storage") from exc
+        if not math.isfinite(struct.unpack("<f", encoded)[0]):
+            raise ValueError("Vector exceeds finite float32 storage")
+        digest.update(encoded)
+    return digest.digest()
+
+
+def _factory(records):
+    if callable(records):
+        return records
+    if iter(records) is records:
+        raise ValueError("A one-shot iterator needs a reusable record factory")
+    return lambda: iter(records)
+
+
+class ExpectedRecords:
+    """UUIDs and SHA-256 fingerprints on disk; no corpus vectors held in RAM.
+
+    The SQLite cache is limited to 1 MiB. Capture/preflight and writing each
+    stream records separately; transient verification state never changes a
+    durable expectation snapshot used by restart cleanup.
+    """
+    def __init__(self):
+        Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix="batch-verify-", dir=settings.upload_dir)
+        self.path = Path(self.temp.name) / "expected.sqlite3"
+        self.db = sqlite3.connect(self.path)
+        self.db.execute("PRAGMA cache_size=-1024")
+        self.db.execute("PRAGMA temp_store=FILE")
+        self.db.execute("PRAGMA user_version=1")
+        self.db.execute("CREATE TABLE expected (position INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, "
+                        "properties BLOB NOT NULL, vector BLOB, seen INTEGER NOT NULL DEFAULT 0)")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        # Temporary index cleanup cannot turn a confirmed write into a failed
+        # ingest after its rollback boundary has already passed.
+        try:
+            self.db.close()
+            self.temp.cleanup()
+        except (OSError, sqlite3.Error):
+            log.exception("Could not remove temporary batch verification index %s", self.path)
+
+    @property
+    def count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM expected").fetchone()[0]
+
+    def capture(self, records, expected_count=None, *, generated_only=False):
+        if expected_count is not None and (type(expected_count) is not int or expected_count < 0):
+            raise ValueError("Declared object count must be a nonnegative integer")
+        for position, record in enumerate(_factory(records)()):
+            if generated_only and "id" in record:
+                raise ValueError("Owned ingestion cleanup requires newly generated UUIDs")
+            key = str(uuid.UUID(str(record["id"]))) if "id" in record else str(uuid.uuid4())
+            vector = _vector_digest(record["vector"]) if "vector" in record else None
+            try:
+                self.db.execute("INSERT INTO expected(position,id,properties,vector) VALUES (?,?,?,?)",
+                                (position, key, _property_digest(record["properties"]), vector))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"Duplicate chunk UUID {key}") from exc
+        if expected_count is not None and self.count != expected_count:
+            raise ValueError(f"Package contains {self.count} objects but declares {expected_count}")
+        self.db.commit()
+
+    def snapshot(self, destination: Path):
+        with closing(sqlite3.connect(destination)) as target:
+            self.db.backup(target)
+
+    def load_snapshot(self, source: Path, expected_count: int):
+        with closing(sqlite3.connect("file:" + quote(str(source)) + "?mode=ro", uri=True)) as original:
+            if original.execute("PRAGMA user_version").fetchone()[0] != 1:
+                raise ValueError("Unsupported expected-record snapshot")
+            original.backup(self.db)
+        self.db.execute("PRAGMA cache_size=-1024")
+        if self.count != expected_count:
+            raise ValueError("Expected-record snapshot count mismatch")
+        for position, row in enumerate(self.db.execute(
+                "SELECT position,id,properties,vector,seen FROM expected ORDER BY position")):
+            index, key, properties, vector, seen = row
+            if (index != position or str(uuid.UUID(key)) != key
+                    or not isinstance(properties, bytes) or len(properties) != 32
+                    or (vector is not None and (not isinstance(vector, bytes) or len(vector) != 32))
+                    or seen != 0):
+                raise ValueError("Invalid expected-record snapshot entry")
+
+    def prepare(self, position, record):
+        expected = self.db.execute("SELECT id,properties,vector FROM expected WHERE position=?",
+                                   (position,)).fetchone()
+        if expected is None:
+            raise ValueError("Record stream changed after preflight")
+        key, properties, vector = expected
+        actual_id = str(uuid.UUID(str(record["id"]))) if "id" in record else key
+        actual_vector = _vector_digest(record["vector"]) if "vector" in record else None
+        if (actual_id != key or _property_digest(record["properties"]) != properties or actual_vector != vector):
+            raise ValueError("Record stream changed after preflight")
+        return {**record, "id": key}
+
+    def id_batches(self):
+        cursor = self.db.execute("SELECT id FROM expected ORDER BY position")
+        while rows := cursor.fetchmany(LOOKUP_SIZE):
+            yield [row[0] for row in rows]
+
+    def verify(self, collection, *, exact: bool) -> int:
+        self.db.execute("UPDATE expected SET seen=0")
+        vectorless_allowed = None
+
+        def stored_objects():
+            if exact:
+                yield from collection.iterator(include_vector=True)
+            else:
+                for ids in self.id_batches():
+                    yield from collection.query.fetch_objects(
+                        filters=Filter.by_id().contains_any(ids), limit=len(ids), include_vector=True).objects
+
+        for obj in stored_objects():
+            key = str(obj.uuid)
+            expected = self.db.execute("SELECT properties,vector,seen FROM expected WHERE id=?", (key,)).fetchone()
+            if expected is None:
+                if exact:
+                    raise BatchVerificationError(f"Unexpected stored object {key}")
+                continue
+            properties, vector, seen = expected
+            if seen:
+                raise BatchVerificationError(f"Duplicate stored object {key}")
+            if _property_digest(obj.properties or {}) != properties:
+                raise BatchVerificationError(f"Stored properties differ for {key}")
+            stored_vector = (obj.vector or {}).get("default")
+            if stored_vector is None and vector is None:
+                if vectorless_allowed is None:
+                    config = getattr(collection, "config", None)
+                    vectorizer = config.get().vectorizer if config is not None else None
+                    vectorless_allowed = getattr(vectorizer, "value", None) == "none"
+                if not vectorless_allowed:
+                    raise BatchVerificationError(f"Stored vector is missing or invalid for {key}")
+                actual_vector = None
+            else:
+                try:
+                    actual_vector = _vector_digest(stored_vector)
+                except ValueError as exc:
+                    raise BatchVerificationError(f"Stored vector is missing or invalid for {key}") from exc
+            if vector is not None and vector != actual_vector:
+                raise BatchVerificationError(f"Stored float32 vector differs for {key}")
+            self.db.execute("UPDATE expected SET seen=1 WHERE id=?", (key,))
+        confirmed = self.db.execute("SELECT COUNT(*) FROM expected WHERE seen=1").fetchone()[0]
+        if confirmed != self.count:
+            raise BatchVerificationError(f"Confirmed {confirmed} of {self.count} expected objects")
+        return confirmed
+
+    def rollback(self, collection):
+        for ids in self.id_batches():
+            result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
+            if result.failed:
+                raise RuntimeError(f"Could not remove {result.failed} owned ingestion object(s)")
+            remaining = collection.query.fetch_objects(filters=Filter.by_id().contains_any(ids), limit=len(ids))
+            if remaining.objects:
+                raise RuntimeError("Owned ingestion objects remain after cleanup")
+
+
+def verify(collection, records, *, exact: bool) -> int:
+    with ExpectedRecords() as expected:
+        expected.capture(records)
+        return expected.verify(collection, exact=exact)
+
+
+def insert(collection, records, *, exact: bool = True, expected_count: int | None = None,
+           cleanup_owned: bool = False) -> int:
+    """Preflight a reusable stream, flush, then compare persisted fingerprints.
+
+    Only ingestion-generated UUIDs may be rolled back individually. Import and
+    tuning own new collections and retain/remove them at their operation boundary.
+    """
+    factory = _factory(records)
+    with ExpectedRecords() as expected:
+        expected.capture(factory, expected_count, generated_only=cleanup_owned)
+        try:
+            queued = 0
+            with collection.batch.dynamic() as batch:
+                for position, record in enumerate(factory()):
+                    record = expected.prepare(position, record)
+                    batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
+                    queued += 1
+                if queued != expected.count:
+                    raise ValueError("Record stream changed after preflight")
+            failed = collection.batch.failed_objects
+            if failed:
+                detail = getattr(failed[0], "message", None)
+                raise RuntimeError(
+                    f"Weaviate rejected {len(failed)} batch object(s)"
+                    + (f": {detail}" if detail else ""))
+            return expected.verify(collection, exact=exact)
+        except Exception as original:
+            if cleanup_owned:
+                try:
+                    expected.rollback(collection)
+                except Exception as cleanup:
+                    raise BatchCleanupError(original, cleanup) from original
+            raise
+```
+
+### api/services/collection_recovery.py
+
+```python
+"""Durable ownership of scratch collections and retained recovery copies.
+
+Names are never cleanup authority. Only a valid record created by this service
+allows startup to remove scratch; recovery records survive until explicit
+collection deletion or successful completion of their owning operation.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import uuid
+from pathlib import Path
+
+from config import settings
+from services import sources
+
+log = logging.getLogger(__name__)
+_NAME = re.compile(r"[A-Z][A-Za-z0-9_]*")
+
+
+def _root() -> Path:
+    root = Path(settings.upload_dir) / "collection_operations"
+    created = not root.exists()
+    root.mkdir(parents=True, exist_ok=True)
+    if created:
+        _sync_dir(root.parent)
+    return root
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_json(path: Path, record: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w") as output:
+        json.dump(record, output, indent=2, sort_keys=True)
+        output.flush()
+        os.fsync(output.fileno())
+    tmp.replace(path)
+    _sync_dir(path.parent)
+
+
+def _write(record: dict) -> None:
+    atomic_json(_root() / f"{record['operation_id']}.json", record)
+
+
+def begin(target: str, operation: str, client) -> dict:
+    if not _NAME.fullmatch(target) or operation not in ("import", "tune"):
+        raise ValueError("Invalid collection operation")
+    token = uuid.uuid4().hex
+    marker = "__importing_" if operation == "import" else "__tuning_"
+    staging = f"{target}{marker}{token}"
+    if client.collections.exists(staging):
+        raise RuntimeError(f"Recovery name '{staging}' is already in use")
+    record = dict(version=1, operation_id=token, operation=operation,
+                  target=target, staging=staging, state="scratch")
+    _write(record)  # Ownership is persisted before collection creation.
+    return record
+
+
+def _copy(source: Path, destination: Path) -> None:
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    elif source.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
+def retain(record: dict, *, package: Path | None = None) -> None:
+    """Snapshot sidecars and mark recovery durably BEFORE deleting the target."""
+    metadata = _root() / record["operation_id"]
+    metadata.mkdir()
+    target, staging = record["target"], record["staging"]
+    upload = Path(settings.upload_dir)
+    _copy(package / "sources" if package else sources.collection_dir(target),
+          sources.collection_dir(staging))
+    for kind in ("ingest", "retrieval"):
+        origin = package / f"{kind}_config.json" if package else upload / f"{kind}_configs" / f"{target}.json"
+        _copy(origin, metadata / f"{kind}_config.json")
+        if origin.is_file():
+            config = json.loads(origin.read_text())
+            config["collection"] = staging
+            out = upload / f"{kind}_configs" / f"{staging}.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(config, indent=2, sort_keys=True))
+    if package:
+        _copy(package / "goldstandard", metadata / "goldstandard")
+        _copy(package / "collection.json", metadata / "collection.json")
+        _copy(package / "manifest.json", metadata / "manifest.json")
+    else:
+        sessions = upload / "goldstandard_sessions"
+        for path in sessions.glob("*.json"):
+            # Preserve unreadable state rather than guessing that it is unrelated.
+            try:
+                belongs = json.loads(path.read_text()).get("collection") == target
+            except (ValueError, OSError, AttributeError):
+                belongs = True
+            if belongs:
+                _copy(path, metadata / "goldstandard" / path.name)
+    # Sources live on a separate named volume. Flush both snapshots before the
+    # state transition; a crash before the transition leaves the original safe.
+    paths = [metadata, sources.collection_dir(staging)]
+    paths += [upload / f"{kind}_configs" / f"{staging}.json" for kind in ("ingest", "retrieval")]
+    for path in paths:
+        files = list(path.rglob("*")) if path.is_dir() else [path]
+        for item in files:
+            if item.is_file():
+                with item.open("rb") as data:
+                    os.fsync(data.fileno())
+        if path.is_dir():
+            for directory in sorted((p for p in path.rglob("*") if p.is_dir()), reverse=True):
+                _sync_dir(directory)
+            _sync_dir(path)
+        if path.exists():
+            _sync_dir(path.parent)
+    _sync_dir(upload)
+    updated = {**record, "state": "recovery"}
+    _write(updated)
+    record.update(updated)
+
+
+def discard(record: dict, client) -> None:
+    """Delete an owned copy after success, or scratch while the target is safe."""
+    # Persist intent before the first deletion. Startup can finish this exact
+    # authorized cleanup even if backend or filesystem cleanup is interrupted.
+    if record["state"] != "cleanup":
+        updated = {**record, "state": "cleanup"}
+        _write(updated)
+        record.update(updated)
+    name = record["staging"]
+    if client.collections.exists(name):
+        client.collections.delete(name)
+    sources.delete(name)
+    if sources.collection_dir(name).exists():
+        raise OSError(f"Could not remove recovery sources for {name}")
+    for kind in ("ingest", "retrieval"):
+        (Path(settings.upload_dir) / f"{kind}_configs" / f"{name}.json").unlink(missing_ok=True)
+    metadata = _root() / record["operation_id"]
+    if metadata.exists():
+        shutil.rmtree(metadata)
+    (_root() / f"{record['operation_id']}.json").unlink(missing_ok=True)
+    _sync_dir(_root())
+
+
+def sweep(client) -> list[str]:
+    removed = []
+    for path in sorted(_root().glob("*.json")):
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+                raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
+            record = json.loads(path.read_text())
+            token = record["operation_id"]
+            operation = record["operation"]
+            marker = "__importing_" if operation == "import" else "__tuning_"
+            if (type(record.get("version")) is not int or record["version"] != 1 or operation not in ("import", "tune")
+                    or not re.fullmatch(r"[0-9a-f]{32}", token)
+                    or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
+                    or record["staging"] != f"{record['target']}{marker}{token}"
+                    or record["state"] not in ("scratch", "recovery", "cleanup")):
+                raise ValueError("Invalid collection ownership record")
+            if record["state"] == "recovery":
+                log.warning("Retained recovery collection %r; sidecar snapshots: %s",
+                            record["staging"], _root() / token)
+                continue
+            discard(record, client)
+            removed.append(record["staging"])
+        except Exception:  # Unreadable ownership never grants deletion authority.
+            log.exception("Could not resolve collection ownership %s; preserved", path)
+    return removed
+```
+
 ### api/services/weaviate_client.py
 
 ```python
@@ -1417,15 +1929,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
-from weaviate.classes.query import MetadataQuery
+from weaviate.classes.query import MetadataQuery, Filter
 
 from config import settings
+from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
+from services import batch_write, collection_recovery
 
 log = logging.getLogger(__name__)
 
@@ -1500,9 +2015,15 @@ def _create_collection_sync(
     index_type: str,
     distance_metric: str,
     hnsw_config: dict,
+    *,
+    preserve_hnsw: bool = False,
 ) -> None:
+    schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
+    validated = schema(name=name, index_type=index_type,
+                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+    hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
-    dist = DISTANCE_MAP.get(distance_metric, VectorDistances.COSINE)
+    dist = DISTANCE_MAP[validated.distance_metric]
 
     if index_type == "flat":
         vector_index = Configure.VectorIndex.flat(distance_metric=dist)
@@ -1583,20 +2104,36 @@ def _get_collections_sync() -> list[dict]:
         # vector_index_config (weaviate-client 4.x dropped it from the reduced
         # config). Fetch the full per-collection config for the index details.
         vector_config = coll.config.get().vector_index_config
-        index_type = "flat" if "flat" in type(vector_config).__name__.lower() else "hnsw"
+        index_name = type(vector_config).__name__.lower()
+        hnsw_fields = tuple(
+            getattr(vector_config, field, None)
+            for field in ("ef", "ef_construction", "max_connections")
+        )
+        if "flat" in index_name:
+            index_type = "flat"
+        elif "dynamic" in index_name:
+            index_type = "dynamic"
+        elif all(value is not None for value in hnsw_fields):
+            index_type = "hnsw"
+        else:
+            index_type = "unknown"
 
-        distance_attr = getattr(vector_config, "distance_metric", VectorDistances.COSINE)
+        distance_attr = getattr(vector_config, "distance_metric", None)
         distance_str = {
             VectorDistances.COSINE: "cosine",
             VectorDistances.DOT: "dot",
             VectorDistances.L2_SQUARED: "l2-squared",
-        }.get(distance_attr, "cosine")
+        }.get(distance_attr, "unknown")
 
         result.append({
             "name": col_name,
             "object_count": count,
             "index_type": index_type,
             "distance_metric": distance_str,
+            "hnsw_config": ({"ef": hnsw_fields[0],
+                             "efConstruction": hnsw_fields[1],
+                             "maxConnections": hnsw_fields[2]}
+                            if index_type == "hnsw" else None),
         })
     return result
 
@@ -1605,29 +2142,12 @@ async def get_collections() -> list[dict]:
     return await asyncio.to_thread(_get_collections_sync)
 
 
-# Collections created mid-operation and normally removed by the operation's own
-# cleanup. A hard kill (SIGKILL, OOM, `docker compose kill`) skips that cleanup,
-# so they are swept at startup instead — nothing can legitimately be using one
-# before the application has begun serving.
-STAGING_MARKERS = ("__importing_", "__tuning_")
-
-
 def _sweep_staging_sync() -> list[str]:
-    client = get_client()
-    removed = []
-    for name in list(client.collections.list_all()):
-        if any(marker in name for marker in STAGING_MARKERS):
-            try:
-                client.collections.delete(name)
-            except Exception:                         # noqa: BLE001
-                log.exception("Could not remove abandoned staging collection %r", name)
-                continue
-            removed.append(name)
-    return removed
+    return collection_recovery.sweep(get_client())
 
 
 async def sweep_staging() -> list[str]:
-    """Remove staging collections abandoned by a previous process."""
+    """Remove positively owned scratch; preserve recovery and unowned names."""
     return await asyncio.to_thread(_sweep_staging_sync)
 
 
@@ -1687,14 +2207,33 @@ async def get_collection_config(name: str) -> dict:
     return await asyncio.to_thread(_collection_config_sync, name)
 
 
+# Just after a collection is created under a name that was dropped moments
+# earlier, Weaviate can reject writes with "could not find index for class ...
+# It might have been deleted in the meantime" until the new index is loaded.
+# The verify suite hit this when it recreated a collection between checks (#95).
+_INDEX_NOT_READY = "could not find index"
+_INSERT_ATTEMPTS = 3
+_INSERT_RETRY_DELAY = 1.0
+
+
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
-    with coll.batch.dynamic() as batch:
-        for chunk in chunks:
-            batch.add_object(properties=chunk)
-        if batch.number_errors > 0:
-            raise RuntimeError(f"{batch.number_errors} batch error(s) inserting into '{collection_name}'")
+    for attempt in range(1, _INSERT_ATTEMPTS + 1):
+        try:
+            # The writer verifies persisted records and removes only UUIDs
+            # generated by a failed attempt before a retry can begin.
+            return batch_write.insert(
+                coll, lambda: ({"properties": chunk} for chunk in chunks),
+                exact=False, cleanup_owned=True)
+        except RuntimeError as exc:
+            failed = coll.batch.failed_objects
+            if not (type(exc) is RuntimeError
+                    and str(exc).startswith("Weaviate rejected ")
+                    and attempt < _INSERT_ATTEMPTS and failed
+                    and all(_INDEX_NOT_READY in getattr(f, "message", "") for f in failed)):
+                raise
+            time.sleep(_INSERT_RETRY_DELAY)
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
@@ -1788,25 +2327,30 @@ async def hybrid_query(
     return await asyncio.to_thread(_hybrid_query_sync, collection_name, query, alpha, top_k)
 
 
-def _sample_chunks_sync(collection_name: str, limit: int) -> list[dict]:
+def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    from models.schemas import GenerateRequest
+    from services.chunk_sampling import select_chunk_ids
+    request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.fetch_objects(
-        limit=limit,
-        return_properties=["content", "source_file", "chunk_index"],
-    )
-    return [
-        {
-            "content": obj.properties.get("content", ""),
-            "source_file": obj.properties.get("source_file", ""),
-            "chunk_index": obj.properties.get("chunk_index", 0),
-        }
-        for obj in result.objects
-    ]
+    objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
+    identities = select_chunk_ids(objects, request.sample_size, request.seed)
+    if not identities:
+        return []
+    payloads = coll.query.fetch_objects(
+        filters=Filter.by_id().contains_any(identities), limit=len(identities),
+        include_vector=False, return_properties=["content", "source_file", "chunk_index"],
+    ).objects
+    by_id = {str(obj.uuid): obj.properties for obj in payloads}
+    # Concurrent deletion can remove a winner between the UUID and payload passes.
+    return [{"object_id": identity, "content": by_id[identity].get("content", ""),
+             "source_file": by_id[identity].get("source_file", ""),
+             "chunk_index": by_id[identity].get("chunk_index", 0)}
+            for identity in identities if identity in by_id]
 
 
-async def sample_chunks(collection_name: str, limit: int) -> list[dict]:
-    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit)
+async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit, seed)
 ```
 
 ### api/services/ollama_client.py
@@ -1849,6 +2393,14 @@ async def chat(system: str, user: str) -> str:
         return resp.json()["message"]["content"]
 
 
+async def list_models() -> set[str]:
+    """Full names (`name:tag`) of the models Ollama reports."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{_BASE}/api/tags")
+        resp.raise_for_status()
+        return {m["name"] for m in resp.json().get("models", [])}
+
+
 async def check_health() -> dict:
     start = time.monotonic()
     try:
@@ -1877,8 +2429,12 @@ async def check_health() -> dict:
 from __future__ import annotations
 import threading
 from typing import Any
+from models.schemas import IngestConfig
 
 from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter
+
+MAX_OVERLAP_WINDOWS = 10_000
+MAX_OVERLAP_OUTPUT_CHARACTERS = 10_000_000
 
 _semantic_model = None
 _semantic_model_lock = threading.Lock()
@@ -1913,9 +2469,47 @@ def chunk_fixed(text: str, chunk_size: int, min_chunk_size: int) -> list[str]:
 
 
 def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size: int) -> list[str]:
-    splitter = CharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = splitter.split_text(text)
-    return _enforce_min_chunk_size(chunks, min_chunk_size)
+    # This strategy promises character overlap, independently of paragraph or
+    # word boundaries. A separator-only splitter cannot bound a long paragraph.
+    for name, value in (("chunk_size", chunk_size), ("chunk_overlap", chunk_overlap),
+                        ("min_chunk_size", min_chunk_size)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+    if chunk_size <= 0 or not 0 <= chunk_overlap < chunk_size:
+        raise ValueError("chunk_size must be positive and 0 <= chunk_overlap < chunk_size")
+    if min_chunk_size < 0:
+        raise ValueError("min_chunk_size must be nonnegative")
+    if not text.strip():
+        return []
+
+    stride = chunk_size - chunk_overlap
+    windows = 1 if len(text) <= chunk_size else 1 + (len(text) - chunk_size + stride - 1) // stride
+    # Count repeated overlap before allocating slices. The count and payload
+    # limits are conservative before the optional tail merge removes overlap.
+    output_characters = len(text) + (windows - 1) * chunk_overlap
+    if windows > MAX_OVERLAP_WINDOWS or output_characters > MAX_OVERLAP_OUTPUT_CHARACTERS:
+        raise ValueError(
+            f"Overlap output exceeds per-file limit: {windows} pre-merge windows "
+            f"(maximum {MAX_OVERLAP_WINDOWS}), {output_characters} characters "
+            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.")
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = end - chunk_overlap
+
+    # The tail repeats the preceding window's overlap. Append only its new
+    # suffix, preserving coverage without duplicating those repeated bytes.
+    # Only this last window can be undersized. A short whole document stays
+    # one short chunk; minimum size is a preference, not fabricated content.
+    if len(chunks) > 1 and len(chunks[-1]) < min_chunk_size:
+        tail = chunks.pop()
+        chunks[-1] += tail[chunk_overlap:]
+    return chunks
 
 
 def chunk_language(
@@ -2003,6 +2597,12 @@ def chunk(
     min_chunk_size: int = 100,
     elements: list[Any] | None = None,
 ) -> list[str]:
+    config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                          chunk_overlap=chunk_overlap_size, similarity_threshold=similarity_threshold,
+                          min_chunk_size=min_chunk_size)
+    strategy, chunk_size, chunk_overlap_size = config.chunking_strategy, config.chunk_size, config.chunk_overlap
+    min_chunk_size = config.min_chunk_size
+    similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     if strategy == "fixed":
         return chunk_fixed(text, chunk_size, min_chunk_size)
     elif strategy == "overlap":
@@ -2011,12 +2611,12 @@ def chunk(
         return chunk_language(text, chunk_size, chunk_overlap_size, min_chunk_size)
     elif strategy == "context_aware":
         if elements is None:
-            return chunk_language(text, chunk_size, chunk_overlap_size, min_chunk_size)
+            return chunk_language(text, chunk_size, 0, min_chunk_size)
         return chunk_context_aware(elements, chunk_size, min_chunk_size)
     elif strategy == "semantic":
         return chunk_semantic(text, similarity_threshold, min_chunk_size)
     else:
-        return chunk_overlap(text, chunk_size, chunk_overlap_size, min_chunk_size)
+        raise ValueError(f"Unsupported chunking strategy: {strategy!r}")
 ```
 
 ### api/services/ingest_pipeline.py
@@ -2036,6 +2636,7 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
+from models.schemas import IngestConfig
 from services.chunker import chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
@@ -2048,6 +2649,11 @@ _log = logging.getLogger(__name__)
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def _save_upload(src, dest: Path) -> None:
+    with dest.open("wb") as fh:
+        shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
@@ -2166,6 +2772,12 @@ async def start_ingest_job(
     similarity_threshold: float,
     min_chunk_size: int,
 ) -> str:
+    config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                          chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                          min_chunk_size=min_chunk_size)
+    strategy, chunk_size, chunk_overlap, min_chunk_size = (
+        config.chunking_strategy, config.chunk_size, config.chunk_overlap, config.min_chunk_size)
+    similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     job_id = str(uuid.uuid4())[:8]
 
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
@@ -2182,8 +2794,11 @@ async def start_ingest_job(
             if not safe_name:
                 continue
             dest = tmp_dir / safe_name
-            content = await upload.read()
-            dest.write_bytes(content)
+            # Copy in blocks rather than `await upload.read()`, which held the
+            # whole file in memory. Uploads can now reach 512 MB (issue #21),
+            # and this container already runs close to its memory budget. The
+            # copy blocks, so it runs off the event loop.
+            await asyncio.to_thread(_save_upload, upload.file, dest)
 
             if safe_name.lower().endswith(".zip"):
                 resolved_tmp = tmp_dir.resolve()
@@ -2265,6 +2880,7 @@ async def start_ingest_job(
 from __future__ import annotations
 import time
 
+from models.schemas import QueryRequest
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 
@@ -2278,7 +2894,8 @@ SYNTHESIS_END_USER_SYSTEM = (
     "You are a helpful assistant. Answer the user's question using only the provided context. "
     "If the context does not contain enough information to answer the question, say so clearly. "
     "Do not use any knowledge outside the provided context. "
-    "Write in plain, clear language for a non-technical reader."
+    "Write in plain, clear language for a non-technical reader. "
+    "Keep the answer short: a few sentences, without technical detail."
 )
 
 SYNTHESIS_ENGINEER_SYSTEM = (
@@ -2312,6 +2929,11 @@ async def run_query(
     include_citations: bool,
     response_format: str,
 ) -> dict:
+    config = QueryRequest(question=question, collection=collection, retrieval_mode=retrieval_mode,
+                          top_k=top_k, alpha=alpha, include_citations=include_citations,
+                          response_format=response_format)
+    retrieval_mode, top_k, alpha, response_format = (
+        config.retrieval_mode, config.top_k, config.alpha, config.response_format)
     reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
     reformulated = reformulated.strip()
 
@@ -2321,7 +2943,7 @@ async def run_query(
         chunks = await wc.near_vector_query(collection, vector, top_k)
     elif retrieval_mode == "hybrid":
         chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
-    else:
+    elif retrieval_mode == "semantic":
         chunks = await wc.near_text_query(collection, reformulated, top_k)
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
@@ -2355,6 +2977,51 @@ async def run_query(
     }
 ```
 
+### api/services/chunk_sampling.py
+
+```python
+"""Order-independent selection of stable chunk UUIDs."""
+import hashlib
+import heapq
+import secrets
+from uuid import UUID
+
+MAX_SAMPLE_SIZE = 100
+
+
+def select_chunk_ids(objects, limit: int, seed: int | None = None) -> list[str]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_SAMPLE_SIZE:
+        raise ValueError("sample_size must be an integer between 1 and 100")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("seed must be an integer or null")
+    domain = b"rag-evaluation-sample-v1\0"
+    prefix = (domain + b"seed\0" + str(seed).encode("ascii") + b"\0" if seed is not None
+              else domain + b"nonce\0" + secrets.token_bytes(32) + b"\0")
+    base = hashlib.sha256(prefix)
+    heap = []
+    selected = set()
+    for obj in objects:
+        identity = UUID(str(obj.uuid))
+        if identity in selected:
+            continue
+        digest = base.copy()
+        digest.update(identity.bytes)
+        priority = int.from_bytes(digest.digest(), "big")
+        # Negated scores make the heap root the worst retained candidate.
+        key = (-priority, -identity.int)
+        if len(heap) == limit and key <= heap[0][:2]:
+            continue
+        entry = (*key, identity)
+        if len(heap) == limit:
+            removed = heapq.heapreplace(heap, entry)
+            selected.remove(removed[2])
+        else:
+            heapq.heappush(heap, entry)
+        selected.add(identity)
+    # The UUID tie-breaker also fixes output order if priorities collide.
+    return [str(entry[2]) for entry in sorted(heap, key=lambda entry: (-entry[0], -entry[1]))]
+```
+
 ### api/services/goldstandard.py
 
 ```python
@@ -2374,6 +3041,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
+from models.schemas import SessionResponse
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 
@@ -2406,10 +3074,34 @@ _state_lock = threading.RLock()
 _diagnostics: dict[str, dict] = {}
 _scan_lock = threading.Lock()
 _store_revision = 0
+_SESSION_ID = re.compile(r"gs_[0-9a-f]{8}")
+
+
+def validate_session_id(session_id: str) -> None:
+    """Imported identities use the same grammar as locally generated ones."""
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        raise ValueError("Invalid evaluation session ID.")
+
+
+def validate_session(session: dict) -> None:
+    """Validate without normalising or dropping historical validity metadata."""
+    SessionResponse.model_validate(session, strict=True)
+    validate_session_id(session["session_id"])
+
+
+def _session_storage_root() -> Path:
+    upload = Path(settings.upload_dir).resolve()
+    p = upload / "goldstandard_sessions"
+    if p.is_symlink() or (p.exists() and not p.is_dir()):
+        raise ValueError("Evaluation session storage is not a regular directory.")
+    root = p.resolve()
+    if root.parent != upload:
+        raise ValueError("Evaluation session storage is outside the upload directory.")
+    return root
 
 
 def _sessions_dir() -> Path:
-    p = Path(settings.upload_dir) / "goldstandard_sessions"
+    p = _session_storage_root()
     created = not p.exists()
     p.mkdir(parents=True, exist_ok=True)
     if created:
@@ -2418,7 +3110,19 @@ def _sessions_dir() -> Path:
 
 
 def _session_path(session_id: str) -> Path:
-    return _sessions_dir() / f"{session_id}.json"
+    validate_session_id(session_id)
+    # Preflight must be read-only; the writer creates the directory only after
+    # every imported session has been checked.
+    root = _session_storage_root()
+    candidate = root / f"{session_id}.json"
+    if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+        raise ValueError("Evaluation session destination is not a regular file.")
+    target = candidate.resolve()
+    # Grammar prevents metadata-derived paths; containment also refuses an
+    # existing file symlink which would redirect a valid identity's write.
+    if target.parent != root:
+        raise ValueError("Evaluation session destination is outside session storage.")
+    return target
 
 
 def _record_issue(path: Path, code: str) -> None:
@@ -2455,6 +3159,7 @@ def _save_session_sync(session: dict) -> None:
         snapshot = copy.deepcopy(session)
         try:
             path = _session_path(snapshot["session_id"])
+            _sessions_dir()
         except OSError as exc:
             _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (str(snapshot["session_id"]) + ".json"), "SESSION_WRITE_FAILED")
             raise GoldStandardError("SESSION_WRITE_FAILED", "Session directory could not be prepared. The previous snapshot is unchanged.", 503) from exc
@@ -2502,10 +3207,10 @@ def _scan_sessions() -> None:
         with _state_lock:
             revision = _store_revision
         storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
-        root = storage_label
         loaded = {}
         issues = {}
         try:
+            root = _session_storage_root()
             with os.scandir(root) as entries:
                 paths = [Path(entry.path) for entry in entries]
         except FileNotFoundError:
@@ -2520,11 +3225,12 @@ def _scan_sessions() -> None:
                 issues[path] = "SESSION_INTERRUPTED_WRITE"
             elif path.name.endswith(".json"):
                 try:
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError("Evaluation session must be a regular file.")
                     data = json.loads(path.read_text())
-                    if not isinstance(data, dict) or data.get("session_id") != path.stem or not isinstance(data.get("pairs"), list) or not all(isinstance(pair, dict) for pair in data["pairs"]):
-                        raise ValueError("Invalid retained session structure")
-                    from models.schemas import SessionResponse
-                    SessionResponse.model_validate(data)
+                    validate_session(data)
+                    if path != _session_path(data["session_id"]):
+                        raise ValueError("Evaluation session filename does not match its identity.")
                     loaded[data["session_id"]] = data
                     retained_error = data.get("persistence_error")
                     if isinstance(retained_error, dict) and retained_error.get("code") in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
@@ -2555,6 +3261,30 @@ def load_sessions_from_disk() -> None:
     _scan_sessions()
 
 
+def _sessions_on_disk() -> list[dict]:
+    """Return detached, validated files for export without changing the cache."""
+    try:
+        paths = sorted(_session_storage_root().glob("*.json"))
+    except (OSError, ValueError, RuntimeError):
+        log.exception("Cannot read evaluation session storage; existing files are unchanged")
+        return []
+    sessions = []
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("Evaluation session must be a regular file.")
+            data = json.loads(path.read_text())
+            validate_session(data)
+            if path != _session_path(data["session_id"]):
+                raise ValueError("Evaluation session filename does not match its identity.")
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warning("Skipping invalid evaluation session %s; file is unchanged (%s)",
+                        path.name, type(exc).__name__)
+            continue
+        sessions.append(data)
+    return sessions
+
+
 def session_diagnostics() -> list[dict]:
     _scan_sessions()
     with _state_lock:
@@ -2570,10 +3300,13 @@ def sessions_for(collection: str) -> list[dict]:
                 continue
             try:
                 from models.schemas import SessionResponse
-                SessionResponse.model_validate(session)
+                validate_session(session)
                 if sid != session.get("session_id"):
                     raise ValueError("Cached session key does not match identity")
-            except (ValueError, TypeError):
+                _session_path(sid)
+            except (OSError, ValueError, RuntimeError) as exc:
+                log.warning("Skipping invalid cached evaluation session %s (%s)",
+                            sid, type(exc).__name__)
                 _record_issue(Path(str(sid) + ".json"), "SESSION_READ_FAILED")
                 continue
             found.append(session)
@@ -2582,6 +3315,7 @@ def sessions_for(collection: str) -> list[dict]:
 
 def store_session(session: dict) -> None:
     """Explicit whole-session storage; publishes cache only after replacement."""
+    validate_session(session)
     _save_session_sync(session)
 
 
@@ -2609,7 +3343,7 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
         try:
             _update_session_sync(session["session_id"], change)
             marked += 1
-        except GoldStandardError:
+        except (GoldStandardError, OSError, ValueError, RuntimeError):
             # The primary collection mutation already happened. Preserve the
             # failed-write diagnostic and continue other markers; never turn a
             # completed delete/rebuild into a fictitious primary failure.
@@ -2706,12 +3440,12 @@ async def _generate_pair(chunk: dict) -> dict:
 
     return {
         "pair_id": f"p_{uuid.uuid4().hex[:8]}",
-        "question": data.get("question", ""),
-        "answer": data.get("answer", ""),
+        "question": str(data.get("question", "")),
+        "answer": str(data.get("answer", "")),
         "contexts": [chunk["content"]],
-        "ground_truth": data.get("ground_truth", data.get("answer", "")),
+        "ground_truth": str(data.get("ground_truth", data.get("answer", ""))),
         "source_file": chunk.get("source_file", ""),
-        "chunk_index": chunk.get("chunk_index", 0),
+        "chunk_index": int(chunk.get("chunk_index", 0)),
         "status": "pending",
     }
 
@@ -2781,7 +3515,9 @@ async def start_generation(
     sample_size: int,
     seed: int | None,
 ) -> dict:
-    all_chunks = await wc.sample_chunks(collection, limit=sample_size)
+    from models.schemas import GenerateRequest
+    request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
+    all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
     actual_size = len(all_chunks)
 
     session_id = f"gs_{uuid.uuid4().hex[:8]}"
@@ -2882,10 +3618,22 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     out_path.write_text(json.dumps(ragas, indent=2))
 
 
-async def save_session(session_id: str, filename: str | None) -> dict | None:
+async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
         return None
+
+    from models.schemas import SessionValidity
+    if not isinstance(allow_historical, bool):
+        raise ValueError("allow_historical must be a boolean")
+    validity = SessionValidity.model_validate(session).model_dump()
+    historical = validity["stale"] or validity["orphaned"]
+    if historical and not allow_historical:
+        raise GoldStandardError(
+            "HISTORICAL_SESSION",
+            "This retained session is stale or orphaned and is not a current "
+            "collection baseline. Inspect its validity metadata and explicitly "
+            "set allow_historical=true to export historical pairs.", 409)
 
     approved = [p for p in session["pairs"] if p["status"] in ("approved", "edited")]
     excluded = len(session["pairs"]) - len(approved)
@@ -2920,6 +3668,8 @@ async def save_session(session_id: str, filename: str | None) -> dict | None:
         "pairs_saved": len(approved),
         "pairs_excluded": excluded,
         "download_url": f"/api/goldstandard/download/{filename}",
+        "historical": historical,
+        "session_validity": validity,
     }
 ```
 
@@ -2948,6 +3698,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from config import settings
+from services import goldstandard
 from services import ingest_config
 from services import model_bundle
 from services import retrieval_config
@@ -3110,19 +3861,11 @@ def _ingest_config(collection: str) -> dict | None:
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:
-    out = []
-    d = Path(settings.upload_dir) / "goldstandard_sessions"
-    if not d.is_dir():
-        return out
-    for p in sorted(d.glob("*.json")):
-        try:
-            data = json.loads(p.read_text())
-        except (OSError, ValueError):
-            _log.warning("Skipping unreadable gold-standard session %s", p.name)
-            continue
-        if data.get("collection") == collection:
-            out.append(data)
-    return out
+    # Preserve export's detached on-disk snapshots. The cache contains live
+    # generation/edit objects, which must not change during JSON serialization.
+    # Disk reads still share schema, identity and regular-file validation.
+    return [session for session in goldstandard._sessions_on_disk()
+            if session["collection"] == collection]
 
 
 def _fidelity_note(fidelity: str) -> str:
@@ -3413,6 +4156,11 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
                 "PACKAGE_UNREADABLE",
                 f"Package contains a link ('{member.name}'), which is not allowed.",
                 {"member": member.name})
+        if not (member.isfile() or member.isdir()):
+            raise PackageError(
+                "PACKAGE_UNREADABLE",
+                "Package contains a non-regular archive member.",
+                {"member": member.name})
         target = (dest / member.name).resolve()
         if target != root and root not in target.parents:
             raise PackageError(
@@ -3625,7 +4373,7 @@ depending on whether there is anything to protect:
 * `replace` builds into a temporary collection first, to prove the package
   inserts cleanly, and only then deletes the existing collection and builds the
   real one. That costs a second insert pass, which is the price of a
-  non-destructive replace in a database that cannot rename. If the second pass
+  staged replace with a recoverable failure path in a database that cannot rename. If the second pass
   fails, the temporary collection is *kept* and named in the error, so the data
   is recoverable rather than lost.
 """
@@ -3634,6 +4382,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -3648,6 +4397,7 @@ from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
@@ -3685,23 +4435,66 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str) -> None:
-    _marker_path(collection).write_text(json.dumps({
-        "collection": collection,
-        "expected_chunks": expected_chunks,
-        "job_id": job_id,
-    }, indent=2))
+def _read_marker(path: Path) -> tuple[dict, Path]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
+    data = json.loads(path.read_text())
+    collection, count = data["collection"], data["expected_chunks"]
+    snapshot = data["expected_snapshot"]
+    if (type(data.get("version")) is not int or data["version"] != 3
+            or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
+            or path.name != f"{collection}.json" or type(count) is not int or count < 0
+            or data["state"] not in ("building", "cleanup")
+            or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
+        raise ValueError("Invalid import ownership")
+    return data, _markers_dir() / snapshot["file"]
+
+
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> None:
+    snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
+    try:
+        with batch_write.ExpectedRecords() as expected:
+            try:
+                expected.capture(records, expected_chunks)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
+            expected.snapshot(snapshot)
+        with snapshot.open("rb") as data:
+            os.fsync(data.fileno())
+        collection_recovery._sync_dir(_markers_dir())
+        collection_recovery._sync_dir(Path(settings.upload_dir))
+        collection_recovery.atomic_json(_marker_path(collection), {
+            "version": 3, "collection": collection, "expected_chunks": expected_chunks,
+            "job_id": job_id, "state": "building",
+            "expected_snapshot": {"file": snapshot.name, "sha256": packager.sha256_file(snapshot)},
+        })
+    except Exception:
+        try:
+            snapshot.unlink(missing_ok=True)
+        except OSError:
+            _log.exception("Could not remove unpublished expectation snapshot %s", snapshot)
+        raise
 
 
 def _mark_finished(collection: str) -> None:
-    _marker_path(collection).unlink(missing_ok=True)
+    marker = _marker_path(collection)
+    if not marker.exists():
+        return
+    record, snapshot = _read_marker(marker)
+    if record["state"] != "cleanup":
+        record["state"] = "cleanup"
+        collection_recovery.atomic_json(marker, record)
+    snapshot.unlink(missing_ok=True)
+    marker.unlink()
+    collection_recovery._sync_dir(_markers_dir())
 
 
 # Extraction workspaces created by an import or a re-chunk. Both remove their
 # own directory in a `finally`, which a hard kill skips -- twelve of these were
 # found holding 152 MB after the kill tests, and a with-models package would
 # leave 2.3 GB behind each time.
-_WORKDIR_PREFIXES = ("import-", "rechunk-")
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -3726,30 +4519,34 @@ def sweep_stale_workdirs() -> list[str]:
 def sweep_interrupted_imports() -> list[str]:
     """Remove collections left half-built by a killed import.
 
-    The expected chunk count is compared rather than trusting the marker alone:
-    a marker that outlived a *successful* import — a failed unlink, a disk
-    error — must not cost the user a complete collection.
+    Compare the expected identities, properties and vectors, not just count.
+    Unreadable or legacy ownership cannot authorize destructive cleanup.
     """
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
         try:
-            data = json.loads(marker.read_text())
+            data, snapshot = _read_marker(marker)
             collection = data["collection"]
-            expected = int(data.get("expected_chunks", -1))
-        except (OSError, ValueError, KeyError):
-            marker.unlink(missing_ok=True)
+            if data["state"] == "building":
+                if snapshot.is_symlink() or not snapshot.is_file():
+                    raise ValueError("Expected-record snapshot is not a regular file")
+                if packager.sha256_file(snapshot) != data["expected_snapshot"]["sha256"]:
+                    raise ValueError("Expected-record snapshot integrity mismatch")
+                with batch_write.ExpectedRecords() as expected:
+                    expected.load_snapshot(snapshot, data["expected_chunks"])
+                    if wc._collection_exists_sync(collection):
+                        col = wc.get_client().collections.get(collection)
+                        try:
+                            expected.verify(col, exact=True)
+                        except batch_write.BatchVerificationError:
+                            wc.get_client().collections.delete(collection)
+                            removed.append(f"{collection} (persisted records did not match import)")
+            # Cleanup is an explicit durable phase: failure here never converts
+            # a verified target back into a candidate for backend deletion.
+            _mark_finished(collection)
+        except Exception:
+            _log.exception("Could not resolve import ownership %s; preserved", marker)
             continue
-        try:
-            if wc._collection_exists_sync(collection):
-                col = wc.get_client().collections.get(collection)
-                actual = col.aggregate.over_all(total_count=True).total_count or 0
-                if expected < 0 or actual != expected:
-                    wc.get_client().collections.delete(collection)
-                    removed.append(f"{collection} ({actual} of {expected} chunks)")
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not resolve interrupted import of %r", collection)
-            continue
-        marker.unlink(missing_ok=True)
     return removed
 
 
@@ -3836,12 +4633,29 @@ def _probe_dimensions() -> int | None:
     return _probed_dimensions
 
 
+def _ollama_reports(model: str) -> bool | None:
+    """Whether Ollama lists the model, matching `name:tag` (tag defaults to latest).
+
+    None means Ollama couldn't be asked. That isn't "absent": saying the model is
+    missing would send the user to pull one they may already have.
+    """
+    from services import ollama_client
+    want = model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+    try:
+        return want in asyncio.run(ollama_client.list_models())
+    except Exception as exc:                      # noqa: BLE001
+        _log.warning("Could not list Ollama models: %s", exc)
+        return None
+
+
 def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     """Spec §6.3. The embedding model is the one that decides the import.
 
-    Present by name  -> skip; an existing model is assumed deliberate.
-    Absent, bundled  -> install, then verify Ollama actually reports it.
-    Absent, unbundled-> EMBEDDING_MODEL_MISSING.
+    Present, bytes intact -> skip; an existing model is assumed deliberate.
+    Present, bytes differ -> MODEL_INTEGRITY_FAILED (embedding) or a note (LLM).
+    Absent, bundled       -> install, then verify Ollama actually reports it.
+    Absent, unbundled     -> EMBEDDING_MODEL_MISSING.
+    Namespaced name       -> ask Ollama; it can't be checked or installed here.
     """
     notes: list[str] = []
     if not model_bundle.store_available():
@@ -3854,10 +4668,56 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     bundled = model_bundle.bundled_models(pkg)
 
     for model, required in ((embed_model, True), (llm_model, False)):
+        if not model_bundle.supports_name(model):
+            # `user/model` and the like have no path in the store layout that
+            # bundles use. Refusing every import over the name would block
+            # packages that don't bundle models at all, so defer to Ollama.
+            reported = _ollama_reports(model)
+            if reported:
+                notes.append(f"model '{model}' reported by Ollama; a namespaced "
+                             "model's files can't be checked, so they weren't")
+                continue
+            if reported is None:
+                if not required:
+                    notes.append(f"model '{model}' wasn't checked: Ollama couldn't be "
+                                 "reached to confirm it is there")
+                    continue
+                raise PackageError(
+                    "IMPORT_FAILED",
+                    f"Couldn't reach Ollama to confirm the embedding model '{model}' is "
+                    f"there. A namespaced model can only be checked through Ollama. "
+                    f"Check that the ollama service is running, then import again.",
+                    {"model": model})
+            if not required:
+                notes.append(f"model '{model}' is absent; a namespaced model can't be "
+                             "installed from a package, so pull it before querying")
+                continue
+            pkg_model = (manifest.get("embedding") or {}).get("model")
+            raise PackageError(
+                "EMBEDDING_MODEL_MISSING",
+                f"This instance does not have the embedding model '{model}'. It is "
+                f"a namespaced model, which can't be installed from a package. Pull "
+                f"it with `docker compose exec ollama ollama pull {model}`.",
+                {"model": model, "package_model": pkg_model, "bundled": bundled})
+
         name = model_bundle.split_ref(model)[0]
-        if model_bundle.is_installed(model):
+        state = model_bundle.installed_state(model)
+        if state == "present":
             notes.append(f"model '{name}' already present; left untouched")
             continue
+        if state == "corrupt":
+            # Installing over it could break other models that share the
+            # blobs, so restoring it stays an owner action (§6.3).
+            if not required:
+                notes.append(f"model '{name}' is installed but its files don't match "
+                             "their checksums; restore or re-pull it before querying")
+                continue
+            raise PackageError(
+                "MODEL_INTEGRITY_FAILED",
+                f"The embedding model '{name}' is installed, but its files don't "
+                f"match their checksums. Restore it, or re-pull it with "
+                f"`docker compose exec ollama ollama pull {name}`, then import again.",
+                {"model": name})
         if name not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
@@ -3898,11 +4758,29 @@ def _create_from_package(name: str, pkg: Path) -> None:
         cfg.get("index_type", "hnsw"),
         cfg.get("distance_metric", "cosine"),
         cfg.get("hnsw_config") or {},
+        preserve_hnsw=True,
     )
 
 
-def _insert_chunks(name: str, pkg: Path, manifest: dict,
-                   progress) -> int:
+def _package_records(pkg: Path, manifest: dict):
+    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
+    for record in packager.iter_chunks_file(pkg):
+        try:
+            uuid.UUID(record["id"])
+            if not isinstance(record["properties"], dict):
+                raise ValueError("Chunk properties must be an object")
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise PackageError("PACKAGE_CORRUPT", f"Invalid chunk identity or properties: {exc}",
+                               {"file": "chunks.jsonl"}) from exc
+        vector = record.get("vector")
+        if not batch_write._valid_vector(vector):
+            raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has no valid vector.")
+        if expected_dims and len(vector) != expected_dims:
+            raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has the wrong vector width.")
+        yield record
+
+
+def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     """Insert every chunk with its original uuid and vector.
 
     The uuid is preserved deliberately: gold-standard sessions reference chunks
@@ -3910,38 +4788,55 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict,
     """
     client = wc.get_client()
     col = client.collections.get(name)
-    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
-    written = 0
-    with col.batch.dynamic() as batch:
-        for record in packager.iter_chunks_file(pkg):
-            vector = record.get("vector")
-            if not isinstance(vector, list) or not vector:
-                raise PackageError("PACKAGE_CORRUPT",
-                                   f"Chunk {record.get('id')} has no vector.",
-                                   {"file": "chunks.jsonl", "id": record.get("id")})
-            if expected_dims and len(vector) != expected_dims:
-                raise PackageError(
-                    "PACKAGE_CORRUPT",
-                    f"Chunk {record.get('id')} has {len(vector)} dimensions but the "
-                    f"manifest declares {expected_dims}.",
-                    {"file": "chunks.jsonl", "id": record.get("id")})
-            batch.add_object(properties=record["properties"],
-                             uuid=record["id"],
-                             vector=vector)
-            written += 1
-            if progress and written % 500 == 0:
-                progress(written)
-        if batch.number_errors > 0:
-            raise PackageError(
-                "PACKAGE_CORRUPT",
-                f"Weaviate rejected {batch.number_errors} object(s) while importing.",
-                {"errors": batch.number_errors})
+    try:
+        written = batch_write.insert(col, lambda: _package_records(pkg, manifest),
+                                     expected_count=manifest["collection"]["chunk_count"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
     if progress:
         progress(written)
     return written
 
 
-def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
+def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
+    """Preflight every evaluation sidecar before touching live state.
+
+    A valid archive and matching digests prove neither metadata validity nor
+    safe persistence destinations. Retain these parsed snapshots so restoration
+    cannot discover an invalid later session after a replacement has begun.
+    """
+    gold = pkg / "goldstandard"
+    if not gold.exists():
+        return []
+    if not gold.is_dir():
+        raise PackageError("PACKAGE_CORRUPT", "goldstandard must be a directory.",
+                           {"file": "goldstandard"})
+    sessions: list[dict] = []
+    identities: set[str] = set()
+    for path in sorted(gold.glob("*.json")):
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("Evaluation session must be a regular file.")
+            data = json.loads(path.read_text())
+            goldstandard.validate_session(data)
+            if canonical(data["collection"]) != canonical(original):
+                raise ValueError("Evaluation session belongs to a different collection.")
+            if data["session_id"] in identities:
+                raise ValueError("Duplicate evaluation session identity.")
+            # Check the live write boundary too, before any collection/model
+            # mutation. This catches pre-existing redirected destinations.
+            goldstandard._session_path(data["session_id"])
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise PackageError(
+                "PACKAGE_CORRUPT", "Invalid evaluation session metadata.",
+                {"file": f"goldstandard/{path.name}"}) from exc
+        identities.add(data["session_id"])
+        sessions.append(data)
+    return sessions
+
+
+def _restore_sidecars(target: str, pkg: Path, original: str,
+                      validated_sessions: list[dict]) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -3970,16 +4865,10 @@ def _restore_sidecars(target: str, pkg: Path, original: str) -> list[str]:
         except Exception as exc:                      # noqa: BLE001
             notes.append(f"retrieval settings could not be restored: {exc}")
 
-    gold = pkg / "goldstandard"
-    if gold.is_dir():
-        (Path(settings.upload_dir) / "goldstandard_sessions").mkdir(parents=True, exist_ok=True)
+    if validated_sessions:
         restored = 0
-        for session_file in sorted(gold.glob("*.json")):
-            try:
-                data = json.loads(session_file.read_text())
-            except ValueError:
-                notes.append(f"gold-standard session {session_file.name} was unreadable")
-                continue
+        for session in validated_sessions:
+            data = dict(session)
             # The session points at the collection by name; after a rename that
             # name is different, and a session pointing at nothing is worse than
             # no session.
@@ -4006,12 +4895,14 @@ def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
     _create_from_package(target, pkg)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
-    except Exception:
+    except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
             wc.get_client().collections.delete(target)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove partial collection %r", target)
+        except Exception as cleanup:
+            raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
+                               f"partial target cleanup failed ({cleanup})",
+                               {"collection": target, "cleanup_pending": True}) from original
         raise
 
 
@@ -4025,6 +4916,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     # _build deletes its own collection on failure, so temp_collection being
     # set is not by itself evidence that anything survived to recover.
     staged = False
+    ownership: dict | None = None
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -4047,6 +4939,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                f"'{original}' is not a usable collection name.",
                                {"name": original})
 
+        validated_sessions = _read_goldstandard_sessions(pkg, original)
+
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
         exists = wc._collection_exists_sync(target)                 # check 5
@@ -4062,12 +4956,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         if exists and on_conflict == "replace":
             # Prove the package inserts cleanly before destroying anything.
-            temp_collection = f"{canonical(original)}__importing_{id8}"
-            if wc._collection_exists_sync(temp_collection):
-                wc.get_client().collections.delete(temp_collection)
+            ownership = collection_recovery.begin(target, "import", wc.get_client())
+            temp_collection = ownership["staging"]
             _build(temp_collection, pkg, manifest, progress)
-            staged = True
             job["chunks_written"] = 0
+            collection_recovery.retain(ownership, package=pkg)
+            staged = True
             # Counted before the delete, because the delete is what orphans them.
             orphaned = len(goldstandard.sessions_for(target))
             wc._delete_collection_sync(target)   # also drops its sources + config
@@ -4081,16 +4975,17 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     "if an orphan marker could not be persisted")
 
         expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id)
+        _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
         marked = target
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
         marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(target, pkg, original)
+        notes = model_notes + replace_notes + _restore_sidecars(
+            target, pkg, original, validated_sessions)
 
         if staged and temp_collection:
             try:
-                wc.get_client().collections.delete(temp_collection)
+                collection_recovery.discard(ownership, wc.get_client())
             except Exception:                         # noqa: BLE001
                 _log.exception("Could not remove staging collection %r", temp_collection)
             staged = False
@@ -4107,7 +5002,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # staging collection means the data is recoverable, not lost.
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection}
+            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -4115,13 +5011,22 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {"recovered_as": temp_collection}
+            job["error_detail"] = {"recovered_as": temp_collection,
+                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
         # behind, which is the case the startup sweep exists for.
-        if marked:
-            _mark_finished(marked)
+        if marked and not (job.get("error_detail") or {}).get("cleanup_pending"):
+            try:
+                _mark_finished(marked)
+            except Exception:
+                _log.exception("Could not finish import marker for %r; startup will retry", marked)
+        if ownership and ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, wc.get_client())
+            except Exception:
+                _log.exception("Could not remove owned scratch collection %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
         with _lock:
             _active.discard(filename)
@@ -4175,9 +5080,12 @@ model that produced the vectors.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
+import tempfile
 import logging
-import shutil
 from pathlib import Path
 
 from config import settings
@@ -4187,6 +5095,9 @@ _log = logging.getLogger(__name__)
 REGISTRY = "registry.ollama.ai"
 NAMESPACE = "library"
 DEFAULT_TAG = "latest"
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_READ_SIZE = 1024 * 1024
 
 
 def _root() -> Path:
@@ -4196,17 +5107,21 @@ def _root() -> Path:
 def split_ref(model: str) -> tuple[str, str]:
     """'phi3.5' -> ('phi3.5', 'latest'); 'phi3.5:3.8b' -> ('phi3.5', '3.8b')."""
     name, _, tag = model.partition(":")
-    return name, (tag or DEFAULT_TAG)
+    tag = tag or DEFAULT_TAG
+    if not _COMPONENT.fullmatch(name) or not _COMPONENT.fullmatch(tag):
+        raise ValueError("Model name and tag must be simple path components")
+    return name, tag
 
 
 def manifest_path(model: str) -> Path:
     name, tag = split_ref(model)
-    return _root() / "manifests" / REGISTRY / NAMESPACE / name / tag
+    return _contained(_root(), "manifests", REGISTRY, NAMESPACE, name, tag)
 
 
 def blob_path(digest: str) -> Path:
     # Manifests write 'sha256:<hex>'; the filename on disk is 'sha256-<hex>'.
-    return _root() / "blobs" / digest.replace(":", "-")
+    _validate_digest(digest)
+    return _contained(_root(), "blobs", digest.replace(":", "-"))
 
 
 def store_available() -> bool:
@@ -4214,29 +5129,92 @@ def store_available() -> bool:
     return _root().is_dir()
 
 
-def is_installed(model: str) -> bool:
-    """A model counts as installed only if every blob it names is present."""
-    mp = manifest_path(model)
-    if not mp.is_file():
-        return False
+def _contained(root: Path, *parts: str) -> Path:
+    """Reject symlinks and paths outside the configured store/package root."""
+    root = root.resolve()
+    path = root.joinpath(*parts)
+    if not path.resolve().is_relative_to(root):
+        raise ValueError("Model path leaves its storage root")
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"Model storage path is a symlink: {current.name}")
+    return path
+
+
+def _validate_digest(digest) -> None:
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise ValueError("Model blob digest must be sha256 followed by 64 lowercase hex digits")
+
+
+def _digests(manifest: dict) -> list[str]:
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("config"), dict):
+        raise ValueError("Model manifest must contain a config object")
+    layers = manifest.get("layers")
+    if not isinstance(layers, list) or any(not isinstance(layer, dict) for layer in layers):
+        raise ValueError("Model manifest layers must be an array of objects")
+    digests = [manifest["config"].get("digest"), *(layer.get("digest") for layer in layers)]
+    for digest in digests:
+        _validate_digest(digest)
+    return list(dict.fromkeys(digests))
+
+
+def _check_blob(path: Path, digest: str) -> None:
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError(f"Model blob is not a regular file: {path.name}")
+    actual = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(_READ_SIZE):
+            actual.update(chunk)
+    if actual.hexdigest() != digest.split(":", 1)[1]:
+        raise ValueError(f"Model blob bytes disagree with {digest}; restore the content before importing")
+
+
+def supports_name(model: str) -> bool:
+    """Whether the model has a path in this store layout.
+
+    Namespaced names (`user/model`, `hf.co/org/model`) don't: they can still be
+    pulled and served by Ollama, but they can't be checked or installed here.
+    """
     try:
-        for digest in _digests(json.loads(mp.read_text())):
-            if not blob_path(digest).is_file():
-                return False
-    except (OSError, ValueError, KeyError):
+        split_ref(model)
+    except ValueError:
         return False
     return True
 
 
-def _digests(manifest: dict) -> list[str]:
-    digests = []
-    config = manifest.get("config") or {}
-    if config.get("digest"):
-        digests.append(config["digest"])
-    for layer in manifest.get("layers") or []:
-        if layer.get("digest"):
-            digests.append(layer["digest"])
-    return digests
+def installed_state(model: str) -> str:
+    """'present', 'absent' or 'corrupt'.
+
+    'corrupt' means a manifest exists but a referenced blob is missing or its
+    bytes disagree with its address. Import treats that as its own outcome:
+    telling the user to pull a model they already have would send them the
+    wrong way.
+    """
+    split_ref(model)  # a name with no path here is the caller's to handle (supports_name)
+    try:
+        mp = manifest_path(model)
+    except ValueError:
+        # A path that leaves the store or passes through a symlink is not a
+        # model this store can vouch for.
+        return "corrupt"
+    if not mp.is_file():
+        return "absent"
+    try:
+        for digest in _digests(json.loads(mp.read_text())):
+            _check_blob(blob_path(digest), digest)
+    except (OSError, ValueError):
+        return "corrupt"
+    return "present"
+
+
+def is_installed(model: str) -> bool:
+    """A model is installed only if its referenced bytes match their addresses."""
+    try:
+        return installed_state(model) == "present"
+    except (OSError, ValueError):
+        return False
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
@@ -4268,40 +5246,76 @@ def bundled_models(pkg: Path) -> list[str]:
     return sorted(p.name for p in d.iterdir() if p.is_dir() and (p / "manifest.json").is_file())
 
 
-def install_model(pkg: Path, model: str) -> None:
-    """Copy a bundled model into the live store, blobs before the manifest.
+def _publish(path: Path, write, *, replace: bool = True) -> None:
+    """Write a unique private temporary file and publish only verified bytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, filename = tempfile.mkstemp(prefix=path.name + ".", suffix=".partial", dir=path.parent)
+    tmp = Path(filename)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            write(output)
+            output.flush()
+            os.fsync(output.fileno())
+        if replace:
+            tmp.replace(path)
+        else:
+            try:
+                os.link(tmp, path)  # An independent installer may have won; never overwrite its blob.
+            except FileExistsError:
+                pass               # The caller verifies the winning content before publishing a manifest.
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        tmp.unlink(missing_ok=True)
 
-    Order matters: the manifest is what makes Ollama consider the model
-    present, so writing it last means an interrupted install leaves unreferenced
-    blobs rather than a model that cannot be served.
+
+def install_model(pkg: Path, model: str) -> None:
+    """Verify all referenced bytes before publishing the captured manifest.
+
+    Existing content is checked and reused unchanged. A corrupt existing blob
+    is refused rather than replacing shared content behind other model names.
+    An interrupted install can leave valid unreferenced blobs, never a newly
+    published manifest whose bytes were not checked.
     """
-    name, tag = split_ref(model)
-    src = pkg / "models" / name
-    src_manifest = src / "manifest.json"
+    name, _ = split_ref(model)
+    src = _contained(pkg, "models", name)
+    src_manifest = _contained(src, "manifest.json")
     if not src_manifest.is_file():
         raise FileNotFoundError(f"Package does not bundle '{model}'")
-    manifest = json.loads(src_manifest.read_text())
+    manifest_bytes = src_manifest.read_bytes()
+    digests = _digests(json.loads(manifest_bytes))
+    destination = manifest_path(model)
+    references = []
+    for digest in digests:
+        source = _contained(src, "blobs", digest.replace(":", "-"))
+        target = blob_path(digest)
+        _check_blob(source, digest)
+        if target.exists():
+            _check_blob(target, digest)
+        references.append((digest, source, target))
 
-    blobs_dir = _root() / "blobs"
-    blobs_dir.mkdir(parents=True, exist_ok=True)
-    for digest in _digests(manifest):
-        filename = digest.replace(":", "-")
-        target = blobs_dir / filename
-        if target.is_file():
-            continue                      # content-addressed: identical by name
-        source = src / "blobs" / filename
-        if not source.is_file():
-            raise FileNotFoundError(
-                f"Bundled model '{model}' is missing blob {digest}")
-        tmp = target.with_name(filename + ".partial")
-        shutil.copyfile(source, tmp)
-        tmp.replace(target)
+    for digest, source, target in references:
+        if target.exists():
+            _check_blob(target, digest)
+            continue
+        def copy_verified(output, source=source, digest=digest):
+            actual = hashlib.sha256()
+            with source.open("rb") as data:
+                while chunk := data.read(_READ_SIZE):
+                    actual.update(chunk)
+                    output.write(chunk)
+            if actual.hexdigest() != digest.split(":", 1)[1]:
+                raise ValueError(f"Bundled blob changed or disagrees with {digest}")
+        _publish(target, copy_verified, replace=False)
 
-    dest_manifest = manifest_path(model)
-    dest_manifest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest_manifest.with_name(tag + ".partial")
-    shutil.copyfile(src_manifest, tmp)
-    tmp.replace(dest_manifest)
+    # Recheck reused files after writes too; manifest data itself is the exact
+    # snapshot whose grammar and references were preflighted, not a reread.
+    for digest, _, target in references:
+        _check_blob(blob_path(digest), digest)
+    _publish(destination, lambda output: output.write(manifest_bytes))
     _log.info("Installed model %r from package", model)
 ```
 
@@ -4317,7 +5331,10 @@ or vector width changes and Weaviate cannot alter either in place.
 collection first, and the live one is replaced only once that succeeds. Weaviate
 has no rename (see `importer.py`), so the final step copies vectors out of the
 staging collection rather than re-embedding — one embedding pass, not two. A
-failure at any point leaves the original collection untouched.
+failure before replacement leaves the original untouched. After replacement
+starts, a verified recovery copy and its sidecars survive failure and restart.
+Identity-changing operations flag retained evaluations before replacement;
+failed cutovers flag them too.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -4339,6 +5356,7 @@ from config import settings
 from services import goldstandard
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
 from services.ingest_pipeline import _parse_file
 from services.packager import PackageError
@@ -4436,52 +5454,65 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress) -> int:
+             distance_metric: str | None, progress, before_replace=None) -> int:
     """Stage the new chunks, then swap them into place.
 
     Weaviate embeds during the staging insert. The final insert reuses those
     vectors verbatim, so the corpus is embedded once rather than twice.
     """
+    cutover_started = False
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
 
-    staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw)
+    ownership = collection_recovery.begin(collection, "tune", client)
+    staging = ownership["staging"]
+    completed = False
     try:
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
         wc._insert_chunks_sync(staging, properties)
-        staged = [
-            {"id": str(o.uuid),
-             "vector": (o.vector or {}).get("default"),
-             "properties": dict(o.properties or {})}
-            for o in client.collections.get(staging).iterator(include_vector=True)
-        ]
-        if len(staged) != len(properties):
+        def staged():
+            return (
+                {"id": str(o.uuid),
+                 "vector": (o.vector or {}).get("default"),
+                 "properties": dict(o.properties or {})}
+                for o in client.collections.get(staging).iterator(include_vector=True)
+            )
+        staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+        if staged_count != len(properties):
             raise RuntimeError(
-                f"staged {len(staged)} chunks but expected {len(properties)}")
-        if progress:
-            progress(len(staged))
-
-        # Past this point the original is replaced. Everything that could fail
-        # has already run against the staging collection.
+                f"staged {staged_count} chunks but expected {len(properties)}")
+        collection_recovery.retain(ownership)
+        # The final create, write and verification can still fail. Durable
+        # recovery ownership must precede deletion, including on a hard kill.
+        if before_replace:
+            before_replace()
+        cutover_started = True
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
         target = client.collections.get(collection)
-        with target.batch.dynamic() as batch:
-            for record in staged:
-                batch.add_object(properties=record["properties"],
-                                 uuid=record["id"], vector=record["vector"])
-            if batch.number_errors > 0:
-                raise RuntimeError(
-                    f"{batch.number_errors} error(s) writing the rebuilt collection")
-        return len(staged)
+        written = batch_write.insert(target, staged, expected_count=len(properties))
+        if progress:
+            progress(written)
+        completed = True
+        return written
+    except Exception as exc:
+        if cutover_started:
+            goldstandard.mark_stale(collection, "collection replacement failed after cutover began; retained pairs require historical review")
+        if ownership["state"] == "recovery":
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified rebuilt data "
+                f"is retained as '{staging}'.",
+                {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
+        raise
     finally:
-        try:
-            client.collections.delete(staging)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove staging collection %r", staging)
+        if completed or ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, client)
+            except Exception:                         # noqa: BLE001
+                _log.exception("Could not remove owned staging collection %r", staging)
 
 
 def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
@@ -4537,7 +5568,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
         job["chunks_total"] = len(properties)
         written = _rebuild(collection, properties,
                            params.get("index_type"), params.get("distance_metric"),
-                           progress)
+                           progress, before_replace=(lambda: goldstandard.mark_stale(collection, reason)) if reason else None)
 
         notes = []
         if reason:
@@ -4821,6 +5852,7 @@ async def list_collections():
             index_type=c["index_type"],
             distance_metric=c["distance_metric"],
             created_at=registry.get(c["name"]),
+            hnsw_config=c.get("hnsw_config"),
         )
         for c in raw
     ]
@@ -4877,10 +5909,10 @@ import json
 import re
 from pathlib import Path
 from fastapi import APIRouter, Form, UploadFile, File
-from pydantic import BaseModel
+from pydantic import ValidationError
 
 from config import settings
-from models.schemas import IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadResponse, JobStatusResponse
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
@@ -4888,13 +5920,8 @@ from utils import api_error
 
 router = APIRouter(prefix="/ingest")
 
-class SaveIngestConfigBody(BaseModel):
+class SaveIngestConfigBody(IngestConfig):
     collection: str
-    chunking_strategy: str = "overlap"
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    similarity_threshold: float | None = None
-    min_chunk_size: int = 100
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -4907,6 +5934,13 @@ async def ingest_upload(
     min_chunk_size: int = Form(100),
     files: list[UploadFile] = File(...),
 ):
+    try:
+        IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                     chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                     min_chunk_size=min_chunk_size)
+    except ValidationError as exc:
+        return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
+                         detail={"errors": exc.errors(include_context=False, include_input=False)})
     if not await wc.collection_exists(collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
 
@@ -5255,6 +6289,7 @@ from models.schemas import (
     SaveRequest,
     SaveResponse,
     SessionResponse,
+    SessionValidity,
 )
 from services import goldstandard as gs
 from services import weaviate_client as wc
@@ -5300,6 +6335,7 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        **SessionValidity.model_validate(session).model_dump(),
     )
 
 
@@ -5328,7 +6364,10 @@ async def regenerate(body: RegenerateRequest):
 
 @router.post("/save", response_model=SaveResponse)
 async def save(body: SaveRequest):
-    result = await gs.save_session(body.session_id, body.filename)
+    try:
+        result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if result is None:
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{body.session_id}' not found.")
     return SaveResponse(**result)
@@ -5912,8 +6951,11 @@ fidelity for an older corpus.
 If the target machine has no embedding model at all, export with
 `include_models: true`. That bundles `@@EMBED_MODEL@@` and `@@LLM_MODEL@@` as
 Ollama's own manifest and blob files, taking the package from kilobytes to
-roughly 2.3 GB. On import a model already present is left alone; a missing one is
-installed from the package and checked before the collection is built.
+roughly 2.3 GB. On import a model already present is left alone, provided its
+files match their checksums; a missing one is installed from the package and
+checked before the collection is built. If the embedding model is present but
+damaged, the import fails with `MODEL_INTEGRITY_FAILED`: restore or re-pull it,
+then import again.
 
 Without bundled models, importing into a machine that lacks the embedding model
 fails with `EMBEDDING_MODEL_MISSING` — a different error from a mismatch, because
@@ -5970,6 +7012,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from utils import api_error
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -5980,9 +7024,8 @@ async def lifespan(app: FastAPI):
     from services import weaviate_client as wc
     goldstandard.load_sessions_from_disk()
     metrics.load_from_disk()
-    # An import or tune killed part-way cannot run its own cleanup, so its
-    # staging collection would survive forever. Nothing can be using one before
-    # the app starts serving, so clearing them here is safe.
+    # Sweep only durably owned scratch. Verified recovery collections and
+    # unowned marker-like names must survive startup.
     log = logging.getLogger(__name__)
     try:
         abandoned = await wc.sweep_staging()
@@ -6013,6 +7056,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
 
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(request, exc):
+    # Invalid settings can include non-finite JSON numbers. Echoing their raw
+    # values in a JSONResponse would raise a serialization error instead of 422.
+    errors = [{key: value for key, value in error.items() if key not in ("input", "ctx")}
+              for error in exc.errors()]
+    return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -6041,14 +7093,14 @@ app.include_router(tuning.router)
 ### ui/Dockerfile
 
 ```dockerfile
-FROM node:20-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM node:20-alpine
+FROM node:26-alpine
 WORKDIR /app
 RUN npm install -g serve
 COPY --from=builder /app/dist ./dist
@@ -6069,12 +7121,12 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "preview": "vite preview"
   },
   "dependencies": {
-    "lucide-react": "^0.441.0",
+    "lucide-react": "^1.48.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
-    "react-router-dom": "^6.26.0",
-    "recharts": "^2.12.7",
+    "react-router-dom": "^7.18.4",
+    "recharts": "^3.10.1",
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
@@ -6082,11 +7134,11 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "autoprefixer": "^10.4.20",
+    "autoprefixer": "^10.6.1",
     "postcss": "^8.4.45",
     "tailwindcss": "^3.4.11",
-    "typescript": "^5.5.4",
-    "vite": "^5.4.2"
+    "typescript": "^7.0.2",
+    "vite": "^6.4.3"
   }
 }
 ```
@@ -6517,10 +7569,10 @@ export const api = {
   query: (body: QueryBody) => request<QueryResult>('POST', '/query', body),
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
-  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${sessionId}`),
-  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${sessionId}/pair/${pairId}`, body),
+  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
-  saveSession: (body: { session_id: string; filename?: string }) => request<SaveResult>('POST', '/goldstandard/save', body),
+  saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
   downloadUrl: (filename: string) => `${BASE}/goldstandard/download/${filename}`,
 
   // Transfer
@@ -6540,6 +7592,7 @@ export const api = {
 // Types
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
+  hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
@@ -6576,12 +7629,16 @@ export interface GenerateResult { session_id: string; status: string; pairs_tota
 export interface GoldPair {
   pair_id: string; question: string; answer: string; contexts: string[]; ground_truth: string; source_file: string; chunk_index: number; status: string
 }
-export interface Session {
+export interface SessionValidity {
+  stale?: boolean; stale_reason?: string | null; stale_at?: string | null
+  orphaned?: boolean; orphaned_reason?: string | null; orphaned_at?: string | null
+}
+export interface Session extends SessionValidity {
   session_id: string; status: string; pairs_total: number; pairs_attempted?: number
   pairs_completed: number; pairs_failed?: number; pairs: GoldPair[]; collection: string; errors?: string[]
 }
 export interface PatchPairBody { status: string; question?: string; answer?: string; ground_truth?: string }
-export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string }
+export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string; historical?: boolean; session_validity?: SessionValidity }
 export interface LatencyStats { p50: number; p95: number; p99: number }
 export interface LatencyRecord {
   timestamp: string
@@ -6974,7 +8031,7 @@ export default function QAPage() {
         </select>
         {role !== 'end_user' && (
           <select value={config.retrieval_mode} disabled className="border rounded px-3 py-2 text-sm bg-gray-50 text-gray-500">
-            <option value={config.retrieval_mode}>{config.retrieval_mode}</option>
+            <option value={config.retrieval_mode}>{["hnsw", "flat"].includes(config.retrieval_mode) ? "Vector — existing index" : config.retrieval_mode}</option>
           </select>
         )}
       </div>
@@ -7022,7 +8079,7 @@ export default function QAPage() {
 
 ```typescript
 import { useState, useEffect } from 'react'
-import { api, CollectionInfo, JobStatus } from '../api/client'
+import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
@@ -7095,6 +8152,14 @@ export default function ImportPage() {
   async function startIngest() {
     if (!files.length || !collection) return
     setError('')
+    // Refuse before sending: the proxy would reject it anyway, but only after
+    // the browser had started pushing hundreds of MB, and a connection the
+    // proxy closes mid-upload can surface as a bare network error.
+    const total = files.reduce((n, f) => n + f.size, 0)
+    if (total > MAX_UPLOAD_BYTES) {
+      setError(`These files total ${(total / 1024 / 1024).toFixed(0)} MB; one upload can be at most ${MAX_UPLOAD_MB} MB. Split them into smaller batches.`)
+      return
+    }
     const form = new FormData()
     files.forEach(f => form.append('files', f))
     form.append('collection', collection)
@@ -7124,7 +8189,7 @@ export default function ImportPage() {
         onClick={() => document.getElementById('file-input')?.click()}
       >
         <p className="text-gray-500">Drop files here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP</p>
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
         <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
@@ -7161,7 +8226,7 @@ export default function ImportPage() {
       <div className="grid grid-cols-2 gap-4 mt-4 mb-4">
         <div>
           <label className="block text-xs text-gray-600 mb-1">Chunk Size: {chunkSize}</label>
-          <input type="range" min={200} max={16000} step={100} value={chunkSize} onChange={e => setChunkSize(+e.target.value)} className="w-full" />
+          <input type="range" min={50} max={6000} step={50} value={chunkSize} onChange={e => setChunkSize(+e.target.value)} className="w-full" />
         </div>
         {showOverlap && (
           <div>
@@ -7171,7 +8236,7 @@ export default function ImportPage() {
         )}
         <div>
           <label className="block text-xs text-gray-600 mb-1">Min Chunk Size: {minChunkSize}</label>
-          <input type="range" min={40} max={2000} step={10} value={minChunkSize} onChange={e => setMinChunkSize(+e.target.value)} className="w-full" />
+          <input type="range" min={0} max={6000} step={10} value={minChunkSize} onChange={e => setMinChunkSize(+e.target.value)} className="w-full" />
         </div>
         {showSimilarity && (
           <div>
@@ -7283,7 +8348,7 @@ export default function ChunkingPage() {
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
               <label className="block text-xs text-gray-600 mb-1">Chunk Size: {config.chunk_size}</label>
-              <input type="range" min={200} max={16000} step={100} value={config.chunk_size} onChange={e => setConfig({ ...config, chunk_size: +e.target.value })} className="w-full" />
+              <input type="range" min={50} max={6000} step={50} value={config.chunk_size} onChange={e => setConfig({ ...config, chunk_size: +e.target.value })} className="w-full" />
             </div>
             {showOverlap && (
               <div>
@@ -7293,7 +8358,7 @@ export default function ChunkingPage() {
             )}
             <div>
               <label className="block text-xs text-gray-600 mb-1">Min Chunk Size: {config.min_chunk_size}</label>
-              <input type="range" min={40} max={2000} step={10} value={config.min_chunk_size} onChange={e => setConfig({ ...config, min_chunk_size: +e.target.value })} className="w-full" />
+              <input type="range" min={0} max={6000} step={10} value={config.min_chunk_size} onChange={e => setConfig({ ...config, min_chunk_size: +e.target.value })} className="w-full" />
             </div>
             {showSimilarity && (
               <div>
@@ -7315,14 +8380,13 @@ export default function ChunkingPage() {
 ### ui/src/pages/RetrievalPage.tsx
 
 ```typescript
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, CollectionInfo } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
 
 const MODES = [
-  { id: 'hnsw', label: 'HNSW — Approximate (default)', description: 'The fastest option. Uses a smart graph to find the closest matches quickly. May very rarely miss the single best result, but works well for almost all use cases.' },
-  { id: 'flat', label: 'Flat — Exact', description: 'Checks every stored chunk to find the mathematically perfect match. More accurate but slower as your collection grows. Best for collections under 10,000 chunks.' },
+  { id: 'hnsw', label: 'Vector — existing index', description: 'Finds similar chunks using the physical index already configured for this collection. Choosing this method does not switch between HNSW and Flat.' },
   { id: 'hybrid', label: 'Hybrid', description: 'Combines keyword search with meaning-based search. Best when your questions include specific terms, names, or codes. Adjust the slider to balance between the two modes.' },
   { id: 'semantic', label: 'Semantic', description: 'Pure meaning-based search. Best for conceptual questions where the exact words are less important than the idea.' },
 ]
@@ -7331,20 +8395,24 @@ export default function RetrievalPage() {
   const { role } = useRole()
   const { collection, setCollection, config, isDefault, loading, error, saveConfig } = useQueryConfig()
   const [collections, setCollections] = useState<CollectionInfo[]>([])
-  const [mode, setMode] = useState(config.retrieval_mode)
+  const [mode, setMode] = useState(config.retrieval_mode === 'flat' ? 'hnsw' : config.retrieval_mode)
   const [topK, setTopK] = useState(config.top_k)
   const [alpha, setAlpha] = useState(config.alpha)
-  const [ef, setEf] = useState(config.ef ?? 64)
-  const [efConstruction, setEfConstruction] = useState(128)
-  const [maxConnections, setMaxConnections] = useState(64)
+  const [indexError, setIndexError] = useState('')
+  const [indexLoading, setIndexLoading] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const indexRequest = useRef(0)
 
   useEffect(() => {
+    const ticket = ++indexRequest.current
     api.getCollections().then(r => {
+      if (ticket !== indexRequest.current) return
+      setIndexError('')
       setCollections(r.collections)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch(() => { if (ticket === indexRequest.current) setIndexError('Could not read the current physical index.') })
+    return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -7354,10 +8422,9 @@ export default function RetrievalPage() {
   // the values. `applied` is deliberately not reset here: a save replaces
   // `config`, which would otherwise clear the confirmation immediately.
   useEffect(() => {
-    setMode(config.retrieval_mode)
+    setMode(config.retrieval_mode === 'flat' ? 'hnsw' : config.retrieval_mode)
     setTopK(config.top_k)
     setAlpha(config.alpha)
-    setEf(config.ef ?? 64)
   }, [config])
 
   useEffect(() => {
@@ -7370,7 +8437,7 @@ export default function RetrievalPage() {
       retrieval_mode: mode,
       top_k: topK,
       alpha,
-      ef: mode === 'hnsw' ? ef : null,
+      ef: null, // Legacy overrides were saved but never applied to query execution.
       // The role toggle drives the answer style live; persisting it here is
       // what makes the stored config usable by an exported retrieval script.
       response_format: role === 'end_user' ? 'end_user' : 'engineer',
@@ -7383,6 +8450,21 @@ export default function RetrievalPage() {
     } catch (e: unknown) {
       setSaveError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  const physicalIndex = collections.find(c => c.name === collection)
+
+  async function refreshIndex() {
+    const ticket = ++indexRequest.current
+    setIndexLoading(true); setIndexError('')
+    try {
+      const result = await api.getCollections()
+      if (ticket !== indexRequest.current) return
+      setCollections(result.collections)
+      if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
+    }
+    catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
+    finally { if (ticket === indexRequest.current) setIndexLoading(false) }
   }
 
   return (
@@ -7433,7 +8515,7 @@ export default function RetrievalPage() {
 
       <div className="mb-4">
         <label className="block text-xs text-gray-600 mb-1">Top-K Results: {topK}</label>
-        <input type="range" min={1} max={20} value={topK} onChange={e => setTopK(+e.target.value)} className="w-full" />
+        <input type="range" min={1} max={50} value={topK} onChange={e => setTopK(+e.target.value)} className="w-full" />
       </div>
 
       {mode === 'hybrid' && (
@@ -7445,25 +8527,17 @@ export default function RetrievalPage() {
         </div>
       )}
 
-      {mode === 'hnsw' && role === 'engineer' && (
-        <details className="mb-4 border rounded">
-          <summary className="px-3 py-2 text-sm cursor-pointer font-medium">Advanced HNSW Parameters</summary>
-          <div className="p-3 space-y-3">
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">ef (query accuracy): {ef}</label>
-              <input type="range" min={16} max={512} step={8} value={ef} onChange={e => setEf(+e.target.value)} className="w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">efConstruction (build accuracy): {efConstruction}</label>
-              <input type="range" min={64} max={512} step={8} value={efConstruction} onChange={e => setEfConstruction(+e.target.value)} className="w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">maxConnections (graph density): {maxConnections}</label>
-              <input type="range" min={16} max={128} step={4} value={maxConnections} onChange={e => setMaxConnections(+e.target.value)} className="w-full" />
-            </div>
-          </div>
-        </details>
-      )}
+      <div className="mb-4 border rounded p-3 text-sm">
+        <h2 className="font-semibold mb-2">Physical index (read only)</h2>
+        {indexError && <p className="text-amber-700">{indexError}</p>}
+        {physicalIndex ? <>
+          <p>Type: {physicalIndex.index_type} · Distance: {physicalIndex.distance_metric}</p>
+          {physicalIndex.hnsw_config && <p className="mt-1">ef: {physicalIndex.hnsw_config.ef} · efConstruction: {physicalIndex.hnsw_config.efConstruction} · maxConnections: {physicalIndex.hnsw_config.maxConnections}</p>}
+          <p className="text-xs text-gray-500 mt-1">Observed when index details were last refreshed. Saved query methods do not rebuild the index.</p>
+        </> : <p>Index details are unavailable for this collection.</p>}
+        {config.ef !== null && <p className="text-xs text-amber-700 mt-2">The legacy saved ef override ({config.ef}) is inactive. Queries use the physical index settings; saving here clears that override.</p>}
+        <button onClick={refreshIndex} disabled={indexLoading} className="mt-2 border rounded px-2 py-1 text-xs disabled:opacity-50">Refresh index details</button>
+      </div>
 
       <button
         onClick={apply}
@@ -7491,7 +8565,12 @@ export default function GoldStandardPage() {
   const [sampleSize, setSampleSize] = useState(20)
   const [session, setSession] = useState<Session | null>(null)
   const [sessionId, setSessionId] = useState('')
+  const [sessionLookup, setSessionLookup] = useState('')
+  const [allowHistorical, setAllowHistorical] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [exportPending, setExportPending] = useState(false)
+  const exportPendingRef = useRef(false)
+  const activeSessionRef = useRef('')
   const [error, setError] = useState('')
   const [filename, setFilename] = useState('')
   const [saveResult, setSaveResult] = useState('')
@@ -7510,26 +8589,50 @@ export default function GoldStandardPage() {
 
   useEffect(() => {
     if (!sessionId) return
+    let active = true
     pollRef.current = setInterval(async () => {
       try {
         const s = await api.getSession(sessionId)
+        if (!active || activeSessionRef.current !== sessionId) return
         setSession(s)
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
         }
       } catch { /* ignore */ }
     }, 2000)
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+    return () => { active = false; if (pollRef.current) clearInterval(pollRef.current) }
   }, [sessionId])
 
+  useEffect(() => {
+    setAllowHistorical(false)
+  }, [sessionId, session?.stale, session?.orphaned, session?.stale_at, session?.orphaned_at])
+
+  async function loadSession() {
+    const id = sessionLookup.trim()
+    if (!id || exportPendingRef.current) return
+    activeSessionRef.current = ''
+    setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
+    setError(''); setSaveResult(''); setLoading(true)
+    try {
+      const loaded = await api.getSession(id)
+      activeSessionRef.current = loaded.session_id
+      setSessionId(loaded.session_id); setSession(loaded); setAllowHistorical(false)
+      setFilename('')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally { setLoading(false) }
+  }
+
   async function generate() {
-    if (session && !confirm('This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?')) return
+    if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
     setLoading(true)
     setSaveResult('')
     try {
       const res = await api.generateGoldStandard({ collection, sample_size: sampleSize })
+      activeSessionRef.current = res.session_id
       setSessionId(res.session_id)
+      setSessionLookup(res.session_id)
       setSession(null)
       const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
       setFilename(`${collection}_${ts}.json`)
@@ -7562,14 +8665,15 @@ export default function GoldStandardPage() {
   }
 
   async function saveExport() {
-    if (!sessionId) return
+    if (!sessionId || exportPendingRef.current || loading) return
+    exportPendingRef.current = true; setExportPending(true); setError(''); setSaveResult('')
     try {
-      const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined })
-      setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.`)
+      const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined, allow_historical: allowHistorical })
+      setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.${res.historical ? " Historical data; not a current collection baseline." : ""}`)
       window.open(api.downloadUrl(res.filename), '_blank')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
-    }
+    } finally { exportPendingRef.current = false; setExportPending(false) }
   }
 
   function openEdit(pair: GoldPair) {
@@ -7593,7 +8697,8 @@ export default function GoldStandardPage() {
   const edited = session?.pairs.filter(p => p.status === 'edited').length ?? 0
   const rejected = session?.pairs.filter(p => p.status === 'rejected').length ?? 0
   const pending = session?.pairs.filter(p => p.status === 'pending').length ?? 0
-  const canExport = approved + edited > 0
+  const historical = Boolean(session?.stale || session?.orphaned)
+  const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -7612,7 +8717,7 @@ export default function GoldStandardPage() {
             <label className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
             <input type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
           </div>
-          <button onClick={generate} disabled={loading} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
+          <button onClick={generate} disabled={loading || exportPending} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
             Generate Pairs
           </button>
         </div>
@@ -7627,7 +8732,25 @@ export default function GoldStandardPage() {
         )}
       </div>
 
+      <div className="bg-white border rounded p-4 mb-6">
+        <label htmlFor="retained-session" className="block text-sm font-semibold mb-2">Inspect a retained session</label>
+        <div className="flex gap-3">
+          <input id="retained-session" disabled={exportPending} value={sessionLookup} onChange={e => setSessionLookup(e.target.value)} placeholder="Session ID" className="border rounded px-3 py-2 text-sm flex-1" />
+          <button onClick={loadSession} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
+        </div>
+        {session && <p className="text-xs text-gray-500 mt-2">Session {session.session_id} · Collection {session.collection}</p>}
+      </div>
+
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
+      {session && historical && (
+        <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
+          <h2 className="font-semibold">Historical evaluation data</h2>
+          <p className="text-sm">These retained pairs are not a current collection baseline. Review them as historical data.</p>
+          {session.stale && <p className="text-sm mt-2">Stale: {session.stale_reason || 'No reason was recorded.'} {session.stale_at && <span>Recorded {session.stale_at}</span>}</p>}
+          {session.orphaned && <p className="text-sm mt-2">Orphaned: {session.orphaned_reason || 'No reason was recorded.'} {session.orphaned_at && <span>Recorded {session.orphaned_at}</span>}</p>}
+        </div>
+      )}
+
 
       {session && session.pairs.length > 0 && (
         <div className="bg-white border rounded p-4 mb-6">
@@ -7666,10 +8789,15 @@ export default function GoldStandardPage() {
       {session && session.pairs.length > 0 && (
         <div className="bg-white border rounded p-4">
           <h2 className="font-semibold mb-3">Phase 3 — Export</h2>
+          {historical && <label className="flex gap-2 items-start text-sm mb-3">
+            <input type="checkbox" checked={allowHistorical} onChange={e => setAllowHistorical(e.target.checked)} />
+            <span>I want to export historical pairs. The RAGAS file does not carry these validity warnings and must not be treated as a current baseline.</span>
+          </label>}
+
           <div className="flex gap-3 items-center">
             <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="filename.json" className="border rounded px-3 py-2 text-sm flex-1" />
-            <button onClick={saveExport} disabled={!canExport} className="bg-green-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-green-700">
-              Export Approved
+            <button onClick={saveExport} disabled={!canExport || exportPending || loading} className="bg-green-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-green-700">
+              {exportPending ? "Exporting…" : historical ? "Export Historical Approved" : "Export Approved"}
             </button>
           </div>
           {saveResult && <p className="text-sm text-green-600 mt-2">{saveResult}</p>}
@@ -8276,6 +9404,64 @@ Integration tests for the acceptance criteria in Section 10 of
 They require a running stack; `scripts/verify/README.md` explains why unit
 tests would not have caught the defects this project actually produced.
 
+### scripts/verify/model_integrity.py
+
+```python
+"""Real bundled-model filesystem acceptance; no model parsing or shared-store writes.
+
+Run on the disposable API with: python - < scripts/verify/model_integrity.py
+Existing pulled embedding-model bytes are copied into a temporary package/store,
+then all temporary content is removed. The live store is only read.
+"""
+import json
+import shutil
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+from config import settings
+from services import model_bundle as models
+
+model = settings.embed_model
+assert models.is_installed(model), 'Review embedding model is not byte-consistent'
+print('PASS existing review embedding model has matching referenced bytes', flush=True)
+files = models.export_model(model, Path())
+original = {source: source.stat().st_mtime_ns for _, source in files}
+with tempfile.TemporaryDirectory(prefix='model-integrity-', dir=settings.upload_dir) as directory:
+    root = Path(directory); pkg = root / 'package'; store = root / 'store'
+    for relative, source in files:
+        destination = pkg / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    total = sum(source.stat().st_size for _, source in files)
+    with patch.object(settings, 'ollama_models_dir', str(store)):
+        models.install_model(pkg, model)
+        assert models.is_installed(model)
+        print(f'PASS real bundled install verified {len(files)-1} referenced files, {total} bytes', flush=True)
+        mp = models.manifest_path(model)
+        manifest_bytes = mp.read_bytes()
+        digests = models._digests(json.loads(manifest_bytes))
+        stamps = {models.blob_path(d): models.blob_path(d).stat().st_mtime_ns for d in digests}
+        models.install_model(pkg, model)
+        assert {p: p.stat().st_mtime_ns for p in stamps} == stamps
+        print('PASS already-present real blobs reused unchanged', flush=True)
+        name, _ = models.split_ref(model)
+        damaged = pkg / 'models' / name / 'blobs' / digests[-1].replace(':', '-')
+        damaged.write_bytes(b'ordinary mismatched review bytes')
+        try:
+            models.install_model(pkg, model)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Mismatched package blob was accepted')
+        assert mp.read_bytes() == manifest_bytes
+        assert models.is_installed(model)
+        assert {p: p.stat().st_mtime_ns for p in stamps} == stamps
+        print('PASS mismatched bundle refused; existing manifest and healthy blobs unchanged', flush=True)
+    assert {p: p.stat().st_mtime_ns for p in original} == original
+    print('PASS original shared model store left unchanged', flush=True)
+print('PASS disposable model package and target removed', flush=True)
+```
+
 ### scripts/verify/README.md
 
 ````markdown
@@ -8293,6 +9479,32 @@ bash scripts/verify/all.sh 02 04              # only the named suites
 ```
 
 Exits non-zero if any check fails.
+
+## Focused import validation regressions
+
+Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
+
+`05_transfer.sh` registers both controlled regressions and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename.
+
+`scripts/tests/test_session_import.py` exercises the real package reader and
+evaluation persistence with disposable fixtures. Model and database mutation
+seams are mocked; this complements the live transfer suite and does not prove
+Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies:
+
+```bash
+docker compose run --rm --no-deps \
+  -v "$PWD/scripts/tests:/tests:ro" -e RAG_TEST_API_DIR=/app \
+  api python /tests/test_session_import.py
+```
+
+Alternatively, with `uv` on the host:
+
+```bash
+uv run --no-project --python 3.11 \
+  --with pydantic-settings==2.15.0 --with pydantic==2.13.5 \
+  --with httpx==0.28.1 --with weaviate-client==4.23.1 \
+  python scripts/tests/test_session_import.py
+```
 
 ## Why integration tests
 
@@ -8312,25 +9524,69 @@ the same code:
 These tests talk to the running API, the real Weaviate and the real model, and
 drive the UI in a real browser.
 
+## Batch faults and recovery across restart
+
+Run the controlled regressions with the API dependencies installed:
+
+```bash
+python -m unittest discover -s scripts/tests -p 'test_batch*.py'
+```
+
+For a **disposable stack**, the following fault acceptance uses real Weaviate,
+synthetic `VfyBatchRecovery*` collections and the real embedding model. It injects
+final-create failures into the test process, retains import/tuning recovery,
+restarts the API, then verifies exact UUIDs, properties, vectors and sources.
+It also checks real completed-batch rejection/partial acceptance, ingestion UUID
+rollback after a post-write read fault, resumption of metadata cleanup after backend
+deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack.
+
+```bash
+docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
+docker compose restart api
+# Wait for /api/health to report healthy before the next phase.
+docker compose exec -T api python - check < scripts/verify/batch_recovery.py
+docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
+```
+
+If interrupted, keep the recorded fixtures and run `check` after restarting; run
+`cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
+live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
+
 ## Layout
 
 | File | Covers |
 |---|---|
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
+| `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
+| `settings_validation.py` | standalone: `RAG_API=http://localhost:8080/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
+| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
+| `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
+| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, plus shared-template drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23, E26 and E27; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
+| `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
+| `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
+| `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
+
+`10_validity.sh` is called by suite05 (and thus all.sh). It runs
+`session_validity.py` inside the disposable API, using an owned real collection,
+synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
+It checks warning metadata, actual deletion marking and explicit historical export.
 
 ## Environment
 
 | Variable | Default | Effect |
 |---|---|---|
+| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; use `18080` with a deliberate loopback test override |
 | `RAG_API` | `http://localhost:8080/api` | where the API is |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
 | `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks) |
@@ -8341,6 +9597,10 @@ drive the UI in a real browser.
 ## Writing a check
 
 `12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. The same registered script executes `session_persistence_cases.py` in the API image: owned filesystem/concurrency cases additionally hard-kill an owned writer at the replace boundary, pause archive inspection during a concurrent commit, retain generation failure codes and test marker-failure continuation. Native browser criteria verify pending, failed and out-of-order diagnostic refreshes using isolated HTTP responses. The in-container script rejects remote or mismatched `RAG_API` targets before health/backend execution.
+
+The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
+
+`11_retrieval.sh` is called by03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
 
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
@@ -8359,6 +9619,27 @@ Two rules the hard way:
   passed vacuously — asserting on a selector that matched nothing, or comparing
   a count to itself.
 
+## Bundled-model integrity
+
+On a disposable stack with its embedding model already pulled, run:
+
+```bash
+docker compose exec -T api python - < scripts/verify/model_integrity.py
+```
+
+This verifies the real model's referenced bytes, copies them into a temporary
+package/store, checks valid install and unchanged reuse, and refuses ordinary
+mismatched bytes without changing the published manifest or healthy blobs.
+The actual shared model store is only read; temporary content is removed. It
+needs disk space for two copies of the embedding model and performs several
+streamed hash passes. It does not invoke a model parser or claim trusted model
+provenance. Controlled regression tests additionally cover digest grammar,
+containment, interrupted publication and concurrent blob publication:
+
+```bash
+python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
+```
+
 ## Cleaning up
 
 Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
@@ -8369,6 +9650,10 @@ curl -s localhost:8080/api/collections | python3 -c \
   "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
+
+The infrastructure suite requires Docker Engine 28.0.0+ and checks both resolved Compose and live Docker bindings for a single loopback proxy publication. When deploying an alternate host port for testing, set `RAG_EXPECTED_PROXY_PORT` to that port as well as `RAG_API`. Its inspection files are kept in a private temporary directory removed on exit. The local profile assumes standard bridge/NAT routing.
+
+Run `python3 scripts/tests/test_loopback_verification.py` from the repository root for the verifier's engine-version and adverse binding regressions. These exercise the actual assertion blocks and resolved default Compose; the live infrastructure suite still requires a running stack.
 ````
 
 ### scripts/verify/all.sh
@@ -8392,6 +9677,8 @@ curl -s localhost:8080/api/collections | python3 -c \
 set -uo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
+# One run at a time: the fixtures rebuilt below are shared (#95).
+. ./lock.sh
 
 API="${RAG_API:-http://localhost:8080/api}"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -8407,7 +9694,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -8464,6 +9751,9 @@ exit "$overall"
 # more than once.
 
 set -uo pipefail
+
+# One verify run at a time; see lock.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lock.sh"
 
 API="${RAG_API:-http://localhost:8080/api}"
 # Collections and packages created by the suites all carry this prefix so
@@ -8564,6 +9854,229 @@ summary() {
 }
 ```
 
+### scripts/verify/lock.sh
+
+```bash
+#!/usr/bin/env bash
+# One verify run at a time against a stack.
+#
+# Sourced by all.sh and lib.sh, never executed. Every run shares the $PREFIX
+# collection names, the /tmp/vfy_*.json scratch files and the fixtures folder,
+# which all.sh deletes and rebuilds when it starts. Two runs at once overwrite
+# each other: one run's upload finds its fixture gone, or its chunks land in the
+# other run's recreated collection (#95).
+#
+# The first script to source this holds the lock for its whole process tree:
+# it exports RAG_VERIFY_LOCK_HELD, so the suites all.sh starts don't try again.
+#
+# The lock is a directory holding a pid file. mkdir is atomic, so only one run
+# can create it. A lock whose holder has died is taken over, but only under a
+# second mutex ($lock.takeover, also a mkdir) and only if the pid is still the
+# dead one, so of several runs that find the same stale lock, exactly one clears
+# it and the rest retry. A lock with no pid file yet is treated as held: its
+# owner is between mkdir and writing the pid. Only once it is over a minute old,
+# still checked under the mutex, is it taken over as a run that died there.
+# The lock is only ever removed file by file (pid, then rmdir), never with
+# rm -rf, because its path can come from the environment.
+
+_rag_lock_release() {
+  [ -n "${RAG_VERIFY_LOCK:-}" ] || return 0
+  [ "$(cat "$RAG_VERIFY_LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$RAG_VERIFY_LOCK/pid"
+  rmdir "$RAG_VERIFY_LOCK" 2>/dev/null || true
+}
+
+_rag_lock_acquire() {
+  local lock="$1" holder stale tries=0
+  if [ -L "$lock" ]; then
+    printf '\nThe verify lock %s is a symlink; refusing to use it.\n\n' "$lock" >&2
+    return 3
+  fi
+  while [ "$tries" -lt 50 ]; do
+    tries=$((tries + 1))
+    if mkdir "$lock" 2>/dev/null; then
+      if echo $$ > "$lock/pid.$$" 2>/dev/null && mv "$lock/pid.$$" "$lock/pid" 2>/dev/null; then
+        return 0
+      fi
+      # Couldn't record our pid (a full /tmp, say). Don't leave a lock that
+      # nothing could ever recognise as stale.
+      rm -f "$lock/pid.$$" 2>/dev/null; rmdir "$lock" 2>/dev/null || true
+      printf '\nCould not write the verify lock %s.\n\n' "$lock" >&2
+      return 3
+    fi
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    if [ -z "$holder" ]; then
+      # Normally another run between mkdir and writing its pid, so wait. A
+      # pid-less lock older than a minute belongs to a run that died there.
+      if [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        sleep 0.1; continue
+      fi
+      holder="none"
+    fi
+    case "$holder" in
+      none) ;;
+      *[!0-9]*)
+        # Shown, not trusted: printable characters other than the quote, and
+        # not much of them.
+        holder=$(printf '%s' "$holder" | LC_ALL=C tr -cd '[:print:]' | tr -d '"' | cut -c1-40)
+        printf '\nThe verify lock %s holds "%s", not a pid; remove it by hand if no run is using it.\n\n' "$lock" "$holder" >&2
+        return 3 ;;
+    esac
+    if [ "$holder" != none ] && kill -0 "$holder" 2>/dev/null; then
+      printf '\nAnother verify run (pid %s) is using this machine. Wait for it to finish.\n\n' "$holder" >&2
+      return 3
+    fi
+    # Stale. Only one run may take it over, so take a second, short-lived
+    # mutex first, and re-read the pid under it: another run may already have
+    # replaced the stale lock with a live one. For a pid-less lock that means
+    # re-checking its age too, since a replacement is pid-less for a moment.
+    if mkdir "$lock.takeover" 2>/dev/null; then
+      local now
+      now=$(cat "$lock/pid" 2>/dev/null || true)
+      if [ ! -L "$lock" ] && { [ "$now" = "$holder" ] || { [ "$holder" = none ] && [ -z "$now" ] &&
+           [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; }; }; then
+        rm -f "$lock/pid" "$lock"/pid.* 2>/dev/null
+        rmdir "$lock" 2>/dev/null || true
+      fi
+      rmdir "$lock.takeover" 2>/dev/null || true
+    else
+      # Another run is taking it over. A takeover mutex older than a minute
+      # belongs to a run that died mid-takeover.
+      if [ -n "$(find "$lock.takeover" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        rmdir "$lock.takeover" 2>/dev/null || true
+      fi
+      sleep 0.1
+    fi
+  done
+  printf '\nCould not take the verify lock %s.\n\n' "$lock" >&2
+  return 3
+}
+
+if [ -z "${RAG_VERIFY_LOCK_HELD:-}" ]; then
+  RAG_VERIFY_LOCK="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}"
+  _rag_lock_acquire "$RAG_VERIFY_LOCK" || exit 3
+  export RAG_VERIFY_LOCK_HELD=1
+  # Released on exit, after any EXIT trap already set (bash traps replace
+  # rather than chain, so keep the earlier one). A suite that sets its own
+  # EXIT trap later should call _rag_lock_release in it; if it doesn't, the
+  # next run takes the lock over once this pid is gone.
+  # `trap -p` prints the command shell-quoted (trap -- '<command>' EXIT), so
+  # let the shell unquote it rather than stripping quotes as text, which broke
+  # any command that itself contains a quote. A function, not `set --`, so the
+  # sourcing script's own arguments are left alone.
+  _rag_prev_exit=$(trap -p EXIT)
+  _rag_trap_command() { _rag_prev_exit=$3; }
+  if [ -n "$_rag_prev_exit" ]; then eval "_rag_trap_command $_rag_prev_exit"; fi
+  unset -f _rag_trap_command
+  trap "_rag_lock_release; ${_rag_prev_exit:-:}" EXIT
+fi
+```
+
+### scripts/verify/08_overlap.sh
+
+```bash
+#!/usr/bin/env bash
+# Real parser/window/ingest/storage acceptance on an owned text-only fixture.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Bounded overlap text storage"
+(cd ../.. && docker compose exec -T -e RAG_OVERLAP_REAL_EMBEDDING="${RAG_OVERLAP_REAL_EMBEDDING:-0}" api python - < scripts/verify/overlap_chunks.py)
+check "overlap coverage, bounds, budget rejection and owned-fixture cleanup" $?
+summary
+```
+
+### scripts/verify/overlap_chunks.py
+
+```python
+"""Real parser/ingest/Weaviate text-storage acceptance on one owned collection.
+
+Run inside a disposable API: python - < scripts/verify/overlap_chunks.py
+Default fixture disables vectorization to isolate text/window storage from
+model availability. RAG_OVERLAP_REAL_EMBEDDING=1 optionally uses production
+Ollama vectorization; do not treat the default as model acceptance.
+Only this script's unique collection and temporary source/config paths are used.
+"""
+import os
+import tempfile
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+from weaviate.classes.config import Configure, VectorDistances
+from config import settings
+from services import chunker, ingest_pipeline, weaviate_client as wc
+
+collection = 'VfyOverlap' + uuid.uuid4().hex[:12]
+assert not wc._collection_exists_sync(collection)
+created = False
+try:
+    real_embedding = os.environ.get('RAG_OVERLAP_REAL_EMBEDDING') == '1'
+    if real_embedding:
+        wc._create_collection_sync(collection, 'hnsw', 'cosine', {})
+    else:
+        wc.get_client().collections.create(name=collection,
+            vectorizer_config=Configure.Vectorizer.none(),
+            vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE),
+            properties=wc.COLLECTION_PROPERTIES)
+    created = True
+    print('PASS owned overlap collection created; mode=' + ('real embedding' if real_embedding else 'text storage without vectorization'),flush=True)
+    with tempfile.TemporaryDirectory(prefix='overlap-live-') as directory:
+        root = Path(directory)
+        cases = [('long_token', 'x' * 10000, 200, 100),
+                 ('single_newlines', '\n'.join('Inert source line ' + str(i) for i in range(600)), 200, 100),
+                 ('paragraphs', '\n\n'.join('Inert paragraph ' + str(i) + ' abc' * 80 for i in range(20)), 200, 100),
+                 ('short_tail', 'z' * 1020, 10, 100)]
+        with patch.object(settings, 'sources_dir', str(root/'retained')):
+            for label, text, overlap, minimum in cases:
+                stage = root/label; stage.mkdir()
+                source = stage/(label + '.txt'); source.write_text(text)
+                parsed, _ = ingest_pipeline._parse_file(source)
+                assert parsed.strip(), f'{label}: parser returned no nonblank text'
+                expected = chunker.chunk_overlap(parsed,1000,overlap,minimum)
+                job_id = 'overlap-' + uuid.uuid4().hex[:8]
+                job = {'status':'queued', 'files_total':1, 'files_completed':0, 'files_failed':0,
+                       'chunks_stored':0, 'errors':[]}
+                ingest_pipeline._jobs[job_id] = job
+                try:
+                    ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,overlap,0.85,minimum)
+                    assert job['status'] == 'completed' and job['files_failed'] == 0, job
+                    objects = wc.get_client().collections.get(collection).iterator()
+                    saved = sorted((o.properties for o in objects if o.properties['source_file'] == source.name),
+                                   key=lambda p:p['chunk_index'])
+                    chunks = [p['content'] for p in saved]
+                    assert chunks and expected, f'{label}: no windows were stored'
+                    assert chunks == expected and job['chunks_stored'] == len(chunks), (label,job)
+                    restored = chunks[0] + ''.join(c[overlap:] for c in chunks[1:]) if chunks else ''
+                    assert restored == parsed, label
+                    assert all(len(c) <= 1000 for c in chunks[:-1])
+                    assert all(len(c) <= 1000 + max(0,min(1000,minimum-1)-overlap) for c in chunks)
+                    assert all(a[-overlap:] == b[:overlap] for a,b in zip(chunks,chunks[1:]))
+                    print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
+                finally:
+                    ingest_pipeline._jobs.pop(job_id,None)
+        stage=root/'budget';stage.mkdir()
+        source=stage/'over-budget.txt';source.write_text('x'*100000)
+        job_id='overlap-budget-'+uuid.uuid4().hex[:8]
+        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
+        ingest_pipeline._jobs[job_id]=job
+        try:
+            ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,999,0.85,100)
+            assert job['status']=='failed' and job['files_failed']==1 and job['chunks_stored']==0,job
+            assert any('per-file limit' in error for error in job['errors']),job
+            stored=list(wc.get_client().collections.get(collection).iterator())
+            assert not any(o.properties['source_file']==source.name for o in stored)
+            print('PASS excessive overlap output fails before object storage',flush=True)
+        finally: ingest_pipeline._jobs.pop(job_id,None)
+    print('PASS owned temporary source paths removed', flush=True)
+finally:
+    if created:
+        wc._delete_collection_sync(collection)
+    wc.close_client()
+assert not wc._collection_exists_sync(collection)
+wc.close_client()
+print('PASS owned overlap collection and its configuration removed', flush=True)
+```
+
 ### scripts/verify/fixtures.py
 
 ```python
@@ -8580,6 +10093,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import random
 import sys
 import zipfile
 
@@ -8600,8 +10114,13 @@ PARAGRAPHS = [
 ONE_LINER = PARAGRAPHS[0]
 
 
-def _pdf(paragraphs: list[str]) -> bytes:
-    """A minimal single-page PDF. Hand-built to avoid a writer dependency."""
+def _pdf(paragraphs: list[str], padding: int = 0) -> bytes:
+    """A minimal single-page PDF. Hand-built to avoid a writer dependency.
+
+    `padding` adds an unreferenced stream object of that many bytes. No page
+    points at it, so parsers skip it: the file is large on the wire but carries
+    only the text above, which keeps an upload-size test fast to ingest.
+    """
     lines: list[str] = []
     for para in paragraphs:
         cur = ""
@@ -8628,6 +10147,12 @@ def _pdf(paragraphs: list[str]) -> bytes:
         b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
+    if padding:
+        # Seeded so the fixture is byte-identical on every run. Random bytes
+        # rather than zeros so nothing on the path can compress it away.
+        filler = random.Random(21).randbytes(padding)
+        objects.append(b"<< /Length " + str(padding).encode() + b" >>\nstream\n"
+                       + filler + b"\nendstream")
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, body in enumerate(objects, 1):
@@ -8688,6 +10213,9 @@ def write(target: pathlib.Path) -> None:
     (target / "tiny.txt").write_text("Short.\n\nAlso short.\n\n" + ONE_LINER + "\n")
     # Right extension, unparseable content — one bad file must not fail a batch.
     (target / "broken.pdf").write_bytes(b"%PDF-1.4\nnot a real pdf body\n%%EOF\n")
+    # Over nginx's 1 MB default request-body limit, which once rejected every
+    # real-world PDF with a 413 before the API saw it. See issue #21.
+    (target / "large.pdf").write_bytes(_pdf(PARAGRAPHS, padding=3 * 1024 * 1024))
     # Unsupported types, which must be reported rather than dropped in silence.
     (target / "notes.xyz").write_text("unsupported\n")
     (target / "notes.rtf").write_text("also unsupported\n")
@@ -8884,18 +10412,66 @@ require_stack
 C="${PREFIX}Infra"
 
 section "§10.5 Infrastructure"
+RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
+export RAG_INFRA_TMP
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$RAG_INFRA_TMP"; _rag_lock_release 2>/dev/null || true' EXIT
+EXPECTED_PORT="${RAG_EXPECTED_PROXY_PORT:-8080}"
+export EXPECTED_PORT
+engine=$(docker version --format '{{.Server.Version}}')
+python3 - "$engine" <<'ENDPY'
+import re, sys
+version = sys.argv[1]
+match = re.match(r'^(\d+)\.(\d+)\.(\d+)', version)
+ok = bool(match and tuple(map(int, match.groups())) >= (28, 0, 0)
+          and not (version.startswith('28.0.0-') and any(x in version for x in ('alpha', 'beta', 'rc'))))
+sys.exit(0 if ok else 1)
+ENDPY
+check "Docker Engine is 28.0.0 or newer for localhost port isolation" $? "$engine"
 
-# ── exactly one host-published port ──────────────────────────────────────────
-bindings=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Ports}}') \
-  | grep -o '0\.0\.0\.0:[0-9]*->[0-9]*/tcp' | sort -u)
-count=$(printf '%s\n' "$bindings" | grep -c . )
+# ── resolved configuration and live bindings ─────────────────────────────────
+# Inspect structured ports, including their host addresses. Matching only
+# 0.0.0.0 made a loopback deployment look as though it published no ports.
+(cd "$REPO_ROOT" && docker compose config --format json) > "$RAG_INFRA_TMP/vfy_compose.json"
+python3 - <<'ENDPY'
+import json, sys, os
+services = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_compose.json'))['services']
+ports = [(name, port) for name, service in services.items() for port in service.get('ports', [])]
+ok = (len(ports) == 1 and ports[0][0] == 'proxy'
+      and ports[0][1].get('host_ip') == '127.0.0.1'
+      and str(ports[0][1]['published']) == os.environ['EXPECTED_PORT']
+      and ports[0][1]['target'] == 80 and ports[0][1].get('protocol', 'tcp') == 'tcp')
+sys.exit(0 if ok else 1)
+ENDPY
+check "resolved Compose publishes only the proxy on host loopback" $?
+
+(cd "$REPO_ROOT" && python3 - <<'ENDPY'
+import json, subprocess
+ids = subprocess.check_output(['docker', 'compose', 'ps', '-q'], text=True).split()
+containers = json.loads(subprocess.check_output(['docker', 'inspect', *ids], text=True)) if ids else []
+bindings = [{'service': container['Config']['Labels']['com.docker.compose.service'],
+             'container_port': port, **binding}
+            for container in containers
+            for port, published in container['NetworkSettings']['Ports'].items()
+            for binding in (published or [])]
+print(json.dumps(bindings))
+ENDPY
+) > "$RAG_INFRA_TMP/vfy_bindings.json"
+count=$(python3 -c "import json, os; print(len(json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_bindings.json'))))")
 check_eq "only one port is published to the host" "$count" "1"
-printf '%s' "$bindings" | grep -q -- '->80/tcp'
-check "that port maps to the proxy's port 80" $? "$bindings"
+python3 - <<'ENDPY'
+import json, sys, os
+bindings = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_bindings.json'))
+ok = (len(bindings) == 1 and bindings[0]['service'] == 'proxy'
+      and bindings[0]['container_port'] == '80/tcp' and bindings[0]['HostIp'] == '127.0.0.1'
+      and bindings[0]['HostPort'] == os.environ['EXPECTED_PORT'])
+sys.exit(0 if ok else 1)
+ENDPY
+check "the live proxy port is bound only to host loopback" $?
 
 for svc in api weaviate; do
   published=$( (cd "$REPO_ROOT" && docker compose ps --format "{{.Service}}|{{.Ports}}") \
-    | grep "^$svc|" | grep -c '0\.0\.0\.0' || true)
+    | grep "^$svc|" | grep -c -- '->[0-9]*/tcp' || true)
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
@@ -8906,10 +10482,10 @@ unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | gre
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
 # ── health endpoint reports each dependency ──────────────────────────────────
-api_get "/health" > /tmp/vfy_health.json
-check_eq "health status is ok" "$(jfield "['status']" < /tmp/vfy_health.json)" "ok"
+api_get "/health" > "$RAG_INFRA_TMP/vfy_health.json"
+check_eq "health status is ok" "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_health.json")" "ok"
 python3 -c "
-import json,sys; d=json.load(open('/tmp/vfy_health.json'))
+import json,sys,os; d=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))
 s=d['services']
 ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
       and s['ollama']['embed']['status']=='ok'
@@ -8917,14 +10493,47 @@ ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
 sys.exit(0 if ok else 1)"
 check "per-service status and latency are reported" $?
 
+# ── memory resource reporting (Issue #98) ────────────────────────────────────
+# Advisory only (see the comment in api/routers/health.py), so it never
+# affects overall_ok, but the report itself must be right: the configured
+# recommendation, and a flip to below_recommended -- with a note -- once the
+# recommendation exceeds what's actually allocated.
+check_eq "the recommended minimum defaults to 12.0 GB" \
+  "$(jfield "['resources']['memory']['recommended_minimum_gb']" < "$RAG_INFRA_TMP/vfy_health.json")" "12.0"
+# Whether this machine meets it depends on its Docker allocation, so check the
+# status agrees with the allocation /health reports, not that it is 'ok'.
+python3 -c "
+import json, os
+m = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['resources']['memory']
+want = 'ok' if m['allocated_gb'] >= m['recommended_minimum_gb'] * 0.95 else 'below_recommended'
+raise SystemExit(0 if m['status'] == want else 1)"
+check "the memory status agrees with the reported allocation" $?
+
+# Raise the recommendation past the actual allocation (in-process only --
+# neither the running server nor docker-compose.yml is touched) and confirm
+# the status flips and a note is attached.
+(cd "$REPO_ROOT" && docker compose exec -T api env RECOMMENDED_MEMORY_GB=13 python3 -c "
+import json
+from config import Settings
+from services import system_info
+print(json.dumps(system_info.memory_info(Settings().recommended_memory_gb)))
+") > "$RAG_INFRA_TMP/vfy_mem_override.json"
+check_eq "a recommendation above the allocation reports below_recommended" \
+  "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_mem_override.json")" "below_recommended"
+python3 -c "
+import json, os
+d = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_mem_override.json'))
+raise SystemExit(0 if d.get('note') and 'recommended' in d['note'] else 1)"
+check "the below-recommended report includes an explanatory note" $?
+
 # ── ingest config defaults ───────────────────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 check_eq "a fresh collection reports is_default true" \
   "$(api_get "/ingest/config/$C" | jfield "['is_default']")" "True"
 api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"semantic\",\"chunk_size\":800,\"chunk_overlap\":150,\"similarity_threshold\":0.9,\"min_chunk_size\":80}" >/dev/null
-api_get "/ingest/config/$C" > /tmp/vfy_cfg.json
-check_eq "after saving, is_default is false" "$(jfield "['is_default']" < /tmp/vfy_cfg.json)" "False"
-check_eq "the saved strategy is returned" "$(jfield "['chunking_strategy']" < /tmp/vfy_cfg.json)" "semantic"
+api_get "/ingest/config/$C" > "$RAG_INFRA_TMP/vfy_cfg.json"
+check_eq "after saving, is_default is false" "$(jfield "['is_default']" < "$RAG_INFRA_TMP/vfy_cfg.json")" "False"
+check_eq "the saved strategy is returned" "$(jfield "['chunking_strategy']" < "$RAG_INFRA_TMP/vfy_cfg.json")" "semantic"
 
 # ── deleting a collection must take its configs with it ──────────────────────
 # Spec §8 rule 1. This was not happening for the ingest config, so a recreated
@@ -8942,25 +10551,25 @@ check_eq "a recreated collection does not inherit the retrieval config" \
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
-  api_get "/collections" > /tmp/vfy_before.json
+  api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
   (cd "$REPO_ROOT" && docker compose down >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1)
   for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
   elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
   [ "$elapsed" -le 120 ]
   check "restart reaches healthy within 120s" $? "took ${elapsed}s"
-  api_get "/collections" > /tmp/vfy_after.json
+  api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
-import json,sys
-b={c['name']:c for c in json.load(open('/tmp/vfy_before.json'))['collections']}
-a={c['name']:c for c in json.load(open('/tmp/vfy_after.json'))['collections']}
+import json,sys,os
+b={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_before.json'))['collections']}
+a={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_after.json'))['collections']}
 ok = set(b)==set(a) and all(b[k]['object_count']==a[k]['object_count'] for k in b)
 sys.exit(0 if ok else 1)"
   check "Weaviate data survives down/up" $?
   python3 -c "
-import json,sys
-b={c['name']:c for c in json.load(open('/tmp/vfy_before.json'))['collections']}
-a={c['name']:c for c in json.load(open('/tmp/vfy_after.json'))['collections']}
+import json,sys,os
+b={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_before.json'))['collections']}
+a={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_after.json'))['collections']}
 sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) else 1)"
   check "created_at is preserved across restart" $?
   check_eq "saved ingest config survives restart" \
@@ -8973,11 +10582,17 @@ fi
 leftover=$( (cd "$REPO_ROOT" && docker compose exec -T api sh -c \
   'ls -d /app/uploads/import-* /app/uploads/rechunk-* 2>/dev/null | wc -l') | tr -d ' ')
 check_eq "no abandoned extraction directories" "${leftover:-0}" "0"
-staging=$(api_get "/collections" | python3 -c "
-import json,sys
-print(sum(1 for c in json.load(sys.stdin)['collections']
-          if '__importing_' in c['name'] or '__tuning_' in c['name']))")
-check_eq "no abandoned staging collections" "$staging" "0"
+staging=$( (cd "$REPO_ROOT" && docker compose exec -T api python -c '
+import json
+from services import collection_recovery as recovery, weaviate_client as wc
+try:
+    records = [json.loads(path.read_text()) for path in recovery._root().glob("*.json")]
+    print(sum(record.get("state") == "scratch" and wc.get_client().collections.exists(record["staging"])
+              for record in records))
+finally:
+    wc.close_client()
+'))
+check_eq "no abandoned owned scratch collections" "$staging" "0"
 
 drop_collection "$C"
 cleanup_prefixed
@@ -8992,9 +10607,14 @@ summary
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
-[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+# Regenerate when the newest fixture is missing, so a directory left by an
+# older run does not hide a check behind a missing file.
+[ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
+# Run the independent text-storage window acceptance without model work.
+bash ./08_overlap.sh
+check "bounded overlap text-storage acceptance" $?
 C="${PREFIX}Ingest"
 
 # Uploads a set of files and echoes the finished job document to a file.
@@ -9045,6 +10665,36 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
 check "each skip names the unsupported extension" $?
+
+# ── upload size limit at the proxy ───────────────────────────────────────────
+# nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
+# a 413 before the API sees them, so every real-world PDF failed through the
+# UI while the few-KB fixtures here all passed. These go through $API, which is
+# the proxy, on purpose. See issue #21.
+size=$(python3 -c "import os;print(os.path.getsize('$FIX/large.pdf'))")
+[ "$size" -gt 1048576 ]
+check "the large fixture is over nginx's 1 MB default" $? "$size bytes"
+
+drop_collection "$C"; make_collection "$C"
+if ingest "$C" fixed 300 50 "$FIX/large.pdf"; then
+  read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+else
+  status="rejected"; completed=0; chunks=0
+fi
+[ "$status" = completed ] && [ "$completed" = 1 ] && [ "$chunks" -gt 0 ]
+check "an upload over 1 MB is accepted through the proxy and ingests" $? \
+  "status=$status completed=$completed chunks=$chunks"
+
+# Just over the 512 MB limit. A sparse file, so nothing is written to disk, and
+# nginx answers from the Content-Length header without reading the body.
+big_dir=$(mktemp -d)
+python3 -c "open('$big_dir/oversize.txt','wb').truncate(513*1024*1024)"
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "strategy=fixed" -F "files=@$big_dir/oversize.txt")
+rm -rf "$big_dir"
+check_eq "an upload over the 512 MB limit is refused with 413" "$code" "413"
 
 # ── every chunking strategy against a PDF ────────────────────────────────────
 for strategy in fixed overlap language context_aware semantic; do
@@ -9107,6 +10757,133 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/compose_target.py
+
+```python
+"""Refuse an in-container verifier when RAG_API selects another deployment."""
+import sys
+from urllib.parse import urlsplit
+
+def matches_local_proxy(api, bindings):
+    try:
+        url=urlsplit(api)
+        if url.scheme!='http' or url.hostname not in ('localhost','127.0.0.1','::1') or url.username or url.password or url.path.rstrip('/')!='/api' or url.query or url.fragment:
+            return False
+        port=url.port or 80
+        for binding in bindings.splitlines():
+            host, published=binding.rsplit(':',1)
+            host=host.strip('[]')
+            if int(published)!=port:continue
+            if host in ('0.0.0.0','::') or host==url.hostname or (host=='127.0.0.1' and url.hostname=='localhost'):
+                return True
+        return False
+    except (ValueError,TypeError):return False
+
+if __name__=='__main__':
+    if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
+        print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
+        sys.exit(2)
+```
+
+### scripts/verify/11_retrieval.sh
+
+```bash
+#!/usr/bin/env bash
+# Observe physical config and execute top-K on real backend, controlling models.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
+require_stack
+section "Physical index and effective query controls"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
+check "physical index, legacy vector aliases, executed topK and config lifecycle" $?
+summary
+```
+
+### scripts/verify/retrieval_controls.py
+
+```python
+"""Real physical config and executed query limits on owned synthetic collections.
+
+Inside disposable API: python - < scripts/verify/retrieval_controls.py
+Actual SDK/backend storage and vector queries; only Ollama reformulation,
+embedding and answer calls are controlled. No startup sweep/model calls.
+"""
+import importlib.util,json,os,tempfile,uuid
+from unittest.mock import AsyncMock,patch
+from fastapi.testclient import TestClient
+from config import settings
+from main import app
+from services import weaviate_client as wc,rag_pipeline as rag
+
+prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
+collections=[]
+owners=[]
+persistent_upload=settings.upload_dir
+if importlib.util.find_spec('services.collection_recovery'):
+    from services import collection_recovery as recovery
+else:
+    recovery=None  # The pre-recovery baseline sweeps legacy staging markers.
+
+client=TestClient(app)
+with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
+    try:
+        for index in ('hnsw','flat'):
+            if recovery:
+                with patch.object(settings,'upload_dir',persistent_upload):
+                    owner=recovery.begin(prefix+index,'tune',wc.get_client())
+                owners.append(owner);name=owner['staging']
+            else:
+                name=prefix+index+'__tuning_'+uuid.uuid4().hex
+            assert not wc._collection_exists_sync(name);collections.append(name)
+            response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
+            assert response.status_code==201,response.text
+            if os.environ.get('RAG_VERIFY_INTERRUPT_AFTER_CREATE')=='1':
+                print('OWNED_INTERRUPTED_FIXTURE '+json.dumps({'name':name,'owner':owners[-1] if owners else None}),flush=True)
+                os._exit(86)  # Acceptance injection: skips finally like a hard kill.
+            coll=wc.get_client().collections.get(name)
+            for i in range(1,11):coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
+            assert row['index_type']==index and row['distance_metric']=='cosine'
+            assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
+            print('PASS real '+index+' physical settings are observed, not query labels',flush=True)
+            for mode,limit in (('hnsw',1),('flat',50)):
+                with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
+                    response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
+                assert response.status_code==200,response.text
+                body=response.json();assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
+            after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
+            assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
+            print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
+            config={'collection':name,'retrieval_mode':'hybrid','top_k':7,'alpha':0.25,'ef':96,'response_format':'engineer'}
+            assert client.post('/retrieval/config',json=config).status_code==201
+            loaded=client.get('/retrieval/config/'+name).json()
+            assert all(loaded[key]==value for key,value in config.items()),loaded
+            config['ef']=None
+            assert client.post('/retrieval/config',json=config).status_code==201
+            assert client.get('/retrieval/config/'+name).json()['ef'] is None
+            for limit in (1,50):
+                config['top_k']=limit
+                saved=client.post('/retrieval/config',json=config)
+                assert saved.status_code==201 and client.get('/retrieval/config/'+name).json()['top_k']==limit,saved.text
+            for limit in (0,51):
+                invalid=client.post('/retrieval/config',json={**config,'top_k':limit})
+                assert invalid.status_code==422,invalid.text
+            print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
+    finally:
+        for name in collections:
+            if wc._collection_exists_sync(name):
+                response=client.delete('/collections/'+name+'?confirm=true');assert response.status_code==200,response.text
+        if recovery:
+            with patch.object(settings,'upload_dir',persistent_upload):
+                for owner in owners:recovery.discard(owner,wc.get_client())
+        wc.close_client()
+assert all(not wc._collection_exists_sync(name) for name in collections)
+wc.close_client()
+print('PASS owned synthetic collections/config/files removed',flush=True)
+```
+
 ### scripts/verify/03_query.sh
 
 ```bash
@@ -9116,6 +10893,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./11_retrieval.sh
+check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
@@ -9131,7 +10910,7 @@ ask() {  # ask <mode> <format> <citations> -> writes /tmp/vfy_ans.json
 }
 
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.2 entirely" "every check needs an LLM call"
+  skip "LLM query assertions" "set RAG_SKIP_SLOW=0 to include model calls"
   summary; exit $?
 fi
 
@@ -9177,8 +10956,9 @@ sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('an
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
-# The prompts instruct plain language but never brevity, so a single pair is
-# noise. Compare across trials and require a clear majority.
+# The end_user prompt asks for a short answer (#109), but a CPU model still
+# varies answer to answer, so a single pair is noise. Compare the mean length
+# across trials.
 trials="${RAG_FORMAT_TRIALS:-3}"
 eu_total=0; en_total=0; eu_wins=0
 for _ in $(seq 1 "$trials"); do
@@ -9311,6 +11091,90 @@ assert not wc._collection_exists_sync(collection);wc.close_client()
 print('PASS owned collection/session/files removed',flush=True)
 ```
 
+### scripts/verify/09_sampling.sh
+
+```bash
+#!/usr/bin/env bash
+# UUID selection through the real SDK; owned fixtures and supplied vectors.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Evaluation sampling across iterator pages"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/chunk_sampling.py)
+check "seeded selection, iterator paging, bounds and owned-fixture cleanup" $?
+section "Generation request validation before backend/model work"
+for body in \
+  '{"collection":"MissingSamplingFixture","sample_size":0}' \
+  '{"collection":"MissingSamplingFixture","sample_size":101}' \
+  '{"collection":"MissingSamplingFixture","sample_size":true}' \
+  '{"collection":"MissingSamplingFixture","sample_size":1.5}' \
+  '{"collection":"MissingSamplingFixture","seed":false}' \
+  '{"collection":"MissingSamplingFixture","seed":1.5}' \
+  '{"collection":"MissingSamplingFixture","seed":NaN}' \
+  '{"collection":"MissingSamplingFixture","sample_size":Infinity}'
+do
+  code=$(api_post_code /goldstandard/generate "$body")
+  check_eq "invalid sampling request rejected with422: $body" "$code" "422"
+done
+summary
+```
+
+### scripts/verify/chunk_sampling.py
+
+```python
+"""Real SDK sampling checks; owned synthetic objects with supplied vectors.
+
+Run inside a disposable API: python - < scripts/verify/chunk_sampling.py
+Does not call embedding or language models. UUID selection, not answer output,
+is the reproducibility contract. Deletes only its unique collection/config.
+"""
+import uuid
+import os
+from services import weaviate_client as wc
+from services.chunk_sampling import select_chunk_ids
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Sampling'+uuid.uuid4().hex[:12]
+creation_attempted=False
+try:
+    assert not wc._collection_exists_sync(collection)
+    creation_attempted=True
+    wc._create_collection_sync(collection,'hnsw','cosine',{})
+    coll=wc.get_client().collections.get(collection)
+    for i in range(1,161):
+        coll.data.insert(uuid=uuid.UUID(int=i),properties={
+            'content':f'Inert sampling fixture {i}', 'source_file':'sampling.txt',
+            'chunk_index':i},vector=[0.1]*768)
+    assert coll.aggregate.over_all(total_count=True).total_count==160
+    print('PASS created 160 owned synthetic objects with supplied vectors',flush=True)
+    first=wc._sample_chunks_sync(collection,5,7)
+    assert len(first)==5 and len({r['object_id'] for r in first})==5
+    assert any(uuid.UUID(r['object_id']).int>100 for r in first)
+    print('PASS seeded sample reaches beyond the first 100-object iterator page',flush=True)
+    assert wc._sample_chunks_sync(collection,5,7)==first
+    print('PASS repeated seed preserves UUIDs and ordered payloads',flush=True)
+    snapshot=list(coll.iterator(include_vector=False,return_properties=[],cache_size=100))
+    assert len(snapshot)==160 and all(not obj.properties for obj in snapshot)
+    assert all(row['source_file']=='sampling.txt' and row['content']==f"Inert sampling fixture {uuid.UUID(row['object_id']).int}" for row in first)
+    assert select_chunk_ids(reversed(snapshot),5,7)==[row['object_id'] for row in first]
+    print('PASS UUID-only SDK scan and reversed order preserve selected payloads',flush=True)
+    maximum=wc._sample_chunks_sync(collection,100,7)
+    assert len(maximum)==100 and len({r['object_id'] for r in maximum})==100
+    print('PASS maximum request is bounded across multiple iterator pages',flush=True)
+    for i in range(61,161): coll.data.delete_by_id(uuid.UUID(int=i))
+    rows=wc._sample_chunks_sync(collection,100,7)
+    assert len(rows)==60 and {r['object_id'] for r in rows}=={str(uuid.UUID(int=i)) for i in range(1,61)}
+    print('PASS oversize request returns all available unique objects',flush=True)
+    unseeded=wc._sample_chunks_sync(collection,5,None)
+    assert len(unseeded)==5 and all(1<=uuid.UUID(r['object_id']).int<=60 for r in unseeded)
+    print('PASS null seed produces a bounded valid sample',flush=True)
+finally:
+    if creation_attempted and wc._collection_exists_sync(collection): wc._delete_collection_sync(collection)
+    wc.close_client()
+assert not wc._collection_exists_sync(collection)
+wc.close_client()
+print('PASS owned collection and configuration removed',flush=True)
+```
+
 ### scripts/verify/04_goldstandard.sh
 
 ```bash
@@ -9330,8 +11194,12 @@ C="${PREFIX}Gold"
 
 section "§10.3 Gold Standard"
 
+# Selection needs the backend but no LLM work; include it even in slow-skip runs.
+bash ./09_sampling.sh
+check "UUID sampling acceptance" $?
+
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.3 entirely" "every check needs LLM generation"
+  skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
 fi
 
@@ -9490,11 +11358,25 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/10_validity.sh
+
+```bash
+#!/usr/bin/env bash
+# Retained-session validity and explicit historical export, without model calls.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Retained evaluation validity and historical export"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_validity.py)
+check "legacy defaults, real stale/orphan markers, export guard and historical file" $?
+summary
+```
+
 ### scripts/verify/05_transfer.sh
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26, E27)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -9504,6 +11386,11 @@ C="${PREFIX}Transfer"
 EXPORTS="$REPO_ROOT/exports"
 
 section "Export, import and tuning"
+
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
+check "evaluation import and generated-session regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
+check "embedded session/import verification sources match" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -9563,6 +11450,131 @@ sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
 check "the corruption error names the offending file" $?
 rm -f "$EXPORTS/$CORRUPT"
 
+# ── evaluation metadata is validated before mutation (E23) ──────────────────
+# Add one evaluation sidecar to a copy of the package and re-sign the manifest,
+# so the archive is digest-valid and only the session metadata decides.
+GS_SID="gs_$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+make_gs_pkg() {   # make_gs_pkg <session-id> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$C" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, sid, suffix, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+session = {"session_id": sid, "collection": coll, "status": "completed",
+           "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
+           "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
+                      "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
+                      "chunk_index": 0, "status": "approved"}]}
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    (root / "goldstandard").mkdir(exist_ok=True)
+    side = root / "goldstandard" / "session.json"
+    side.write_text(json.dumps(session))
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["files"]["goldstandard/session.json"] = \
+        "sha256:" + hashlib.sha256(side.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+}
+count_of() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
+
+BADGS=$(make_gs_pkg "not-a-generated-id" badgs)
+api_post "/import" "{\"filename\":\"$BADGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+check_eq "E23: malformed evaluation metadata is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_gsjob.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
+sys.exit(0 if 'goldstandard/session.json' in json.dumps(d) else 1)"
+check "E23: the refusal names the offending sidecar" $?
+check_eq "E23: replace left the existing collection untouched" "$(count_of "$C")" "$chunks_before"
+code=$(api_code "$API/goldstandard/session/not-a-generated-id")
+check_eq "E23: no session was restored from the refused package" "$code" "404"
+rm -f "$EXPORTS/$BADGS"
+
+# A refused package must change no live state at all. A replace from this
+# package would restore the same chunks, so the count above can't tell; the
+# retrieval setting and the earlier, valid sidecar can.
+MIX_SID="gs_$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+MIXGS=$(python3 - "$EXPORTS/$PKG" "$MIX_SID" "$C" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, sid, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+def session(i, **over):
+    s = {"session_id": i, "collection": coll, "status": "completed",
+         "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
+         "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
+                    "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
+                    "chunk_index": 0, "status": "approved"}]}
+    s.update(over); return s
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    gold = root / "goldstandard"; gold.mkdir(exist_ok=True)
+    manifest = json.loads((root / "manifest.json").read_text())
+    # a_valid sorts first: a restore that isn't preflighted writes it before
+    # it reaches the bad one.
+    for name, body in (("a_valid.json", session(sid)),
+                       ("b_bad.json", session("gs_0000beef", pairs_total="many"))):
+        (gold / name).write_text(json.dumps(body))
+        manifest["files"][f"goldstandard/{name}"] = \
+            "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+)
+api_post "/import" "{\"filename\":\"$MIXGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+check_eq "E23: a schema-invalid sidecar after a valid one is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_gsjob.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
+sys.exit(0 if 'goldstandard/b_bad.json' in json.dumps(d) else 1)"
+check "E23: the refusal names the invalid sidecar, not the valid one" $?
+code=$(api_code "$API/goldstandard/session/$MIX_SID")
+check_eq "E23: the valid sidecar in a refused package is not restored" "$code" "404"
+topk=$(api_get "/retrieval/config/$C" | jfield "['top_k']")
+check_eq "E23: a refused replace leaves the live retrieval settings alone" "$topk" "7"
+check_eq "E23: ... and the collection's chunk count" "$(count_of "$C")" "$chunks_before"
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+rm -f "$EXPORTS/$MIXGS"
+(cd "$REPO_ROOT" && docker compose exec -T api rm -f \
+  "/app/uploads/goldstandard_sessions/$MIX_SID.json" \
+  "/app/uploads/goldstandard_sessions/gs_0000beef.json") >/dev/null 2>&1 || true
+
+GOODGS=$(make_gs_pkg "$GS_SID" goodgs)
+api_post "/import" "{\"filename\":\"$GOODGS\",\"on_conflict\":\"rename\"}" > /tmp/vfy_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 1800 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_gsjob.json
+read -r gstat gname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_gsjob.json')); print(d['status'], d['collection'])")"
+check_eq "E23: a package with valid evaluation metadata still imports" "$gstat" "completed"
+api_get "/goldstandard/session/$GS_SID" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+sys.exit(0 if d['collection']=='$gname' and d['pairs'][0]['status']=='approved' else 1)"
+check "E23: the valid session is restored against the imported collection" $? "session $GS_SID -> $gname"
+rm -f "$EXPORTS/$GOODGS"
+drop_collection "$gname"
+# The restored session file outlives its collection by design (spec §8 rule 4).
+(cd "$REPO_ROOT" && docker compose exec -T api \
+  rm -f "/app/uploads/goldstandard_sessions/$GS_SID.json") >/dev/null 2>&1 || true
+
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
@@ -9582,12 +11594,25 @@ check_eq "rename imports alongside the original" "$istat" "completed"
 check "the renamed collection has a new name" $? "imported as $iname"
 check_eq "every chunk is imported" "$iwritten" "$chunks_before"
 
+# A successful destructive replace must be exercised as well as abort/rename.
+api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
+rjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace.json'))['job_id'])")
+rstatus=$(wait_for_job "/import/job/$rjob" 1800)
+check_eq "replace completes after verified final writes" "$rstatus" "completed"
+check_eq "replace reports confirmed target objects" "$(api_get "/import/job/$rjob" | jfield "['chunks_written']")" "$chunks_before"
+api_post "/export" "{\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
+rejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace_exp.json'))['job_id'])")
+wait_for_job "/export/job/$rejob" 1800 >/dev/null
+RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
+[ "$RPKG" != "$PKG" ]
+check "replace fidelity compares an independent re-export" $?
+
 # ── import is lossless ───────────────────────────────────────────────────────
 api_post "/export" "{\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
 ejob2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp2.json'))['job_id'])")
 wait_for_job "/export/job/$ejob2" 1800 >/dev/null
 PKG2=$(api_get "/export/job/$ejob2" | jfield "['filename']")
-python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" <<'ENDPY'
+python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" "$EXPORTS/$RPKG" <<'ENDPY'
 import json, sys, tarfile, tempfile, pathlib
 def chunks(path):
     with tempfile.TemporaryDirectory() as td:
@@ -9596,14 +11621,99 @@ def chunks(path):
         root = next(p for p in pathlib.Path(td).iterdir() if p.is_dir())
         return {r["id"]: r for r in
                 (json.loads(l) for l in (root / "chunks.jsonl").read_text().splitlines() if l.strip())}
-a, b = chunks(sys.argv[1]), chunks(sys.argv[2])
-same = set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
+a = chunks(sys.argv[1])
+comparisons = [chunks(path) for path in sys.argv[2:]]
+same = all(set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
                                 and a[k]["properties"] == b[k]["properties"] for k in a)
+           for b in comparisons)
 sys.exit(0 if same else 1)
 ENDPY
-check "re-export after import is byte-identical (uuids, vectors, properties)" $?
-rm -f "$EXPORTS/$PKG2"
+check "rename and replace preserve exported uuids, vectors and properties" $?
+rm -f "$EXPORTS/$PKG2" "$EXPORTS/$RPKG"
 drop_collection "$iname"
+
+# ── models on import: damaged and namespaced (E26, E27) ──────────────────────
+# Runs the importer inside the API process with its settings patched. E26 copies
+# the embedding model into a temporary store and damages the copy; the live
+# model store is only read. E27 uses the live store and a namespaced LLM name.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PKG") > /tmp/vfy_models.json 2>/tmp/vfy_models.err <<'ENDPY'
+import json, shutil, sys, tempfile, uuid
+from pathlib import Path
+from unittest.mock import patch
+from config import settings
+from services import importer, model_bundle as models
+pkg, out = sys.argv[1], {}
+
+def run(conflict):
+    jid = "vfy" + uuid.uuid4().hex[:6]
+    importer._jobs[jid] = {"job_id": jid, "status": "queued", "filename": pkg,
+                           "on_conflict": conflict, "collection": None,
+                           "original_collection": None, "chunks_written": 0,
+                           "fidelity": None, "renamed": False, "notes": [],
+                           "error": None, "error_code": None, "error_detail": None}
+    importer._active.add(pkg)
+    importer._run(jid, pkg, conflict)
+    return importer._jobs.pop(jid)
+
+model = settings.embed_model
+name = models.split_ref(model)[0]
+out["live_intact"] = models.is_installed(model)
+live_manifest = models.manifest_path(model)
+digests = models._digests(json.loads(live_manifest.read_text()))
+live_blobs = {d: models.blob_path(d) for d in digests}
+live_stamps = {p: p.stat().st_mtime_ns for p in [live_manifest, *live_blobs.values()]}
+
+# E26: installed but damaged -> MODEL_INTEGRITY_FAILED, the copy left as it was
+with tempfile.TemporaryDirectory(prefix="vfy-model-", dir=settings.upload_dir) as td:
+    with patch.object(settings, "ollama_models_dir", str(Path(td) / "store")):
+        mp = models.manifest_path(model)
+        mp.parent.mkdir(parents=True)
+        shutil.copyfile(live_manifest, mp)
+        for d, src in live_blobs.items():
+            models.blob_path(d).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, models.blob_path(d))
+        out["copy_present"] = models.is_installed(model)
+        smallest = min(digests, key=lambda d: live_blobs[d].stat().st_size)
+        damaged = models.blob_path(smallest)
+        damaged.write_bytes(b"ordinary damaged review bytes")
+        manifest_before = mp.read_bytes()
+        job = run("rename")
+        out["e26_status"] = job["status"]
+        out["e26_code"] = job["error_code"]
+        out["e26_message"] = job["error"] or ""
+        out["e26_untouched"] = (damaged.read_bytes() == b"ordinary damaged review bytes"
+                                and mp.read_bytes() == manifest_before)
+
+# E27: a namespaced LLM that Ollama doesn't report -> import completes with a note
+ns = "vfy-namespace/absent-llm"
+reports = getattr(importer, "_ollama_reports", None)
+if reports:                                              # real /api/tags; tag defaults to latest
+    out["tags_have_embed"], out["ns_reported"] = reports(name), reports(ns)
+with patch.object(settings, "llm_model", ns):
+    job = run("rename")
+out["e27_status"] = job["status"]
+out["e27_error"] = f"{job['error_code']}: {job['error']}"
+out["e27_collection"] = job["collection"]
+out["e27_note"] = any(ns in n for n in job["notes"])
+out["live_untouched"] = all(p.stat().st_mtime_ns == s for p, s in live_stamps.items())
+print(json.dumps(out))
+ENDPY
+m() { python3 -c "import json,sys;print(json.load(open('/tmp/vfy_models.json'))[sys.argv[1]])" "$1" 2>/dev/null; }
+check_eq "the live embedding model's files match their checksums" "$(m live_intact)" "True"
+check_eq "the temporary copy of the embedding model starts intact" "$(m copy_present)" "True"
+check_eq "E26 a damaged installed embedding model fails the import" "$(m e26_status)" "failed"
+check_eq "E26 ... as MODEL_INTEGRITY_FAILED, not EMBEDDING_MODEL_MISSING" "$(m e26_code)" "MODEL_INTEGRITY_FAILED"
+m e26_message | grep -qi "re-pull"
+check "E26 the message says to restore or re-pull the model" $? "$(m e26_message)"
+check_eq "E26 the damaged model's files are left untouched" "$(m e26_untouched)" "True"
+check_eq "Ollama's /api/tags reports the embedding model by name (tag defaults to latest)" "$(m tags_have_embed)" "True"
+check_eq "a namespaced model Ollama doesn't have is not reported" "$(m ns_reported)" "False"
+check_eq "E27 with a namespaced LLM_MODEL, an import without bundled models completes" "$(m e27_status)" "completed"
+[ "$(m e27_status)" = completed ] || printf '      %s\n' "$(m e27_error)"
+check_eq "E27 the import notes the namespaced model" "$(m e27_note)" "True"
+check_eq "the live model store was only read" "$(m live_untouched)" "True"
+[ -s /tmp/vfy_models.json ] || sed 's/^/      /' /tmp/vfy_models.err | tail -5
+e27c=$(m e27_collection); [ -n "$e27c" ] && [ "$e27c" != "None" ] && [ "$e27c" != "$C" ] && drop_collection "$e27c"
 
 # ── tuning ───────────────────────────────────────────────────────────────────
 api_get "/tune/$C" > /tmp/vfy_tune.json
@@ -9645,7 +11755,8 @@ tjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_tj.json'))['job_id
 wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-chunking a chunks-only collection is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
-api_post "/tune/reembed" "{\"collection\":\"$SRCLESS\",\"chunk_size\":80}" > /tmp/vfy_tj.json
+# Use valid fixed settings so this tests source eligibility, not overlap validation.
+api_post "/tune/reembed" "{\"collection\":\"$SRCLESS\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80}" > /tmp/vfy_tj.json
 tjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_tj.json'))['job_id'])")
 wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-embedding a chunks-only collection with new chunking is refused" \
@@ -9684,10 +11795,254 @@ m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
+# ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  RP="${PREFIX}BatchRecovery"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
+  check "batch faults fail truthfully and retain verified recovery" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_prepare.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose restart api) >/dev/null 2>&1
+  for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+  (cd "$REPO_ROOT" && docker compose exec -T api python - check --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_check.log 2>&1
+  check "recovery survives restart; owned scratch swept, unowned names kept" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_check.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
+  check "recovery acceptance fixtures are removed" $?
+else
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
+bash ./10_validity.sh
+check "retained-session validity acceptance suite" $?
 summary
+```
+
+### scripts/verify/batch_recovery.py
+
+```python
+"""Destructive fault acceptance for a disposable stack, using only Vfy names.
+
+Run prepare in the API container, restart the API, then run check and cleanup.
+No production fault switches are added to the server.
+"""
+import argparse
+import asyncio
+import json
+import re
+import sys
+import tarfile
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, '/app')
+from config import settings
+from services import batch_write, collection_recovery as recovery, goldstandard, importer, ollama_client, packager, sources, tuning, weaviate_client as wc
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+    print('PASS ' + message)
+
+
+def prepare(prefix, state_path):
+    require(not state_path.exists(), 'no previous acceptance state is overwritten')
+    client = wc.get_client()
+    require(not any(name.startswith(prefix) for name in client.collections.list_all()), 'disposable names are unused')
+    vector = asyncio.run(ollama_client.embed('synthetic recovery acceptance text'))
+    rows = [dict(id=str(uuid.uuid4()), properties={'content': f'synthetic chunk {i}',
+            'source_file': 'synthetic.txt', 'chunk_index': i, 'created_at': '2026-09-27T00:00:00Z'}, vector=vector)
+            for i in range(2)]
+    state = {'prefix': prefix, 'recoveries': [], 'names': [], 'archives': []}
+    state_path.write_text(json.dumps(state))
+
+    def save():
+        state_path.write_text(json.dumps(state, indent=2, default=lambda value: value.isoformat()))
+
+    def collection(suffix):
+        name = prefix + suffix
+        state['names'].append(name)
+        save()
+        wc._create_collection_sync(name, 'hnsw', 'cosine', {})
+        batch_write.insert(client.collections.get(name), rows)
+        return name
+
+    rejected = collection('Reject')
+    col = client.collections.get(rejected)
+    invalid = [{**row, 'id': str(uuid.uuid4()), 'properties': {**row['properties'], 'chunk_index': 'not an integer'}} for row in rows]
+    invalid[1]['properties'] = dict(rows[1]['properties'])
+    try:
+        batch_write.insert(col, invalid, exact=False)
+    except RuntimeError:
+        require(bool(col.batch.failed_objects), 'real completed batch rejection is reported')
+        stored_ids = {str(obj.uuid) for obj in col.iterator()}
+        require(invalid[0]['id'] not in stored_ids and invalid[1]['id'] in stored_ids,
+                'real partial acceptance still fails the batch')
+    else:
+        raise AssertionError('real invalid batch reported success')
+
+    before_attempt = list(packager.read_chunks(rejected))
+    original_fetch = col.query.fetch_objects
+    def fail_verification_read(*args, **kwargs):
+        if kwargs.get('include_vector'):
+            raise OSError('controlled post-write read fault')
+        return original_fetch(*args, **kwargs)
+    with patch.object(col.query, 'fetch_objects', side_effect=fail_verification_read):
+        try:
+            batch_write.insert(col, lambda: ({'properties': row['properties']} for row in rows),
+                               exact=False, cleanup_owned=True)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('post-write read fault reported success')
+    require(batch_write.verify(col, before_attempt, exact=True) == len(before_attempt),
+            'failed ingestion removes only its generated UUIDs and preserves prior records')
+
+    def remember(name, detail):
+        record_path = next(p for p in recovery._root().glob('*.json')
+                           if json.loads(p.read_text()).get('staging') == detail['recovered_as'])
+        record = json.loads(record_path.read_text())
+        expected = list(packager.read_chunks(record['staging']))
+        require(len(expected) == 2, name + ' retains every verified record')
+        state['recoveries'].append({'record': record, 'rows': expected})
+        save()
+
+    tune_name = collection('Tune')
+    sources.store(tune_name, 'synthetic.txt', b'synthetic retained source')
+    real_create = wc._create_collection_sync
+    def fail_create(name, *args, **kwargs):
+        if name == tune_name:
+            raise RuntimeError('controlled final-create fault')
+        return real_create(name, *args, **kwargs)
+    with patch.object(wc, '_create_collection_sync', side_effect=fail_create):
+        try:
+            tuning._rebuild(tune_name, [row['properties'] for row in rows], None, None, None)
+        except packager.PackageError as exc:
+            remember('tuning', exc.detail)
+        else:
+            raise AssertionError('tuning final-create fault reported success')
+
+    import_name = collection('Import')
+    package = Path(settings.upload_dir) / (prefix + '-package')
+    package.mkdir()
+    (package / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    (package / 'collection.json').write_text('{}')
+    source_dir = package / 'sources'
+    source_dir.mkdir()
+    (source_dir / 'synthetic-source').write_bytes(b'synthetic imported source')
+    manifest = {'package_format': 1, 'collection': {'name': import_name, 'chunk_count': 2},
+                'embedding': {'model': settings.embed_model, 'dimensions': len(vector)},
+                'fidelity': 'with-sources', 'files': {str(p.relative_to(package)): 'sha256:' + packager.sha256_file(p)
+                    for p in package.rglob('*') if p.is_file()}}
+    (package / 'manifest.json').write_text(json.dumps(manifest))
+    archive = packager.exports_dir() / (prefix + '-fixture.tar.gz')
+    state['archives'].append(str(archive))
+    save()
+    with tarfile.open(archive, 'w:gz') as tar:
+        tar.add(package, arcname='package')
+    def fail_import_create(name, *args, **kwargs):
+        if name == import_name:
+            raise RuntimeError('controlled final-create fault')
+        return real_create(name, *args, **kwargs)
+    importer._jobs['live-acceptance'] = {'chunks_written': 0}
+    with patch.object(wc, '_create_collection_sync', side_effect=fail_import_create):
+        importer._run('live-acceptance', archive.name, 'replace')
+    job = importer._jobs['live-acceptance']
+    require(job['status'] == 'failed' and job['chunks_written'] == 0, 'replace failure reports zero confirmed target writes')
+    remember('replace import', job['error_detail'])
+
+    cleanup_record = recovery.begin(prefix + 'Cleanup', 'tune', client)
+    wc._create_collection_sync(cleanup_record['staging'], 'hnsw', 'cosine', {})
+    recovery.retain(cleanup_record)
+    metadata = recovery._root() / cleanup_record['operation_id']
+    actual_rmtree = recovery.shutil.rmtree
+    def fail_metadata_cleanup(path, *args, **kwargs):
+        if Path(path) == metadata:
+            raise OSError('controlled metadata cleanup fault')
+        return actual_rmtree(path, *args, **kwargs)
+    with patch.object(recovery.shutil, 'rmtree', side_effect=fail_metadata_cleanup):
+        try:
+            recovery.discard(cleanup_record, client)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('cleanup fault was not observed')
+    require(cleanup_record['state'] == 'cleanup' and not client.collections.exists(cleanup_record['staging']),
+            'cleanup intent survives filesystem failure after backend deletion')
+    state['cleanup_record'] = cleanup_record
+    save()
+
+    unrelated = collection('__tuning_user_data')
+    state['unrelated'] = unrelated
+    scratch = recovery.begin(prefix + 'Scratch', 'tune', client)
+    wc._create_collection_sync(scratch['staging'], 'hnsw', 'cosine', {})
+    state['scratch'] = scratch['staging']
+    save()
+    print('READY restart the API before check')
+
+
+def check(state):
+    client = wc.get_client()
+    for entry in state['recoveries']:
+        record = entry['record']
+        require(client.collections.exists(record['staging']), 'recovery survives API restart: ' + record['operation'])
+        require(batch_write.verify(client.collections.get(record['staging']), entry['rows'], exact=True) == 2,
+                'recovery UUIDs, properties and vectors match: ' + record['operation'])
+        source_dir = sources.collection_dir(record['staging'])
+        require(source_dir.is_dir() and any(source_dir.iterdir()), 'recovery sources survive: ' + record['operation'])
+        require((recovery._root() / (record['operation_id'] + '.json')).is_file(), 'recovery ownership survives: ' + record['operation'])
+    require(client.collections.exists(state['unrelated']), 'unowned marker-like collection survives restart')
+    require(not client.collections.exists(state['scratch']), 'positively owned scratch is removed at startup')
+    cleanup_record = state['cleanup_record']
+    require(not (recovery._root() / (cleanup_record['operation_id'] + '.json')).exists(),
+            'startup finishes interrupted recovery journal cleanup')
+    require(not (recovery._root() / cleanup_record['operation_id']).exists(),
+            'startup removes remaining cleanup metadata')
+
+
+def cleanup(state, state_path):
+    client = wc.get_client()
+    for entry in state['recoveries']:
+        recovery.discard(entry['record'], client)
+    for name in state['names'] + [state.get('scratch', '')]:
+        if name and client.collections.exists(name):
+            wc._delete_collection_sync(name)
+        elif name:
+            sources.delete(name)
+            wc.ingest_config.delete(name)
+            wc.retrieval_config.delete(name)
+    for archive in state['archives']:
+        Path(archive).unlink(missing_ok=True)
+    import shutil
+    shutil.rmtree(Path(settings.upload_dir) / (state['prefix'] + '-package'), ignore_errors=True)
+    state_path.unlink()
+    print('PASS disposable recovery fixtures removed')
+
+
+if __name__ == '__main__':
+    args = argparse.ArgumentParser()
+    args.add_argument('phase', choices=('prepare', 'check', 'cleanup'))
+    args.add_argument('--prefix', default='VfyBatchRecovery')
+    options = args.parse_args()
+    if not re.fullmatch(r'Vfy[A-Za-z0-9_]+', options.prefix):
+        args.error('prefix must be a safe Vfy collection prefix')
+    state_path = Path(settings.upload_dir) / (options.prefix + '-acceptance.json')
+    try:
+        if options.phase == 'prepare':
+            prepare(options.prefix, state_path)
+        elif options.phase == 'check':
+            check(json.loads(state_path.read_text()))
+        else:
+            cleanup(json.loads(state_path.read_text()), state_path)
+    finally:
+        wc.close_client()
 ```
 
 ### scripts/verify/06_ui.sh
@@ -9729,6 +12084,146 @@ rc=$?
 drop_collection "$C"
 cleanup_prefixed
 exit $rc
+```
+
+### scripts/verify/session_validity.py
+
+```python
+"""Real backend/session marking and in-process HTTP validity/export acceptance.
+
+Run inside a disposable API: python - < scripts/verify/session_validity.py
+Uses a unique real collection, synthetic pairs and temporary local files. No
+startup sweep or model calls. Only its own collection/session/files are removed.
+"""
+import copy
+import os
+import tempfile
+import uuid
+from unittest.mock import patch
+from fastapi.testclient import TestClient
+from config import settings
+from main import app
+from services import goldstandard as gs, weaviate_client as wc, tuning
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Validity'+uuid.uuid4().hex[:12]
+session_id='gs_'+uuid.uuid4().hex[:8]
+client=TestClient(app)  # Do not run global startup sweeps alongside other tests.
+creation_attempted=False
+with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.object(settings,'upload_dir',directory):
+    try:
+        creation_attempted=True
+        response=client.post('/collections',json={'name':collection})
+        assert response.status_code==201,response.text
+        print('PASS unique real backend collection created',flush=True)
+        pairs=[{'pair_id':'validity_pair','question':'Inert question','answer':'Inert answer',
+            'contexts':['Inert retained context'],'ground_truth':'Inert truth','source_file':'inert.txt',
+            'chunk_index':0,'status':'approved'}]
+        session={'session_id':session_id,'collection':collection,'status':'completed',
+            'pairs_total':1,'pairs_completed':1,'pairs':pairs}
+        gs.store_session(session)
+        response=client.get('/goldstandard/session/'+session_id)
+        assert response.status_code==200,response.text
+        assert not response.json()['stale'] and not response.json()['orphaned']
+        assert response.json()['pairs']==pairs
+        print('PASS legacy defaults and retained pairs reach HTTP response',flush=True)
+        for option in ({},{'allow_historical':False},{'allow_historical':True}):
+            response=client.post('/goldstandard/save',json={'session_id':session_id,'filename':'current.json',**option})
+            assert response.status_code==200 and not response.json()['historical'],response.text
+        print('PASS current/legacy export keeps default and explicit choices',flush=True)
+        for value in (1,0,'true','false',None,[],{}):
+            response=client.post('/goldstandard/save',json={'session_id':session_id,'allow_historical':value})
+            assert response.status_code==422,response.text
+        for value in ('NaN','Infinity','-Infinity'):
+            response=client.post('/goldstandard/save',content='{"session_id":"'+session_id+'","allow_historical":'+value+'}',headers={'Content-Type':'application/json'})
+            assert response.status_code==422 and response.json()['error']['code']=='INVALID_PARAMETER',response.text
+        print('PASS live HTTP choices reject bool coercion and nonfinite inputs',flush=True)
+        assert client.get('/goldstandard/session/gs_00000000').status_code==404
+        assert client.post('/goldstandard/save',json={'session_id':'gs_00000000','allow_historical':True}).status_code==404
+        print('PASS unknown lookup/export remain404',flush=True)
+        assert gs.mark_stale(collection,'Synthetic chunk-identity change')==1
+        response=client.get('/goldstandard/session/'+session_id)
+        assert response.json()['stale'] and response.json()['stale_reason']=='Synthetic chunk-identity change'
+        assert response.json()['stale_at']
+        print('PASS real persistence marker reason/timestamp reach HTTP response',flush=True)
+        response=client.post('/goldstandard/save',json={'session_id':session_id})
+        assert response.status_code==409 and response.json()['error']['code']=='HISTORICAL_SESSION',response.text
+        print('PASS stale export is refused without explicit choice',flush=True)
+        empty_id='gs_'+uuid.uuid4().hex[:8]
+        empty={**session,'session_id':empty_id,'pairs':[],'pairs_total':0,'pairs_completed':0,
+               'stale':True,'stale_reason':'Synthetic empty historical fixture','stale_at':gs.get_session(session_id)['stale_at']}
+        gs.store_session(empty)
+        response=client.get('/goldstandard/session/'+empty_id)
+        assert response.status_code==200 and response.json()['stale'] and response.json()['pairs']==[],response.text
+        print('PASS empty retained history carries warning metadata through HTTP',flush=True)
+        response=client.delete('/collections/'+collection+'?confirm=true')
+        assert response.status_code==200,response.text
+        creation_attempted=False
+        response=client.get('/goldstandard/session/'+session_id)
+        historical=response.json()
+        assert response.status_code==200 and historical['orphaned'] and historical['orphaned_reason'] and historical['orphaned_at']
+        assert historical['stale'] and historical['pairs']==pairs
+        refused=client.post('/goldstandard/save',json={'session_id':session_id,'allow_historical':False})
+        assert refused.status_code==409 and refused.json()['error']['code']=='HISTORICAL_SESSION',refused.text
+        print('PASS actual collection deletion forwards orphan warning without deleting history',flush=True)
+        before=copy.deepcopy(gs.get_session(session_id))
+        response=client.post('/goldstandard/save',json={'session_id':session_id,'allow_historical':True,'filename':'historical.json'})
+        assert response.status_code==200,response.text
+        exported=response.json()
+        assert exported['historical'] and exported['session_validity']['stale'] and exported['session_validity']['orphaned']
+        download=client.get('/goldstandard/download/'+exported['filename'])
+        assert download.status_code==200,download.text
+        rows=download.json()
+        assert len(rows)==1 and set(rows[0])=={'question','answer','contexts','ground_truth'}
+        assert gs.get_session(session_id)==before
+        print('PASS explicit historical export retains RAGAS fields and original history',flush=True)
+        # Exercise the real destructive boundary with supplied vectors and an
+        # injected final-create fault. No model contact or global fixture sweep.
+        response=client.post('/collections',json={'name':collection})
+        assert response.status_code==201,response.text
+        creation_attempted=True
+        fault_id='gs_'+uuid.uuid4().hex[:8]
+        gs.store_session({'session_id':fault_id,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':copy.deepcopy(pairs)})
+        assert not client.get('/goldstandard/session/'+fault_id).json()['stale']
+        real_create=wc._create_collection_sync
+        def fail_final_create(name,*args,**kwargs):
+            if name==collection:
+                assert not wc._collection_exists_sync(collection)
+                raise RuntimeError('Owned synthetic final-create fault')
+            return real_create(name,*args,**kwargs)
+        def insert_supplied(name,properties):
+            target=wc.get_client().collections.get(name)
+            for properties_row in properties:
+                target.data.insert(properties=properties_row,vector=[0.125]*768)
+        with patch.object(wc,'_create_collection_sync',side_effect=fail_final_create), patch.object(wc,'_insert_chunks_sync',side_effect=insert_supplied):
+            try:
+                tuning._rebuild(collection,[{'content':'Owned inert chunk','source_file':'inert.txt','chunk_index':0}],None,None,None)
+                raise AssertionError('Expected final-create fault')
+            except Exception as error:  # Recovery-enabled rebuilds wrap this fault.
+                assert 'Owned synthetic final-create fault' in str(error),str(error)
+        fault=client.get('/goldstandard/session/'+fault_id)
+        assert fault.status_code==200 and fault.json()['stale'] and fault.json()['stale_at'],fault.text
+        assert 'cutover' in fault.json()['stale_reason']
+        refused=client.post('/goldstandard/save',json={'session_id':fault_id})
+        assert refused.status_code==409 and refused.json()['error']['code']=='HISTORICAL_SESSION',refused.text
+        print('PASS actual failed reindex cutover marks retained history and blocks default export',flush=True)
+        creation_attempted=False
+
+    finally:
+        if creation_attempted and wc._collection_exists_sync(collection):
+            response=client.delete('/collections/'+collection+'?confirm=true')
+            assert response.status_code==200,response.text
+        # Recovery-enabled source combinations may retain a verified stage.
+        # Only this helper's unique collection prefix authorizes its cleanup.
+        for name in wc.get_client().collections.list_all(simple=True):
+            if name.startswith(collection+'__'):
+                wc.get_client().collections.delete(name)
+        gs._sessions.pop(session_id,None)
+        if 'empty_id' in locals():gs._sessions.pop(empty_id,None)
+        if 'fault_id' in locals():gs._sessions.pop(fault_id,None)
+        wc.close_client()
+assert not wc._collection_exists_sync(collection)
+wc.close_client()
+print('PASS owned collection/session/files removed',flush=True)
 ```
 
 ### scripts/verify/browser/Dockerfile
@@ -9862,6 +12357,56 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── owned historical UI fixtures (no persistent backend state) ────────────
+  r.section('retained-session UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const suffix = require('crypto').randomBytes(4).toString('hex');
+    const emptyId = 'gs_' + suffix, currentId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const missingId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const common = { collection: 'OwnedHistoricalBrowserFixture', status: 'completed', pairs_total: 0, pairs_completed: 0, pairs: [] };
+    let exports = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/goldstandard/session/' + emptyId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: emptyId, stale: true, stale_reason: 'Synthetic empty history', stale_at: '2026-09-28T00:00:00+00:00', orphaned: true, orphaned_reason: 'Synthetic deleted fixture', orphaned_at: '2026-09-28T00:01:00+00:00' }) });
+      }
+      if (path === '/api/goldstandard/session/' + currentId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: currentId, pairs_total: 1, pairs_completed: 1, pairs: [{ pair_id: 'fixture', question: 'Owned synthetic question', answer: 'Inert', contexts: ['Inert'], ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: 0, status: 'approved' }] }) });
+      }
+      if (path === '/api/goldstandard/session/' + missingId) {
+        return request.respond({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SESSION_NOT_FOUND', message: 'Unknown fixture session.' } }) });
+      }
+      if (path === '/api/goldstandard/save') {
+        exports++; await sleep(500);
+        return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Synthetic export failure.' } }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/goldstandard', { waitUntil: 'networkidle2' });
+      async function load(id) {
+        await s.page.evaluate(value => { const input = document.getElementById('retained-session'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value); input.dispatchEvent(new Event('input', { bubbles: true })); }, id);
+        await sleep(100); await clickByText(s.page, 'Load / refresh session'); await sleep(200);
+      }
+      await load(emptyId);
+      const empty = await bodyText(s.page);
+      r.check('empty historical session keeps stale/orphaned reasons and timestamps visible', /Historical evaluation data/.test(empty) && /Synthetic empty history/.test(empty) && /Synthetic deleted fixture/.test(empty) && /2026-09-28T00:00/.test(empty));
+      r.check('empty historical session has no pair-dependent export button', await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b => /Export.*Approved/.test(b.textContent))));
+      await load(currentId);
+      r.check('legacy current fixture remains exportable without warning', await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && !document.querySelector('[role=alert]'); }));
+      await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); b.click(); b.click(); });
+      await sleep(100);
+      r.check('an export in flight indicates progress and is disabled', await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Exporting…'); return b && b.disabled; }));
+      await sleep(700);
+      r.check('duplicate clicks issue one export and failure clears pending state', exports===1 && await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && document.body.innerText.includes('Synthetic export failure.'); }));
+      await load(missingId);
+      r.check('a failed retained lookup clears prior pairs and export controls', /Unknown fixture session/.test(await bodyText(s.page)) && await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b=>/Export.*Approved/.test(b.textContent)) && !document.body.innerText.includes('Owned synthetic question')));
+      r.check('historical UI fixtures cause no React page errors', !s.errors.some(error=>error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); } // All synthetic responses/context owned here.
+  }
+
   // ── role gating ────────────────────────────────────────────────────────────
   r.section('§10.4 role gating');
   {
@@ -9910,6 +12455,74 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
             options.length > 1 && new Set(seen).size === options.length, `${new Set(seen).size} distinct`);
     r.check('no page reload occurs', reloads === 0, `${reloads} navigations`);
     await s.ctx.close();
+  }
+
+  // ── owned retrieval HTTP fixtures; no backend writes/model calls ───────────
+  r.section('effective retrieval UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedRetrievalBrowserFixture';
+    const row = { name, object_count: 10, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 72, efConstruction: 160, maxConnections: 32 } };
+    let lists = 0, failRefresh = false;
+    const saves = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        lists++;
+        return request.respond({ status: lists === 1 || failRefresh ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lists === 1 || failRefresh ? { error: { message: 'Synthetic index read failure.' } } : { collections: [row] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.25, ef: 96, response_format: 'engineer', is_default: false }) });
+      }
+      if (path === '/api/retrieval/config' && request.method() === 'POST') {
+        const body = JSON.parse(request.postData()); saves.push(body);
+        return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ ...body, is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
+      r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      await clickByText(s.page, 'Refresh index details'); await sleep(500);
+      const refreshed = await bodyText(s.page);
+      r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
+      r.check('three query methods replace inactive build controls and show legacy ef warning', await s.page.evaluate(() => document.querySelectorAll('input[name=mode]').length === 3 && document.querySelectorAll('input[type=range]').length === 1 && document.querySelector('input[value=hnsw]').checked && document.body.innerText.includes('legacy saved ef override (96) is inactive')));
+      for (const limit of [1, 50]) {
+        await s.page.evaluate(value => { const input = document.querySelector('input[type=range]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(value)); input.dispatchEvent(new Event('input', { bubbles: true })); }, limit);
+        await sleep(100); await clickByText(s.page, 'Save for this collection'); await sleep(300);
+        r.check('Top-K ' + limit + ' is selected and sent when saving', saves.at(-1)?.top_k === limit && (await bodyText(s.page)).includes('Top-K Results: ' + limit));
+      }
+      r.check('saving normalizes legacy vector alias and clears inactive ef without changing observed index', saves.length === 2 && saves.every(save => save.retrieval_mode === 'hnsw' && save.ef === null) && /ef: 72/.test(await bodyText(s.page)));
+      failRefresh = true;
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      r.check('failed refresh keeps prior physical details with an explicit warning', /displayed details are from the prior read/.test(await bodyText(s.page)) && /ef: 72/.test(await bodyText(s.page)));
+      r.check('retrieval fixture causes no React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+  for (const lateFailure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    let initial, count = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/collections') {
+        count++;
+        if (count === 1) { initial = request; return; }
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 191, efConstruction: 170, maxConnections: 40 } }] }) });
+      }
+      if (new URL(request.url()).pathname.startsWith('/api/retrieval/config/')) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: 'OwnedLatestIndexFixture', retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
+      if (!initial) throw new Error('Initial metadata request was not observed');
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      const freshVisible = /ef: 191/.test(await bodyText(s.page));
+      await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
+      await sleep(300);
+      const after = await bodyText(s.page);
+      r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
   }
 
   // ── delete confirmation ────────────────────────────────────────────────────
@@ -10751,30 +13364,138 @@ if __name__ == '__main__':
     unittest.main()
 ```
 
-### scripts/verify/compose_target.py
+
+### scripts/verify/07_settings.sh
+
+```bash
+#!/usr/bin/env bash
+# Settings validation through the running API; the helper owns its collection.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+require_stack
+section "Settings validation before work"
+RAG_API="$API" python3 ./settings_validation.py
+check "live settings validation and owned-fixture cleanup" $?
+summary
+```
+
+### scripts/verify/settings_validation.py
 
 ```python
-"""Refuse an in-container verifier when RAG_API selects another deployment."""
-import sys
-from urllib.parse import urlsplit
+"""Live HTTP settings acceptance on one disposable, uniquely named collection.
 
-def matches_local_proxy(api, bindings):
+RAG_API=http://127.0.0.1:18080/api python3 scripts/verify/settings_validation.py
+No query/model jobs are launched. Only this script's new collection is deleted.
+"""
+import json
+import os
+import uuid
+import urllib.error
+import urllib.request
+
+api = os.environ.get('RAG_API', 'http://localhost:8080/api').rstrip('/')
+collection = 'VfySettings' + uuid.uuid4().hex[:12]
+
+
+def request(path, body=None, method=None, raw=None, content_type='application/json'):
+    data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+    req = urllib.request.Request(api + path, data=data, method=method,
+                                 headers={'Content-Type': content_type})
     try:
-        url=urlsplit(api)
-        if url.scheme!='http' or url.hostname not in ('localhost','127.0.0.1','::1') or url.username or url.password or url.path.rstrip('/')!='/api' or url.query or url.fragment:
-            return False
-        port=url.port or 80
-        for binding in bindings.splitlines():
-            host, published=binding.rsplit(':',1)
-            host=host.strip('[]')
-            if int(published)!=port:continue
-            if host in ('0.0.0.0','::') or host==url.hostname or (host=='127.0.0.1' and url.hostname=='localhost'):
-                return True
-        return False
-    except (ValueError,TypeError):return False
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as response:
+        return response.code, json.load(response)
 
-if __name__=='__main__':
-    if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
-        print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
-        sys.exit(2)
+
+def expect(path, body, code):
+    status, result = request(path, body)
+    assert status == code, (path, status, result)
+    return result
+
+
+def names():
+    status, result = request('/collections')
+    assert status == 200, result
+    return {entry['name'] for entry in result['collections']}
+
+
+before = names()
+assert collection not in before
+expect('/collections', {'name': collection, 'index_type': 'invalid'}, 422)
+assert names() == before
+print('PASS invalid collection settings do not create a collection', flush=True)
+created = False
+try:
+    expect('/collections', {'name': collection}, 201)
+    created = True
+    print('PASS omitted collection settings preserve valid defaults', flush=True)
+
+    ingest = {'collection': collection, 'chunking_strategy': 'fixed', 'chunk_size': 150, 'min_chunk_size': 40}
+    retrieval = {'collection': collection, 'retrieval_mode': 'hybrid', 'top_k': 50, 'alpha': 1, 'ef': 512, 'response_format': 'engineer'}
+    expect('/ingest/config', ingest, 201)
+    expect('/retrieval/config', retrieval, 201)
+    _, saved_ingest = request('/ingest/config/' + collection)
+    _, saved_retrieval = request('/retrieval/config/' + collection)
+    assert saved_ingest['chunk_size'] == 150 and saved_ingest['chunk_overlap'] == 200
+    assert saved_retrieval['top_k'] == 50 and saved_retrieval['ef'] == 512
+    print('PASS valid saved settings round trip, including unused default overlap', flush=True)
+
+    for route, good, bad in (('/ingest/config', ingest, {'chunking_strategy': 'invalid'}),
+                             ('/ingest/config', ingest, {'chunk_size': 0}),
+                             ('/retrieval/config', retrieval, {'top_k': 0}),
+                             ('/retrieval/config', retrieval, {'alpha': 1.1})):
+        expect(route, {**good, **bad}, 422)
+    assert request('/ingest/config/' + collection)[1] == saved_ingest
+    assert request('/retrieval/config/' + collection)[1] == saved_retrieval
+    print('PASS rejected saved settings preserve prior configuration', flush=True)
+
+    expect('/ingest/config', {'collection': collection, 'chunking_strategy': 'fixed',
+                              'chunk_size': 60, 'min_chunk_size': 100}, 201)
+    status, minimum = request('/ingest/config/' + collection)
+    assert status == 200 and minimum['chunk_size'] == 60 and minimum['min_chunk_size'] == 100
+    print('PASS fixed minimum above split target saves and round trips', flush=True)
+
+    expect('/ingest/config', {'collection': collection, 'chunking_strategy':'fixed',
+                              'chunk_size':50, 'min_chunk_size':0}, 201)
+    status, smallest = request('/ingest/config/' + collection)
+    assert status == 200 and smallest['chunk_size'] == 50 and smallest['min_chunk_size'] == 0
+    for bad in ({'chunk_size':49}, {'chunk_size':6001}, {'min_chunk_size':6001}):
+        expect('/ingest/config', {'collection':collection,'chunking_strategy':'fixed','chunk_size':50, **bad},422)
+    assert request('/ingest/config/' + collection)[1] == smallest
+    expect('/ingest/config', {'collection': collection, 'chunking_strategy':'fixed',
+                              'chunk_size':6000, 'min_chunk_size':6000}, 201)
+    status, largest = request('/ingest/config/' + collection)
+    assert status == 200 and largest['chunk_size'] == 6000 and largest['min_chunk_size'] == 6000
+    print('PASS chunk bounds (50-6000, minimum 0-6000) accept both edges, reject their neighbours and preserve settings',flush=True)
+
+    for path, bad in (('/query', {'question': 'inert', 'retrieval_mode': 'invalid'}),
+                      ('/query', {'question': 'inert', 'response_format': 'invalid'}),
+                      ('/query', {'question': 'inert', 'top_k': True}),
+                      ('/tune/rechunk', {'chunk_overlap': 1000}),
+                      ('/tune/reembed', {'chunk_size': 0}),
+                      ('/tune/reindex', {'distance_metric': 'invalid'})):
+        expect(path, {'collection': collection, **bad}, 422)
+    print('PASS invalid query and tuning settings return 422', flush=True)
+
+    raw = ('{"collection":"' + collection + '","question":"inert","alpha":NaN}').encode()
+    assert request('/query', raw=raw)[0] == 422
+    print('PASS non-finite input has a serializable 422 response', flush=True)
+
+    boundary = 'ReviewSettingsBoundary'
+    form = (f'--{boundary}\r\nContent-Disposition: form-data; name="collection"\r\n\r\n{collection}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="chunk_size"\r\n\r\n0\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="inert.txt"\r\n'
+            f'Content-Type: text/plain\r\n\r\nInert review text.\r\n--{boundary}--\r\n').encode()
+    assert request('/ingest/upload', raw=form, content_type='multipart/form-data; boundary=' + boundary)[0] == 422
+    status, current = request('/collections')
+    assert status == 200
+    assert next(c for c in current['collections'] if c['name'] == collection)['object_count'] == 0
+    print('PASS invalid multipart settings leave the collection empty', flush=True)
+finally:
+    if created:
+        status, result = request('/collections/' + collection + '?confirm=true', method='DELETE')
+        assert status == 200, result
+assert collection not in names()
+print('PASS owned disposable collection removed', flush=True)
 ```

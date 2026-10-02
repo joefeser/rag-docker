@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
+from models.schemas import SessionResponse
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 
@@ -46,10 +47,34 @@ _state_lock = threading.RLock()
 _diagnostics: dict[str, dict] = {}
 _scan_lock = threading.Lock()
 _store_revision = 0
+_SESSION_ID = re.compile(r"gs_[0-9a-f]{8}")
+
+
+def validate_session_id(session_id: str) -> None:
+    """Imported identities use the same grammar as locally generated ones."""
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        raise ValueError("Invalid evaluation session ID.")
+
+
+def validate_session(session: dict) -> None:
+    """Validate without normalising or dropping historical validity metadata."""
+    SessionResponse.model_validate(session, strict=True)
+    validate_session_id(session["session_id"])
+
+
+def _session_storage_root() -> Path:
+    upload = Path(settings.upload_dir).resolve()
+    p = upload / "goldstandard_sessions"
+    if p.is_symlink() or (p.exists() and not p.is_dir()):
+        raise ValueError("Evaluation session storage is not a regular directory.")
+    root = p.resolve()
+    if root.parent != upload:
+        raise ValueError("Evaluation session storage is outside the upload directory.")
+    return root
 
 
 def _sessions_dir() -> Path:
-    p = Path(settings.upload_dir) / "goldstandard_sessions"
+    p = _session_storage_root()
     created = not p.exists()
     p.mkdir(parents=True, exist_ok=True)
     if created:
@@ -58,7 +83,19 @@ def _sessions_dir() -> Path:
 
 
 def _session_path(session_id: str) -> Path:
-    return _sessions_dir() / f"{session_id}.json"
+    validate_session_id(session_id)
+    # Preflight must be read-only; the writer creates the directory only after
+    # every imported session has been checked.
+    root = _session_storage_root()
+    candidate = root / f"{session_id}.json"
+    if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+        raise ValueError("Evaluation session destination is not a regular file.")
+    target = candidate.resolve()
+    # Grammar prevents metadata-derived paths; containment also refuses an
+    # existing file symlink which would redirect a valid identity's write.
+    if target.parent != root:
+        raise ValueError("Evaluation session destination is outside session storage.")
+    return target
 
 
 def _record_issue(path: Path, code: str) -> None:
@@ -95,6 +132,7 @@ def _save_session_sync(session: dict) -> None:
         snapshot = copy.deepcopy(session)
         try:
             path = _session_path(snapshot["session_id"])
+            _sessions_dir()
         except OSError as exc:
             _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (str(snapshot["session_id"]) + ".json"), "SESSION_WRITE_FAILED")
             raise GoldStandardError("SESSION_WRITE_FAILED", "Session directory could not be prepared. The previous snapshot is unchanged.", 503) from exc
@@ -142,10 +180,10 @@ def _scan_sessions() -> None:
         with _state_lock:
             revision = _store_revision
         storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
-        root = storage_label
         loaded = {}
         issues = {}
         try:
+            root = _session_storage_root()
             with os.scandir(root) as entries:
                 paths = [Path(entry.path) for entry in entries]
         except FileNotFoundError:
@@ -160,11 +198,12 @@ def _scan_sessions() -> None:
                 issues[path] = "SESSION_INTERRUPTED_WRITE"
             elif path.name.endswith(".json"):
                 try:
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError("Evaluation session must be a regular file.")
                     data = json.loads(path.read_text())
-                    if not isinstance(data, dict) or data.get("session_id") != path.stem or not isinstance(data.get("pairs"), list) or not all(isinstance(pair, dict) for pair in data["pairs"]):
-                        raise ValueError("Invalid retained session structure")
-                    from models.schemas import SessionResponse
-                    SessionResponse.model_validate(data)
+                    validate_session(data)
+                    if path != _session_path(data["session_id"]):
+                        raise ValueError("Evaluation session filename does not match its identity.")
                     loaded[data["session_id"]] = data
                     retained_error = data.get("persistence_error")
                     if isinstance(retained_error, dict) and retained_error.get("code") in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
@@ -195,6 +234,30 @@ def load_sessions_from_disk() -> None:
     _scan_sessions()
 
 
+def _sessions_on_disk() -> list[dict]:
+    """Return detached, validated files for export without changing the cache."""
+    try:
+        paths = sorted(_session_storage_root().glob("*.json"))
+    except (OSError, ValueError, RuntimeError):
+        log.exception("Cannot read evaluation session storage; existing files are unchanged")
+        return []
+    sessions = []
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("Evaluation session must be a regular file.")
+            data = json.loads(path.read_text())
+            validate_session(data)
+            if path != _session_path(data["session_id"]):
+                raise ValueError("Evaluation session filename does not match its identity.")
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warning("Skipping invalid evaluation session %s; file is unchanged (%s)",
+                        path.name, type(exc).__name__)
+            continue
+        sessions.append(data)
+    return sessions
+
+
 def session_diagnostics() -> list[dict]:
     _scan_sessions()
     with _state_lock:
@@ -210,10 +273,13 @@ def sessions_for(collection: str) -> list[dict]:
                 continue
             try:
                 from models.schemas import SessionResponse
-                SessionResponse.model_validate(session)
+                validate_session(session)
                 if sid != session.get("session_id"):
                     raise ValueError("Cached session key does not match identity")
-            except (ValueError, TypeError):
+                _session_path(sid)
+            except (OSError, ValueError, RuntimeError) as exc:
+                log.warning("Skipping invalid cached evaluation session %s (%s)",
+                            sid, type(exc).__name__)
                 _record_issue(Path(str(sid) + ".json"), "SESSION_READ_FAILED")
                 continue
             found.append(session)
@@ -222,6 +288,7 @@ def sessions_for(collection: str) -> list[dict]:
 
 def store_session(session: dict) -> None:
     """Explicit whole-session storage; publishes cache only after replacement."""
+    validate_session(session)
     _save_session_sync(session)
 
 
@@ -249,7 +316,7 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
         try:
             _update_session_sync(session["session_id"], change)
             marked += 1
-        except GoldStandardError:
+        except (GoldStandardError, OSError, ValueError, RuntimeError):
             # The primary collection mutation already happened. Preserve the
             # failed-write diagnostic and continue other markers; never turn a
             # completed delete/rebuild into a fictitious primary failure.
@@ -346,12 +413,12 @@ async def _generate_pair(chunk: dict) -> dict:
 
     return {
         "pair_id": f"p_{uuid.uuid4().hex[:8]}",
-        "question": data.get("question", ""),
-        "answer": data.get("answer", ""),
+        "question": str(data.get("question", "")),
+        "answer": str(data.get("answer", "")),
         "contexts": [chunk["content"]],
-        "ground_truth": data.get("ground_truth", data.get("answer", "")),
+        "ground_truth": str(data.get("ground_truth", data.get("answer", ""))),
         "source_file": chunk.get("source_file", ""),
-        "chunk_index": chunk.get("chunk_index", 0),
+        "chunk_index": int(chunk.get("chunk_index", 0)),
         "status": "pending",
     }
 
@@ -421,7 +488,9 @@ async def start_generation(
     sample_size: int,
     seed: int | None,
 ) -> dict:
-    all_chunks = await wc.sample_chunks(collection, limit=sample_size)
+    from models.schemas import GenerateRequest
+    request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
+    all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
     actual_size = len(all_chunks)
 
     session_id = f"gs_{uuid.uuid4().hex[:8]}"
@@ -522,10 +591,22 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     out_path.write_text(json.dumps(ragas, indent=2))
 
 
-async def save_session(session_id: str, filename: str | None) -> dict | None:
+async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
         return None
+
+    from models.schemas import SessionValidity
+    if not isinstance(allow_historical, bool):
+        raise ValueError("allow_historical must be a boolean")
+    validity = SessionValidity.model_validate(session).model_dump()
+    historical = validity["stale"] or validity["orphaned"]
+    if historical and not allow_historical:
+        raise GoldStandardError(
+            "HISTORICAL_SESSION",
+            "This retained session is stale or orphaned and is not a current "
+            "collection baseline. Inspect its validity metadata and explicitly "
+            "set allow_historical=true to export historical pairs.", 409)
 
     approved = [p for p in session["pairs"] if p["status"] in ("approved", "edited")]
     excluded = len(session["pairs"]) - len(approved)
@@ -560,4 +641,6 @@ async def save_session(session_id: str, filename: str | None) -> dict | None:
         "pairs_saved": len(approved),
         "pairs_excluded": excluded,
         "download_url": f"/api/goldstandard/download/{filename}",
+        "historical": historical,
+        "session_validity": validity,
     }
