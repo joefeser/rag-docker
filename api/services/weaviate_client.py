@@ -176,20 +176,36 @@ def _get_collections_sync() -> list[dict]:
         # vector_index_config (weaviate-client 4.x dropped it from the reduced
         # config). Fetch the full per-collection config for the index details.
         vector_config = coll.config.get().vector_index_config
-        index_type = "flat" if "flat" in type(vector_config).__name__.lower() else "hnsw"
+        index_name = type(vector_config).__name__.lower()
+        hnsw_fields = tuple(
+            getattr(vector_config, field, None)
+            for field in ("ef", "ef_construction", "max_connections")
+        )
+        if "flat" in index_name:
+            index_type = "flat"
+        elif "dynamic" in index_name:
+            index_type = "dynamic"
+        elif all(value is not None for value in hnsw_fields):
+            index_type = "hnsw"
+        else:
+            index_type = "unknown"
 
-        distance_attr = getattr(vector_config, "distance_metric", VectorDistances.COSINE)
+        distance_attr = getattr(vector_config, "distance_metric", None)
         distance_str = {
             VectorDistances.COSINE: "cosine",
             VectorDistances.DOT: "dot",
             VectorDistances.L2_SQUARED: "l2-squared",
-        }.get(distance_attr, "cosine")
+        }.get(distance_attr, "unknown")
 
         result.append({
             "name": col_name,
             "object_count": count,
             "index_type": index_type,
             "distance_metric": distance_str,
+            "hnsw_config": ({"ef": hnsw_fields[0],
+                             "efConstruction": hnsw_fields[1],
+                             "maxConnections": hnsw_fields[2]}
+                            if index_type == "hnsw" else None),
         })
     return result
 

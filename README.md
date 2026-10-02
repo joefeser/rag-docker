@@ -134,10 +134,11 @@ Navigate to **Retrieval** to choose a retrieval mode and top-K value for a colle
 
 | Mode | Description |
 |---|---|
-| `hnsw` | Approximate nearest-neighbor — fast, recommended default |
-| `flat` | Exact KNN — slower at scale but perfectly accurate |
-| `hybrid` | BM25 keyword + vector; tune the alpha slider |
-| `semantic` | Pure meaning-based via Weaviate's text2vec-ollama |
+| Vector — existing index | Similarity search using the collection's physical index |
+| Hybrid | BM25 keyword + vector; tune the alpha slider |
+| Semantic | Pure meaning-based via Weaviate's text2vec-ollama |
+
+The API accepts `hnsw` and `flat` as aliases for Vector; selecting either does not change the collection's physical index. Exact KNN requires a collection created with a Flat index.
 
 ### 4. Ask questions
 

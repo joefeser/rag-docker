@@ -686,6 +686,7 @@ class CollectionInfo(BaseModel):
     index_type: str
     distance_metric: str
     created_at: Optional[str]
+    hnsw_config: Optional[dict[str, int]] = None
 
 
 class CollectionsResponse(BaseModel):
@@ -1628,20 +1629,36 @@ def _get_collections_sync() -> list[dict]:
         # vector_index_config (weaviate-client 4.x dropped it from the reduced
         # config). Fetch the full per-collection config for the index details.
         vector_config = coll.config.get().vector_index_config
-        index_type = "flat" if "flat" in type(vector_config).__name__.lower() else "hnsw"
+        index_name = type(vector_config).__name__.lower()
+        hnsw_fields = tuple(
+            getattr(vector_config, field, None)
+            for field in ("ef", "ef_construction", "max_connections")
+        )
+        if "flat" in index_name:
+            index_type = "flat"
+        elif "dynamic" in index_name:
+            index_type = "dynamic"
+        elif all(value is not None for value in hnsw_fields):
+            index_type = "hnsw"
+        else:
+            index_type = "unknown"
 
-        distance_attr = getattr(vector_config, "distance_metric", VectorDistances.COSINE)
+        distance_attr = getattr(vector_config, "distance_metric", None)
         distance_str = {
             VectorDistances.COSINE: "cosine",
             VectorDistances.DOT: "dot",
             VectorDistances.L2_SQUARED: "l2-squared",
-        }.get(distance_attr, "cosine")
+        }.get(distance_attr, "unknown")
 
         result.append({
             "name": col_name,
             "object_count": count,
             "index_type": index_type,
             "distance_metric": distance_str,
+            "hnsw_config": ({"ef": hnsw_fields[0],
+                             "efConstruction": hnsw_fields[1],
+                             "maxConnections": hnsw_fields[2]}
+                            if index_type == "hnsw" else None),
         })
     return result
 
@@ -5162,6 +5179,7 @@ async def list_collections():
             index_type=c["index_type"],
             distance_metric=c["distance_metric"],
             created_at=registry.get(c["name"]),
+            hnsw_config=c.get("hnsw_config"),
         )
         for c in raw
     ]
@@ -6889,6 +6907,7 @@ export const api = {
 // Types
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
+  hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
@@ -7327,7 +7346,7 @@ export default function QAPage() {
         </select>
         {role !== 'end_user' && (
           <select value={config.retrieval_mode} disabled className="border rounded px-3 py-2 text-sm bg-gray-50 text-gray-500">
-            <option value={config.retrieval_mode}>{config.retrieval_mode}</option>
+            <option value={config.retrieval_mode}>{["hnsw", "flat"].includes(config.retrieval_mode) ? "Vector — existing index" : config.retrieval_mode}</option>
           </select>
         )}
       </div>
@@ -7676,14 +7695,13 @@ export default function ChunkingPage() {
 ### ui/src/pages/RetrievalPage.tsx
 
 ```typescript
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, CollectionInfo } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
 
 const MODES = [
-  { id: 'hnsw', label: 'HNSW — Approximate (default)', description: 'The fastest option. Uses a smart graph to find the closest matches quickly. May very rarely miss the single best result, but works well for almost all use cases.' },
-  { id: 'flat', label: 'Flat — Exact', description: 'Checks every stored chunk to find the mathematically perfect match. More accurate but slower as your collection grows. Best for collections under 10,000 chunks.' },
+  { id: 'hnsw', label: 'Vector — existing index', description: 'Finds similar chunks using the physical index already configured for this collection. Choosing this method does not switch between HNSW and Flat.' },
   { id: 'hybrid', label: 'Hybrid', description: 'Combines keyword search with meaning-based search. Best when your questions include specific terms, names, or codes. Adjust the slider to balance between the two modes.' },
   { id: 'semantic', label: 'Semantic', description: 'Pure meaning-based search. Best for conceptual questions where the exact words are less important than the idea.' },
 ]
@@ -7692,20 +7710,24 @@ export default function RetrievalPage() {
   const { role } = useRole()
   const { collection, setCollection, config, isDefault, loading, error, saveConfig } = useQueryConfig()
   const [collections, setCollections] = useState<CollectionInfo[]>([])
-  const [mode, setMode] = useState(config.retrieval_mode)
+  const [mode, setMode] = useState(config.retrieval_mode === 'flat' ? 'hnsw' : config.retrieval_mode)
   const [topK, setTopK] = useState(config.top_k)
   const [alpha, setAlpha] = useState(config.alpha)
-  const [ef, setEf] = useState(config.ef ?? 64)
-  const [efConstruction, setEfConstruction] = useState(128)
-  const [maxConnections, setMaxConnections] = useState(64)
+  const [indexError, setIndexError] = useState('')
+  const [indexLoading, setIndexLoading] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const indexRequest = useRef(0)
 
   useEffect(() => {
+    const ticket = ++indexRequest.current
     api.getCollections().then(r => {
+      if (ticket !== indexRequest.current) return
+      setIndexError('')
       setCollections(r.collections)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch(() => { if (ticket === indexRequest.current) setIndexError('Could not read the current physical index.') })
+    return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -7715,10 +7737,9 @@ export default function RetrievalPage() {
   // the values. `applied` is deliberately not reset here: a save replaces
   // `config`, which would otherwise clear the confirmation immediately.
   useEffect(() => {
-    setMode(config.retrieval_mode)
+    setMode(config.retrieval_mode === 'flat' ? 'hnsw' : config.retrieval_mode)
     setTopK(config.top_k)
     setAlpha(config.alpha)
-    setEf(config.ef ?? 64)
   }, [config])
 
   useEffect(() => {
@@ -7731,7 +7752,7 @@ export default function RetrievalPage() {
       retrieval_mode: mode,
       top_k: topK,
       alpha,
-      ef: mode === 'hnsw' ? ef : null,
+      ef: null, // Legacy overrides were saved but never applied to query execution.
       // The role toggle drives the answer style live; persisting it here is
       // what makes the stored config usable by an exported retrieval script.
       response_format: role === 'end_user' ? 'end_user' : 'engineer',
@@ -7744,6 +7765,21 @@ export default function RetrievalPage() {
     } catch (e: unknown) {
       setSaveError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  const physicalIndex = collections.find(c => c.name === collection)
+
+  async function refreshIndex() {
+    const ticket = ++indexRequest.current
+    setIndexLoading(true); setIndexError('')
+    try {
+      const result = await api.getCollections()
+      if (ticket !== indexRequest.current) return
+      setCollections(result.collections)
+      if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
+    }
+    catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
+    finally { if (ticket === indexRequest.current) setIndexLoading(false) }
   }
 
   return (
@@ -7794,7 +7830,7 @@ export default function RetrievalPage() {
 
       <div className="mb-4">
         <label className="block text-xs text-gray-600 mb-1">Top-K Results: {topK}</label>
-        <input type="range" min={1} max={20} value={topK} onChange={e => setTopK(+e.target.value)} className="w-full" />
+        <input type="range" min={1} max={50} value={topK} onChange={e => setTopK(+e.target.value)} className="w-full" />
       </div>
 
       {mode === 'hybrid' && (
@@ -7806,25 +7842,17 @@ export default function RetrievalPage() {
         </div>
       )}
 
-      {mode === 'hnsw' && role === 'engineer' && (
-        <details className="mb-4 border rounded">
-          <summary className="px-3 py-2 text-sm cursor-pointer font-medium">Advanced HNSW Parameters</summary>
-          <div className="p-3 space-y-3">
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">ef (query accuracy): {ef}</label>
-              <input type="range" min={16} max={512} step={8} value={ef} onChange={e => setEf(+e.target.value)} className="w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">efConstruction (build accuracy): {efConstruction}</label>
-              <input type="range" min={64} max={512} step={8} value={efConstruction} onChange={e => setEfConstruction(+e.target.value)} className="w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">maxConnections (graph density): {maxConnections}</label>
-              <input type="range" min={16} max={128} step={4} value={maxConnections} onChange={e => setMaxConnections(+e.target.value)} className="w-full" />
-            </div>
-          </div>
-        </details>
-      )}
+      <div className="mb-4 border rounded p-3 text-sm">
+        <h2 className="font-semibold mb-2">Physical index (read only)</h2>
+        {indexError && <p className="text-amber-700">{indexError}</p>}
+        {physicalIndex ? <>
+          <p>Type: {physicalIndex.index_type} · Distance: {physicalIndex.distance_metric}</p>
+          {physicalIndex.hnsw_config && <p className="mt-1">ef: {physicalIndex.hnsw_config.ef} · efConstruction: {physicalIndex.hnsw_config.efConstruction} · maxConnections: {physicalIndex.hnsw_config.maxConnections}</p>}
+          <p className="text-xs text-gray-500 mt-1">Observed when index details were last refreshed. Saved query methods do not rebuild the index.</p>
+        </> : <p>Index details are unavailable for this collection.</p>}
+        {config.ef !== null && <p className="text-xs text-amber-700 mt-2">The legacy saved ef override ({config.ef}) is inactive. Queries use the physical index settings; saving here clears that override.</p>}
+        <button onClick={refreshIndex} disabled={indexLoading} className="mt-2 border rounded px-2 py-1 text-xs disabled:opacity-50">Refresh index details</button>
+      </div>
 
       <button
         onClick={apply}
@@ -8831,6 +8859,10 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_NETWORK` | detected | compose network for the browser container |
 
 ## Writing a check
+
+The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
+
+`11_retrieval.sh` is called by03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
 
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
@@ -9963,6 +9995,133 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/compose_target.py
+
+```python
+"""Refuse an in-container verifier when RAG_API selects another deployment."""
+import sys
+from urllib.parse import urlsplit
+
+def matches_local_proxy(api, bindings):
+    try:
+        url=urlsplit(api)
+        if url.scheme!='http' or url.hostname not in ('localhost','127.0.0.1','::1') or url.username or url.password or url.path.rstrip('/')!='/api' or url.query or url.fragment:
+            return False
+        port=url.port or 80
+        for binding in bindings.splitlines():
+            host, published=binding.rsplit(':',1)
+            host=host.strip('[]')
+            if int(published)!=port:continue
+            if host in ('0.0.0.0','::') or host==url.hostname or (host=='127.0.0.1' and url.hostname=='localhost'):
+                return True
+        return False
+    except (ValueError,TypeError):return False
+
+if __name__=='__main__':
+    if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
+        print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
+        sys.exit(2)
+```
+
+### scripts/verify/11_retrieval.sh
+
+```bash
+#!/usr/bin/env bash
+# Observe physical config and execute top-K on real backend, controlling models.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
+require_stack
+section "Physical index and effective query controls"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
+check "physical index, legacy vector aliases, executed topK and config lifecycle" $?
+summary
+```
+
+### scripts/verify/retrieval_controls.py
+
+```python
+"""Real physical config and executed query limits on owned synthetic collections.
+
+Inside disposable API: python - < scripts/verify/retrieval_controls.py
+Actual SDK/backend storage and vector queries; only Ollama reformulation,
+embedding and answer calls are controlled. No startup sweep/model calls.
+"""
+import importlib.util,json,os,tempfile,uuid
+from unittest.mock import AsyncMock,patch
+from fastapi.testclient import TestClient
+from config import settings
+from main import app
+from services import weaviate_client as wc,rag_pipeline as rag
+
+prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
+collections=[]
+owners=[]
+persistent_upload=settings.upload_dir
+if importlib.util.find_spec('services.collection_recovery'):
+    from services import collection_recovery as recovery
+else:
+    recovery=None  # The pre-recovery baseline sweeps legacy staging markers.
+
+client=TestClient(app)
+with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
+    try:
+        for index in ('hnsw','flat'):
+            if recovery:
+                with patch.object(settings,'upload_dir',persistent_upload):
+                    owner=recovery.begin(prefix+index,'tune',wc.get_client())
+                owners.append(owner);name=owner['staging']
+            else:
+                name=prefix+index+'__tuning_'+uuid.uuid4().hex
+            assert not wc._collection_exists_sync(name);collections.append(name)
+            response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
+            assert response.status_code==201,response.text
+            if os.environ.get('RAG_VERIFY_INTERRUPT_AFTER_CREATE')=='1':
+                print('OWNED_INTERRUPTED_FIXTURE '+json.dumps({'name':name,'owner':owners[-1] if owners else None}),flush=True)
+                os._exit(86)  # Acceptance injection: skips finally like a hard kill.
+            coll=wc.get_client().collections.get(name)
+            for i in range(1,11):coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
+            assert row['index_type']==index and row['distance_metric']=='cosine'
+            assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
+            print('PASS real '+index+' physical settings are observed, not query labels',flush=True)
+            for mode,limit in (('hnsw',1),('flat',50)):
+                with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
+                    response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
+                assert response.status_code==200,response.text
+                body=response.json();assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
+            after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
+            assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
+            print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
+            config={'collection':name,'retrieval_mode':'hybrid','top_k':7,'alpha':0.25,'ef':96,'response_format':'engineer'}
+            assert client.post('/retrieval/config',json=config).status_code==201
+            loaded=client.get('/retrieval/config/'+name).json()
+            assert all(loaded[key]==value for key,value in config.items()),loaded
+            config['ef']=None
+            assert client.post('/retrieval/config',json=config).status_code==201
+            assert client.get('/retrieval/config/'+name).json()['ef'] is None
+            for limit in (1,50):
+                config['top_k']=limit
+                saved=client.post('/retrieval/config',json=config)
+                assert saved.status_code==201 and client.get('/retrieval/config/'+name).json()['top_k']==limit,saved.text
+            for limit in (0,51):
+                invalid=client.post('/retrieval/config',json={**config,'top_k':limit})
+                assert invalid.status_code==422,invalid.text
+            print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
+    finally:
+        for name in collections:
+            if wc._collection_exists_sync(name):
+                response=client.delete('/collections/'+name+'?confirm=true');assert response.status_code==200,response.text
+        if recovery:
+            with patch.object(settings,'upload_dir',persistent_upload):
+                for owner in owners:recovery.discard(owner,wc.get_client())
+        wc.close_client()
+assert all(not wc._collection_exists_sync(name) for name in collections)
+wc.close_client()
+print('PASS owned synthetic collections/config/files removed',flush=True)
+```
+
 ### scripts/verify/03_query.sh
 
 ```bash
@@ -9972,6 +10131,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./11_retrieval.sh
+check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
@@ -9987,7 +10148,7 @@ ask() {  # ask <mode> <format> <citations> -> writes /tmp/vfy_ans.json
 }
 
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.2 entirely" "every check needs an LLM call"
+  skip "LLM query assertions" "set RAG_SKIP_SLOW=0 to include model calls"
   summary; exit $?
 fi
 
@@ -11157,6 +11318,74 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
             options.length > 1 && new Set(seen).size === options.length, `${new Set(seen).size} distinct`);
     r.check('no page reload occurs', reloads === 0, `${reloads} navigations`);
     await s.ctx.close();
+  }
+
+  // ── owned retrieval HTTP fixtures; no backend writes/model calls ───────────
+  r.section('effective retrieval UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedRetrievalBrowserFixture';
+    const row = { name, object_count: 10, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 72, efConstruction: 160, maxConnections: 32 } };
+    let lists = 0, failRefresh = false;
+    const saves = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        lists++;
+        return request.respond({ status: lists === 1 || failRefresh ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lists === 1 || failRefresh ? { error: { message: 'Synthetic index read failure.' } } : { collections: [row] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.25, ef: 96, response_format: 'engineer', is_default: false }) });
+      }
+      if (path === '/api/retrieval/config' && request.method() === 'POST') {
+        const body = JSON.parse(request.postData()); saves.push(body);
+        return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ ...body, is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
+      r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      await clickByText(s.page, 'Refresh index details'); await sleep(500);
+      const refreshed = await bodyText(s.page);
+      r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
+      r.check('three query methods replace inactive build controls and show legacy ef warning', await s.page.evaluate(() => document.querySelectorAll('input[name=mode]').length === 3 && document.querySelectorAll('input[type=range]').length === 1 && document.querySelector('input[value=hnsw]').checked && document.body.innerText.includes('legacy saved ef override (96) is inactive')));
+      for (const limit of [1, 50]) {
+        await s.page.evaluate(value => { const input = document.querySelector('input[type=range]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(value)); input.dispatchEvent(new Event('input', { bubbles: true })); }, limit);
+        await sleep(100); await clickByText(s.page, 'Save for this collection'); await sleep(300);
+        r.check('Top-K ' + limit + ' is selected and sent when saving', saves.at(-1)?.top_k === limit && (await bodyText(s.page)).includes('Top-K Results: ' + limit));
+      }
+      r.check('saving normalizes legacy vector alias and clears inactive ef without changing observed index', saves.length === 2 && saves.every(save => save.retrieval_mode === 'hnsw' && save.ef === null) && /ef: 72/.test(await bodyText(s.page)));
+      failRefresh = true;
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      r.check('failed refresh keeps prior physical details with an explicit warning', /displayed details are from the prior read/.test(await bodyText(s.page)) && /ef: 72/.test(await bodyText(s.page)));
+      r.check('retrieval fixture causes no React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+  for (const lateFailure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    let initial, count = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/collections') {
+        count++;
+        if (count === 1) { initial = request; return; }
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 191, efConstruction: 170, maxConnections: 40 } }] }) });
+      }
+      if (new URL(request.url()).pathname.startsWith('/api/retrieval/config/')) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: 'OwnedLatestIndexFixture', retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
+      if (!initial) throw new Error('Initial metadata request was not observed');
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      const freshVisible = /ef: 191/.test(await bodyText(s.page));
+      await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
+      await sleep(300);
+      const after = await bodyText(s.page);
+      r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
   }
 
   // ── delete confirmation ────────────────────────────────────────────────────
