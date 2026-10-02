@@ -17,6 +17,10 @@ MAX_CHUNKS_PER_FILE = MAX_OVERLAP_WINDOWS
 MAX_CHUNK_CHARACTERS = 6000
 MIN_SEMANTIC_CHUNK_CHARACTERS = 50
 MAX_SEMANTIC_SENTENCES = 10 * MAX_CHUNKS_PER_FILE
+# The most text one file may bring to any strategy, checked before splitting
+# or embedding: the count caps alone still let a size-based splitter or the
+# embedding model spend minutes on a huge file before refusing it.
+MAX_TEXT_CHARACTERS = MAX_OVERLAP_OUTPUT_CHARACTERS
 
 _semantic_model = None
 _semantic_model_lock = threading.Lock()
@@ -47,23 +51,33 @@ def _enforce_min_chunk_size(chunks: list[str], min_size: int) -> list[str]:
 
 
 def _cap_chunk_length(chunks: list[str]) -> list[str]:
-    """Split any chunk over MAX_CHUNK_CHARACTERS, at whitespace where possible."""
+    """Split any chunk over MAX_CHUNK_CHARACTERS, at whitespace where possible.
+
+    Walks each chunk by index rather than re-slicing the remainder, so a long
+    chunk costs time in proportion to its length.
+    """
     capped: list[str] = []
     for chunk in chunks:
-        while len(chunk) > MAX_CHUNK_CHARACTERS:
-            cut = chunk.rfind(" ", MAX_CHUNK_CHARACTERS // 2, MAX_CHUNK_CHARACTERS + 1)
-            cut = cut if cut > 0 else MAX_CHUNK_CHARACTERS
-            capped.append(chunk[:cut].rstrip())
-            chunk = chunk[cut:].lstrip()
-        if chunk:
-            capped.append(chunk)
+        start, end = 0, len(chunk)
+        while end - start > MAX_CHUNK_CHARACTERS:
+            limit = start + MAX_CHUNK_CHARACTERS
+            cut = max(chunk.rfind(ws, start + MAX_CHUNK_CHARACTERS // 2, limit + 1) for ws in (" ", "\n", "\t"))
+            cut = cut if cut > start else limit
+            piece = chunk[start:cut].rstrip()
+            if piece:
+                capped.append(piece)
+            start = cut
+            while start < end and chunk[start].isspace():
+                start += 1
+        if start < end:
+            capped.append(chunk[start:end])
     return capped
 
 
-def _check_chunk_count(count: int, strategy: str) -> None:
+def _check_chunk_count(count: int, strategy: str, unit: str = "chunks") -> None:
     if count > MAX_CHUNKS_PER_FILE:
         raise ValueError(
-            f"{strategy} chunking exceeds the per-file limit: {count} chunks "
+            f"{strategy} chunking exceeds the per-file limit: {count} {unit} "
             f"(maximum {MAX_CHUNKS_PER_FILE}). Use a larger chunk size or split the file.")
 
 
@@ -214,11 +228,16 @@ def chunk(
     strategy, chunk_size, chunk_overlap_size = config.chunking_strategy, config.chunk_size, config.chunk_overlap
     min_chunk_size = config.min_chunk_size
     similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
+    text_length = len(text) if elements is None else sum(len(str(el)) for el in elements)
+    if text_length > MAX_TEXT_CHARACTERS:
+        raise ValueError(
+            f"{strategy} chunking exceeds the per-file limit: {text_length} characters "
+            f"(maximum {MAX_TEXT_CHARACTERS}). Split the file.")
     if strategy in ("fixed", "language", "context_aware"):
         # These split by size, so the count is known before splitting. Refuse
         # an oversized file before the splitter allocates every chunk.
         stride = chunk_size - (chunk_overlap_size if strategy == "language" else 0)
-        _check_chunk_count(len(text) // max(stride, 1), strategy)
+        _check_chunk_count(len(text) // max(stride, 1), strategy, "pieces before minimum-size merging")
     if strategy == "fixed":
         chunks = chunk_fixed(text, chunk_size, min_chunk_size)
     elif strategy == "overlap":

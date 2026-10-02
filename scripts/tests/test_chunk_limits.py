@@ -98,5 +98,34 @@ class CountTests(unittest.TestCase):
             model.assert_not_called()
 
 
+class TextLimitTests(unittest.TestCase):
+    def test_every_strategy_refuses_an_oversized_file_before_any_work(self):
+        text = 'q' * (chunker.MAX_TEXT_CHARACTERS + 1)
+        for strategy in ('fixed', 'overlap', 'language', 'context_aware', 'semantic'):
+            with self.subTest(strategy=strategy):
+                with patch.object(chunker, 'CharacterTextSplitter') as fixed, \
+                     patch.object(chunker, 'RecursiveCharacterTextSplitter') as language, \
+                     patch.object(chunker, '_get_semantic_model') as model:
+                    with self.assertRaisesRegex(ValueError, 'characters'):
+                        chunker.chunk(text, strategy, chunk_size=6000, chunk_overlap_size=0, min_chunk_size=0)
+                    fixed.assert_not_called(); language.assert_not_called(); model.assert_not_called()
+
+    def test_ceiling_split_breaks_at_newlines_and_keeps_every_character(self):
+        # Newline-separated words with no spaces used to be cut mid-word.
+        text = ('linetext\n' * 2000).strip()
+        chunks = chunker._cap_chunk_length([text])
+        self.assertTrue(all(len(c) <= CEILING for c in chunks))
+        self.assertTrue(all(c.endswith('linetext') for c in chunks), [c[-12:] for c in chunks])
+        self.assertEqual(''.join(chunks).replace('\n', ''), text.replace('\n', ''))
+
+    def test_ceiling_split_is_linear(self):
+        import time
+        text = 'w' * 5_000_000
+        started = time.perf_counter()
+        chunks = chunker._cap_chunk_length([text])
+        self.assertLess(time.perf_counter() - started, 2.0)
+        self.assertEqual(sum(map(len, chunks)), len(text))
+
+
 if __name__ == '__main__':
     unittest.main()
