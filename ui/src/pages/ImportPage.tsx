@@ -151,7 +151,7 @@ export default function ImportPage() {
         {showOverlap && (
           <div>
             <label className="block text-xs text-gray-600 mb-1">Overlap: {chunkOverlap}</label>
-            <input type="range" min={0} max={2000} step={50} value={chunkOverlap} onChange={e => setChunkOverlap(+e.target.value)} className="w-full" />
+            <input type="range" min={0} max={Math.max(0, Math.min(2000, chunkSize - 50))} step={50} value={chunkOverlap} onChange={e => setChunkOverlap(+e.target.value)} className="w-full" />
           </div>
         )}
         <div>

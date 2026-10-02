@@ -75,7 +75,7 @@ export default function ChunkingPage() {
             {showOverlap && (
               <div>
                 <label className="block text-xs text-gray-600 mb-1">Overlap: {config.chunk_overlap}</label>
-                <input type="range" min={0} max={2000} step={50} value={config.chunk_overlap} onChange={e => setConfig({ ...config, chunk_overlap: +e.target.value })} className="w-full" />
+                <input type="range" min={0} max={Math.max(0, Math.min(2000, config.chunk_size - 50))} step={50} value={config.chunk_overlap} onChange={e => setConfig({ ...config, chunk_overlap: +e.target.value })} className="w-full" />
               </div>
             )}
             <div>
