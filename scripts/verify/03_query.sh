@@ -67,8 +67,9 @@ sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('an
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
-# The prompts instruct plain language but never brevity, so a single pair is
-# noise. Compare across trials and require a clear majority.
+# The end_user prompt asks for a short answer (#109), but a CPU model still
+# varies answer to answer, so a single pair is noise. Compare the mean length
+# across trials.
 trials="${RAG_FORMAT_TRIALS:-3}"
 eu_total=0; en_total=0; eu_wins=0
 for _ in $(seq 1 "$trials"); do

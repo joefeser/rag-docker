@@ -9178,8 +9178,9 @@ _rag_lock_acquire() {
     case "$holder" in
       none) ;;
       *[!0-9]*)
-        # Shown, not trusted: printable characters only, and not much of them.
-        holder=$(printf '%s' "$holder" | LC_ALL=C tr -cd '[:print:]' | cut -c1-40)
+        # Shown, not trusted: printable characters other than the quote, and
+        # not much of them.
+        holder=$(printf '%s' "$holder" | LC_ALL=C tr -cd '[:print:]' | tr -d '"' | cut -c1-40)
         printf '\nThe verify lock %s holds "%s", not a pid; remove it by hand if no run is using it.\n\n' "$lock" "$holder" >&2
         return 3 ;;
     esac
@@ -10196,8 +10197,9 @@ sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('an
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
-# The prompts instruct plain language but never brevity, so a single pair is
-# noise. Compare across trials and require a clear majority.
+# The end_user prompt asks for a short answer (#109), but a CPU model still
+# varies answer to answer, so a single pair is noise. Compare the mean length
+# across trials.
 trials="${RAG_FORMAT_TRIALS:-3}"
 eu_total=0; en_total=0; eu_wins=0
 for _ in $(seq 1 "$trials"); do

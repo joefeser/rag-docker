@@ -17,8 +17,9 @@ the advisory and credit you unless you'd rather stay anonymous.
 ## Supported versions
 
 Releases are tagged with semantic versions (`v1.0.0` onward). Only the latest
-release gets security fixes: currently **1.0.x**. A fix lands on `develop`
-first and ships in the next release.
+release gets security fixes: currently **1.0.x**. A reported vulnerability is
+fixed privately in its advisory, and the fix is published with a release
+alongside the advisory.
 
 ## Scope
 
@@ -28,7 +29,8 @@ This platform is built to run locally, and it has no authentication.
   `127.0.0.1:8080`, so other machines can't reach it. That holds on Docker
   Engine 28.0.0 or newer: Docker documents that older engines still let hosts
   on the same network reach localhost-published ports. Engine 28.0.0 or newer
-  is a prerequisite.
+  is a prerequisite. This assumes Docker's standard bridge/NAT networking;
+  custom direct-routing setups are outside this local configuration.
 - **Web pages in a local browser can still reach it.** The API accepts
   requests from any origin (CORS), so a web page open in a browser on the same
   machine can call it. This is tracked in #25.
