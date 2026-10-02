@@ -1342,7 +1342,7 @@ Original question: {user_question}
 
 **System:**
 ```
-You are a helpful assistant. Answer the user's question using only the provided context. If the context does not contain enough information to answer the question, say so clearly. Do not use any knowledge outside the provided context. Write in plain, clear language for a non-technical reader.
+You are a helpful assistant. Answer the user's question using only the provided context. If the context does not contain enough information to answer the question, say so clearly. Do not use any knowledge outside the provided context. Write in plain, clear language for a non-technical reader. Keep the answer short: a few sentences, without technical detail.
 ```
 
 **User:**
@@ -1861,10 +1861,11 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] `include_citations: true` returns citation objects with source_file and score.
       *Each citation carries source_file, chunk_index, score and excerpt.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
-      *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Note
-      that "plain language" is instructed but brevity is not — it follows from
-      engineer being told to add technical detail and a confidence level, so the
-      margin is a tendency rather than a guarantee.*
+      *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
+      was originally not instructed, so the margin was only a tendency, and
+      `03_query.sh`'s 3-trial mean flipped in several PR evaluations (#109). The
+      end_user prompt now asks for a short answer without technical detail, so
+      "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
 
 ### 10.3 Gold Standard
