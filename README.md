@@ -645,6 +645,8 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull phi3.5` etc.) is in progress. Run `docker compose logs -f ollama` to watch. If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
 
+**LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
+
 **Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80.
 
 **Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. This workbench currently has no API authentication; authenticated LAN access with TLS is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
