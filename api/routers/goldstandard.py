@@ -14,6 +14,7 @@ from models.schemas import (
     SaveRequest,
     SaveResponse,
     SessionResponse,
+    SessionValidity,
 )
 from services import goldstandard as gs
 from services import weaviate_client as wc
@@ -27,11 +28,14 @@ async def generate(body: GenerateRequest):
     if not await wc.collection_exists(body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
-    result = await gs.start_generation(
-        collection=body.collection,
-        sample_size=body.sample_size,
-        seed=body.seed,
-    )
+    try:
+        result = await gs.start_generation(
+            collection=body.collection,
+            sample_size=body.sample_size,
+            seed=body.seed,
+        )
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     return GenerateResponse(**result)
 
 
@@ -56,13 +60,17 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        **SessionValidity.model_validate(session).model_dump(),
     )
 
 
 @router.patch("/session/{session_id}/pair/{pair_id}", response_model=GoldPair)
 async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
     updates = body.model_dump(exclude_none=True)
-    pair = await gs.update_pair(session_id, pair_id, updates)
+    try:
+        pair = await gs.update_pair(session_id, pair_id, updates)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if pair is None:
         return api_error(404, "PAIR_NOT_FOUND", f"Pair '{pair_id}' not found in session '{session_id}'.")
     return GoldPair(**pair)
@@ -81,7 +89,10 @@ async def regenerate(body: RegenerateRequest):
 
 @router.post("/save", response_model=SaveResponse)
 async def save(body: SaveRequest):
-    result = await gs.save_session(body.session_id, body.filename)
+    try:
+        result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if result is None:
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{body.session_id}' not found.")
     return SaveResponse(**result)
@@ -100,3 +111,9 @@ async def download(filename: str):
         media_type="application/json",
         filename=filename,
     )
+
+
+@router.get("/diagnostics")
+async def diagnostics():
+    import asyncio
+    return {"issues": await asyncio.to_thread(gs.session_diagnostics)}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 
+from models.schemas import QueryRequest
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 
@@ -14,7 +15,8 @@ SYNTHESIS_END_USER_SYSTEM = (
     "You are a helpful assistant. Answer the user's question using only the provided context. "
     "If the context does not contain enough information to answer the question, say so clearly. "
     "Do not use any knowledge outside the provided context. "
-    "Write in plain, clear language for a non-technical reader."
+    "Write in plain, clear language for a non-technical reader. "
+    "Keep the answer short: a few sentences, without technical detail."
 )
 
 SYNTHESIS_ENGINEER_SYSTEM = (
@@ -48,6 +50,11 @@ async def run_query(
     include_citations: bool,
     response_format: str,
 ) -> dict:
+    config = QueryRequest(question=question, collection=collection, retrieval_mode=retrieval_mode,
+                          top_k=top_k, alpha=alpha, include_citations=include_citations,
+                          response_format=response_format)
+    retrieval_mode, top_k, alpha, response_format = (
+        config.retrieval_mode, config.top_k, config.alpha, config.response_format)
     reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
     reformulated = reformulated.strip()
 
@@ -57,7 +64,7 @@ async def run_query(
         chunks = await wc.near_vector_query(collection, vector, top_k)
     elif retrieval_mode == "hybrid":
         chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
-    else:
+    elif retrieval_mode == "semantic":
         chunks = await wc.near_text_query(collection, reformulated, top_k)
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 

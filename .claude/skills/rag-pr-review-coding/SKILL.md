@@ -7,7 +7,9 @@ description: Use when dispatched by the rag-pr-review coordinator as the coding 
 
 You are a senior engineer who knows the rag-docker codebase. You judge whether the code in the PR correctly and cleanly does what its linked issue asks, in the idiom of each language it touches.
 
-**REQUIRED:** Read `.claude/skills/rag-pr-review/reference.md` first. It defines severities, the requirements ledger, the review loop, posting and the result block. Work in the worktree at the reviewed SHA. Don't modify it, and don't push anything.
+**REQUIRED:** Read `.claude/skills/rag-pr-review/reference.md` first. It defines severities, the requirements ledger, the review loop, posting and the result block. Work in the worktree at the reviewed SHA (`worktree/`), and cite lines there. Where the PR's code meets code that `develop` changed after the PR's base, also read the merged worktree (`merged/`, the evaluated commit): a change that merges without conflict can still break there. Don't modify either, don't push anything, and never change git config.
+
+**Cross-repository PR: run nothing on the PR's files, not even `py_compile`.** Read the code only. See "Checks you may run" for why.
 
 ## Before the first pass
 
@@ -51,20 +53,20 @@ Apply only the sections for languages the PR touches.
 
 ## Checks you may run
 
-These are static and need no running stack. Run them in the worktree:
+**Cross-repository PR: run nothing from the PR.** You're dispatched alongside security, before any go-ahead exists, so read the code only: `git diff`, `git show`, `git grep`, and reading files. Even "parse-only" tools can run the PR's code: `python3 -m py_compile` imports a `py_compile.py` or `argparse.py` placed at the worktree root, `npm run build` runs the PR's `ui/package.json` scripts and `ui/vite.config.ts`, and a changed file's name typed into a shell can itself run a command. The coordinator's build check (step 8) builds every image after the go-ahead, and a syntax error shows up there.
+
+**Same-repository PR:** run these static checks in the worktree. Filenames are passed NUL-separated, never typed into a shell, and after `--`, so a file named like an option (`--require=x.js`) stays a filename. Python runs isolated (`-I`), so a file in the worktree can't shadow a standard module:
 
 ```bash
-python3 -m py_compile $(git diff --name-only <base>...<sha> -- '*.py')
-bash -n <each changed .sh>
-node --check <each changed .js>
+git diff -z --name-only --diff-filter=d <base>...<sha> -- '*.py' | xargs -0 -r python3 -I -m py_compile --
+git diff -z --name-only --diff-filter=d <base>...<sha> -- '*.sh' | xargs -0 -r -n1 bash -n --
+git diff -z --name-only --diff-filter=d <base>...<sha> -- '*.js' | xargs -0 -r -n1 node --check --
 (cd ui && npm ci --no-audit --no-fund && npm run build)   # when ui/ changed
 ```
 
-Only when the PR is same-repository, or the coordinator has confirmed the user's go-ahead, may you run `npm ci`. It executes install scripts.
-
 A failing build is a **High**.
 
-## Your extra summary section
+## Your extra recap section
 
 ```markdown
 ### Coding notes
@@ -72,4 +74,4 @@ A failing build is a **High**.
 - Static checks: <command> → <result>, one line each
 ```
 
-Apply `Passed: Coding` or `FAILED: Coding` per `reference.md`, then return the result block.
+Write `findings-coding.json` per `reference.md`, with the section above appended to your recap section, then return the result block. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.
