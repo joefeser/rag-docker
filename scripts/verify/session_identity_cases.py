@@ -195,4 +195,41 @@ class IdentityTests(unittest.TestCase):
                 self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/expected):'SESSION_WRITE_FAILED'})
                 self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
 
+    # Testing reviewer (#148): the ValueError branch, the HTTP envelope and grammar boundaries.
+    def test_reviewer_generation_redirected_storage_root_is_session_write_failed_503(self):
+        storage=Path(settings.upload_dir)/'goldstandard_sessions';moved=Path(self.tmp.name)/'owned-moved-sessions'
+        storage.rename(moved);storage.symlink_to(moved);before=sorted(p.name for p in moved.iterdir())
+        with patch.object(gs,'_diagnostics',{}),patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abc11'+'0'*24)):
+            with self.assertRaises(gs.GoldStandardError) as caught:gs._store_generated_session(fixture())
+            self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
+            self.assertIsInstance(caught.exception.__cause__,ValueError)
+            self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/'gs_460abc11.json'):'SESSION_WRITE_FAILED'})
+        self.assertEqual(sorted(p.name for p in moved.iterdir()),before);self.assertEqual(list(gs._sessions),[self.original['session_id']])
+
+    def test_reviewer_generate_route_returns_503_session_write_failed_envelope(self):
+        from routers import goldstandard as route
+        from models.schemas import GenerateRequest
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(route.wc,'collection_exists',new=AsyncMock(return_value=True)),patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+                response=await route.generate(GenerateRequest(collection='OwnedGeneration',sample_size=1,seed=None))
+                generate.assert_not_called()
+            return response
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code,503);self.assertEqual(json.loads(response.body)['error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(list(gs._sessions),[self.original['session_id']])
+
+    def test_reviewer_preflight_refuses_near_canonical_and_unbounded_source_ids(self):
+        before=self.path.read_bytes()
+        for source in ['gs_460ABCDE','GS_460abcde','gs_460abcd','gs_460abcde0','gs_460abcdg',' gs_460abcde','gs_460abcde\n','gs_'+'a'*10000,'',460]:
+            with self.subTest(source=repr(source)[:40]):
+                package=Path(tempfile.mkdtemp(dir=self.tmp.name));gold=package/'goldstandard';gold.mkdir()
+                data=fixture();data['session_id']=source;(gold/'owned.json').write_text(json.dumps(data))
+                with self.assertRaises(importer.PackageError) as caught:importer._read_goldstandard_sessions(package,'OwnedOriginal')
+                self.assertEqual((caught.exception.code,caught.exception.detail),('PACKAGE_CORRUPT',{'file':'goldstandard/owned.json'}))
+        package=Path(tempfile.mkdtemp(dir=self.tmp.name));gold=package/'goldstandard';gold.mkdir()
+        data=fixture();data['session_id']='gs_0123abcd';(gold/'owned.json').write_text(json.dumps(data))
+        self.assertEqual([s['session_id'] for s in importer._read_goldstandard_sessions(package,'OwnedOriginal')],['gs_0123abcd'])
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(list(self.path.parent.glob('*.json'))),1)
+
 if __name__=='__main__':unittest.main()
