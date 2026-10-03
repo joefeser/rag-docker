@@ -96,7 +96,7 @@ def _create_collection_sync(
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
-                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+                       distance_metric=distance_metric, hnsw_config=hnsw_config)
     hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
     dist = DISTANCE_MAP[validated.distance_metric]

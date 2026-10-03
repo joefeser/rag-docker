@@ -35,7 +35,6 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
-from models.schemas import SessionResponse
 from services import goldstandard
 from services import model_bundle
 from services import packager
@@ -524,10 +523,10 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(path.read_text())
-            # A historical source ID is provenance, not a local destination.
-            # Validate its type and all content, then check the guarded root
-            # without turning the source ID into a filesystem path.
-            SessionResponse.model_validate(data, strict=True)
+            # Source IDs must use the generated grammar. An occupied one is
+            # kept as provenance at restore, so only the guarded root is
+            # checked here, not the source ID's own file.
+            goldstandard.validate_session(data)
             if canonical(data["collection"]) != canonical(original):
                 raise ValueError("Evaluation session belongs to a different collection.")
             if data["session_id"] in identities:

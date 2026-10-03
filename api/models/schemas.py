@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
 
 
 def _numeric(value):
@@ -27,6 +27,7 @@ MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
+OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -109,7 +110,7 @@ class IngestConfig(BaseModel):
     @model_validator(mode="after")
     def _relationships(self):
         if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+            raise ValueError(OVERLAP_RULE)
         return self
 
 
@@ -243,9 +244,6 @@ class PackageListResponse(BaseModel):
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
-
-
 class _ChunkingFields(BaseModel):
     chunking_strategy: Optional[ChunkingStrategy] = None
     chunk_size: Optional[ChunkSize] = None
@@ -255,8 +253,13 @@ class _ChunkingFields(BaseModel):
 
     @model_validator(mode="after")
     def _relationships(self):
-        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
-                        if getattr(self, name) is not None})
+        # Fields are already checked, so only the overlap rule can fail here.
+        # A plain ValueError keeps the nested model's input out of the error.
+        try:
+            IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                            if getattr(self, name) is not None})
+        except ValidationError:
+            raise ValueError(OVERLAP_RULE) from None
         return self
 
     def has_chunking(self) -> bool:

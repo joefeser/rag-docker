@@ -180,6 +180,40 @@ networks:
     driver: bridge
 ```
 
+### docker-compose.verify.yml
+
+```yaml
+# Overlay for the disposable verify project (#152). Used only by
+# scripts/verify/stack.sh, which runs it as compose project `rag-verify` on top
+# of the docker-compose.yml of the checkout under test, and sets the two
+# variables below. Run any other way, it refuses to resolve.
+#
+# Everything here keeps verification away from the live `rag-docker` stack:
+services:
+  proxy:
+    # Replace the base list rather than add to it (compose merges `ports`
+    # otherwise), so the live port 8080 is never published by this project.
+    ports: !override
+      - "127.0.0.1:${RAG_VERIFY_PORT:?set by scripts/verify/stack.sh}:80"
+  api:
+    # Own image tags: building with the base file's rag-docker-api:latest would
+    # move the live stack's tag to the code under test.
+    image: rag-verify-api:latest
+    volumes:
+      # Same container path as the base file's ./exports, so this entry
+      # replaces it: from the main checkout, ./exports is the live exports folder.
+      - ${RAG_EXPORTS_DIR:?set by scripts/verify/stack.sh}:/app/exports
+  ui:
+    image: rag-verify-ui:latest
+
+volumes:
+  # A copy of the live models that stack.sh keeps in step with
+  # rag-docker_ollama_models (read-only there). External, so `down -v` keeps it.
+  ollama_models:
+    external: true
+    name: rag-verify-ollama-models
+```
+
 ### ollama/entrypoint.sh
 
 ```bash
@@ -623,7 +657,6 @@ settings = Settings()
 ### api/models/__init__.py
 
 ```python
-
 ```
 
 ### api/models/schemas.py
@@ -631,7 +664,7 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
 
 
 def _numeric(value):
@@ -658,6 +691,7 @@ MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
+OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -740,7 +774,7 @@ class IngestConfig(BaseModel):
     @model_validator(mode="after")
     def _relationships(self):
         if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+            raise ValueError(OVERLAP_RULE)
         return self
 
 
@@ -874,9 +908,6 @@ class PackageListResponse(BaseModel):
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
-
-
 class _ChunkingFields(BaseModel):
     chunking_strategy: Optional[ChunkingStrategy] = None
     chunk_size: Optional[ChunkSize] = None
@@ -886,8 +917,13 @@ class _ChunkingFields(BaseModel):
 
     @model_validator(mode="after")
     def _relationships(self):
-        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
-                        if getattr(self, name) is not None})
+        # Fields are already checked, so only the overlap rule can fail here.
+        # A plain ValueError keeps the nested model's input out of the error.
+        try:
+            IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                            if getattr(self, name) is not None})
+        except ValidationError:
+            raise ValueError(OVERLAP_RULE) from None
         return self
 
     def has_chunking(self) -> bool:
@@ -1160,7 +1196,6 @@ class ErrorResponse(BaseModel):
 ### api/services/__init__.py
 
 ```python
-
 ```
 
 ### api/services/sources.py
@@ -2074,7 +2109,7 @@ def _create_collection_sync(
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
-                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+                       distance_metric=distance_metric, hnsw_config=hnsw_config)
     hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
     dist = DISTANCE_MAP[validated.distance_metric]
@@ -3358,10 +3393,6 @@ def _save_session_sync(session: dict) -> None:
                     log.exception("Could not remove owned session temporary file %s", temporary.name)
 
 
-async def _save_session(session: dict) -> None:
-    await asyncio.to_thread(store_session, session)
-
-
 def _scan_sessions() -> None:
     """Inspect disk without blocking writers, then publish only a current scan."""
     global _store_revision
@@ -3496,12 +3527,14 @@ def _identity_available(session_id: str) -> bool:
     return False
 
 
-def _allocate_identity(preferred: str | None = None) -> str:
+def _allocate_identity(preferred: str | None = None, tried: list[str] | None = None) -> str:
     # Callers hold _state_lock across allocation and durable publication.
     if preferred is not None and _identity_available(preferred):
         return preferred
     for _ in range(128):
         candidate = f"gs_{uuid.uuid4().hex[:8]}"
+        if tried is not None:
+            tried.append(candidate)
         if _identity_available(candidate):
             return candidate
     raise RuntimeError("Could not allocate an unoccupied session identity")
@@ -3510,7 +3543,14 @@ def _allocate_identity(preferred: str | None = None) -> str:
 def _store_generated_session(session: dict) -> dict:
     snapshot = copy.deepcopy(session)
     with _state_lock:
-        snapshot["session_id"] = _allocate_identity()
+        tried: list[str] = []
+        try:
+            snapshot["session_id"] = _allocate_identity(tried=tried)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Nothing was written. Report it like the writer's own prepare
+            # failure, under the candidate being checked or the last one tried.
+            _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (tried[-1] + ".json"), "SESSION_WRITE_FAILED")
+            raise GoldStandardError("SESSION_WRITE_FAILED", "Session storage could not be inspected to allocate an identity. No session was written.", 503) from exc
         store_session(snapshot)
     return copy.deepcopy(snapshot)
 
@@ -3518,8 +3558,8 @@ def _store_generated_session(session: dict) -> dict:
 def store_imported_session(session: dict, source_collection: str) -> dict:
     """Serialize source-ID collision handling with generation and other imports."""
     snapshot = copy.deepcopy(session)
-    # The source ID can be historical, but the rest of the session must still
-    # satisfy the strict schema before it is given a canonical local ID.
+    # Import preflight (check 4a) has already refused noncanonical source IDs.
+    # Allocation keeps the source ID only when it is free; it stays provenance.
     SessionResponse.model_validate(snapshot, strict=True)
     source_id = snapshot["session_id"]
     with _state_lock:
@@ -4617,7 +4657,6 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
-from models.schemas import SessionResponse
 from services import goldstandard
 from services import model_bundle
 from services import packager
@@ -5106,10 +5145,10 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(path.read_text())
-            # A historical source ID is provenance, not a local destination.
-            # Validate its type and all content, then check the guarded root
-            # without turning the source ID into a filesystem path.
-            SessionResponse.model_validate(data, strict=True)
+            # Source IDs must use the generated grammar. An occupied one is
+            # kept as provenance at restore, so only the guarded root is
+            # checked here, not the source ID's own file.
+            goldstandard.validate_session(data)
             if canonical(data["collection"]) != canonical(original):
                 raise ValueError("Evaluation session belongs to a different collection.")
             if data["session_id"] in identities:
@@ -6018,7 +6057,6 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
 ### api/routers/__init__.py
 
 ```python
-
 ```
 
 ### api/services/system_info.py
@@ -6328,16 +6366,18 @@ class SaveIngestConfigBody(IngestConfig):
 async def ingest_upload(
     collection: str = Form(...),
     strategy: str = Form("overlap"),
-    chunk_size: int = Form(1000),
-    chunk_overlap: int = Form(200),
-    similarity_threshold: float = Form(0.85),
-    min_chunk_size: int = Form(100),
+    # Strings, so IngestConfig parses them and a non-numeric value is
+    # INVALID_SETTINGS like any other invalid setting, not a form error.
+    chunk_size: str = Form("1000"),
+    chunk_overlap: str = Form("200"),
+    similarity_threshold: str = Form("0.85"),
+    min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
     try:
-        IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
-                     chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
-                     min_chunk_size=min_chunk_size)
+        config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                              chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                              min_chunk_size=min_chunk_size)
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
@@ -6348,11 +6388,11 @@ async def ingest_upload(
         job_id = await ingest_pipeline.start_ingest_job(
             files=files,
             collection=collection,
-            strategy=strategy,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            similarity_threshold=similarity_threshold,
-            min_chunk_size=min_chunk_size,
+            strategy=config.chunking_strategy,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            similarity_threshold=config.similarity_threshold,
+            min_chunk_size=config.min_chunk_size,
         )
     except ValueError as exc:
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
@@ -8803,6 +8843,7 @@ export default function RetrievalPage() {
   const [alpha, setAlpha] = useState(config.alpha)
   const [indexError, setIndexError] = useState('')
   const [indexLoading, setIndexLoading] = useState(false)
+  const [indexRead, setIndexRead] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
   const indexRequest = useRef(0)
@@ -8813,8 +8854,9 @@ export default function RetrievalPage() {
       if (ticket !== indexRequest.current) return
       setIndexError('')
       setCollections(r.collections)
+      setIndexRead(true)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => { if (ticket === indexRequest.current) setIndexError('Could not read the current physical index.') })
+    }).catch(() => { if (ticket === indexRequest.current) { setIndexError('Could not read the current physical index.'); setIndexRead(true) } })
     return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -8867,7 +8909,7 @@ export default function RetrievalPage() {
       if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
     }
     catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
-    finally { if (ticket === indexRequest.current) setIndexLoading(false) }
+    finally { if (ticket === indexRequest.current) { setIndexLoading(false); setIndexRead(true) } }
   }
 
   return (
@@ -8937,7 +8979,7 @@ export default function RetrievalPage() {
           <p>Type: {physicalIndex.index_type} · Distance: {physicalIndex.distance_metric}</p>
           {physicalIndex.hnsw_config && <p className="mt-1">ef: {physicalIndex.hnsw_config.ef} · efConstruction: {physicalIndex.hnsw_config.efConstruction} · maxConnections: {physicalIndex.hnsw_config.maxConnections}</p>}
           <p className="text-xs text-gray-500 mt-1">Observed when index details were last refreshed. Saved query methods do not rebuild the index.</p>
-        </> : <p>Index details are unavailable for this collection.</p>}
+        </> : <p>{indexRead ? 'Index details are unavailable for this collection.' : 'Reading index details…'}</p>}
         {config.ef !== null && <p className="text-xs text-amber-700 mt-2">The legacy saved ef override ({config.ef}) is inactive. Queries use the physical index settings; saving here clears that override.</p>}
         <button onClick={refreshIndex} disabled={indexLoading} className="mt-2 border rounded px-2 py-1 text-xs disabled:opacity-50">Refresh index details</button>
       </div>
@@ -9871,17 +9913,109 @@ print('PASS disposable model package and target removed', flush=True)
 # Verification suite
 
 Integration tests that run the acceptance criteria in `SPECIFICATIONS.md` §10
-and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a live stack.
+and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a running stack: the disposable
+verify project, never the live stack (#152).
 
 ```bash
-docker compose up -d          # they need the stack running
-
-bash scripts/verify/all.sh                    # everything, ~20 min
-RAG_SKIP_SLOW=1 bash scripts/verify/all.sh    # skip LLM work, ~3 min
-bash scripts/verify/all.sh 02 04              # only the named suites
+bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
+bash scripts/verify/stack.sh run 02 04              # only the named suites
 ```
 
 Exits non-zero if any check fails.
+
+## Entry point and verify project
+
+`stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
+the stack built from a checkout. `stack.sh` never builds, starts or stops the
+live `rag-docker` stack, and only reads its model volume, to copy the models.
+That guards against accidents, not hostile code (see "What it doesn't protect
+against" below).
+
+| Command | What it does |
+|---|---|
+| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
+
+`--checkout` is the checkout to build and test; the default is the one holding
+`stack.sh`. The overlay `docker-compose.verify.yml` and `stack.sh` itself always
+come from the checkout holding `stack.sh`, so a reviewer can run a trusted copy
+against someone else's checkout.
+
+What makes it separate from the live stack:
+
+- **Its own project and port.** Compose project `rag-verify`, publishing only
+  the proxy, on `127.0.0.1:8081` (`RAG_VERIFY_PORT`; 8080 is refused). Its
+  network, containers and volumes (`rag-verify_weaviate_data`, ...) are its
+  own, and empty at every `up`.
+- **Its own images.** `rag-verify-api:latest` and `rag-verify-ui:latest`, and
+  `rag-verify-<service>:latest` for any other service that builds. The
+  configuration check refuses a build that would write any other tag, so the
+  build doesn't move the base file's `rag-docker-api` and `rag-docker-ui`
+  tags, or a third-party tag the live stack runs. `down` removes every image
+  the project built.
+- **Its own exports folder.** `${TMPDIR:-/tmp}/rag-verify-<uid>/exports`,
+  inside a folder of the user's own with mode 700 (a symlink there, or a
+  folder owned by someone else, is refused). It is passed to the suites as
+  `RAG_EXPORTS_DIR`, in place of the checkout's `./exports`.
+- **A copy of the models.** The Ollama models are copied once from the live
+  `rag-docker_ollama_models` into the volume `rag-verify-ollama-models` (about
+  2.5 GB). Every `up` checks the copy against the live store by sha256 and
+  repairs any difference. The live volume is mounted read-only, in a throwaway
+  container with no network, and only for that copy. The copy is kept by
+  `down`, so later runs don't copy again. With no live model volume, the copy
+  is skipped and the verify project's Ollama pulls the models into it, which
+  needs the internet.
+- **A configuration check.** Before anything is built, `up` reads the resolved
+  configuration (`docker compose config`) and checks it against an allow-list
+  of what the base file and the overlay need (#154). It refuses any other
+  top-level or service key (for example `volumes_from`, `network_mode`,
+  `privileged`, `cap_add`, `devices`, `pid`, `secrets`, `configs`); a build
+  with options other than a context and Dockerfile inside the checkout, or
+  whose image isn't `rag-verify-<service>`; a `rag-docker-*` image, under any
+  registry name; a network other than the project's own bridge network, or
+  joined with options; a volume that isn't the project's own or the model
+  copy; anything but the proxy published, on loopback at the verify port; a
+  mount other than a volume or a read-only bind from inside the checkout
+  (never its `exports` folder), apart from the api's own exports folder; and
+  the Docker socket. It can't see `env_file`, which compose merges into the
+  environment.
+- **Start-up.** `up` tears down anything left from an earlier run first, then
+  builds, then starts with `up --wait` (15 minutes), and tries once more if that
+  fails (Weaviate can be slow to report healthy, #130). If it still fails, it
+  prints the last log lines of each service that isn't up. `up` then leaves
+  the project running for inspection (`down` removes it); `run` removes it.
+
+**Memory.** The verify project runs next to the live stack on the same Docker
+VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
+answer LLM questions at once, each loads its own model (about 3 GB), so
+expect slower answers or a reload rather than a failure.
+
+**What it doesn't protect against.** The suites, and anything else a checkout
+runs on the host, have full access to Docker. The verify project keeps
+verification away from the live stack by accident, not from hostile code:
+reviewing what a branch runs is the security review's job.
+
+### The live stack is refused
+
+`all.sh` and every suite (`NN_*.sh`) refuse to run, exit 2, before any request
+or Docker command, when their target is the live stack: when the compose
+project they would act on is `rag-docker` (from `COMPOSE_PROJECT_NAME`, or
+the folder name when it's unset), or when `RAG_API` uses port 8080, which is
+also its default. `stack.sh` sets both for the verify project.
+
+`RAG_VERIFY_LIVE=1` overrides the refusal with a warning, for someone verifying
+their own deployment on purpose. The documented commands and the PR review
+never use it. Restarts never reach the live project, even with it: with
+`RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
+`04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing.
+
+`python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
+configuration check and both refusals, with Docker replaced by a stub, so it
+needs no stack.
 
 ## Focused import validation regressions
 
@@ -9892,13 +10026,19 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
 seams are mocked; this complements the live transfer suite and does not prove
-Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies:
+Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies, on
+the verify project: `bash scripts/verify/stack.sh up`, paste the `export` lines
+it prints, then
 
 ```bash
 docker compose run --rm --no-deps \
   -v "$PWD/scripts/tests:/tests:ro" -e RAG_TEST_API_DIR=/app \
   api python /tests/test_session_import.py
 ```
+
+and `bash scripts/verify/stack.sh down` when done. Without those exports,
+`docker compose run` from the main checkout starts a container in the live
+`rag-docker` project, with the live volumes mounted.
 
 Alternatively, with `uv` on the host:
 
@@ -9908,6 +10048,19 @@ uv run --no-project --python 3.11 \
   --with httpx==0.28.1 --with weaviate-client==4.23.1 \
   python scripts/tests/test_session_import.py
 ```
+
+`scripts/tests/test_settings_validation.py` checks that invalid settings are
+refused before backend, model or staging work, with every backend mocked. Its
+embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
+(on the verify project, with the exports from `stack.sh up`, as above):
+
+```bash
+docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
+  api python scripts/tests/test_settings_validation.py
+```
+
+With only `scripts/tests` mounted (as for `test_session_import.py` above) the
+other tests still run and the embedded-source check is skipped.
 
 ## Why integration tests
 
@@ -9941,7 +10094,8 @@ the test process, retains import/tuning recovery, restarts the API, then verifie
 exact UUIDs, properties, vectors and sources. It also checks real completed-batch
 rejection/partial acceptance, ingestion UUID rollback after a post-write read fault,
 resumption of metadata cleanup after backend deletion, owned scratch cleanup and
-retention of an unowned marker-like collection.
+retention of an unowned marker-like collection. It must not run against a
+user's data stack: run it on the verify project.
 
 `05_transfer.sh` runs it when `RAG_ALLOW_RESTART=1`: prepare, `docker compose
 restart api`, check, then cleanup. It creates and deletes only the
@@ -9956,11 +10110,13 @@ the suite skips these checks and says why.
 To run the phases by hand on a disposable stack:
 
 ```bash
+bash scripts/verify/stack.sh up      # then paste the export lines it prints
 docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
 docker compose restart api
 # Wait for /api/health to report healthy before the next phase.
 docker compose exec -T api python - check < scripts/verify/batch_recovery.py
 docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
+bash scripts/verify/stack.sh down
 ```
 
 In a manual run, if interrupted, keep the recorded fixtures and run `check` after
@@ -9974,7 +10130,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
-| `settings_validation.py` | standalone: `RAG_API=http://localhost:8080/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
+| `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
@@ -10004,10 +10160,13 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; use `18080` with a deliberate loopback test override |
-| `RAG_API` | `http://localhost:8080/api` | where the API is |
+| `RAG_VERIFY_PORT` | `8081` | `stack.sh`: the verify project's host port; 8080 is refused |
+| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; `stack.sh` sets it to the verify port |
+| `RAG_API` | `http://localhost:8080/api` | where the API is; `stack.sh` sets it to the verify project. Port 8080, the default, is refused as the live stack unless `RAG_VERIFY_LIVE=1` |
+| `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
+| `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`) |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
@@ -10016,9 +10175,9 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 
 `12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. The same registered script executes `session_persistence_cases.py` in the API image: owned filesystem/concurrency cases additionally hard-kill an owned writer at the replace boundary, pause archive inspection during a concurrent commit, retain generation failure codes and test marker-failure continuation. Native browser criteria verify pending, failed and out-of-order diagnostic refreshes using isolated HTTP responses. The in-container script rejects remote or mismatched `RAG_API` targets before health/backend execution.
 
-The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
+The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K 1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
 
-`11_retrieval.sh` is called by03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
+`11_retrieval.sh` is called by 03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
 
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
@@ -10039,10 +10198,12 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On a disposable stack with its embedding model already pulled, run:
+On the verify project (`bash scripts/verify/stack.sh up`, then paste the
+`export` lines it prints), whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
+bash scripts/verify/stack.sh down
 ```
 
 This verifies the real model's referenced bytes, copies them into a temporary
@@ -10061,15 +10222,15 @@ python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
 ## Cleaning up
 
 Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
-the end. If a run is interrupted:
+the end. On the verify project nothing outlives the run: `stack.sh run` removes
+the whole project, volumes included, even when interrupted. If `stack.sh` itself
+was killed, remove what is left with:
 
 ```bash
-curl -s localhost:8080/api/collections | python3 -c \
-  "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
-  | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
+bash scripts/verify/stack.sh down
 ```
 
-`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes fourteen owned cache/disk/collision/redirected-slot/historical-ID/concurrent-insertion cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes eighteen owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 
 The infrastructure suite requires Docker Engine 28.0.0+ and checks both resolved Compose and live Docker bindings for a single loopback proxy publication. When deploying an alternate host port for testing, set `RAG_EXPECTED_PROXY_PORT` to that port as well as `RAG_API`. Its inspection files are kept in a private temporary directory removed on exit. The local profile assumes standard bridge/NAT routing.
 
@@ -10091,9 +10252,12 @@ Tuning normalizes the backend first-character alias for active jobs and ownershi
 # Run every verification suite against a running stack.
 #
 #   bash scripts/verify/all.sh              # everything (~20 min, LLM-bound)
-#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~3 min)
+#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~8 min)
 #   RAG_ALLOW_RESTART=1 bash scripts/verify/all.sh  # also restart the stack
 #   bash scripts/verify/all.sh 02 04        # only the named suites
+#
+# Normally started by scripts/verify/stack.sh run, on the disposable verify
+# project. It refuses the live rag-docker stack (#152).
 #
 # Exits non-zero if any check fails, so it can gate a commit or a release.
 #
@@ -10104,8 +10268,10 @@ Tuning normalizes the backend first-character alias for active jobs and ownershi
 set -uo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
-# One run at a time: the fixtures rebuilt below are shared (#95).
-. ./lock.sh
+# One run at a time: the fixtures rebuilt below are shared (#95). lib.sh takes
+# the lock (lock.sh) and holds the live-stack guard (#152).
+. ./lib.sh
+live_guard
 
 API="${RAG_API:-http://localhost:8080/api}"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -10113,7 +10279,7 @@ FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
 if [ "$code" != "200" ]; then
   printf '\nNo healthy API at %s (HTTP %s).\n' "$API" "$code"
-  printf 'Start the stack first:  docker compose up -d\n\n'
+  printf 'Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
   exit 2
 fi
 
@@ -10123,7 +10289,8 @@ fi
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
     printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
-    printf 'Restart it and run again:  docker compose restart ollama\n\n'
+    printf 'Restart it and run again:  docker compose restart ollama\n'
+    printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
   fi
   printf '\n%s\n' "$sanity"
@@ -10172,6 +10339,515 @@ else
   printf '\n  At least one suite failed.\n\n'
 fi
 exit "$overall"
+```
+
+### scripts/verify/stack.sh
+
+```bash
+#!/usr/bin/env bash
+#
+# Run the verification suite on a disposable compose project, never on the
+# live stack (#152).
+#
+#   bash scripts/verify/stack.sh run [--checkout DIR] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
+#   bash scripts/verify/stack.sh down
+#
+# `run` brings the verify project up, runs that checkout's all.sh against it
+# (RAG_SKIP_SLOW and RAG_ALLOW_RESTART pass through) and always tears it down,
+# exiting with all.sh's status. `up` leaves the project running and prints the
+# environment that points docker compose and the suites at it; `down` removes
+# it. --checkout picks the checkout to build and test (default: this one).
+#
+# The verify project is compose project `rag-verify` on port RAG_VERIFY_PORT
+# (default 8081; 8080 is refused), with its own empty volumes, its own image
+# tags (rag-verify-api, rag-verify-ui) and its own exports folder. The live
+# `rag-docker` stack holds real data, and nothing here builds, starts, stops or
+# writes to it. Its only contact with it: the Ollama models are copied from
+# rag-docker_ollama_models, mounted read-only in a throwaway container, into
+# the volume rag-verify-ollama-models, which is kept between runs and checked
+# by sha256 on every `up`.
+#
+# The overlay docker-compose.verify.yml and this script come from the checkout
+# that holds this script, so an evaluation can run a trusted copy against a PR's
+# checkout. Before anything is built, the resolved configuration is checked
+# against an allow-list of what docker-compose.yml and the overlay need (#154),
+# and refused otherwise: any other top-level or service key (volumes_from,
+# network_mode, privileged, secrets, ...); a build with options other than a
+# context and Dockerfile inside the checkout, or one that would write a tag
+# other than rag-verify-<service>; a rag-docker-* image under any registry
+# name; a network or volume other than the project's own (and the model copy);
+# any published port but the proxy on loopback at the verify port; a mount
+# other than a volume or a read-only bind from inside the checkout (never its
+# exports folder), apart from the api's own exports folder; the Docker socket.
+# It can't see env_file, which compose merges into the environment.
+#
+# What this does not do: the suites, and anything else the checkout runs on the
+# host, still have full access to Docker. It keeps verification away from the
+# live stack by accident, not from hostile code; that is the security review's.
+set -uo pipefail
+
+PROJECT=rag-verify
+LIVE_MODELS=rag-docker_ollama_models
+MODELS=rag-verify-ollama-models
+HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+SCRATCH="${TMPDIR:-/tmp}"
+SCRATCH="${SCRATCH%/}"
+[ -n "$SCRATCH" ] || SCRATCH=/tmp
+# A folder of this user's own, mode 700, holds the exports folder, so another
+# local user can't pre-create it or plant a symlink there (#154).
+PRIVATE="$SCRATCH/rag-verify-$(id -u)"
+EXPORTS="$PRIVATE/exports"
+
+usage() {
+  sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
+  exit 2
+}
+
+fail() {
+  printf '\nstack.sh: %s\n\n' "$1" >&2
+  exit 2
+}
+
+# Prints why the private folder can't be used, or nothing.
+private_problem() {
+  if [ -L "$PRIVATE" ]; then
+    printf '%s is a symlink; refusing to use it.' "$PRIVATE"
+  elif [ -e "$PRIVATE" ] && [ ! -d "$PRIVATE" ]; then
+    printf '%s exists and is not a folder; refusing to use it.' "$PRIVATE"
+  elif [ -d "$PRIVATE" ] && [ ! -O "$PRIVATE" ]; then
+    printf '%s belongs to another user; refusing to use it.' "$PRIVATE"
+  fi
+}
+
+# ── arguments, checked before any Docker command ─────────────────────────────
+[ "$#" -ge 1 ] || usage
+CMD="$1"; shift
+case "$CMD" in up|down|run) ;; *) usage ;; esac
+CHECKOUT="$HARNESS"
+PULL=""
+ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --checkout)
+      [ "$CMD" != down ] && [ "$#" -ge 2 ] || usage
+      CHECKOUT="$2"; shift 2 ;;
+    --pull)
+      [ "$CMD" = up ] || usage
+      PULL=1; shift ;;
+    -*) usage ;;
+    *)
+      [ "$CMD" = run ] || usage
+      ARGS+=("$1"); shift ;;
+  esac
+done
+
+PORT="${RAG_VERIFY_PORT:-8081}"
+case "$PORT" in
+  ''|*[!0-9]*) fail "RAG_VERIFY_PORT must be a port number, not '$PORT'." ;;
+esac
+[ "${#PORT}" -le 5 ] || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
+PORT=$((10#$PORT))
+{ [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ]; } || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
+[ "$PORT" -ne 8080 ] || fail "RAG_VERIFY_PORT can't be 8080: that is the live rag-docker stack's port."
+
+if [ "$CMD" != down ]; then
+  { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
+    || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
+  CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# The private folder, checked before any Docker command; up and run create it.
+problem=$(private_problem)
+[ -z "$problem" ] || fail "$problem"
+if [ "$CMD" != down ]; then
+  if [ -d "$PRIVATE" ]; then
+    chmod 700 "$PRIVATE" || fail "could not set $PRIVATE to mode 700."
+  else
+    mkdir -m 700 "$PRIVATE" || fail "could not create $PRIVATE."
+  fi
+fi
+
+# ── one verify run per machine ───────────────────────────────────────────────
+# Held for the whole command; the all.sh started below inherits it.
+. "$HARNESS/scripts/verify/lock.sh"
+TEARDOWN=0
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [ "$TEARDOWN" = 1 ]; then
+    TEARDOWN=0
+    do_down || rc=2
+  fi
+  _rag_lock_release
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── the verify environment ───────────────────────────────────────────────────
+unset COMPOSE_PATH_SEPARATOR
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$HARNESS/docker-compose.verify.yml"
+export RAG_VERIFY_PORT="$PORT"
+export RAG_API="http://localhost:$PORT/api"
+export RAG_EXPECTED_PROXY_PORT="$PORT"
+export RAG_EXPORTS_DIR="$EXPORTS"
+
+# ── down: remove everything of the verify project, except the model copy ────
+# The images the verify project built, by name. Untagged entries are left
+# out: they can't be removed by name.
+labelled_images() {
+  docker image ls --filter "label=com.docker.compose.project=$PROJECT" \
+    --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>'
+}
+
+do_down() {
+  local filter="label=com.docker.compose.project=$PROJECT" ids images problem left
+  # Project name only, from a neutral folder: no compose file is needed.
+  (cd / && env -u COMPOSE_FILE docker compose -p "$PROJECT" down -v --remove-orphans) >/dev/null 2>&1
+  ids=$(docker ps -aq --filter "$filter")
+  [ -z "$ids" ] || docker rm -f $ids >/dev/null
+  ids=$(docker network ls -q --filter "$filter")
+  [ -z "$ids" ] || docker network rm $ids >/dev/null
+  ids=$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")
+  [ -z "$ids" ] || docker volume rm $ids >/dev/null
+  # Every image built for the project, whatever its service, but only by a
+  # rag-verify-* name. A labelled image under any other name is left alone
+  # and reported below.
+  images=$(labelled_images | grep '^rag-verify-')
+  [ -z "$images" ] || docker image rm $images >/dev/null
+  problem=$(private_problem)
+  if [ -n "$problem" ]; then
+    printf 'stack.sh: %s\n' "$problem" >&2
+    return 2
+  fi
+  if [ -L "$EXPORTS" ]; then
+    printf 'stack.sh: %s is a symlink; not removing it.\n' "$EXPORTS" >&2
+    return 2
+  fi
+  [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
+  left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
+  if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
+    left="$left $EXPORTS"
+  fi
+  if [ -n "$left" ]; then
+    printf 'stack.sh: the verify project was not fully removed: %s\n' "$(printf '%s' "$left" | tr '\n' ' ')" >&2
+    return 2
+  fi
+  printf 'verify project %s removed (the model copy %s is kept)\n' "$PROJECT" "$MODELS"
+}
+
+# ── the models: a copy of the live store, checked on every up ────────────────
+# The image that runs the copy is the ollama image pinned by the harness's own
+# docker-compose.yml, already on this machine, not one the checkout picks.
+seed_image() {
+  python3 - "$HARNESS/docker-compose.yml" <<'IMAGEPY'
+import sys
+inside = False
+for line in open(sys.argv[1]):
+    if line.rstrip('\n') == '  ollama:':
+        inside = True
+    elif inside and line.startswith('  ') and not line.startswith('   ') and line.strip():
+        break
+    elif inside and line.startswith('    image:'):
+        print(line.split(':', 1)[1].strip().strip('"\''))
+        sys.exit(0)
+sys.exit(1)
+IMAGEPY
+}
+
+# Runs in the throwaway container: /live is the live store (read-only), /copy
+# the verify copy. Every file is compared by sha256 and copied when missing or
+# different; files the live store doesn't have are removed.
+SYNC='set -euo pipefail
+copied=0; repaired=0; removed=0
+cd /live
+while IFS= read -r -d "" f; do
+  f="${f#./}"
+  want=$(sha256sum "/live/$f" | cut -d" " -f1)
+  case "$f" in
+    */blobs/sha256-*) [ "${f##*/sha256-}" = "$want" ] || echo "warning: live blob $f does not match its name" >&2 ;;
+  esac
+  if [ -f "/copy/$f" ] && [ ! -L "/copy/$f" ]; then
+    [ "$(sha256sum "/copy/$f" | cut -d" " -f1)" = "$want" ] && continue
+    repaired=$((repaired + 1))
+  else
+    copied=$((copied + 1))
+  fi
+  mkdir -p "/copy/$(dirname "$f")"
+  rm -rf "/copy/$f"
+  cp -p "/live/$f" "/copy/$f"
+done < <(find . -type f -print0)
+cd /copy
+while IFS= read -r -d "" f; do
+  f="${f#./}"
+  if [ ! -f "/live/$f" ] || [ -L "/live/$f" ]; then rm -f "/copy/$f"; removed=$((removed + 1)); fi
+done < <(find . \( -type f -o -type l \) -print0)
+find /copy -mindepth 1 -type d -empty -delete
+echo "models: copied=$copied repaired=$repaired removed=$removed"'
+
+do_seed() {
+  local img
+  if ! docker volume inspect "$MODELS" >/dev/null 2>&1; then
+    docker volume create --label rag-verify.models=1 "$MODELS" >/dev/null || fail "could not create the volume $MODELS."
+  fi
+  if ! docker volume inspect "$LIVE_MODELS" >/dev/null 2>&1; then
+    printf 'note: there is no %s volume to copy the models from, so the verify\n' "$LIVE_MODELS"
+    printf 'project'"'"'s ollama will pull them into %s (this needs the internet).\n' "$MODELS"
+    return 0
+  fi
+  img=$(seed_image) || fail "could not find the ollama image in $HARNESS/docker-compose.yml."
+  docker image inspect "$img" >/dev/null 2>&1 \
+    || fail "the image $img, used to copy the models, isn't on this machine; it isn't pulled for this."
+  printf 'checking the model copy %s against %s (read-only)...\n' "$MODELS" "$LIVE_MODELS"
+  docker run --rm --network none --entrypoint /bin/bash \
+    -v "$LIVE_MODELS:/live:ro" -v "$MODELS:/copy" "$img" -c "$SYNC" \
+    || fail "copying the models into $MODELS failed."
+}
+
+# ── the guard on the resolved configuration ──────────────────────────────────
+do_guard() {
+  local config rc
+  config=$(mktemp "$SCRATCH/rag-verify-config.XXXXXX") || fail "could not create a scratch file."
+  if ! docker compose -p "$PROJECT" config --format json > "$config"; then
+    rm -f "$config"
+    fail "docker compose config failed for $CHECKOUT."
+  fi
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" <<'GUARDPY'
+import json, os, sys
+
+checkout, exports, port, path = sys.argv[1:5]
+config = json.load(open(path))
+services = config.get('services') or {}
+volumes = config.get('volumes') or {}
+networks = config.get('networks') or {}
+real = os.path.realpath
+problems = []
+
+# An allow-list (#154): only the keys and values that docker-compose.yml and
+# the overlay resolve to. Anything else could reach the host or other
+# containers, so it is refused; a branch that needs more changes this list.
+TOP_KEYS = {'name', 'services', 'volumes', 'networks'}
+SERVICE_KEYS = {'build', 'command', 'depends_on', 'entrypoint', 'environment',
+                'healthcheck', 'image', 'networks', 'ports', 'volumes'}
+BUILD_KEYS = {'context', 'dockerfile'}
+NETWORK_KEYS = {'name', 'driver', 'ipam'}
+VOLUME_KEYS = {'name', 'external'}
+MOUNT_KEYS = {'type', 'source', 'target', 'read_only', 'bind', 'volume'}
+
+def inside(child, parent):
+    child, parent = real(child), real(parent)
+    return child == parent or child.startswith(parent.rstrip('/') + '/')
+
+def normalise(image):
+    # The same image under its registry-qualified names.
+    for prefix in ('docker.io/', 'index.docker.io/', 'registry-1.docker.io/'):
+        if image.startswith(prefix):
+            image = image[len(prefix):]
+            break
+    if image.startswith('library/'):
+        image = image[len('library/'):]
+    return image
+
+def extra(keys, allowed):
+    return ', '.join(sorted(set(keys) - allowed))
+
+# (g) top level: only these keys, and the verify project's name
+if extra(config, TOP_KEYS):
+    problems.append(f"(g) top-level keys not allowed: {extra(config, TOP_KEYS)}")
+if config.get('name') != 'rag-verify':
+    problems.append(f"(g) the project name is {config.get('name')!r}, not 'rag-verify'")
+
+# (h) service keys: only the base file's
+for svc, service in services.items():
+    if extra(service, SERVICE_KEYS):
+        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, SERVICE_KEYS)}")
+
+# (i) builds: only a context and a Dockerfile, both inside the checkout
+for svc, service in services.items():
+    if 'build' not in service:
+        continue
+    build = service['build']
+    if not isinstance(build, dict):
+        problems.append(f"(i) service {svc!r} has a build of an unexpected form: {build!r}")
+        continue
+    if extra(build, BUILD_KEYS):
+        problems.append(f"(i) service {svc!r} uses build keys not allowed: {extra(build, BUILD_KEYS)}")
+    context = build.get('context')
+    if not (isinstance(context, str) and os.path.isabs(context) and inside(context, checkout)):
+        problems.append(f"(i) service {svc!r} builds from {context!r}, not a folder inside the checkout")
+        continue
+    dockerfile = os.path.join(context, build.get('dockerfile') or 'Dockerfile')
+    if not inside(dockerfile, checkout):
+        problems.append(f"(i) service {svc!r} uses the Dockerfile {dockerfile!r}, outside the checkout")
+
+# (a) volumes: the project's own, or the external model copy, nothing else
+for key, volume in volumes.items():
+    volume = volume or {}
+    name = volume.get('name')
+    if key == 'ollama_models' or name == 'rag-verify-ollama-models':
+        ok = (name == 'rag-verify-ollama-models' and volume.get('external') is True
+              and not volume.get('driver_opts'))
+    else:
+        ok = (name == 'rag-verify_' + key and not volume.get('external')
+              and not volume.get('driver_opts'))
+    if not ok:
+        problems.append(f"(a) volume {key!r} resolves to {name!r}"
+                        f"{' (external)' if volume.get('external') else ''}"
+                        f"{' (driver_opts)' if volume.get('driver_opts') else ''}; "
+                        f"only rag-verify_{key} or the external rag-verify-ollama-models are allowed")
+    if extra(volume, VOLUME_KEYS):
+        problems.append(f"(a) volume {key!r} uses keys not allowed: {extra(volume, VOLUME_KEYS)}")
+for svc, service in services.items():
+    for mount in service.get('volumes') or []:
+        if mount.get('type') == 'volume' and mount.get('source') and mount['source'] not in volumes:
+            problems.append(f"(a) service {svc!r} mounts undeclared volume {mount['source']!r}")
+
+# (b) images: never the live stack's tags; a build writes only its own
+# rag-verify-<service> tag, so no tag the live stack runs can be rebuilt
+for svc, service in services.items():
+    image = normalise(service.get('image') or '')
+    if image.startswith('rag-docker-') or image.startswith('rag-docker:'):
+        problems.append(f"(b) service {svc!r} uses the live image {service.get('image')!r}")
+for svc, want in (('api', 'rag-verify-api:latest'), ('ui', 'rag-verify-ui:latest')):
+    if svc in services and services[svc].get('image') != want:
+        problems.append(f"(b) service {svc!r} must use {want}, not {services[svc].get('image')!r}")
+for svc, service in services.items():
+    if 'build' in service and svc not in ('api', 'ui') and 'image' in service \
+            and normalise(service.get('image') or '') not in (f'rag-verify-{svc}:latest', f'rag-verify-{svc}'):
+        problems.append(f"(b) service {svc!r} builds, so its image must be rag-verify-{svc}:latest "
+                        f"or unset, not {service.get('image')!r}")
+
+# (j) networks: the project's own bridge networks, joined with no options
+for key, network in networks.items():
+    network = network or {}
+    if extra(network, NETWORK_KEYS):
+        problems.append(f"(j) network {key!r} uses keys not allowed: {extra(network, NETWORK_KEYS)}")
+    if network.get('name') != 'rag-verify_' + key:
+        problems.append(f"(j) network {key!r} resolves to {network.get('name')!r}; only rag-verify_{key} is allowed")
+    if network.get('driver') not in (None, 'bridge'):
+        problems.append(f"(j) network {key!r} uses the driver {network.get('driver')!r}; only bridge is allowed")
+    if network.get('ipam'):
+        problems.append(f"(j) network {key!r} sets ipam options")
+for svc, service in services.items():
+    joined = service.get('networks') or {}
+    if isinstance(joined, list):
+        joined = {name: None for name in joined}
+    for name, options in joined.items():
+        if name not in networks:
+            problems.append(f"(j) service {svc!r} joins the undeclared network {name!r}")
+        if options:
+            problems.append(f"(j) service {svc!r} sets options on network {name!r}")
+
+# (c) exactly one published port: the proxy, on loopback, the verify port
+ports = [(svc, p) for svc, service in services.items() for p in service.get('ports') or []]
+if not (len(ports) == 1 and ports[0][0] == 'proxy'
+        and ports[0][1].get('host_ip') == '127.0.0.1'
+        and str(ports[0][1].get('published')) == port
+        and ports[0][1].get('target') == 80
+        and ports[0][1].get('protocol', 'tcp') == 'tcp'):
+    shown = ', '.join(f"{svc}:{p.get('host_ip', '')}:{p.get('published')}->{p.get('target')}/{p.get('protocol', 'tcp')}"
+                      for svc, p in ports) or 'none'
+    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->80/tcp, not {shown}")
+
+# (d) mounts: volumes and binds only, with no options; binds read-only, from
+# inside the checkout but not its exports folder; (e) never the socket
+sockets = {'/var/run/docker.sock', '/run/docker.sock'}
+checkout_exports = os.path.join(checkout, 'exports')
+for svc, service in services.items():
+    for mount in service.get('volumes') or []:
+        source, target = mount.get('source') or '', mount.get('target') or ''
+        if source in sockets or target in sockets or (source and real(source) in {real(s) for s in sockets}):
+            problems.append(f"(e) service {svc!r} mounts the Docker socket")
+            continue
+        if extra(mount, MOUNT_KEYS):
+            problems.append(f"(d) service {svc!r} mount {target!r} uses keys not allowed: {extra(mount, MOUNT_KEYS)}")
+        if mount.get('type') not in ('volume', 'bind'):
+            problems.append(f"(d) service {svc!r} mount {target!r} is of type {mount.get('type')!r}; only volume and bind are allowed")
+            continue
+        if mount.get('volume'):
+            problems.append(f"(d) service {svc!r} mount {target!r} sets volume options")
+        if set(mount.get('bind') or {}) - {'create_host_path'}:
+            problems.append(f"(d) service {svc!r} mount {target!r} sets bind options")
+        if mount.get('type') != 'bind' or (svc == 'api' and target == '/app/exports'):
+            continue  # the api's exports: rule (f)
+        if not (os.path.isabs(source) and inside(source, checkout)):
+            problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout")
+        elif inside(source, checkout_exports) or inside(checkout_exports, source):
+            problems.append(f"(d) service {svc!r} binds {source!r}, which is or holds the checkout's exports folder")
+        elif mount.get('read_only') is not True:
+            problems.append(f"(d) service {svc!r} binds {source!r} read-write; binds must be read-only")
+
+# (f) the API's exports are the verify project's own folder
+mounts = [m for m in (services.get('api', {}).get('volumes') or []) if m.get('target') == '/app/exports']
+if not (len(mounts) == 1 and mounts[0].get('type') == 'bind' and real(mounts[0].get('source') or '/') == real(exports)):
+    problems.append(f"(f) the api's /app/exports must be bound from {exports}, not "
+                    f"{[m.get('source') for m in mounts] or 'nothing'}")
+
+if problems:
+    print('The resolved compose configuration is refused:')
+    for problem in problems:
+        print('  ' + problem)
+    sys.exit(2)
+GUARDPY
+  rc=$?
+  rm -f "$config"
+  [ "$rc" -eq 0 ] || fail "the verify project's configuration is refused (see above); nothing was built or started."
+}
+
+# ── up ───────────────────────────────────────────────────────────────────────
+do_up() {
+  local i code=000 service state health
+  printf 'clearing any leftover verify project...\n'
+  do_down >/dev/null || fail "could not remove a leftover verify project."
+  mkdir -p "$EXPORTS" || fail "could not create $EXPORTS."
+  do_seed
+  do_guard
+  printf 'building the verify project from %s...\n' "$CHECKOUT"
+  docker compose -p "$PROJECT" build ${PULL:+--pull} || fail "the build failed."
+  if ! docker compose -p "$PROJECT" up -d --wait --wait-timeout 900; then
+    # Weaviate can be slow to report healthy (#130): one more try.
+    printf 'the first start failed; trying once more...\n'
+    if ! docker compose -p "$PROJECT" up -d --wait --wait-timeout 900; then
+      docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+        | while read -r service state health; do
+            case "$state/${health:-}" in
+              running/healthy|running/) ;;
+              *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+                 docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+            esac
+          done
+      [ "$CMD" != run ] || fail "the verify project did not come up; run removes it now."
+      fail "the verify project did not come up; it is left running for inspection (stack.sh down removes it)."
+    fi
+  fi
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
+  printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+    printf 'export %s=%q\n' "$var" "${!var}"
+  done
+  printf '\n'
+}
+
+case "$CMD" in
+  down)
+    do_down || exit 2 ;;
+  up)
+    do_up ;;
+  run)
+    TEARDOWN=1
+    do_up
+    rc=0
+    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+    exit "$rc" ;;
+esac
 ```
 
 ### scripts/verify/lib.sh
@@ -10246,7 +10922,7 @@ require_stack() {
   code=$(api_code "$API/health")
   if [ "$code" != "200" ]; then
     printf '\n  Cannot reach a healthy API at %s (HTTP %s).\n' "$API" "$code"
-    printf '  Start the stack first:  docker compose up -d\n\n'
+    printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
 }
@@ -10279,7 +10955,7 @@ import json,sys
 for c in json.load(sys.stdin)['collections']:
     if c['name'].startswith('$PREFIX'): print(c['name'])" 2>/dev/null)
   for n in $names; do drop_collection "$n"; done
-  rm -f "${REPO_ROOT:-.}"/exports/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
+  rm -f "${RAG_EXPORTS_DIR:-${REPO_ROOT:-.}/exports}"/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
 }
 
 summary() {
@@ -10291,6 +10967,77 @@ summary() {
   fi
   return 0
 }
+
+# ── the live stack is off limits (#152) ──────────────────────────────────────
+# Verification runs on the disposable `rag-verify` project that
+# scripts/verify/stack.sh brings up, never on the live `rag-docker` stack that
+# holds real data. A target is live when the compose project these scripts
+# would act on is rag-docker, or when RAG_API uses the live port 8080.
+
+# Prints why the current target is the live stack, or nothing.
+live_target_reason() {
+  local project="${COMPOSE_PROJECT_NAME:-}" root port
+  if [ -z "$project" ]; then
+    # What compose would use: COMPOSE_PROJECT_NAME from the checkout's .env
+    # (optionally after `export `; the last one wins; quotes removed), else
+    # a `name:` in the compose file, else the folder name (#154).
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    project=$(sed -n 's/^\(export[[:space:]]\{1,\}\)\{0,1\}COMPOSE_PROJECT_NAME=//p' "$root/.env" 2>/dev/null | tail -1 \
+      | sed -e 's/^"\(.*\)"$/\1/' -e t -e "s/^'\(.*\)'\$/\1/")
+    [ -n "$project" ] || project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
+    [ -n "$project" ] || project=$(basename "$root")
+  fi
+  # Lowercased, everything outside [a-z0-9_-] dropped, and leading `-` and
+  # `_` stripped, as compose normalises a name.
+  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[-_]*//')
+  port=$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+try:
+    port = url.port
+except ValueError:
+    port = None
+print(port if port is not None else (443 if url.scheme == "https" else 80))' "$API" 2>/dev/null)
+  if [ "$project" = "rag-docker" ]; then
+    printf 'the compose project is rag-docker, the live rag-docker stack'
+  elif [ "$port" = "8080" ]; then
+    printf 'RAG_API (%s) uses port 8080, the live rag-docker stack' "$API"
+  fi
+}
+
+# Refuses a live target unless RAG_VERIFY_LIVE=1, which only warns.
+live_guard() {
+  local reason
+  reason=$(live_target_reason)
+  [ -n "$reason" ] || return 0
+  if [ "${RAG_VERIFY_LIVE:-0}" = "1" ]; then
+    printf '\n  WARNING: RAG_VERIFY_LIVE=1, so this run targets the live rag-docker stack:\n  %s.\n\n' "$reason" >&2
+    return 0
+  fi
+  printf '\n  Refusing to verify against the live rag-docker stack: %s.\n' "$reason" >&2
+  printf '  Run it on the disposable verify project:  bash scripts/verify/stack.sh run\n' >&2
+  printf '  (RAG_VERIFY_LIVE=1 overrides this; see scripts/verify/README.md.)\n\n' >&2
+  exit 2
+}
+
+# Prints why a restart must not run here, or nothing. Restarts never reach the
+# live project, whatever RAG_VERIFY_LIVE says.
+restart_refusal_reason() {
+  local project
+  project=$(printf '%s' "${COMPOSE_PROJECT_NAME:-}" | tr '[:upper:]' '[:lower:]')
+  if [ -z "$project" ]; then
+    printf 'COMPOSE_PROJECT_NAME is not set, so a restart could reach the live rag-docker stack; run it through scripts/verify/stack.sh'
+  elif [ "$project" = "rag-docker" ]; then
+    printf 'restarts never run against the live rag-docker project (#152)'
+  fi
+}
+
+# Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
+# that borrow these helpers are not suites and are left alone.
+case "$(basename "$0")" in
+  [0-9][0-9]_*.sh) live_guard ;;
+esac
 ```
 
 ### scripts/verify/lock.sh
@@ -10998,7 +11745,11 @@ check_eq "a recreated collection does not inherit the retrieval config" \
   "$(api_get "/retrieval/config/$C" | jfield "['is_default']")" "True"
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Save a known config here, right before the restart: the section above ends
   # by recreating $C with no saved config, so relying on earlier state made
   # this check fail on every run (#73).
@@ -11007,9 +11758,9 @@ if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
     "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
-  # Name the project: from a checkout in a folder not called rag-docker,
-  # compose would otherwise act on a different project.
-  project="${COMPOSE_PROJECT_NAME:-rag-docker}"
+  # Name the project explicitly; restart_refusal_reason has already made sure
+  # it is set and is not the live rag-docker project.
+  project="$COMPOSE_PROJECT_NAME"
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
   elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
@@ -11270,7 +12021,12 @@ Inside disposable API: python - < scripts/verify/retrieval_controls.py
 Actual SDK/backend storage and vector queries; only Ollama reformulation,
 embedding and answer calls are controlled. No startup sweep/model calls.
 """
-import importlib.util,json,os,tempfile,uuid
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import uuid
 from unittest.mock import AsyncMock,patch
 from fastapi.testclient import TestClient
 from config import settings
@@ -11293,17 +12049,20 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
             if recovery:
                 with patch.object(settings,'upload_dir',persistent_upload):
                     owner=recovery.begin(prefix+index,'tune',wc.get_client())
-                owners.append(owner);name=owner['staging']
+                owners.append(owner)
+                name=owner['staging']
             else:
                 name=prefix+index+'__tuning_'+uuid.uuid4().hex
-            assert not wc._collection_exists_sync(name);collections.append(name)
+            assert not wc._collection_exists_sync(name)
+            collections.append(name)
             response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
             assert response.status_code==201,response.text
             if os.environ.get('RAG_VERIFY_INTERRUPT_AFTER_CREATE')=='1':
                 print('OWNED_INTERRUPTED_FIXTURE '+json.dumps({'name':name,'owner':owners[-1] if owners else None}),flush=True)
                 os._exit(86)  # Acceptance injection: skips finally like a hard kill.
             coll=wc.get_client().collections.get(name)
-            for i in range(1,11):coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            for i in range(1,11):
+                coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
             row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert row['index_type']==index and row['distance_metric']=='cosine'
             assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
@@ -11312,7 +12071,8 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                 with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
                     response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
                 assert response.status_code==200,response.text
-                body=response.json();assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
+                body=response.json()
+                assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
             after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
             print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
@@ -11332,13 +12092,26 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                 assert invalid.status_code==422,invalid.text
             print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
     finally:
+        # Every owned collection gets a deletion attempt; failures are reported
+        # together afterwards so they never hide a failure from the checks.
+        cleanup_failures=[]
         for name in collections:
-            if wc._collection_exists_sync(name):
-                response=client.delete('/collections/'+name+'?confirm=true');assert response.status_code==200,response.text
+            try:
+                if wc._collection_exists_sync(name):
+                    response=client.delete('/collections/'+name+'?confirm=true')
+                    if response.status_code!=200:
+                        cleanup_failures.append(f'{name}: {response.status_code} {response.text}')
+            except Exception as error:
+                cleanup_failures.append(f'{name}: {error!r}')
         if recovery:
             with patch.object(settings,'upload_dir',persistent_upload):
-                for owner in owners:recovery.discard(owner,wc.get_client())
+                for owner in owners:
+                    recovery.discard(owner,wc.get_client())
         wc.close_client()
+        if cleanup_failures:
+            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
+            if sys.exc_info()[0] is None:  # Otherwise the original failure stays the raised error.
+                raise AssertionError('owned collection cleanup failed: '+'; '.join(cleanup_failures))
 assert all(not wc._collection_exists_sync(name) for name in collections)
 wc.close_client()
 print('PASS owned synthetic collections/config/files removed',flush=True)
@@ -11800,7 +12573,11 @@ code=$(api_code "$API/goldstandard/download/definitely_not_here.json")
 check_eq "download of an unknown filename returns 404" "$code" "404"
 
 # ── sessions survive a restart ───────────────────────────────────────────────
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "sessions survive an API restart" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   (cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ../..)" && docker compose restart api >/dev/null 2>&1)
   for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
   api_get "/goldstandard/session/$SID" > /tmp/vfy_post.json
@@ -11847,7 +12624,8 @@ check "imported evaluation identity acceptance suite" $?
 bash ./14_reindex.sh
 check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
-EXPORTS="$REPO_ROOT/exports"
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
 
 section "Export, import and tuning"
 
@@ -12261,8 +13039,12 @@ check "the help page has no unsubstituted placeholders" $?
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
 if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
   skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "batch recovery across an API restart" 1 "$restart_refusal"
 elif ! [[ "$RP" =~ ^Vfy[A-Za-z0-9_]+$ ]]; then
   # batch_recovery.py refuses any other prefix, as a guard on its destructive phases.
   skip "batch recovery across an API restart" "batch_recovery.py accepts only Vfy… prefixes; RAG_TEST_PREFIX='$PREFIX' gives '$RP'"
@@ -12983,12 +13765,39 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     try {
       await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
       if (!initial) throw new Error('Initial metadata request was not observed');
+      if (!lateFailure) {
+        const pending = await bodyText(s.page);
+        r.check('pending initial read says it is reading, not that details are unavailable', pending.includes('Reading index details…') && !/Index details are unavailable/.test(pending));
+      }
       await clickByText(s.page, 'Refresh index details'); await sleep(300);
       const freshVisible = /ef: 191/.test(await bodyText(s.page));
       await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
       await sleep(300);
       const after = await bodyText(s.page);
       r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
+  }
+
+  // ── Q&A page shares the accurate query-method label ─────────────────────
+  r.section('Q&A accurate method label');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedQaLabelFixture';
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name, object_count: 4, index_type: 'flat', distance_metric: 'cosine', hnsw_config: null }] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(700);
+      const labels = await s.page.evaluate(() => [...document.querySelectorAll('select[disabled] option')].map(o => o.textContent));
+      r.check('Q&A shows the same "Vector — existing index" label for a saved flat alias', labels.includes('Vector — existing index') && !labels.includes('flat'), JSON.stringify(labels));
     } finally { await s.ctx.close(); }
   }
 
@@ -14055,6 +14864,8 @@ bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$bindings" || exit 2
 require_stack
 section "Imported evaluation session identities"
+python3 ../tests/test_session_identity.py
+check "embedded identity sources match" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/session_identity_cases.py)
 check "owned identity collision, preservation and allocation regressions" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_identity.py)
@@ -14066,8 +14877,9 @@ summary
 
 ```python
 """Owned import identity preservation; run by13_identity.sh in the API image."""
-import asyncio,copy,json,os,subprocess,sys,tempfile,threading,unittest
+import asyncio,copy,json,os,subprocess,sys,tempfile,threading,time,unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
@@ -14179,17 +14991,14 @@ class IdentityTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
         self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
 
-    def test_historical_source_identity_gets_safe_local_id_and_usable_provenance(self):
-        from models.schemas import SessionResponse
+    def test_noncanonical_source_identity_is_refused_before_restoration(self):
         package=Path(self.tmp.name)/'legacy-package';gold=package/'goldstandard';gold.mkdir(parents=True)
         data=fixture();data['session_id']='legacy-review-2024';(gold/'legacy.json').write_text(json.dumps(data))
-        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
-        importer._restore_sidecars('OwnedLegacy',package,'OwnedOriginal',validated,mappings)
-        local=mappings[0]['session_id'];self.assertRegex(local,r'^gs_[0-9a-f]{8}$')
-        loaded=gs.get_session(local);self.assertEqual(loaded['imported_from']['session_id'],data['session_id'])
-        self.assertEqual(SessionResponse.model_validate(loaded).imported_from.session_id,data['session_id'])
-        self.assertFalse((gs._sessions_dir()/'legacy-review-2024.json').exists())
-        result=asyncio.run(gs.save_session(local,'legacy-rows.json'));self.assertEqual(json.loads((Path(self.tmp.name)/result['filename']).read_text())[0]['answer'],'Original answer')
+        before=self.path.read_bytes()
+        with self.assertRaises(importer.PackageError) as caught:importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        self.assertEqual((caught.exception.code,caught.exception.detail),('PACKAGE_CORRUPT',{'file':'goldstandard/legacy.json'}))
+        self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(len(list(self.path.parent.glob('*.json'))),1)
 
     def test_cache_iteration_serializes_with_generation_insertion(self):
         entered=threading.Event();release=threading.Event();started=threading.Event();mutated=threading.Event()
@@ -14210,6 +15019,59 @@ class IdentityTests(unittest.TestCase):
             finally:release.set()
             self.assertEqual(len(reading.result(timeout=2)),1);self.assertRegex(writing.result(timeout=2)['session_id'],r'^gs_[0-9a-f]{8}$')
 
+
+    # Reviewer-added: forced candidate collisions under real thread contention.
+    def test_reviewer_forced_duplicate_candidates_race_never_share_or_overwrite(self):
+        before=self.path.read_bytes();shared='gs_460abc01';draw=threading.Lock();counter=[0]
+        def duplicated():
+            with draw:
+                n=counter[0];counter[0]+=1
+            return SimpleNamespace(hex='%08x'%(0x46100000+n//2)+'0'*24)
+        original_save=gs._save_session_sync
+        def slow_save(session):
+            time.sleep(.02);return original_save(session)
+        def run(i):
+            data=fixture();data['collection']='OwnedRace'+str(i)
+            if i%3==0:return gs._store_generated_session(data)['session_id']
+            data['session_id']=shared if i%3==1 else self.original['session_id']
+            return gs.store_imported_session(data,'OwnedOriginal')['session_id']
+        with patch.object(gs.uuid,'uuid4',side_effect=duplicated),patch.object(gs,'_save_session_sync',side_effect=slow_save):
+            with ThreadPoolExecutor(max_workers=12) as pool:identities=list(pool.map(run,range(24)))
+        self.assertEqual(len(set(identities)),24,identities);self.assertNotIn(self.original['session_id'],identities)
+        self.assertEqual(identities.count(shared),1,'exactly one concurrent import keeps a free shared source ID')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(list(self.path.parent.glob('*.json'))),25)
+        for sid in identities:self.assertEqual(json.loads((self.path.parent/(sid+'.json')).read_text())['session_id'],sid)
+
+    def test_reviewer_replace_import_into_same_collection_keeps_newer_original(self):
+        package=Path(self.tmp.name)/'owned-replace-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        (gold/(self.original['session_id']+'.json')).write_text(json.dumps(self.original))
+        asyncio.run(gs.update_pair(self.original['session_id'],'p_owned',{'answer':'Newer human review','status':'edited'}));before=self.path.read_bytes()
+        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        importer._restore_sidecars('OwnedOriginal',package,'OwnedOriginal',validated,mappings)
+        self.assertNotEqual(mappings[0]['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(gs.get_session(self.original['session_id'])['pairs'][0]['answer'],'Newer human review')
+
+    def test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503(self):
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+                with self.assertRaises(gs.GoldStandardError) as caught:await gs.start_generation('OwnedGeneration',1,None)
+                generate.assert_not_called()
+            return caught.exception
+        error=asyncio.run(run())
+        self.assertEqual((error.code,error.status),('SESSION_WRITE_FAILED',503));self.assertEqual(self.path.read_bytes(),before)
+
+    def test_generation_allocation_failure_records_diagnostic_for_candidate(self):
+        storage=Path(settings.upload_dir)/'goldstandard_sessions';before=self.path.read_bytes()
+        for name,changes,expected in [('inspection',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcdf'+'0'*24)),patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure'))],'gs_460abcdf.json'),
+                                      ('exhaustion',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcde'+'0'*24))],'gs_460abcde.json')]:
+            with self.subTest(case=name),patch.object(gs,'_diagnostics',{}):
+                with ExitStack() as stack:
+                    for change in changes:stack.enter_context(change)
+                    with self.assertRaises(gs.GoldStandardError) as caught:gs._store_generated_session(fixture())
+                self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
+                self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/expected):'SESSION_WRITE_FAILED'})
+                self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
 
 if __name__=='__main__':unittest.main()
 ```
@@ -14252,7 +15114,7 @@ def legacy_archive(archive,root,identity,source_id):
         with tarfile.open(output,'w:gz') as package:package.add(package_root,arcname=package_root.name)
         return output.name
 
-async def completed(client,path,timeout=300):
+async def completed(client,path,timeout=300,expected='completed'):
     deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
     while True:
         remaining=deadline-asyncio.get_running_loop().time()
@@ -14262,7 +15124,7 @@ async def completed(client,path,timeout=300):
         assert response.status_code==200,response.text
         job=response.json();last=job.get('status','missing')
         if last not in ('queued','running'):
-            assert last=='completed',job
+            assert last==expected,job
             return job
         await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
 
@@ -14355,19 +15217,10 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 print('PASS re-export uses the allocated session filename/provenance and the original package remains byte-identical',flush=True)
                 source_id='legacy-review-2024';legacy_filename=await asyncio.to_thread(legacy_archive,archive,root,sid,source_id)
                 start=await client.post('/import',json={'filename':legacy_filename,'on_conflict':'rename'});assert start.status_code==202,start.text
-                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'])
-                mapping=legacy['restored_sessions'][0];local=mapping['session_id']
-                assert mapping['source_session_id']==source_id and local.startswith('gs_') and len(local)==11
-                response=await client.get('/goldstandard/session/'+local);assert response.status_code==200,response.text
-                assert response.json()['imported_from']['session_id']==source_id
-                print('PASS digest-valid historical-ID archive completes actual import with canonical local lookup and original provenance',flush=True)
-                saved=await client.post('/goldstandard/save',json={'session_id':local,'filename':'owned-legacy-rows.json'});assert saved.status_code==200,saved.text
-                download=await client.get('/goldstandard/download/'+saved.json()['filename']);assert download.status_code==200,download.text
-                assert download.json()[0]['answer']=='Original exported answer'
-                reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),local],text=True,capture_output=True,check=True)
-                assert json.loads(reload.stdout)[0]['imported_from']['session_id']==source_id
+                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'],expected='failed')
+                assert legacy['error_code']=='PACKAGE_CORRUPT' and legacy['error_detail']=={'file':'goldstandard/'+sid+'.json'} and not legacy['restored_sessions'],legacy
                 assert await asyncio.to_thread(original_path.read_bytes)==original_bytes
-                print('PASS historical imported session keeps usable HTTP/RAGAS/restart state while original newer review remains unchanged',flush=True)
+                print('PASS digest-valid noncanonical-ID archive is refused PACKAGE_CORRUPT naming the sidecar, restores nothing and leaves the original newer review unchanged',flush=True)
 
 
         async def owned():

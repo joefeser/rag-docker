@@ -33,7 +33,7 @@ def legacy_archive(archive,root,identity,source_id):
         with tarfile.open(output,'w:gz') as package:package.add(package_root,arcname=package_root.name)
         return output.name
 
-async def completed(client,path,timeout=300):
+async def completed(client,path,timeout=300,expected='completed'):
     deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
     while True:
         remaining=deadline-asyncio.get_running_loop().time()
@@ -43,7 +43,7 @@ async def completed(client,path,timeout=300):
         assert response.status_code==200,response.text
         job=response.json();last=job.get('status','missing')
         if last not in ('queued','running'):
-            assert last=='completed',job
+            assert last==expected,job
             return job
         await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
 
@@ -136,19 +136,10 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 print('PASS re-export uses the allocated session filename/provenance and the original package remains byte-identical',flush=True)
                 source_id='legacy-review-2024';legacy_filename=await asyncio.to_thread(legacy_archive,archive,root,sid,source_id)
                 start=await client.post('/import',json={'filename':legacy_filename,'on_conflict':'rename'});assert start.status_code==202,start.text
-                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'])
-                mapping=legacy['restored_sessions'][0];local=mapping['session_id']
-                assert mapping['source_session_id']==source_id and local.startswith('gs_') and len(local)==11
-                response=await client.get('/goldstandard/session/'+local);assert response.status_code==200,response.text
-                assert response.json()['imported_from']['session_id']==source_id
-                print('PASS digest-valid historical-ID archive completes actual import with canonical local lookup and original provenance',flush=True)
-                saved=await client.post('/goldstandard/save',json={'session_id':local,'filename':'owned-legacy-rows.json'});assert saved.status_code==200,saved.text
-                download=await client.get('/goldstandard/download/'+saved.json()['filename']);assert download.status_code==200,download.text
-                assert download.json()[0]['answer']=='Original exported answer'
-                reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),local],text=True,capture_output=True,check=True)
-                assert json.loads(reload.stdout)[0]['imported_from']['session_id']==source_id
+                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'],expected='failed')
+                assert legacy['error_code']=='PACKAGE_CORRUPT' and legacy['error_detail']=={'file':'goldstandard/'+sid+'.json'} and not legacy['restored_sessions'],legacy
                 assert await asyncio.to_thread(original_path.read_bytes)==original_bytes
-                print('PASS historical imported session keeps usable HTTP/RAGAS/restart state while original newer review remains unchanged',flush=True)
+                print('PASS digest-valid noncanonical-ID archive is refused PACKAGE_CORRUPT naming the sidecar, restores nothing and leaves the original newer review unchanged',flush=True)
 
 
         async def owned():

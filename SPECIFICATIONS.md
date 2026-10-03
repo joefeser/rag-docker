@@ -273,11 +273,20 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
       "object_count": 1842,
       "index_type": "hnsw",
       "distance_metric": "cosine",
+      "hnsw_config": {
+        "ef": 64,
+        "efConstruction": 128,
+        "maxConnections": 64
+      },
       "created_at": "2026-09-10T14:23:00Z"
     }
   ]
 }
 ```
+
+`index_type`: `"hnsw"`, `"flat"`, `"dynamic"`, or `"unknown"` when the collection has no recognized vector index configuration (for example, named vectors).  
+`distance_metric`: `"cosine"`, `"dot"`, `"l2-squared"`, or `"unknown"` when the distance is unavailable.  
+`hnsw_config`: the actual HNSW settings `{ef, efConstruction, maxConnections}` when `index_type` is `"hnsw"`; `null` otherwise.
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
@@ -382,8 +391,8 @@ values are not numeric settings. Strategies must be one of the documented five.
 Ignored overlap settings remain ignored for fixed/context-aware/semantic; the
 context-aware fallback uses language splitting with zero overlap.
 
-Invalid multipart settings return **422 `INVALID_SETTINGS` before collection
-lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
+Invalid multipart settings, including values that aren't numbers, return **422
+`INVALID_SETTINGS` before collection lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
 sanitized field errors in `error.detail`. Raw input/error-context values are omitted from validation replies
 so non-finite input also produces a serializable 422. Defaults remain unchanged.
 
@@ -502,7 +511,6 @@ POST /query
 | `collection` | string | required | Weaviate collection to query |
 | `retrieval_mode` | string | `"hnsw"` | One of: `"hnsw"`, `"flat"`, `"hybrid"`, `"semantic"` |
 | `top_k` | int | 5 | Number of chunks to retrieve |
-
 | `alpha` | float | 0.75 | Hybrid mode only: 0.0 = pure BM25, 1.0 = pure vector |
 | `include_citations` | bool | false | Whether to return source document citations |
 | `response_format` | string | `"end_user"` | `"end_user"` (plain language) or `"engineer"` (verbose, with chunk details) |
@@ -694,7 +702,7 @@ The `pairs` array contains only pairs whose generation has completed so far. Dur
 
 **Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. The API loads existing session files on startup into an in-memory dict. The local deployment uses one API process. A process-wide reentrant lock serializes each session mutation, snapshot and durable write across generation, review, regeneration, import storage and history markers. Files use unique temporary names, file fsync, atomic replacement and directory fsync. Readers receive independent snapshots; no lock is held across model calls. Concurrent edits to distinct fields retain each acknowledged change; edits to the same field follow the serialized commit order. Review during generation remains supported.
 
-Imported sessions keep a free canonical source identity or receive a new local `gs_` identity when the cache or any existing session file occupies it, or when the source identity is historical/noncanonical. Source IDs remain string provenance and never select a local filesystem address. Concurrent imports and generation starts share the same process lock for identity selection and durable publication. The original session and its newer human edits remain intact. Imported sessions retain `imported_from` (`session_id`, `collection`, `imported_at` UTC); GET session exposes that provenance. Import job `restored_sessions` maps source IDs to local lookup IDs and collections, and the UI notes display those IDs. RAGAS rows keep their four fields.
+Imported sessions keep a free source identity or receive a new local `gs_` identity when the cache or any existing session file occupies it. Import refuses a source identity that is not `gs_[0-9a-f]{8}` (`PACKAGE_CORRUPT`, export check 4a). Concurrent imports and generation starts share the same process lock for identity selection and durable publication. If identity selection at generation start cannot inspect session storage, or runs out of attempts, generation returns 503 `SESSION_WRITE_FAILED` without writing, and the diagnostic names the candidate session file being checked (or the last one tried). The original session and its newer human edits remain intact. Imported sessions retain `imported_from` (`session_id`, `collection`, `imported_at` UTC); GET session exposes that provenance. Import job `restored_sessions` maps source IDs to local lookup IDs and collections, and the UI notes display those IDs. RAGAS rows keep their four fields.
 
 Regeneration compares the target pair after the model call. If the target changed, it returns 409 `PAIR_CHANGED_DURING_REGENERATION` and preserves the acknowledged edit; updates to other pairs and validity flags are retained. A write failure before replacement returns 503 `SESSION_WRITE_FAILED`, leaving the prior cache/disk snapshot intact. A directory fsync failure after replacement returns 503 `SESSION_DURABILITY_UNCERTAIN`: cache reflects the replacement, but the caller must refresh and inspect storage before retrying. These errors are not acknowledged edits.
 
@@ -1877,7 +1885,7 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
-      *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K1/50 save payloads, initial/refresh failures and late initial responses. Suite11 (called by03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows72/160/32 backend settings, labels saved ef96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
+      *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
 
 ### 10.3 Gold Standard
 
