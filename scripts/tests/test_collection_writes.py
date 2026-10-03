@@ -1,0 +1,172 @@
+"""Writer barriers cover complete workers, nesting and independent collections."""
+import os,sys,threading,unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+from services import collection_writes as writes
+
+class WriterTests(unittest.TestCase):
+    def test_same_collection_waits_until_complete_guard_releases(self):
+        attempted=threading.Event();entered=threading.Event()
+        def worker():
+            attempted.set()
+            with writes.guard('Owned'):entered.set()
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                task=pool.submit(worker);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05))
+            task.result(timeout=2);self.assertTrue(entered.is_set())
+        self.assertNotIn('Owned',writes._registry)
+    def test_reentrant_worker_and_primitive_share_one_guard(self):
+        @writes.serialized('collection')
+        def primitive(collection):
+            with writes.guard(collection):return writes._registry[collection][1]
+        with writes.guard('Owned'):self.assertEqual(primitive(collection='Owned'),3)
+        self.assertNotIn('Owned',writes._registry)
+    def test_other_collections_do_not_wait(self):
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                def independent():
+                    with writes.guard('Other'):return True
+                self.assertTrue(pool.submit(independent).result(timeout=2))
+    def test_failed_worker_releases_guard(self):
+        with self.assertRaises(RuntimeError):
+            with writes.guard('Owned'):raise RuntimeError('Owned failure')
+        self.assertNotIn('Owned',writes._registry)
+    def test_backend_case_aliases_share_the_same_guard(self):
+        entered=threading.Event()
+        def worker():
+            with writes.guard('owned'):entered.set()
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                task=pool.submit(worker);self.assertFalse(entered.wait(.05))
+            task.result(timeout=2);self.assertTrue(entered.is_set())
+    def test_actual_import_and_backend_mutators_wait_before_entering_their_body(self):
+        from unittest.mock import patch
+        from services import importer,weaviate_client as wc
+        operations=[(wc._create_collection_sync,('owned','hnsw','cosine',{}),wc,'get_client'),
+                    (wc._insert_chunks_sync,('owned',[]),wc,'get_client'),
+                    (wc._delete_collection_sync,('owned',),wc,'get_client'),
+                    (importer._build,('owned',Path('/inert'),{},None),importer,'_create_from_package')]
+        for operation,args,module,boundary in operations:
+            with self.subTest(operation=operation.__name__):
+                attempted=threading.Event();entered=threading.Event()
+                def boundary_call(*args,**kwargs):
+                    entered.set();raise RuntimeError('Owned stopped backend boundary')
+                def worker():attempted.set();return operation(*args)
+                with patch.object(module,boundary,side_effect=boundary_call),ThreadPoolExecutor() as pool:
+                    with writes.guard('Owned'):
+                        task=pool.submit(worker);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05))
+                    with self.assertRaisesRegex(RuntimeError,'Owned stopped'):task.result(timeout=2)
+                    self.assertTrue(entered.is_set())
+                self.assertNotIn('Owned',writes._registry)
+
+class ImportCutoverTests(unittest.TestCase):
+    def execute(self,build_hook=None,restore_hook=None,delete_hook=None):
+        import tempfile,json
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from services import importer,collection_recovery as recovery
+        from config import settings
+        task=tempfile.TemporaryDirectory();self.addCleanup(task.cleanup);root=Path(task.name)
+        pkg=root/'pkg';pkg.mkdir();(pkg/'manifest.json').write_text('{}')
+        backend={'OwnedImport'};deleted=[];observed=[]
+        class Collections:
+            def exists(self,name):return name in backend
+            def delete(self,name):deleted.append(name);backend.discard(name)
+        client=SimpleNamespace(collections=Collections())
+        job={'status':'queued','chunks_written':0};manifest={'collection':{'name':'OwnedImport','chunk_count':1}}
+        def build(name,*args):
+            backend.add(name)
+            if name!='OwnedImport':
+                records=[json.loads(p.read_text()) for p in recovery._root().glob('*.json')]
+                self.assertEqual(len(records),1);self.assertEqual(records[0]['staging'],name);self.assertEqual(records[0]['state'],'scratch');observed.append(name)
+            if build_hook:build_hook(name,backend)
+            return 1
+        def delete(name):
+            client.collections.delete(name)
+            if delete_hook:delete_hook(name)
+        stack=ExitStack();self.addCleanup(stack.close)
+        for change in [patch.object(settings,'upload_dir',str(root)),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(importer,'_jobs',{'owned':job}),patch.object(importer,'_active',{'owned.zip'}),patch.object(importer.packager,'exports_dir',return_value=root),patch.object(importer.packager,'open_package',return_value=(pkg,manifest)),patch.object(importer.packager,'verify_digests'),patch.object(importer,'_check_embedding'),patch.object(importer,'_ensure_models',return_value=[]),patch.object(importer.wc,'get_client',return_value=client),patch.object(importer.wc,'_collection_exists_sync',side_effect=lambda name:name in backend),patch.object(importer.wc,'_delete_collection_sync',side_effect=delete),patch.object(importer,'_build',side_effect=build),patch.object(importer,'_mark_started'),patch.object(importer,'_mark_finished'),patch.object(importer.goldstandard,'sessions_for',return_value=[]),patch.object(importer,'_restore_sidecars',side_effect=restore_hook or (lambda *args:[]))]:stack.enter_context(change)
+        return importer,job,backend,deleted,observed,root
+    def test_replace_guard_spans_deleted_target_and_sidecar_restoration(self):
+        from concurrent.futures import ThreadPoolExecutor
+        deleted_event=threading.Event();restore_event=threading.Event();resume_delete=threading.Event();resume_restore=threading.Event();entered=threading.Event();attempted=threading.Event()
+        def delete(name):deleted_event.set();assert resume_delete.wait(3)
+        def restore(*args):restore_event.set();assert resume_restore.wait(3);return []
+        module,job,backend,deleted,observed,root=self.execute(delete_hook=delete,restore_hook=restore)
+        def writer():
+            attempted.set()
+            with writes.guard('ownedImport'):entered.set();self.assertIn('OwnedImport',backend)
+        with ThreadPoolExecutor() as pool:
+            task=pool.submit(module._run,'owned','owned.zip','replace');self.assertTrue(deleted_event.wait(2))
+            waiting=pool.submit(writer);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05));resume_delete.set()
+            self.assertTrue(restore_event.wait(2));self.assertFalse(entered.wait(.05));resume_restore.set();task.result(timeout=3);waiting.result(timeout=3)
+        self.assertEqual(job['status'],'completed');self.assertEqual(backend,{'OwnedImport'});self.assertEqual(len(observed),1)
+        self.assertEqual(list((root/'collection_operations').glob('*.json')),[])
+    def test_import_staging_failure_cleans_owned_journal_and_collection(self):
+        def fail(name,backend):
+            if name!='OwnedImport':raise RuntimeError('Owned staging insertion failed')
+        module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
+        module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');self.assertEqual(backend,{'OwnedImport'})
+        self.assertNotIn('OwnedImport',deleted);self.assertEqual(list((root/'collection_operations').glob('*.json')),[])
+    def test_replace_failure_retains_positive_recovery_and_startup_preserves_it(self):
+        from services import collection_recovery as recovery
+        def fail(name,backend):
+            if name=='OwnedImport':backend.remove(name);raise RuntimeError('Owned final insertion failed')
+        module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
+        module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');retained=job['error_detail']['recovered_as']
+        self.assertIn(retained,backend);self.assertTrue(Path(job['error_detail']['sidecar_snapshots']).is_dir())
+        self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
+
+
+class DeletedRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from config import settings
+        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs
+        self.recovery,self.wc=recovery,wc
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{})]:stack.enter_context(change)
+        self.backend={'OwnedRecovery'}
+        class Collections:
+            def exists(inner,name):return writes.canonical(name) in self.backend
+            def delete(inner,name):self.backend.remove(writes.canonical(name))
+            def get(inner,name):return SimpleNamespace(aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
+        self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
+        self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
+    def test_explicit_alias_delete_retires_only_matching_recovery_snapshots(self):
+        import json
+        other=self.recovery.begin('OwnedRecovery','import',self.client);self.backend.add(other['staging']);self.recovery.retain(other)
+        corrupt=self.recovery._root()/'invalid.json';corrupt.write_text(json.dumps({**self.owner,'operation_id':'invalid'}))
+        name=self.owner['staging'];self.assertEqual(self.wc._delete_collection_sync(name[:1].lower()+name[1:]),3)
+        self.assertNotIn(name,self.backend);self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists());self.assertFalse((self.recovery._root()/(self.owner['operation_id']+'.json')).exists())
+        self.assertIn(other['staging'],self.backend);self.assertTrue((self.recovery._root()/other['operation_id']).is_dir());self.assertTrue(corrupt.is_file())
+    def test_caller_spelled_sidecars_and_sessions_are_cleaned_on_normal_delete(self):
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        caller='ownedRecovery';sources.store(caller,'inert.txt',b'Owned inert original')
+        ingest_config.save({'collection':caller});retrieval_config.save({'collection':caller})
+        session={'session_id':'gs_490abcde','collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]};gs.store_session(session)
+        self.wc._delete_collection_sync(caller)
+        self.assertFalse(sources.collection_dir(caller).exists());self.assertFalse((self.root/'ingest_configs'/(caller+'.json')).exists());self.assertFalse((self.root/'retrieval_configs'/(caller+'.json')).exists())
+        self.assertTrue(gs.get_session(session['session_id'])['orphaned']);self.assertIn(self.owner['staging'],self.backend)
+    def test_deleting_original_preserves_distinct_retained_recovery(self):
+        self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
+        self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_missing_backend_at_startup_does_not_authorize_snapshot_loss(self):
+        self.backend.remove(self.owner['staging']);self.assertEqual(self.recovery.sweep(self.client),[])
+        self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_explicit_cleanup_failure_is_resumed_from_durable_intent(self):
+        import json
+        from unittest.mock import patch
+        with patch.object(self.recovery.shutil,'rmtree',side_effect=OSError('Owned cleanup failure')):
+            with self.assertRaises(OSError):self.wc._delete_collection_sync(self.owner['staging'])
+        journal=self.recovery._root()/(self.owner['operation_id']+'.json');self.assertEqual(json.loads(journal.read_text())['state'],'cleanup')
+        self.assertEqual(self.recovery.sweep(self.client),[self.owner['staging']]);self.assertFalse(journal.exists());self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists())
+
+
+
+if __name__=='__main__':unittest.main()

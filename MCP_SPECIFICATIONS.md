@@ -158,7 +158,7 @@ Notes:
   that the fallback branch was unnamed. That was wrong: the Retrieval Config page
   has always offered it as "Semantic", and `POST /retrieval/config` accepts it.)
 - **`response_format` selects the synthesis prompt**, not just formatting:
-  `end_user` asks for plain language for a non-technical reader; `engineer` asks
+  `end_user` asks for a short answer in plain language for a non-technical reader; `engineer` asks
   for technical detail plus an explicit confidence level (high/medium/low). The
   default here matches the API's own default rather than overriding it. A caller
   that wants confidence signalling should pass `engineer` — worth considering as
@@ -270,7 +270,7 @@ Annotations: `readOnlyHint: false`, `destructiveHint: false`,
 | Field | Type | Required | Default |
 |---|---|---|---|
 | `collection` | string | yes | — |
-| `sample_size` | integer 1–200 | no | `20` |
+| `sample_size` | integer 1–100 | no | `20` |
 | `seed` | integer | no | — |
 
 MUST return the `session_id` **immediately** without polling (confirmed

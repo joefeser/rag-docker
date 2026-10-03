@@ -16,6 +16,8 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
+# One run at a time: the fixtures rebuilt below are shared (#95).
+. ./lock.sh
 
 API="${RAG_API:-http://localhost:8080/api}"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -27,11 +29,23 @@ if [ "$code" != "200" ]; then
   exit 2
 fi
 
+# A degraded Ollama runner keeps /health ok while every answer is garbage, and
+# then every LLM check fails for reasons unrelated to the code (#119). Ask one
+# question with a known answer first, unless LLM work is being skipped.
+if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
+  if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
+    printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
+    printf 'Restart it and run again:  docker compose restart ollama\n\n'
+    exit 2
+  fi
+  printf '\n%s\n' "$sanity"
+fi
+
 printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
