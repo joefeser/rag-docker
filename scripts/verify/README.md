@@ -39,6 +39,18 @@ uv run --no-project --python 3.11 \
   python scripts/tests/test_session_import.py
 ```
 
+`scripts/tests/test_settings_validation.py` checks that invalid settings are
+refused before backend, model or staging work, with every backend mocked. Its
+embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository:
+
+```bash
+docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
+  api python scripts/tests/test_settings_validation.py
+```
+
+With only `scripts/tests` mounted (as for `test_session_import.py` above) the
+other tests still run and the embedded-source check is skipped.
+
 ## Why integration tests
 
 Every defect this project has actually produced was invisible to a unit test of
