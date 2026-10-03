@@ -10,10 +10,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock,MagicMock,patch
 sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
 from config import settings
-from services import weaviate_client as wc, rag_pipeline as rag, retrieval_config as saved
+from services import weaviate_client as wc,rag_pipeline as rag,retrieval_config as saved
 from weaviate.classes.config import VectorDistances
 
 class ReportingTests(unittest.TestCase):
@@ -118,7 +118,7 @@ class TargetTests(unittest.TestCase):
 class VerifierCleanupTests(unittest.TestCase):
     """The live verifier's cleanup, run against a fake API and backend."""
 
-    def run_verifier(self, fail_query_on=None, fail_delete_on=None):
+    def run_verifier(self, fail_query_on=None, fail_delete_on=None, raise_delete_on=None, fail_discard=False):
         created, deleted, saved_configs = {}, [], {}
 
         class Response:
@@ -158,50 +158,73 @@ class VerifierCleanupTests(unittest.TestCase):
             def delete(self, path):
                 name = path.split('/')[2].split('?')[0]
                 deleted.append(name)
+                if created[name] == raise_delete_on:
+                    raise RuntimeError('synthetic delete exception')
                 return Response(500, {'error': 'synthetic delete failure'}) if created[name] == fail_delete_on else Response(200)
 
         recovery = importlib.import_module('services.collection_recovery')
         script = Path(__file__).resolve().parents[1] / 'verify/retrieval_controls.py'
-        stderr = io.StringIO()
+        stdout = io.StringIO()
+        discard_effect = RuntimeError('synthetic discard failure') if fail_discard else None
         with patch('fastapi.testclient.TestClient', FakeClient), \
              patch.object(wc, '_collection_exists_sync', side_effect=lambda name: name in created and name not in deleted), \
              patch.object(wc, 'get_client', return_value=MagicMock()), \
              patch.object(wc, 'close_client') as close, \
              patch.object(recovery, 'begin', side_effect=lambda target, operation, client: {'staging': target + '__tuning_owned'}), \
-             patch.object(recovery, 'discard') as discard, \
-             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+             patch.object(recovery, 'discard', side_effect=discard_effect) as discard, \
+             contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
             try:
                 runpy.run_path(str(script))
                 error = None
             except BaseException as raised:
                 error = raised
-        return error, created, deleted, discard, close, stderr.getvalue()
+        return error, created, deleted, discard, close, stdout.getvalue()
 
     def test_cleanup_failure_does_not_replace_original_error(self):
-        error, created, deleted, discard, close, stderr = self.run_verifier(fail_query_on='flat', fail_delete_on='hnsw')
+        error, created, deleted, discard, close, stdout = self.run_verifier(fail_query_on='flat', fail_delete_on='hnsw')
         self.assertIsInstance(error, RuntimeError)
         self.assertEqual(str(error), 'original verifier failure')
         self.assertEqual(deleted, list(created))
         self.assertEqual(discard.call_count, 2)
         close.assert_called()
         hnsw_name = next(name for name, index in created.items() if index == 'hnsw')
-        self.assertIn(hnsw_name, stderr)
-        self.assertIn('500', stderr)
+        report = [line for line in stdout.splitlines() if line.startswith('FAIL owned collection cleanup: ')]
+        self.assertEqual(len(report), 1, stdout)
+        self.assertIn(hnsw_name, report[0])
+        self.assertIn('500', report[0])
 
     def test_cleanup_failure_is_reported_after_every_deletion(self):
-        error, created, deleted, discard, close, stderr = self.run_verifier(fail_delete_on='hnsw')
+        error, created, deleted, discard, close, stdout = self.run_verifier(fail_delete_on='hnsw', raise_delete_on='flat')
         self.assertIsInstance(error, AssertionError)
-        hnsw_name = next(name for name, index in created.items() if index == 'hnsw')
-        self.assertIn(hnsw_name, str(error))
         self.assertEqual(deleted, list(created))
         self.assertEqual(discard.call_count, 2)
         close.assert_called()
+        report = [line for line in stdout.splitlines() if line.startswith('FAIL owned collection cleanup: ')]
+        self.assertEqual(len(report), 1, stdout)
+        for name in created:
+            self.assertIn(name, str(error))
+            self.assertIn(name, report[0])
+        for reason in ('500', 'synthetic delete failure', 'synthetic delete exception'):
+            self.assertIn(reason, str(error))
+            self.assertIn(reason, report[0])
+
+    def test_discard_failure_keeps_its_existing_behaviour(self):
+        error, created, deleted, discard, close, stdout = self.run_verifier(fail_discard=True)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(str(error), 'synthetic discard failure')
+        self.assertEqual(deleted, list(created))
+        self.assertEqual(discard.call_count, 1)
+        close.assert_not_called()
+        self.assertNotIn('FAIL owned collection cleanup', stdout)
 
     def test_clean_run_still_passes(self):
-        error, created, deleted, discard, close, stderr = self.run_verifier()
+        error, created, deleted, discard, close, stdout = self.run_verifier()
         self.assertIsNone(error)
         self.assertEqual(deleted, list(created))
         self.assertEqual(len(created), 2)
+        self.assertEqual(discard.call_count, 2)
+        self.assertTrue(stdout.rstrip().endswith('PASS owned synthetic collections/config/files removed'), stdout)
+        self.assertNotIn('FAIL', stdout)
 
 
 class DocumentationTests(unittest.TestCase):

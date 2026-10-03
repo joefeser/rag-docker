@@ -10,11 +10,11 @@ import os
 import sys
 import tempfile
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock,patch
 from fastapi.testclient import TestClient
 from config import settings
 from main import app
-from services import weaviate_client as wc, rag_pipeline as rag
+from services import weaviate_client as wc,rag_pipeline as rag
 
 prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
 collections=[]
@@ -75,7 +75,7 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                 assert invalid.status_code==422,invalid.text
             print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
     finally:
-        # Every owned fixture gets a cleanup attempt; failures are reported
+        # Every owned collection gets a deletion attempt; failures are reported
         # together afterwards so they never hide a failure from the checks.
         cleanup_failures=[]
         for name in collections:
@@ -83,23 +83,18 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                 if wc._collection_exists_sync(name):
                     response=client.delete('/collections/'+name+'?confirm=true')
                     if response.status_code!=200:
-                        cleanup_failures.append(f'delete {name}: {response.status_code} {response.text}')
+                        cleanup_failures.append(f'{name}: {response.status_code} {response.text}')
             except Exception as error:
-                cleanup_failures.append(f'delete {name}: {error!r}')
+                cleanup_failures.append(f'{name}: {error!r}')
         if recovery:
             with patch.object(settings,'upload_dir',persistent_upload):
                 for owner in owners:
-                    try:
-                        recovery.discard(owner,wc.get_client())
-                    except Exception as error:
-                        cleanup_failures.append(f"discard {owner['staging']}: {error!r}")
+                    recovery.discard(owner,wc.get_client())
         wc.close_client()
         if cleanup_failures:
-            message='Cleanup failed: '+'; '.join(cleanup_failures)
-            if sys.exc_info()[0]:
-                print(message,file=sys.stderr,flush=True)  # The original failure stays the raised error.
-            else:
-                raise AssertionError(message)
+            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
+            if sys.exc_info()[0] is None:  # Otherwise the original failure stays the raised error.
+                raise AssertionError('owned collection cleanup failed: '+'; '.join(cleanup_failures))
 assert all(not wc._collection_exists_sync(name) for name in collections)
 wc.close_client()
 print('PASS owned synthetic collections/config/files removed',flush=True)
