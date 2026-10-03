@@ -32,6 +32,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
+from contextlib import nullcontext
 
 from config import settings
 from models.schemas import SessionResponse
@@ -41,7 +42,7 @@ from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
-from services import batch_write, collection_recovery
+from services import batch_write, collection_recovery, collection_writes
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
@@ -542,6 +543,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     return notes
 
 
+@collection_writes.serialized("target")
 def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
     _create_from_package(target, pkg)
@@ -595,57 +597,59 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
-        exists = wc._collection_exists_sync(target)                 # check 5
-        if exists and on_conflict == "abort":
-            raise PackageError(
-                "COLLECTION_EXISTS",
-                f"A collection named '{target}' already exists. Import with "
-                "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
-                {"collection": target})
+        # Hold one target guard across conflict check, replacement, and sidecars.
+        with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
+            exists = wc._collection_exists_sync(target)                 # check 5
+            if exists and on_conflict == "abort":
+                raise PackageError(
+                    "COLLECTION_EXISTS",
+                    f"A collection named '{target}' already exists. Import with "
+                    "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
+                    {"collection": target})
 
-        if exists and on_conflict == "rename":
-            target = _rename_target(original, id8)
+            if exists and on_conflict == "rename":
+                target = _rename_target(original, id8)
 
-        if exists and on_conflict == "replace":
-            # Prove the package inserts cleanly before destroying anything.
-            ownership = collection_recovery.begin(target, "import", wc.get_client())
-            temp_collection = ownership["staging"]
-            _build(temp_collection, pkg, manifest, progress)
-            job["chunks_written"] = 0
-            collection_recovery.retain(ownership, package=pkg)
-            staged = True
-            # Counted before the delete, because the delete is what orphans them.
-            orphaned = len(goldstandard.sessions_for(target))
-            wc._delete_collection_sync(target)   # also drops its sources + config
-            if orphaned:
-                # Spec §8 rule 4: silently destroying evaluation work is worse
-                # than reporting it, and refusing the import would block a
-                # legitimate operation over data the user may not care about.
-                replace_notes.append(
-                    f"{orphaned} gold-standard session(s) from the replaced "
-                    "collection were kept; inspect session recovery diagnostics "
-                    "if an orphan marker could not be persisted")
+            if exists and on_conflict == "replace":
+                # Prove the package inserts cleanly before destroying anything.
+                ownership = collection_recovery.begin(target, "import", wc.get_client())
+                temp_collection = ownership["staging"]
+                _build(temp_collection, pkg, manifest, progress)
+                job["chunks_written"] = 0
+                collection_recovery.retain(ownership, package=pkg)
+                staged = True
+                # Counted before the delete, because the delete is what orphans them.
+                orphaned = len(goldstandard.sessions_for(target))
+                wc._delete_collection_sync(target)   # also drops its sources + config
+                if orphaned:
+                    # Spec §8 rule 4: silently destroying evaluation work is worse
+                    # than reporting it, and refusing the import would block a
+                    # legitimate operation over data the user may not care about.
+                    replace_notes.append(
+                        f"{orphaned} gold-standard session(s) from the replaced "
+                        "collection were kept; inspect session recovery diagnostics "
+                        "if an orphan marker could not be persisted")
 
-        expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
-        marked = target
-        written = _build(target, pkg, manifest, progress)
-        _mark_finished(target)
-        marked = None
-        job.setdefault("restored_sessions", [])
-        notes = model_notes + replace_notes + _restore_sidecars(
-            target, pkg, original, validated_sessions, job["restored_sessions"])
+            expected = manifest.get("collection", {}).get("chunk_count", -1)
+            _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
+            marked = target
+            written = _build(target, pkg, manifest, progress)
+            _mark_finished(target)
+            marked = None
+            job.setdefault("restored_sessions", [])
+            notes = model_notes + replace_notes + _restore_sidecars(
+                target, pkg, original, validated_sessions, job["restored_sessions"])
 
-        if staged and temp_collection:
-            try:
-                collection_recovery.discard(ownership, wc.get_client())
-            except Exception:                         # noqa: BLE001
-                _log.exception("Could not remove staging collection %r", temp_collection)
-            staged = False
+            if staged and temp_collection:
+                try:
+                    collection_recovery.discard(ownership, wc.get_client())
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not remove staging collection %r", temp_collection)
+                staged = False
 
-        job.update(status="completed", collection=target, original_collection=original,
-                   chunks_written=written, renamed=(target != canonical(original)),
-                   notes=notes)
+            job.update(status="completed", collection=target, original_collection=original,
+                       chunks_written=written, renamed=(target != canonical(original)),
+                       notes=notes)
 
     except PackageError as exc:
         job.update(status="failed", error_code=exc.code, error=exc.message,

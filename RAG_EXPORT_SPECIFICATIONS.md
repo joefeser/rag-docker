@@ -563,6 +563,17 @@ For identity-changing rebuilds, persist the flag after preparation succeeds but 
 Changing only the index type or distance metric does **not** change chunk
 identity, and MUST NOT mark sessions stale.
 
+A successfully verified index/distance change preserves exact UUIDs, properties
+and vectors, and MUST NOT mark sessions stale. Single-process application writers
+share the collection guard through snapshot, replacement and final verification;
+external backend writers remain outside it and an observed change is refused.
+A stored vectorizer mismatch with the complete recreation configuration is refused before
+staging, including unknown module options and property name/type/vectorization flags.
+Complete replace-import workers hold the same target guard through conflict check,
+cutover and sidecar restoration; their staging ownership is persisted before creation.
+Staging-creation failures immediately discard only positively owned scratch. Verified staging and pre-cutover sidecars must survive an uncertain
+cutover under durable recovery ownership. A failed delete that leaves exact
+
 **Sessions are cached in memory as well as on disk.** Anything that writes a
 session file directly, without going through the gold-standard service, will be
 silently undone: the cache still holds the previous version and the next
@@ -697,6 +708,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
 | E23 | A digest-valid package with malformed evaluation metadata fails `PACKAGE_CORRUPT` before model installation, collection mutation or sidecar restoration; existing review work remains unchanged |
 | E24 | Export, edit original, rename-import twice: all three session identities retain independent review/export state and reported import provenance |
+| E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 

@@ -8,6 +8,7 @@ import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
 from weaviate.classes.query import MetadataQuery, Filter
 
+from services import collection_writes, collection_recovery
 from config import settings
 from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
@@ -83,6 +84,7 @@ async def check_health() -> bool:
     return await asyncio.to_thread(_check_health_sync)
 
 
+@collection_writes.serialized("name")
 def _create_collection_sync(
     name: str,
     index_type: str,
@@ -141,11 +143,13 @@ async def collection_exists(name: str) -> bool:
     return await asyncio.to_thread(_collection_exists_sync, name)
 
 
+@collection_writes.serialized("name")
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
     count = coll.aggregate.over_all(total_count=True).total_count
     client.collections.delete(name)
+    collection_recovery.retire_deleted(collection_writes.canonical(name), client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
     sources.delete(name)
@@ -280,15 +284,50 @@ async def get_collection_config(name: str) -> dict:
     return await asyncio.to_thread(_collection_config_sync, name)
 
 
+def _validate_reindex_vectorizer_sync(name: str) -> None:
+    """Fail before staging if recreation would change the stored vector space."""
+    cfg = get_client().collections.get(name).config.get()
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model = getattr(vectorizer, "model", None)
+    expected_model = {"model": settings.embed_model,
+                      "apiEndpoint": f"http://{settings.ollama_host}:{settings.ollama_port}"}
+    compatible = (getattr(kind, "value", kind) == "text2vec-ollama"
+                  and model == expected_model
+                  and getattr(vectorizer, "vectorize_collection_name", None) is False
+                  and not getattr(cfg, "vector_config", None))
+    # Property names/types and skip/name flags also determine provider input.
+    # Refuse unknown module options and custom properties instead of copying
+    # old vectors into the fixed schema with different future insert rules.
+    expected_properties = {p.name: p._to_dict() for p in COLLECTION_PROPERTIES}
+    properties = list(getattr(cfg, "properties", None) or [])
+    compatible = compatible and len(properties) == len(expected_properties) and {p.name for p in properties} == set(expected_properties)
+    for prop in properties:
+        expected = expected_properties.get(prop.name)
+        rules = getattr(prop, "vectorizer_config", None)
+        compatible = compatible and bool(
+            expected
+            and getattr(prop.data_type, "value", prop.data_type) == expected["dataType"][0]
+            and getattr(prop, "vectorizer", None) == "text2vec-ollama"
+            and not getattr(prop, "vectorizer_configs", None)
+            and rules is not None
+            and rules.skip == expected["skip_vectorization"]
+            and rules.vectorize_property_name == expected["vectorize_property_name"]
+            and not getattr(prop, "nested_properties", None))
+    if not compatible:
+        raise ValueError("Reindex would change the collection's vectorizer configuration; "
+                         "re-embed with the configured model first")
+
+
+
 # Just after a collection is created under a name that was dropped moments
-# earlier, Weaviate can reject writes with "could not find index for class ...
-# It might have been deleted in the meantime" until the new index is loaded.
-# The verify suite hit this when it recreated a collection between checks (#95).
+# earlier, Weaviate can reject writes until the new index is loaded.
 _INDEX_NOT_READY = "could not find index"
 _INSERT_ATTEMPTS = 3
 _INSERT_RETRY_DELAY = 1.0
 
 
+@collection_writes.serialized("collection_name")
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)

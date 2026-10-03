@@ -2074,3 +2074,6 @@ A rebuild from these documents is correct when:
 - A create → ingest → query round-trip returns a non-empty answer with at least one citation.
 - `docker compose down && docker compose up -d` succeeds twice in a row.
 - The offline bundle installs on a machine with no network and reaches the same state.
+
+- [x] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
+      *Registered `14_reindex.sh`: 24 runtime cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling cases and 44 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*

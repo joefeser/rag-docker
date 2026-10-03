@@ -74,11 +74,11 @@ def _copy(source: Path, destination: Path) -> None:
         shutil.copyfile(source, destination)
 
 
-def retain(record: dict, *, package: Path | None = None) -> None:
+def retain(record: dict, *, package: Path | None = None, source_collection: str | None = None) -> None:
     """Snapshot sidecars and mark recovery durably BEFORE deleting the target."""
     metadata = _root() / record["operation_id"]
     metadata.mkdir()
-    target, staging = record["target"], record["staging"]
+    target, staging = source_collection or record["target"], record["staging"]
     upload = Path(settings.upload_dir)
     _copy(package / "sources" if package else sources.collection_dir(target),
           sources.collection_dir(staging))
@@ -150,25 +150,47 @@ def discard(record: dict, client) -> None:
     _sync_dir(_root())
 
 
+
+def _read_owned_record(path: Path) -> dict:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
+    record = json.loads(path.read_text())
+    token = record["operation_id"]
+    operation = record["operation"]
+    marker = "__importing_" if operation == "import" else "__tuning_"
+    if (type(record.get("version")) is not int or record["version"] != 1 or operation not in ("import", "tune")
+            or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
+            or record["staging"] != f"{record['target']}{marker}{token}"
+            or record["state"] not in ("scratch", "recovery", "cleanup")):
+        raise ValueError("Invalid collection ownership record")
+    return record
+
+
+def retire_deleted(name: str, client) -> None:
+    """Retire exact recovery ownership only after explicit backend deletion.
+
+    A missing backend copy at startup does not itself authorize losing retained
+    snapshots. Invalid or unrelated journals never grant cleanup authority.
+    """
+    for path in sorted(_root().glob("*.json")):
+        try:
+            record = _read_owned_record(path)
+        except Exception:
+            log.exception("Unreadable collection ownership %s; preserved", path)
+            continue
+        if record["staging"] == name and record["state"] in ("recovery", "cleanup"):
+            discard(record, client)
+
+
 def sweep(client) -> list[str]:
     removed = []
     for path in sorted(_root().glob("*.json")):
         try:
-            if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
-                raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
-            record = json.loads(path.read_text())
-            token = record["operation_id"]
-            operation = record["operation"]
-            marker = "__importing_" if operation == "import" else "__tuning_"
-            if (type(record.get("version")) is not int or record["version"] != 1 or operation not in ("import", "tune")
-                    or not re.fullmatch(r"[0-9a-f]{32}", token)
-                    or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
-                    or record["staging"] != f"{record['target']}{marker}{token}"
-                    or record["state"] not in ("scratch", "recovery", "cleanup")):
-                raise ValueError("Invalid collection ownership record")
+            record = _read_owned_record(path)
             if record["state"] == "recovery":
                 log.warning("Retained recovery collection %r; sidecar snapshots: %s",
-                            record["staging"], _root() / token)
+                            record["staging"], _root() / record["operation_id"])
                 continue
             discard(record, client)
             removed.append(record["staging"])

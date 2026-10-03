@@ -7,6 +7,8 @@ FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 require_stack
 bash ./13_identity.sh
 check "imported evaluation identity acceptance suite" $?
+bash ./14_reindex.sh
+check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
 EXPORTS="$REPO_ROOT/exports"
 
