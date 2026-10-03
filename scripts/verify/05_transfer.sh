@@ -10,7 +10,8 @@ check "imported evaluation identity acceptance suite" $?
 bash ./14_reindex.sh
 check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
-EXPORTS="$REPO_ROOT/exports"
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
 
 section "Export, import and tuning"
 
@@ -423,7 +424,11 @@ sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "batch recovery across an API restart" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   RP="${PREFIX}BatchRecovery"
   (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1

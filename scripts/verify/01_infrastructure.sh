@@ -155,7 +155,11 @@ check_eq "a recreated collection does not inherit the retrieval config" \
   "$(api_get "/retrieval/config/$C" | jfield "['is_default']")" "True"
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Save a known config here, right before the restart: the section above ends
   # by recreating $C with no saved config, so relying on earlier state made
   # this check fail on every run (#73).
@@ -164,9 +168,9 @@ if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
     "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
-  # Name the project: from a checkout in a folder not called rag-docker,
-  # compose would otherwise act on a different project.
-  project="${COMPOSE_PROJECT_NAME:-rag-docker}"
+  # Name the project explicitly; restart_refusal_reason has already made sure
+  # it is set and is not the live rag-docker project.
+  project="$COMPOSE_PROJECT_NAME"
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
   elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
