@@ -68,7 +68,9 @@ def get_job(job_id: str) -> dict | None:
 # staging name for the startup sweep to recognise. A SIGKILL during the insert
 # would leave a half-filled collection that looks like a real one. A marker
 # written before the build, and removed after it, lets the next start tell the
-# two apart.
+# two apart. The marker's instance token is also written into the collection's
+# schema description, so a collection created later under the same name is
+# never mistaken for the interrupted import.
 
 def _markers_dir() -> Path:
     d = Path(settings.upload_dir) / "imports_in_progress"
@@ -80,23 +82,34 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
+def _instance_description(instance: str) -> str:
+    return f"rag-import:{instance}"
+
+
 def _read_marker(path: Path) -> tuple[dict, Path]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
         raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
     data = json.loads(path.read_text())
+    if data.get("version") == 3:
+        # Written before markers carried an instance identity; it cannot tell
+        # this import's collection from a later one, so it never deletes.
+        raise ValueError("Import ownership has no instance identity")
     collection, count = data["collection"], data["expected_chunks"]
     snapshot = data["expected_snapshot"]
-    if (type(data.get("version")) is not int or data["version"] != 3
+    if (type(data.get("version")) is not int or data["version"] != 4
             or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
             or path.name != f"{collection}.json" or type(count) is not int or count < 0
             or data["state"] not in ("building", "cleanup")
+            or type(data["instance"]) is not str or not re.fullmatch(r"[0-9a-f]{32}", data["instance"])
             or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
         raise ValueError("Invalid import ownership")
     return data, _markers_dir() / snapshot["file"]
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> None:
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> str:
+    """Publish the marker; returns the instance token the target must carry."""
+    instance = uuid.uuid4().hex
     snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
     try:
         with batch_write.ExpectedRecords() as expected:
@@ -110,8 +123,8 @@ def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -
         collection_recovery._sync_dir(_markers_dir())
         collection_recovery._sync_dir(Path(settings.upload_dir))
         collection_recovery.atomic_json(_marker_path(collection), {
-            "version": 3, "collection": collection, "expected_chunks": expected_chunks,
-            "job_id": job_id, "state": "building",
+            "version": 4, "collection": collection, "expected_chunks": expected_chunks,
+            "job_id": job_id, "state": "building", "instance": instance,
             "expected_snapshot": {"file": snapshot.name, "sha256": packager.sha256_file(snapshot)},
         })
     except Exception:
@@ -120,6 +133,7 @@ def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -
         except OSError:
             _log.exception("Could not remove unpublished expectation snapshot %s", snapshot)
         raise
+    return instance
 
 
 def _mark_finished(collection: str) -> None:
@@ -165,7 +179,9 @@ def sweep_interrupted_imports() -> list[str]:
     """Remove collections left half-built by a killed import.
 
     Compare the expected identities, properties and vectors, not just count.
-    Unreadable or legacy ownership cannot authorize destructive cleanup.
+    Only the collection instance the import created, identified by the token
+    in its schema description, can be deleted. Unreadable or legacy ownership
+    cannot authorize destructive cleanup.
     """
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
@@ -181,18 +197,57 @@ def sweep_interrupted_imports() -> list[str]:
                     expected.load_snapshot(snapshot, data["expected_chunks"])
                     if wc._collection_exists_sync(collection):
                         col = wc.get_client().collections.get(collection)
-                        try:
-                            expected.verify(col, exact=True)
-                        except batch_write.BatchVerificationError:
-                            wc.get_client().collections.delete(collection)
-                            removed.append(f"{collection} (persisted records did not match import)")
+                        if col.config.get().description != _instance_description(data["instance"]):
+                            # Created after the import stopped, for example while
+                            # an earlier start could not resolve this marker.
+                            _log.warning("Collection %r is not the one the interrupted import "
+                                         "created; kept, and its import marker retired", collection)
+                        else:
+                            try:
+                                expected.verify(col, exact=True)
+                            except batch_write.BatchVerificationError:
+                                wc.get_client().collections.delete(collection)
+                                removed.append(f"{collection} (persisted records did not match import)")
             # Cleanup is an explicit durable phase: failure here never converts
             # a verified target back into a candidate for backend deletion.
             _mark_finished(collection)
         except Exception:
             _log.exception("Could not resolve import ownership %s; preserved", marker)
             continue
+    _sweep_orphaned_snapshots()
     return removed
+
+
+def _sweep_orphaned_snapshots() -> None:
+    """Remove expectation snapshots that no marker names.
+
+    A kill between writing the snapshot and publishing its marker, or a new
+    import overwriting a marker, leaves one behind. A marker that cannot be
+    parsed might name any of them, so then nothing is removed.
+    """
+    directory = _markers_dir()
+    referenced: set[str] = set()
+    for marker in directory.glob("*.json"):
+        try:
+            if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
+                raise ValueError("not a bounded regular file")
+            data = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            _log.warning("Unreadable import marker %s; expectation snapshots preserved", marker)
+            return
+        snapshot = data.get("expected_snapshot") if isinstance(data, dict) else None
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("file"), str):
+            referenced.add(snapshot["file"])
+    for path in sorted(directory.glob("*.sqlite3")):
+        if (path.name in referenced or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", path.name)
+                or path.is_symlink() or not path.is_file()):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            _log.exception("Could not remove orphaned expectation snapshot %s", path)
+            continue
+        _log.warning("Removed orphaned import expectation snapshot %s", path.name)
 
 
 def canonical(name: str) -> str:
@@ -395,7 +450,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
 # ── Building ──────────────────────────────────────────────────────────────────
 
-def _create_from_package(name: str, pkg: Path) -> None:
+def _create_from_package(name: str, pkg: Path, instance: str | None = None) -> None:
     cfg_path = pkg / "collection.json"
     cfg = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
     wc._create_collection_sync(
@@ -404,6 +459,7 @@ def _create_from_package(name: str, pkg: Path) -> None:
         cfg.get("distance_metric", "cosine"),
         cfg.get("hnsw_config") or {},
         preserve_hnsw=True,
+        description=_instance_description(instance) if instance else None,
     )
 
 
@@ -544,9 +600,9 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
 
 
 @collection_writes.serialized("target")
-def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
+def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | None = None) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
-    _create_from_package(target, pkg)
+    _create_from_package(target, pkg, instance)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
     except Exception as original:
@@ -631,9 +687,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                         "if an orphan marker could not be persisted")
 
             expected = manifest.get("collection", {}).get("chunk_count", -1)
-            _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
+            instance = _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
             marked = target
-            written = _build(target, pkg, manifest, progress)
+            written = _build(target, pkg, manifest, progress, instance)
             _mark_finished(target)
             marked = None
             job.setdefault("restored_sessions", [])
@@ -660,7 +716,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
             job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
-                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
+                                   "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -669,7 +725,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
             job["error_detail"] = {"recovered_as": temp_collection,
-                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
+                                   "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one

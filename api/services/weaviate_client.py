@@ -92,6 +92,7 @@ def _create_collection_sync(
     hnsw_config: dict,
     *,
     preserve_hnsw: bool = False,
+    description: str | None = None,
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
@@ -118,6 +119,8 @@ def _create_collection_sync(
 
     client.collections.create(
         name=name,
+        # Set only by import, to bind its in-progress marker to this instance.
+        description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
         properties=COLLECTION_PROPERTIES,
