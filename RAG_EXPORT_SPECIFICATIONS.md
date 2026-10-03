@@ -339,7 +339,9 @@ redirected storage directories and non-regular destinations. Archive extraction
 accepts only regular files and directories, so special members cannot block a
 later metadata read. Existing review work remains unchanged on validation
 failure, including `replace`. Optional legacy progress fields retain their
-existing defaults, and historical validity metadata is preserved.
+existing defaults, and historical validity metadata is preserved. A restored
+session's `persistence_error` is removed: a write failure on the source system
+says nothing about this instance's storage.
 
 Startup loading, collection flagging and export use the same session-record
 validation. Invalid legacy files (including filename/identity mismatch) remain

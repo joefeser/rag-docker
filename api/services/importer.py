@@ -524,6 +524,9 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
             data.pop("orphaned", None)
             data.pop("orphaned_reason", None)
             data.pop("orphaned_at", None)
+            # A package can carry any value here, and a write failure on the
+            # source system says nothing about this one's storage.
+            data.pop("persistence_error", None)
             # Write through the service: a direct file write leaves the
             # in-memory cache holding the old version, which the next flagging
             # pass would write straight back over this one.
