@@ -364,4 +364,24 @@ shown19=$(printf '%s' "$out19" | sed -n 's/.*holds "\(.*\)", not a pid.*/\1/p')
 [ "$shown19" = "$(printf 'y%.0s' $(seq 1 40))" ]
 check "T19: a 41-character holder in quotes is shown as its first 40 characters, quotes removed" "$?" "shown: $shown19"
 
+
+# --- T20: a failed mktemp -d for this harness's own scratch dir aborts the
+# run with exit 2, instead of continuing with an empty TESTLOCK_HOME that a
+# later `rm -rf "$TESTLOCK_HOME"` could run against "/" or "" (#121; written
+# by the #122 testing reviewer).
+bad_tmpdir="/nonexistent-rag-lock-test-parent-$$"
+out20=$(TMPDIR="$bad_tmpdir" bash "$REPO_ROOT/scripts/tests/test_verify_lock.sh" 2>&1)
+rc20=$?
+check_eq "T20: a failed mktemp -d for TESTLOCK_HOME aborts with exit 2" "$rc20" "2"
+case "$out20" in *"rm: "*|*"cannot remove"*) unsafe20=1 ;; *) unsafe20=0 ;; esac
+check "T20: no removal is attempted against an unintended path" "$unsafe20" "output: $out20"
+
+# --- T21: a holder of exactly 40 characters is shown whole. ---------------
+L21="$TESTLOCK_HOME/t21.lock"; mkdir "$L21"
+printf '%s' "$(printf 'z%.0s' $(seq 1 40))" > "$L21/pid"
+out21=$(RAG_VERIFY_LOCK="$L21" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' 2>&1)
+shown21=$(printf '%s' "$out21" | sed -n 's/.*holds "\(.*\)", not a pid.*/\1/p')
+[ "$shown21" = "$(printf 'z%.0s' $(seq 1 40))" ]
+check "T21: a 40-character holder is shown whole" "$?" "shown: $shown21"
+
 summary
