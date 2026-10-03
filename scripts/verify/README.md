@@ -6,7 +6,7 @@ verify project, never the live stack (#152).
 
 ```bash
 bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
-RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~3 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
 ```
 
@@ -15,8 +15,10 @@ Exits non-zero if any check fails.
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
-the stack built from a checkout, so verification never touches the live
-`rag-docker` stack and the data in it.
+the stack built from a checkout. `stack.sh` never builds, starts or stops the
+live `rag-docker` stack, and only reads its model volume, to copy the models.
+That guards against accidents, not hostile code (see "What it doesn't protect
+against" below).
 
 | Command | What it does |
 |---|---|
@@ -35,11 +37,16 @@ What makes it separate from the live stack:
   the proxy, on `127.0.0.1:8081` (`RAG_VERIFY_PORT`; 8080 is refused). Its
   network, containers and volumes (`rag-verify_weaviate_data`, ...) are its
   own, and empty at every `up`.
-- **Its own images.** `rag-verify-api:latest` and `rag-verify-ui:latest`. The
-  base file's `rag-docker-api` and `rag-docker-ui` tags are never rebuilt, so the
-  live stack never picks up the code under test.
-- **Its own exports folder.** `${TMPDIR:-/tmp}/rag-verify-exports`, passed to
-  the suites as `RAG_EXPORTS_DIR`, in place of the checkout's `./exports`.
+- **Its own images.** `rag-verify-api:latest` and `rag-verify-ui:latest`, and
+  `rag-verify-<service>:latest` for any other service that builds. The
+  configuration check refuses a build that would write any other tag, so the
+  build doesn't move the base file's `rag-docker-api` and `rag-docker-ui`
+  tags, or a third-party tag the live stack runs. `down` removes every image
+  the project built.
+- **Its own exports folder.** `${TMPDIR:-/tmp}/rag-verify-<uid>/exports`,
+  inside a folder of the user's own with mode 700 (a symlink there, or a
+  folder owned by someone else, is refused). It is passed to the suites as
+  `RAG_EXPORTS_DIR`, in place of the checkout's `./exports`.
 - **A copy of the models.** The Ollama models are copied once from the live
   `rag-docker_ollama_models` into the volume `rag-verify-ollama-models` (about
   2.5 GB). Every `up` checks the copy against the live store by sha256 and
@@ -49,15 +56,24 @@ What makes it separate from the live stack:
   is skipped and the verify project's Ollama pulls the models into it, which
   needs the internet.
 - **A configuration check.** Before anything is built, `up` reads the resolved
-  configuration (`docker compose config`) and refuses it if a volume isn't the
-  project's own or the model copy, an image is a `rag-docker-*` tag, anything
-  but the proxy on loopback at the verify port is published, a bind comes from
-  outside the checkout and the exports folder, or the Docker socket is mounted.
+  configuration (`docker compose config`) and checks it against an allow-list
+  of what the base file and the overlay need (#154). It refuses any other
+  top-level or service key (for example `volumes_from`, `network_mode`,
+  `privileged`, `cap_add`, `devices`, `pid`, `secrets`, `configs`); a build
+  with options other than a context and Dockerfile inside the checkout, or
+  whose image isn't `rag-verify-<service>`; a `rag-docker-*` image, under any
+  registry name; a network other than the project's own bridge network, or
+  joined with options; a volume that isn't the project's own or the model
+  copy; anything but the proxy published, on loopback at the verify port; a
+  mount other than a volume or a read-only bind from inside the checkout
+  (never its `exports` folder), apart from the api's own exports folder; and
+  the Docker socket. It can't see `env_file`, which compose merges into the
+  environment.
 - **Start-up.** `up` tears down anything left from an earlier run first, then
   builds, then starts with `up --wait` (15 minutes), and tries once more if that
   fails (Weaviate can be slow to report healthy, #130). If it still fails, it
-  prints the last log lines of each service that isn't up, and leaves the
-  project running for inspection; `down` removes it.
+  prints the last log lines of each service that isn't up. `up` then leaves
+  the project running for inspection (`down` removes it); `run` removes it.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks

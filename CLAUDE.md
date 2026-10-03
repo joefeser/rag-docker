@@ -38,11 +38,11 @@ At any step, if something is unclear, stop and ask the maintainer. Don't guess. 
 
 ## Before opening a PR
 
-Run the verification suite on the disposable verify project, never on the live stack. `stack.sh` builds the branch as compose project `rag-verify` on port 8081, with its own empty volumes, runs the suite and tears the project down. The live `rag-docker` stack is never built, started, stopped or written to (#152).
+Run the verification suite on the disposable verify project, never on the live stack. `stack.sh` builds the branch as compose project `rag-verify` on port 8081, with its own empty volumes, runs the suite and tears the project down. `stack.sh` never builds, starts or stops the live `rag-docker` stack, and only reads its model volume, to copy the models (#152); that guards against accidents, not hostile code (see `scripts/verify/README.md`).
 
 ```bash
 bash scripts/verify/stack.sh run                  # full run, about 20 minutes plus start-up
-RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skips LLM work, about 3 minutes plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skips LLM work, about 8 minutes, start-up included
 ```
 
 `all.sh` and the suites refuse the live stack on their own. Never override that with `RAG_VERIFY_LIVE=1` for verification. See `scripts/verify/README.md`.

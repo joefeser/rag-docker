@@ -9834,7 +9834,7 @@ verify project, never the live stack (#152).
 
 ```bash
 bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
-RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~3 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
 ```
 
@@ -9843,8 +9843,10 @@ Exits non-zero if any check fails.
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
-the stack built from a checkout, so verification never touches the live
-`rag-docker` stack and the data in it.
+the stack built from a checkout. `stack.sh` never builds, starts or stops the
+live `rag-docker` stack, and only reads its model volume, to copy the models.
+That guards against accidents, not hostile code (see "What it doesn't protect
+against" below).
 
 | Command | What it does |
 |---|---|
@@ -9863,11 +9865,16 @@ What makes it separate from the live stack:
   the proxy, on `127.0.0.1:8081` (`RAG_VERIFY_PORT`; 8080 is refused). Its
   network, containers and volumes (`rag-verify_weaviate_data`, ...) are its
   own, and empty at every `up`.
-- **Its own images.** `rag-verify-api:latest` and `rag-verify-ui:latest`. The
-  base file's `rag-docker-api` and `rag-docker-ui` tags are never rebuilt, so the
-  live stack never picks up the code under test.
-- **Its own exports folder.** `${TMPDIR:-/tmp}/rag-verify-exports`, passed to
-  the suites as `RAG_EXPORTS_DIR`, in place of the checkout's `./exports`.
+- **Its own images.** `rag-verify-api:latest` and `rag-verify-ui:latest`, and
+  `rag-verify-<service>:latest` for any other service that builds. The
+  configuration check refuses a build that would write any other tag, so the
+  build doesn't move the base file's `rag-docker-api` and `rag-docker-ui`
+  tags, or a third-party tag the live stack runs. `down` removes every image
+  the project built.
+- **Its own exports folder.** `${TMPDIR:-/tmp}/rag-verify-<uid>/exports`,
+  inside a folder of the user's own with mode 700 (a symlink there, or a
+  folder owned by someone else, is refused). It is passed to the suites as
+  `RAG_EXPORTS_DIR`, in place of the checkout's `./exports`.
 - **A copy of the models.** The Ollama models are copied once from the live
   `rag-docker_ollama_models` into the volume `rag-verify-ollama-models` (about
   2.5 GB). Every `up` checks the copy against the live store by sha256 and
@@ -9877,15 +9884,24 @@ What makes it separate from the live stack:
   is skipped and the verify project's Ollama pulls the models into it, which
   needs the internet.
 - **A configuration check.** Before anything is built, `up` reads the resolved
-  configuration (`docker compose config`) and refuses it if a volume isn't the
-  project's own or the model copy, an image is a `rag-docker-*` tag, anything
-  but the proxy on loopback at the verify port is published, a bind comes from
-  outside the checkout and the exports folder, or the Docker socket is mounted.
+  configuration (`docker compose config`) and checks it against an allow-list
+  of what the base file and the overlay need (#154). It refuses any other
+  top-level or service key (for example `volumes_from`, `network_mode`,
+  `privileged`, `cap_add`, `devices`, `pid`, `secrets`, `configs`); a build
+  with options other than a context and Dockerfile inside the checkout, or
+  whose image isn't `rag-verify-<service>`; a `rag-docker-*` image, under any
+  registry name; a network other than the project's own bridge network, or
+  joined with options; a volume that isn't the project's own or the model
+  copy; anything but the proxy published, on loopback at the verify port; a
+  mount other than a volume or a read-only bind from inside the checkout
+  (never its `exports` folder), apart from the api's own exports folder; and
+  the Docker socket. It can't see `env_file`, which compose merges into the
+  environment.
 - **Start-up.** `up` tears down anything left from an earlier run first, then
   builds, then starts with `up --wait` (15 minutes), and tries once more if that
   fails (Weaviate can be slow to report healthy, #130). If it still fails, it
-  prints the last log lines of each service that isn't up, and leaves the
-  project running for inspection; `down` removes it.
+  prints the last log lines of each service that isn't up. `up` then leaves
+  the project running for inspection (`down` removes it); `run` removes it.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -10139,12 +10155,12 @@ Tuning normalizes the backend first-character alias for active jobs and ownershi
 # Run every verification suite against a running stack.
 #
 #   bash scripts/verify/all.sh              # everything (~20 min, LLM-bound)
-#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~3 min)
+#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~8 min)
 #   RAG_ALLOW_RESTART=1 bash scripts/verify/all.sh  # also restart the stack
+#   bash scripts/verify/all.sh 02 04        # only the named suites
 #
 # Normally started by scripts/verify/stack.sh run, on the disposable verify
 # project. It refuses the live rag-docker stack (#152).
-#   bash scripts/verify/all.sh 02 04        # only the named suites
 #
 # Exits non-zero if any check fails, so it can gate a commit or a release.
 #
@@ -10257,9 +10273,17 @@ exit "$overall"
 #
 # The overlay docker-compose.verify.yml and this script come from the checkout
 # that holds this script, so an evaluation can run a trusted copy against a PR's
-# checkout. Before anything is built, the resolved configuration is checked: a
-# compose file that names a live volume or image, publishes another port, binds
-# a path outside the checkout or mounts the Docker socket is refused.
+# checkout. Before anything is built, the resolved configuration is checked
+# against an allow-list of what docker-compose.yml and the overlay need (#154),
+# and refused otherwise: any other top-level or service key (volumes_from,
+# network_mode, privileged, secrets, ...); a build with options other than a
+# context and Dockerfile inside the checkout, or one that would write a tag
+# other than rag-verify-<service>; a rag-docker-* image under any registry
+# name; a network or volume other than the project's own (and the model copy);
+# any published port but the proxy on loopback at the verify port; a mount
+# other than a volume or a read-only bind from inside the checkout (never its
+# exports folder), apart from the api's own exports folder; the Docker socket.
+# It can't see env_file, which compose merges into the environment.
 #
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
@@ -10273,7 +10297,10 @@ HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 SCRATCH="${TMPDIR:-/tmp}"
 SCRATCH="${SCRATCH%/}"
 [ -n "$SCRATCH" ] || SCRATCH=/tmp
-EXPORTS="$SCRATCH/rag-verify-exports"
+# A folder of this user's own, mode 700, holds the exports folder, so another
+# local user can't pre-create it or plant a symlink there (#154).
+PRIVATE="$SCRATCH/rag-verify-$(id -u)"
+EXPORTS="$PRIVATE/exports"
 
 usage() {
   sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
@@ -10283,6 +10310,17 @@ usage() {
 fail() {
   printf '\nstack.sh: %s\n\n' "$1" >&2
   exit 2
+}
+
+# Prints why the private folder can't be used, or nothing.
+private_problem() {
+  if [ -L "$PRIVATE" ]; then
+    printf '%s is a symlink; refusing to use it.' "$PRIVATE"
+  elif [ -e "$PRIVATE" ] && [ ! -d "$PRIVATE" ]; then
+    printf '%s exists and is not a folder; refusing to use it.' "$PRIVATE"
+  elif [ -d "$PRIVATE" ] && [ ! -O "$PRIVATE" ]; then
+    printf '%s belongs to another user; refusing to use it.' "$PRIVATE"
+  fi
 }
 
 # ── arguments, checked before any Docker command ─────────────────────────────
@@ -10322,6 +10360,17 @@ if [ "$CMD" != down ]; then
   CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
 fi
 
+# The private folder, checked before any Docker command; up and run create it.
+problem=$(private_problem)
+[ -z "$problem" ] || fail "$problem"
+if [ "$CMD" != down ]; then
+  if [ -d "$PRIVATE" ]; then
+    chmod 700 "$PRIVATE" || fail "could not set $PRIVATE to mode 700."
+  else
+    mkdir -m 700 "$PRIVATE" || fail "could not create $PRIVATE."
+  fi
+fi
+
 # ── one verify run per machine ───────────────────────────────────────────────
 # Held for the whole command; the all.sh started below inherits it.
 . "$HARNESS/scripts/verify/lock.sh"
@@ -10350,8 +10399,15 @@ export RAG_EXPECTED_PROXY_PORT="$PORT"
 export RAG_EXPORTS_DIR="$EXPORTS"
 
 # ── down: remove everything of the verify project, except the model copy ────
+# The images the verify project built, by name. Untagged entries are left
+# out: they can't be removed by name.
+labelled_images() {
+  docker image ls --filter "label=com.docker.compose.project=$PROJECT" \
+    --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>'
+}
+
 do_down() {
-  local filter="label=com.docker.compose.project=$PROJECT" ids images="" img left
+  local filter="label=com.docker.compose.project=$PROJECT" ids images problem left
   # Project name only, from a neutral folder: no compose file is needed.
   (cd / && env -u COMPOSE_FILE docker compose -p "$PROJECT" down -v --remove-orphans) >/dev/null 2>&1
   ids=$(docker ps -aq --filter "$filter")
@@ -10360,19 +10416,25 @@ do_down() {
   [ -z "$ids" ] || docker network rm $ids >/dev/null
   ids=$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")
   [ -z "$ids" ] || docker volume rm $ids >/dev/null
-  for img in rag-verify-api:latest rag-verify-ui:latest; do
-    docker image inspect "$img" >/dev/null 2>&1 && images="$images $img"
-  done
+  # Every image built for the project, whatever its service, but only by a
+  # rag-verify-* name. A labelled image under any other name is left alone
+  # and reported below.
+  images=$(labelled_images | grep '^rag-verify-')
   [ -z "$images" ] || docker image rm $images >/dev/null
+  problem=$(private_problem)
+  if [ -n "$problem" ]; then
+    printf 'stack.sh: %s\n' "$problem" >&2
+    return 2
+  fi
   if [ -L "$EXPORTS" ]; then
     printf 'stack.sh: %s is a symlink; not removing it.\n' "$EXPORTS" >&2
     return 2
   fi
   [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
-  left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")"
-  for img in rag-verify-api:latest rag-verify-ui:latest; do
-    docker image inspect "$img" >/dev/null 2>&1 && left="$left $img"
-  done
+  left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
+  if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
+    left="$left $EXPORTS"
+  fi
   if [ -n "$left" ]; then
     printf 'stack.sh: the verify project was not fully removed: %s\n' "$(printf '%s' "$left" | tr '\n' ' ')" >&2
     return 2
@@ -10463,12 +10525,66 @@ checkout, exports, port, path = sys.argv[1:5]
 config = json.load(open(path))
 services = config.get('services') or {}
 volumes = config.get('volumes') or {}
+networks = config.get('networks') or {}
 real = os.path.realpath
 problems = []
+
+# An allow-list (#154): only the keys and values that docker-compose.yml and
+# the overlay resolve to. Anything else could reach the host or other
+# containers, so it is refused; a branch that needs more changes this list.
+TOP_KEYS = {'name', 'services', 'volumes', 'networks'}
+SERVICE_KEYS = {'build', 'command', 'depends_on', 'entrypoint', 'environment',
+                'healthcheck', 'image', 'networks', 'ports', 'volumes'}
+BUILD_KEYS = {'context', 'dockerfile'}
+NETWORK_KEYS = {'name', 'driver', 'ipam'}
+VOLUME_KEYS = {'name', 'external'}
+MOUNT_KEYS = {'type', 'source', 'target', 'read_only', 'bind', 'volume'}
 
 def inside(child, parent):
     child, parent = real(child), real(parent)
     return child == parent or child.startswith(parent.rstrip('/') + '/')
+
+def normalise(image):
+    # The same image under its registry-qualified names.
+    for prefix in ('docker.io/', 'index.docker.io/', 'registry-1.docker.io/'):
+        if image.startswith(prefix):
+            image = image[len(prefix):]
+            break
+    if image.startswith('library/'):
+        image = image[len('library/'):]
+    return image
+
+def extra(keys, allowed):
+    return ', '.join(sorted(set(keys) - allowed))
+
+# (g) top level: only these keys, and the verify project's name
+if extra(config, TOP_KEYS):
+    problems.append(f"(g) top-level keys not allowed: {extra(config, TOP_KEYS)}")
+if config.get('name') != 'rag-verify':
+    problems.append(f"(g) the project name is {config.get('name')!r}, not 'rag-verify'")
+
+# (h) service keys: only the base file's
+for svc, service in services.items():
+    if extra(service, SERVICE_KEYS):
+        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, SERVICE_KEYS)}")
+
+# (i) builds: only a context and a Dockerfile, both inside the checkout
+for svc, service in services.items():
+    if 'build' not in service:
+        continue
+    build = service['build']
+    if not isinstance(build, dict):
+        problems.append(f"(i) service {svc!r} has a build of an unexpected form: {build!r}")
+        continue
+    if extra(build, BUILD_KEYS):
+        problems.append(f"(i) service {svc!r} uses build keys not allowed: {extra(build, BUILD_KEYS)}")
+    context = build.get('context')
+    if not (isinstance(context, str) and os.path.isabs(context) and inside(context, checkout)):
+        problems.append(f"(i) service {svc!r} builds from {context!r}, not a folder inside the checkout")
+        continue
+    dockerfile = os.path.join(context, build.get('dockerfile') or 'Dockerfile')
+    if not inside(dockerfile, checkout):
+        problems.append(f"(i) service {svc!r} uses the Dockerfile {dockerfile!r}, outside the checkout")
 
 # (a) volumes: the project's own, or the external model copy, nothing else
 for key, volume in volumes.items():
@@ -10485,19 +10601,48 @@ for key, volume in volumes.items():
                         f"{' (external)' if volume.get('external') else ''}"
                         f"{' (driver_opts)' if volume.get('driver_opts') else ''}; "
                         f"only rag-verify_{key} or the external rag-verify-ollama-models are allowed")
+    if extra(volume, VOLUME_KEYS):
+        problems.append(f"(a) volume {key!r} uses keys not allowed: {extra(volume, VOLUME_KEYS)}")
 for svc, service in services.items():
     for mount in service.get('volumes') or []:
         if mount.get('type') == 'volume' and mount.get('source') and mount['source'] not in volumes:
             problems.append(f"(a) service {svc!r} mounts undeclared volume {mount['source']!r}")
 
-# (b) images: never the live stack's tags
+# (b) images: never the live stack's tags; a build writes only its own
+# rag-verify-<service> tag, so no tag the live stack runs can be rebuilt
 for svc, service in services.items():
-    image = service.get('image') or ''
+    image = normalise(service.get('image') or '')
     if image.startswith('rag-docker-') or image.startswith('rag-docker:'):
-        problems.append(f"(b) service {svc!r} uses the live image {image!r}")
+        problems.append(f"(b) service {svc!r} uses the live image {service.get('image')!r}")
 for svc, want in (('api', 'rag-verify-api:latest'), ('ui', 'rag-verify-ui:latest')):
     if svc in services and services[svc].get('image') != want:
         problems.append(f"(b) service {svc!r} must use {want}, not {services[svc].get('image')!r}")
+for svc, service in services.items():
+    if 'build' in service and svc not in ('api', 'ui') and 'image' in service \
+            and normalise(service.get('image') or '') not in (f'rag-verify-{svc}:latest', f'rag-verify-{svc}'):
+        problems.append(f"(b) service {svc!r} builds, so its image must be rag-verify-{svc}:latest "
+                        f"or unset, not {service.get('image')!r}")
+
+# (j) networks: the project's own bridge networks, joined with no options
+for key, network in networks.items():
+    network = network or {}
+    if extra(network, NETWORK_KEYS):
+        problems.append(f"(j) network {key!r} uses keys not allowed: {extra(network, NETWORK_KEYS)}")
+    if network.get('name') != 'rag-verify_' + key:
+        problems.append(f"(j) network {key!r} resolves to {network.get('name')!r}; only rag-verify_{key} is allowed")
+    if network.get('driver') not in (None, 'bridge'):
+        problems.append(f"(j) network {key!r} uses the driver {network.get('driver')!r}; only bridge is allowed")
+    if network.get('ipam'):
+        problems.append(f"(j) network {key!r} sets ipam options")
+for svc, service in services.items():
+    joined = service.get('networks') or {}
+    if isinstance(joined, list):
+        joined = {name: None for name in joined}
+    for name, options in joined.items():
+        if name not in networks:
+            problems.append(f"(j) service {svc!r} joins the undeclared network {name!r}")
+        if options:
+            problems.append(f"(j) service {svc!r} sets options on network {name!r}")
 
 # (c) exactly one published port: the proxy, on loopback, the verify port
 ports = [(svc, p) for svc, service in services.items() for p in service.get('ports') or []]
@@ -10510,16 +10655,33 @@ if not (len(ports) == 1 and ports[0][0] == 'proxy'
                       for svc, p in ports) or 'none'
     problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->80/tcp, not {shown}")
 
-# (d) binds only from the checkout or the exports folder; (e) never the socket
+# (d) mounts: volumes and binds only, with no options; binds read-only, from
+# inside the checkout but not its exports folder; (e) never the socket
 sockets = {'/var/run/docker.sock', '/run/docker.sock'}
+checkout_exports = os.path.join(checkout, 'exports')
 for svc, service in services.items():
     for mount in service.get('volumes') or []:
         source, target = mount.get('source') or '', mount.get('target') or ''
         if source in sockets or target in sockets or (source and real(source) in {real(s) for s in sockets}):
             problems.append(f"(e) service {svc!r} mounts the Docker socket")
             continue
-        if mount.get('type') == 'bind' and not (inside(source, checkout) or real(source) == real(exports)):
-            problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout and the exports folder")
+        if extra(mount, MOUNT_KEYS):
+            problems.append(f"(d) service {svc!r} mount {target!r} uses keys not allowed: {extra(mount, MOUNT_KEYS)}")
+        if mount.get('type') not in ('volume', 'bind'):
+            problems.append(f"(d) service {svc!r} mount {target!r} is of type {mount.get('type')!r}; only volume and bind are allowed")
+            continue
+        if mount.get('volume'):
+            problems.append(f"(d) service {svc!r} mount {target!r} sets volume options")
+        if set(mount.get('bind') or {}) - {'create_host_path'}:
+            problems.append(f"(d) service {svc!r} mount {target!r} sets bind options")
+        if mount.get('type') != 'bind' or (svc == 'api' and target == '/app/exports'):
+            continue  # the api's exports: rule (f)
+        if not (os.path.isabs(source) and inside(source, checkout)):
+            problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout")
+        elif inside(source, checkout_exports) or inside(checkout_exports, source):
+            problems.append(f"(d) service {svc!r} binds {source!r}, which is or holds the checkout's exports folder")
+        elif mount.get('read_only') is not True:
+            problems.append(f"(d) service {svc!r} binds {source!r} read-write; binds must be read-only")
 
 # (f) the API's exports are the verify project's own folder
 mounts = [m for m in (services.get('api', {}).get('volumes') or []) if m.get('target') == '/app/exports']
@@ -10560,6 +10722,7 @@ do_up() {
                  docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
             esac
           done
+      [ "$CMD" != run ] || fail "the verify project did not come up; run removes it now."
       fail "the verify project did not come up; it is left running for inspection (stack.sh down removes it)."
     fi
   fi
@@ -10718,13 +10881,18 @@ summary() {
 live_target_reason() {
   local project="${COMPOSE_PROJECT_NAME:-}" root port
   if [ -z "$project" ]; then
-    # What compose would use: a `name:` in the compose file, else the folder
-    # name, lowercased with everything outside [a-z0-9_-] dropped.
+    # What compose would use: COMPOSE_PROJECT_NAME from the checkout's .env
+    # (optionally after `export `; the last one wins; quotes removed), else
+    # a `name:` in the compose file, else the folder name (#154).
     root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
+    project=$(sed -n 's/^\(export[[:space:]]\{1,\}\)\{0,1\}COMPOSE_PROJECT_NAME=//p' "$root/.env" 2>/dev/null | tail -1 \
+      | sed -e 's/^"\(.*\)"$/\1/' -e t -e "s/^'\(.*\)'\$/\1/")
+    [ -n "$project" ] || project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
     [ -n "$project" ] || project=$(basename "$root")
   fi
-  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+  # Lowercased, everything outside [a-z0-9_-] dropped, and leading `-` and
+  # `_` stripped, as compose normalises a name.
+  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[-_]*//')
   port=$(python3 -c '
 import sys
 from urllib.parse import urlsplit
