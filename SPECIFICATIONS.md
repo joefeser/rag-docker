@@ -382,8 +382,8 @@ values are not numeric settings. Strategies must be one of the documented five.
 Ignored overlap settings remain ignored for fixed/context-aware/semantic; the
 context-aware fallback uses language splitting with zero overlap.
 
-Invalid multipart settings return **422 `INVALID_SETTINGS` before collection
-lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
+Invalid multipart settings, including values that aren't numbers, return **422
+`INVALID_SETTINGS` before collection lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
 sanitized field errors in `error.detail`. Raw input/error-context values are omitted from validation replies
 so non-finite input also produces a serializable 422. Defaults remain unchanged.
 
@@ -502,7 +502,6 @@ POST /query
 | `collection` | string | required | Weaviate collection to query |
 | `retrieval_mode` | string | `"hnsw"` | One of: `"hnsw"`, `"flat"`, `"hybrid"`, `"semantic"` |
 | `top_k` | int | 5 | Number of chunks to retrieve |
-
 | `alpha` | float | 0.75 | Hybrid mode only: 0.0 = pure BM25, 1.0 = pure vector |
 | `include_citations` | bool | false | Whether to return source document citations |
 | `response_format` | string | `"end_user"` | `"end_user"` (plain language) or `"engineer"` (verbose, with chunk details) |

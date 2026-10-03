@@ -631,7 +631,7 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
 
 
 def _numeric(value):
@@ -658,6 +658,7 @@ MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
+OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -740,7 +741,7 @@ class IngestConfig(BaseModel):
     @model_validator(mode="after")
     def _relationships(self):
         if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+            raise ValueError(OVERLAP_RULE)
         return self
 
 
@@ -874,9 +875,6 @@ class PackageListResponse(BaseModel):
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
-
-
 class _ChunkingFields(BaseModel):
     chunking_strategy: Optional[ChunkingStrategy] = None
     chunk_size: Optional[ChunkSize] = None
@@ -886,8 +884,13 @@ class _ChunkingFields(BaseModel):
 
     @model_validator(mode="after")
     def _relationships(self):
-        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
-                        if getattr(self, name) is not None})
+        # Fields are already checked, so only the overlap rule can fail here.
+        # A plain ValueError keeps the nested model's input out of the error.
+        try:
+            IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                            if getattr(self, name) is not None})
+        except ValidationError:
+            raise ValueError(OVERLAP_RULE) from None
         return self
 
     def has_chunking(self) -> bool:
@@ -2060,7 +2063,7 @@ def _create_collection_sync(
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
-                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+                       distance_metric=distance_metric, hnsw_config=hnsw_config)
     hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
     dist = DISTANCE_MAP[validated.distance_metric]
@@ -6244,16 +6247,18 @@ class SaveIngestConfigBody(IngestConfig):
 async def ingest_upload(
     collection: str = Form(...),
     strategy: str = Form("overlap"),
-    chunk_size: int = Form(1000),
-    chunk_overlap: int = Form(200),
-    similarity_threshold: float = Form(0.85),
-    min_chunk_size: int = Form(100),
+    # Strings, so IngestConfig parses them and a non-numeric value is
+    # INVALID_SETTINGS like any other invalid setting, not a form error.
+    chunk_size: str = Form("1000"),
+    chunk_overlap: str = Form("200"),
+    similarity_threshold: str = Form("0.85"),
+    min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
     try:
-        IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
-                     chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
-                     min_chunk_size=min_chunk_size)
+        config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                              chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                              min_chunk_size=min_chunk_size)
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
@@ -6264,11 +6269,11 @@ async def ingest_upload(
         job_id = await ingest_pipeline.start_ingest_job(
             files=files,
             collection=collection,
-            strategy=strategy,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            similarity_threshold=similarity_threshold,
-            min_chunk_size=min_chunk_size,
+            strategy=config.chunking_strategy,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            similarity_threshold=config.similarity_threshold,
+            min_chunk_size=config.min_chunk_size,
         )
     except ValueError as exc:
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
@@ -9824,6 +9829,18 @@ uv run --no-project --python 3.11 \
   --with httpx==0.28.1 --with weaviate-client==4.23.1 \
   python scripts/tests/test_session_import.py
 ```
+
+`scripts/tests/test_settings_validation.py` checks that invalid settings are
+refused before backend, model or staging work, with every backend mocked. Its
+embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository:
+
+```bash
+docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
+  api python scripts/tests/test_settings_validation.py
+```
+
+With only `scripts/tests` mounted (as for `test_session_import.py` above) the
+other tests still run and the embedded-source check is skipped.
 
 ## Why integration tests
 
