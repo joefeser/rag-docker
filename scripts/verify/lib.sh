@@ -67,7 +67,7 @@ require_stack() {
   code=$(api_code "$API/health")
   if [ "$code" != "200" ]; then
     printf '\n  Cannot reach a healthy API at %s (HTTP %s).\n' "$API" "$code"
-    printf '  Start the stack first:  docker compose up -d\n\n'
+    printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
 }
@@ -100,7 +100,7 @@ import json,sys
 for c in json.load(sys.stdin)['collections']:
     if c['name'].startswith('$PREFIX'): print(c['name'])" 2>/dev/null)
   for n in $names; do drop_collection "$n"; done
-  rm -f "${REPO_ROOT:-.}"/exports/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
+  rm -f "${RAG_EXPORTS_DIR:-${REPO_ROOT:-.}/exports}"/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
 }
 
 summary() {
@@ -112,3 +112,69 @@ summary() {
   fi
   return 0
 }
+
+# ── the live stack is off limits (#152) ──────────────────────────────────────
+# Verification runs on the disposable `rag-verify` project that
+# scripts/verify/stack.sh brings up, never on the live `rag-docker` stack that
+# holds real data. A target is live when the compose project these scripts
+# would act on is rag-docker, or when RAG_API uses the live port 8080.
+
+# Prints why the current target is the live stack, or nothing.
+live_target_reason() {
+  local project="${COMPOSE_PROJECT_NAME:-}" root port
+  if [ -z "$project" ]; then
+    # What compose would use: a `name:` in the compose file, else the folder
+    # name, lowercased with everything outside [a-z0-9_-] dropped.
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
+    [ -n "$project" ] || project=$(basename "$root")
+  fi
+  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+  port=$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+try:
+    port = url.port
+except ValueError:
+    port = None
+print(port if port is not None else (443 if url.scheme == "https" else 80))' "$API" 2>/dev/null)
+  if [ "$project" = "rag-docker" ]; then
+    printf 'the compose project is rag-docker, the live rag-docker stack'
+  elif [ "$port" = "8080" ]; then
+    printf 'RAG_API (%s) uses port 8080, the live rag-docker stack' "$API"
+  fi
+}
+
+# Refuses a live target unless RAG_VERIFY_LIVE=1, which only warns.
+live_guard() {
+  local reason
+  reason=$(live_target_reason)
+  [ -n "$reason" ] || return 0
+  if [ "${RAG_VERIFY_LIVE:-0}" = "1" ]; then
+    printf '\n  WARNING: RAG_VERIFY_LIVE=1, so this run targets the live rag-docker stack:\n  %s.\n\n' "$reason" >&2
+    return 0
+  fi
+  printf '\n  Refusing to verify against the live rag-docker stack: %s.\n' "$reason" >&2
+  printf '  Run it on the disposable verify project:  bash scripts/verify/stack.sh run\n' >&2
+  printf '  (RAG_VERIFY_LIVE=1 overrides this; see scripts/verify/README.md.)\n\n' >&2
+  exit 2
+}
+
+# Prints why a restart must not run here, or nothing. Restarts never reach the
+# live project, whatever RAG_VERIFY_LIVE says.
+restart_refusal_reason() {
+  local project
+  project=$(printf '%s' "${COMPOSE_PROJECT_NAME:-}" | tr '[:upper:]' '[:lower:]')
+  if [ -z "$project" ]; then
+    printf 'COMPOSE_PROJECT_NAME is not set, so a restart could reach the live rag-docker stack; run it through scripts/verify/stack.sh'
+  elif [ "$project" = "rag-docker" ]; then
+    printf 'restarts never run against the live rag-docker project (#152)'
+  fi
+}
+
+# Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
+# that borrow these helpers are not suites and are left alone.
+case "$(basename "$0")" in
+  [0-9][0-9]_*.sh) live_guard ;;
+esac

@@ -180,6 +180,40 @@ networks:
     driver: bridge
 ```
 
+### docker-compose.verify.yml
+
+```yaml
+# Overlay for the disposable verify project (#152). Used only by
+# scripts/verify/stack.sh, which runs it as compose project `rag-verify` on top
+# of the docker-compose.yml of the checkout under test, and sets the two
+# variables below. Run any other way, it refuses to resolve.
+#
+# Everything here keeps verification away from the live `rag-docker` stack:
+services:
+  proxy:
+    # Replace the base list rather than add to it (compose merges `ports`
+    # otherwise), so the live port 8080 is never published by this project.
+    ports: !override
+      - "127.0.0.1:${RAG_VERIFY_PORT:?set by scripts/verify/stack.sh}:80"
+  api:
+    # Own image tags: building with the base file's rag-docker-api:latest would
+    # move the live stack's tag to the code under test.
+    image: rag-verify-api:latest
+    volumes:
+      # Same container path as the base file's ./exports, so this entry
+      # replaces it: from the main checkout, ./exports is the live exports folder.
+      - ${RAG_EXPORTS_DIR:?set by scripts/verify/stack.sh}:/app/exports
+  ui:
+    image: rag-verify-ui:latest
+
+volumes:
+  # A copy of the live models that stack.sh keeps in step with
+  # rag-docker_ollama_models (read-only there). External, so `down -v` keeps it.
+  ollama_models:
+    external: true
+    name: rag-verify-ollama-models
+```
+
 ### ollama/entrypoint.sh
 
 ```bash
@@ -9795,17 +9829,93 @@ print('PASS disposable model package and target removed', flush=True)
 # Verification suite
 
 Integration tests that run the acceptance criteria in `SPECIFICATIONS.md` §10
-and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a live stack.
+and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a running stack: the disposable
+verify project, never the live stack (#152).
 
 ```bash
-docker compose up -d          # they need the stack running
-
-bash scripts/verify/all.sh                    # everything, ~20 min
-RAG_SKIP_SLOW=1 bash scripts/verify/all.sh    # skip LLM work, ~3 min
-bash scripts/verify/all.sh 02 04              # only the named suites
+bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~3 min plus start-up
+bash scripts/verify/stack.sh run 02 04              # only the named suites
 ```
 
 Exits non-zero if any check fails.
+
+## Entry point and verify project
+
+`stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
+the stack built from a checkout, so verification never touches the live
+`rag-docker` stack and the data in it.
+
+| Command | What it does |
+|---|---|
+| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
+
+`--checkout` is the checkout to build and test; the default is the one holding
+`stack.sh`. The overlay `docker-compose.verify.yml` and `stack.sh` itself always
+come from the checkout holding `stack.sh`, so a reviewer can run a trusted copy
+against someone else's checkout.
+
+What makes it separate from the live stack:
+
+- **Its own project and port.** Compose project `rag-verify`, publishing only
+  the proxy, on `127.0.0.1:8081` (`RAG_VERIFY_PORT`; 8080 is refused). Its
+  network, containers and volumes (`rag-verify_weaviate_data`, ...) are its
+  own, and empty at every `up`.
+- **Its own images.** `rag-verify-api:latest` and `rag-verify-ui:latest`. The
+  base file's `rag-docker-api` and `rag-docker-ui` tags are never rebuilt, so the
+  live stack never picks up the code under test.
+- **Its own exports folder.** `${TMPDIR:-/tmp}/rag-verify-exports`, passed to
+  the suites as `RAG_EXPORTS_DIR`, in place of the checkout's `./exports`.
+- **A copy of the models.** The Ollama models are copied once from the live
+  `rag-docker_ollama_models` into the volume `rag-verify-ollama-models` (about
+  2.5 GB). Every `up` checks the copy against the live store by sha256 and
+  repairs any difference. The live volume is mounted read-only, in a throwaway
+  container with no network, and only for that copy. The copy is kept by
+  `down`, so later runs don't copy again. With no live model volume, the copy
+  is skipped and the verify project's Ollama pulls the models into it, which
+  needs the internet.
+- **A configuration check.** Before anything is built, `up` reads the resolved
+  configuration (`docker compose config`) and refuses it if a volume isn't the
+  project's own or the model copy, an image is a `rag-docker-*` tag, anything
+  but the proxy on loopback at the verify port is published, a bind comes from
+  outside the checkout and the exports folder, or the Docker socket is mounted.
+- **Start-up.** `up` tears down anything left from an earlier run first, then
+  builds, then starts with `up --wait` (15 minutes), and tries once more if that
+  fails (Weaviate can be slow to report healthy, #130). If it still fails, it
+  prints the last log lines of each service that isn't up, and leaves the
+  project running for inspection; `down` removes it.
+
+**Memory.** The verify project runs next to the live stack on the same Docker
+VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
+answer LLM questions at once, each loads its own model (about 3 GB), so
+expect slower answers or a reload rather than a failure.
+
+**What it doesn't protect against.** The suites, and anything else a checkout
+runs on the host, have full access to Docker. The verify project keeps
+verification away from the live stack by accident, not from hostile code:
+reviewing what a branch runs is the security review's job.
+
+### The live stack is refused
+
+`all.sh` and every suite (`NN_*.sh`) refuse to run, exit 2, before any request
+or Docker command, when their target is the live stack: when the compose
+project they would act on is `rag-docker` (from `COMPOSE_PROJECT_NAME`, or
+the folder name when it's unset), or when `RAG_API` uses port 8080, which is
+also its default. `stack.sh` sets both for the verify project.
+
+`RAG_VERIFY_LIVE=1` overrides the refusal with a warning, for someone verifying
+their own deployment on purpose. The documented commands and the PR review
+never use it. Restarts never reach the live project, even with it: with
+`RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
+`04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing.
+
+`python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
+configuration check and both refusals, with Docker replaced by a stub, so it
+needs no stack.
 
 ## Focused import validation regressions
 
@@ -9816,13 +9926,19 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
 seams are mocked; this complements the live transfer suite and does not prove
-Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies:
+Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies, on
+the verify project: `bash scripts/verify/stack.sh up`, paste the `export` lines
+it prints, then
 
 ```bash
 docker compose run --rm --no-deps \
   -v "$PWD/scripts/tests:/tests:ro" -e RAG_TEST_API_DIR=/app \
   api python /tests/test_session_import.py
 ```
+
+and `bash scripts/verify/stack.sh down` when done. Without those exports,
+`docker compose run` from the main checkout starts a container in the live
+`rag-docker` project, with the live volumes mounted.
 
 Alternatively, with `uv` on the host:
 
@@ -9835,7 +9951,8 @@ uv run --no-project --python 3.11 \
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
-embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository:
+embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
+(on the verify project, with the exports from `stack.sh up`, as above):
 
 ```bash
 docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
@@ -9877,14 +9994,16 @@ final-create failures into the test process, retains import/tuning recovery,
 restarts the API, then verifies exact UUIDs, properties, vectors and sources.
 It also checks real completed-batch rejection/partial acceptance, ingestion UUID
 rollback after a post-write read fault, resumption of metadata cleanup after backend
-deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack.
+deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack: run it on the verify project.
 
 ```bash
+bash scripts/verify/stack.sh up      # then paste the export lines it prints
 docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
 docker compose restart api
 # Wait for /api/health to report healthy before the next phase.
 docker compose exec -T api python - check < scripts/verify/batch_recovery.py
 docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
+bash scripts/verify/stack.sh down
 ```
 
 If interrupted, keep the recorded fixtures and run `check` after restarting; run
@@ -9898,7 +10017,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
-| `settings_validation.py` | standalone: `RAG_API=http://localhost:8080/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
+| `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
@@ -9928,10 +10047,13 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; use `18080` with a deliberate loopback test override |
-| `RAG_API` | `http://localhost:8080/api` | where the API is |
+| `RAG_VERIFY_PORT` | `8081` | `stack.sh`: the verify project's host port; 8080 is refused |
+| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; `stack.sh` sets it to the verify port |
+| `RAG_API` | `http://localhost:8080/api` | where the API is; `stack.sh` sets it to the verify project. Port 8080, the default, is refused as the live stack unless `RAG_VERIFY_LIVE=1` |
+| `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
+| `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks) |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks); never the `rag-docker` project |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
@@ -9963,10 +10085,12 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On a disposable stack with its embedding model already pulled, run:
+On the verify project (`bash scripts/verify/stack.sh up`, then paste the
+`export` lines it prints), whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
+bash scripts/verify/stack.sh down
 ```
 
 This verifies the real model's referenced bytes, copies them into a temporary
@@ -9985,12 +10109,12 @@ python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
 ## Cleaning up
 
 Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
-the end. If a run is interrupted:
+the end. On the verify project nothing outlives the run: `stack.sh run` removes
+the whole project, volumes included, even when interrupted. If `stack.sh` itself
+was killed, remove what is left with:
 
 ```bash
-curl -s localhost:8080/api/collections | python3 -c \
-  "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
-  | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
+bash scripts/verify/stack.sh down
 ```
 
 `13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes eighteen owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
@@ -10017,6 +10141,9 @@ Tuning normalizes the backend first-character alias for active jobs and ownershi
 #   bash scripts/verify/all.sh              # everything (~20 min, LLM-bound)
 #   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~3 min)
 #   RAG_ALLOW_RESTART=1 bash scripts/verify/all.sh  # also restart the stack
+#
+# Normally started by scripts/verify/stack.sh run, on the disposable verify
+# project. It refuses the live rag-docker stack (#152).
 #   bash scripts/verify/all.sh 02 04        # only the named suites
 #
 # Exits non-zero if any check fails, so it can gate a commit or a release.
@@ -10028,8 +10155,10 @@ Tuning normalizes the backend first-character alias for active jobs and ownershi
 set -uo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
-# One run at a time: the fixtures rebuilt below are shared (#95).
-. ./lock.sh
+# One run at a time: the fixtures rebuilt below are shared (#95). lib.sh takes
+# the lock (lock.sh) and holds the live-stack guard (#152).
+. ./lib.sh
+live_guard
 
 API="${RAG_API:-http://localhost:8080/api}"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -10037,7 +10166,7 @@ FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
 if [ "$code" != "200" ]; then
   printf '\nNo healthy API at %s (HTTP %s).\n' "$API" "$code"
-  printf 'Start the stack first:  docker compose up -d\n\n'
+  printf 'Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
   exit 2
 fi
 
@@ -10047,7 +10176,8 @@ fi
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
     printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
-    printf 'Restart it and run again:  docker compose restart ollama\n\n'
+    printf 'Restart it and run again:  docker compose restart ollama\n'
+    printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
   fi
   printf '\n%s\n' "$sanity"
@@ -10096,6 +10226,368 @@ else
   printf '\n  At least one suite failed.\n\n'
 fi
 exit "$overall"
+```
+
+### scripts/verify/stack.sh
+
+```bash
+#!/usr/bin/env bash
+#
+# Run the verification suite on a disposable compose project, never on the
+# live stack (#152).
+#
+#   bash scripts/verify/stack.sh run [--checkout DIR] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
+#   bash scripts/verify/stack.sh down
+#
+# `run` brings the verify project up, runs that checkout's all.sh against it
+# (RAG_SKIP_SLOW and RAG_ALLOW_RESTART pass through) and always tears it down,
+# exiting with all.sh's status. `up` leaves the project running and prints the
+# environment that points docker compose and the suites at it; `down` removes
+# it. --checkout picks the checkout to build and test (default: this one).
+#
+# The verify project is compose project `rag-verify` on port RAG_VERIFY_PORT
+# (default 8081; 8080 is refused), with its own empty volumes, its own image
+# tags (rag-verify-api, rag-verify-ui) and its own exports folder. The live
+# `rag-docker` stack holds real data, and nothing here builds, starts, stops or
+# writes to it. Its only contact with it: the Ollama models are copied from
+# rag-docker_ollama_models, mounted read-only in a throwaway container, into
+# the volume rag-verify-ollama-models, which is kept between runs and checked
+# by sha256 on every `up`.
+#
+# The overlay docker-compose.verify.yml and this script come from the checkout
+# that holds this script, so an evaluation can run a trusted copy against a PR's
+# checkout. Before anything is built, the resolved configuration is checked: a
+# compose file that names a live volume or image, publishes another port, binds
+# a path outside the checkout or mounts the Docker socket is refused.
+#
+# What this does not do: the suites, and anything else the checkout runs on the
+# host, still have full access to Docker. It keeps verification away from the
+# live stack by accident, not from hostile code; that is the security review's.
+set -uo pipefail
+
+PROJECT=rag-verify
+LIVE_MODELS=rag-docker_ollama_models
+MODELS=rag-verify-ollama-models
+HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+SCRATCH="${TMPDIR:-/tmp}"
+SCRATCH="${SCRATCH%/}"
+[ -n "$SCRATCH" ] || SCRATCH=/tmp
+EXPORTS="$SCRATCH/rag-verify-exports"
+
+usage() {
+  sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
+  exit 2
+}
+
+fail() {
+  printf '\nstack.sh: %s\n\n' "$1" >&2
+  exit 2
+}
+
+# ── arguments, checked before any Docker command ─────────────────────────────
+[ "$#" -ge 1 ] || usage
+CMD="$1"; shift
+case "$CMD" in up|down|run) ;; *) usage ;; esac
+CHECKOUT="$HARNESS"
+PULL=""
+ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --checkout)
+      [ "$CMD" != down ] && [ "$#" -ge 2 ] || usage
+      CHECKOUT="$2"; shift 2 ;;
+    --pull)
+      [ "$CMD" = up ] || usage
+      PULL=1; shift ;;
+    -*) usage ;;
+    *)
+      [ "$CMD" = run ] || usage
+      ARGS+=("$1"); shift ;;
+  esac
+done
+
+PORT="${RAG_VERIFY_PORT:-8081}"
+case "$PORT" in
+  ''|*[!0-9]*) fail "RAG_VERIFY_PORT must be a port number, not '$PORT'." ;;
+esac
+[ "${#PORT}" -le 5 ] || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
+PORT=$((10#$PORT))
+{ [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ]; } || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
+[ "$PORT" -ne 8080 ] || fail "RAG_VERIFY_PORT can't be 8080: that is the live rag-docker stack's port."
+
+if [ "$CMD" != down ]; then
+  { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
+    || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
+  CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# ── one verify run per machine ───────────────────────────────────────────────
+# Held for the whole command; the all.sh started below inherits it.
+. "$HARNESS/scripts/verify/lock.sh"
+TEARDOWN=0
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [ "$TEARDOWN" = 1 ]; then
+    TEARDOWN=0
+    do_down || rc=2
+  fi
+  _rag_lock_release
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── the verify environment ───────────────────────────────────────────────────
+unset COMPOSE_PATH_SEPARATOR
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$HARNESS/docker-compose.verify.yml"
+export RAG_VERIFY_PORT="$PORT"
+export RAG_API="http://localhost:$PORT/api"
+export RAG_EXPECTED_PROXY_PORT="$PORT"
+export RAG_EXPORTS_DIR="$EXPORTS"
+
+# ── down: remove everything of the verify project, except the model copy ────
+do_down() {
+  local filter="label=com.docker.compose.project=$PROJECT" ids images="" img left
+  # Project name only, from a neutral folder: no compose file is needed.
+  (cd / && env -u COMPOSE_FILE docker compose -p "$PROJECT" down -v --remove-orphans) >/dev/null 2>&1
+  ids=$(docker ps -aq --filter "$filter")
+  [ -z "$ids" ] || docker rm -f $ids >/dev/null
+  ids=$(docker network ls -q --filter "$filter")
+  [ -z "$ids" ] || docker network rm $ids >/dev/null
+  ids=$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")
+  [ -z "$ids" ] || docker volume rm $ids >/dev/null
+  for img in rag-verify-api:latest rag-verify-ui:latest; do
+    docker image inspect "$img" >/dev/null 2>&1 && images="$images $img"
+  done
+  [ -z "$images" ] || docker image rm $images >/dev/null
+  if [ -L "$EXPORTS" ]; then
+    printf 'stack.sh: %s is a symlink; not removing it.\n' "$EXPORTS" >&2
+    return 2
+  fi
+  [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
+  left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")"
+  for img in rag-verify-api:latest rag-verify-ui:latest; do
+    docker image inspect "$img" >/dev/null 2>&1 && left="$left $img"
+  done
+  if [ -n "$left" ]; then
+    printf 'stack.sh: the verify project was not fully removed: %s\n' "$(printf '%s' "$left" | tr '\n' ' ')" >&2
+    return 2
+  fi
+  printf 'verify project %s removed (the model copy %s is kept)\n' "$PROJECT" "$MODELS"
+}
+
+# ── the models: a copy of the live store, checked on every up ────────────────
+# The image that runs the copy is the ollama image pinned by the harness's own
+# docker-compose.yml, already on this machine, not one the checkout picks.
+seed_image() {
+  python3 - "$HARNESS/docker-compose.yml" <<'IMAGEPY'
+import sys
+inside = False
+for line in open(sys.argv[1]):
+    if line.rstrip('\n') == '  ollama:':
+        inside = True
+    elif inside and line.startswith('  ') and not line.startswith('   ') and line.strip():
+        break
+    elif inside and line.startswith('    image:'):
+        print(line.split(':', 1)[1].strip().strip('"\''))
+        sys.exit(0)
+sys.exit(1)
+IMAGEPY
+}
+
+# Runs in the throwaway container: /live is the live store (read-only), /copy
+# the verify copy. Every file is compared by sha256 and copied when missing or
+# different; files the live store doesn't have are removed.
+SYNC='set -euo pipefail
+copied=0; repaired=0; removed=0
+cd /live
+while IFS= read -r -d "" f; do
+  f="${f#./}"
+  want=$(sha256sum "/live/$f" | cut -d" " -f1)
+  case "$f" in
+    */blobs/sha256-*) [ "${f##*/sha256-}" = "$want" ] || echo "warning: live blob $f does not match its name" >&2 ;;
+  esac
+  if [ -f "/copy/$f" ] && [ ! -L "/copy/$f" ]; then
+    [ "$(sha256sum "/copy/$f" | cut -d" " -f1)" = "$want" ] && continue
+    repaired=$((repaired + 1))
+  else
+    copied=$((copied + 1))
+  fi
+  mkdir -p "/copy/$(dirname "$f")"
+  rm -rf "/copy/$f"
+  cp -p "/live/$f" "/copy/$f"
+done < <(find . -type f -print0)
+cd /copy
+while IFS= read -r -d "" f; do
+  f="${f#./}"
+  if [ ! -f "/live/$f" ] || [ -L "/live/$f" ]; then rm -f "/copy/$f"; removed=$((removed + 1)); fi
+done < <(find . \( -type f -o -type l \) -print0)
+find /copy -mindepth 1 -type d -empty -delete
+echo "models: copied=$copied repaired=$repaired removed=$removed"'
+
+do_seed() {
+  local img
+  if ! docker volume inspect "$MODELS" >/dev/null 2>&1; then
+    docker volume create --label rag-verify.models=1 "$MODELS" >/dev/null || fail "could not create the volume $MODELS."
+  fi
+  if ! docker volume inspect "$LIVE_MODELS" >/dev/null 2>&1; then
+    printf 'note: there is no %s volume to copy the models from, so the verify\n' "$LIVE_MODELS"
+    printf 'project'"'"'s ollama will pull them into %s (this needs the internet).\n' "$MODELS"
+    return 0
+  fi
+  img=$(seed_image) || fail "could not find the ollama image in $HARNESS/docker-compose.yml."
+  docker image inspect "$img" >/dev/null 2>&1 \
+    || fail "the image $img, used to copy the models, isn't on this machine; it isn't pulled for this."
+  printf 'checking the model copy %s against %s (read-only)...\n' "$MODELS" "$LIVE_MODELS"
+  docker run --rm --network none --entrypoint /bin/bash \
+    -v "$LIVE_MODELS:/live:ro" -v "$MODELS:/copy" "$img" -c "$SYNC" \
+    || fail "copying the models into $MODELS failed."
+}
+
+# ── the guard on the resolved configuration ──────────────────────────────────
+do_guard() {
+  local config rc
+  config=$(mktemp "$SCRATCH/rag-verify-config.XXXXXX") || fail "could not create a scratch file."
+  if ! docker compose -p "$PROJECT" config --format json > "$config"; then
+    rm -f "$config"
+    fail "docker compose config failed for $CHECKOUT."
+  fi
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" <<'GUARDPY'
+import json, os, sys
+
+checkout, exports, port, path = sys.argv[1:5]
+config = json.load(open(path))
+services = config.get('services') or {}
+volumes = config.get('volumes') or {}
+real = os.path.realpath
+problems = []
+
+def inside(child, parent):
+    child, parent = real(child), real(parent)
+    return child == parent or child.startswith(parent.rstrip('/') + '/')
+
+# (a) volumes: the project's own, or the external model copy, nothing else
+for key, volume in volumes.items():
+    volume = volume or {}
+    name = volume.get('name')
+    if key == 'ollama_models' or name == 'rag-verify-ollama-models':
+        ok = (name == 'rag-verify-ollama-models' and volume.get('external') is True
+              and not volume.get('driver_opts'))
+    else:
+        ok = (name == 'rag-verify_' + key and not volume.get('external')
+              and not volume.get('driver_opts'))
+    if not ok:
+        problems.append(f"(a) volume {key!r} resolves to {name!r}"
+                        f"{' (external)' if volume.get('external') else ''}"
+                        f"{' (driver_opts)' if volume.get('driver_opts') else ''}; "
+                        f"only rag-verify_{key} or the external rag-verify-ollama-models are allowed")
+for svc, service in services.items():
+    for mount in service.get('volumes') or []:
+        if mount.get('type') == 'volume' and mount.get('source') and mount['source'] not in volumes:
+            problems.append(f"(a) service {svc!r} mounts undeclared volume {mount['source']!r}")
+
+# (b) images: never the live stack's tags
+for svc, service in services.items():
+    image = service.get('image') or ''
+    if image.startswith('rag-docker-') or image.startswith('rag-docker:'):
+        problems.append(f"(b) service {svc!r} uses the live image {image!r}")
+for svc, want in (('api', 'rag-verify-api:latest'), ('ui', 'rag-verify-ui:latest')):
+    if svc in services and services[svc].get('image') != want:
+        problems.append(f"(b) service {svc!r} must use {want}, not {services[svc].get('image')!r}")
+
+# (c) exactly one published port: the proxy, on loopback, the verify port
+ports = [(svc, p) for svc, service in services.items() for p in service.get('ports') or []]
+if not (len(ports) == 1 and ports[0][0] == 'proxy'
+        and ports[0][1].get('host_ip') == '127.0.0.1'
+        and str(ports[0][1].get('published')) == port
+        and ports[0][1].get('target') == 80
+        and ports[0][1].get('protocol', 'tcp') == 'tcp'):
+    shown = ', '.join(f"{svc}:{p.get('host_ip', '')}:{p.get('published')}->{p.get('target')}/{p.get('protocol', 'tcp')}"
+                      for svc, p in ports) or 'none'
+    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->80/tcp, not {shown}")
+
+# (d) binds only from the checkout or the exports folder; (e) never the socket
+sockets = {'/var/run/docker.sock', '/run/docker.sock'}
+for svc, service in services.items():
+    for mount in service.get('volumes') or []:
+        source, target = mount.get('source') or '', mount.get('target') or ''
+        if source in sockets or target in sockets or (source and real(source) in {real(s) for s in sockets}):
+            problems.append(f"(e) service {svc!r} mounts the Docker socket")
+            continue
+        if mount.get('type') == 'bind' and not (inside(source, checkout) or real(source) == real(exports)):
+            problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout and the exports folder")
+
+# (f) the API's exports are the verify project's own folder
+mounts = [m for m in (services.get('api', {}).get('volumes') or []) if m.get('target') == '/app/exports']
+if not (len(mounts) == 1 and mounts[0].get('type') == 'bind' and real(mounts[0].get('source') or '/') == real(exports)):
+    problems.append(f"(f) the api's /app/exports must be bound from {exports}, not "
+                    f"{[m.get('source') for m in mounts] or 'nothing'}")
+
+if problems:
+    print('The resolved compose configuration is refused:')
+    for problem in problems:
+        print('  ' + problem)
+    sys.exit(2)
+GUARDPY
+  rc=$?
+  rm -f "$config"
+  [ "$rc" -eq 0 ] || fail "the verify project's configuration is refused (see above); nothing was built or started."
+}
+
+# ── up ───────────────────────────────────────────────────────────────────────
+do_up() {
+  local i code=000 service state health
+  printf 'clearing any leftover verify project...\n'
+  do_down >/dev/null || fail "could not remove a leftover verify project."
+  mkdir -p "$EXPORTS" || fail "could not create $EXPORTS."
+  do_seed
+  do_guard
+  printf 'building the verify project from %s...\n' "$CHECKOUT"
+  docker compose -p "$PROJECT" build ${PULL:+--pull} || fail "the build failed."
+  if ! docker compose -p "$PROJECT" up -d --wait --wait-timeout 900; then
+    # Weaviate can be slow to report healthy (#130): one more try.
+    printf 'the first start failed; trying once more...\n'
+    if ! docker compose -p "$PROJECT" up -d --wait --wait-timeout 900; then
+      docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+        | while read -r service state health; do
+            case "$state/${health:-}" in
+              running/healthy|running/) ;;
+              *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+                 docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+            esac
+          done
+      fail "the verify project did not come up; it is left running for inspection (stack.sh down removes it)."
+    fi
+  fi
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
+  printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+    printf 'export %s=%q\n' "$var" "${!var}"
+  done
+  printf '\n'
+}
+
+case "$CMD" in
+  down)
+    do_down || exit 2 ;;
+  up)
+    do_up ;;
+  run)
+    TEARDOWN=1
+    do_up
+    rc=0
+    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+    exit "$rc" ;;
+esac
 ```
 
 ### scripts/verify/lib.sh
@@ -10170,7 +10662,7 @@ require_stack() {
   code=$(api_code "$API/health")
   if [ "$code" != "200" ]; then
     printf '\n  Cannot reach a healthy API at %s (HTTP %s).\n' "$API" "$code"
-    printf '  Start the stack first:  docker compose up -d\n\n'
+    printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
 }
@@ -10203,7 +10695,7 @@ import json,sys
 for c in json.load(sys.stdin)['collections']:
     if c['name'].startswith('$PREFIX'): print(c['name'])" 2>/dev/null)
   for n in $names; do drop_collection "$n"; done
-  rm -f "${REPO_ROOT:-.}"/exports/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
+  rm -f "${RAG_EXPORTS_DIR:-${REPO_ROOT:-.}/exports}"/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
 }
 
 summary() {
@@ -10215,6 +10707,72 @@ summary() {
   fi
   return 0
 }
+
+# ── the live stack is off limits (#152) ──────────────────────────────────────
+# Verification runs on the disposable `rag-verify` project that
+# scripts/verify/stack.sh brings up, never on the live `rag-docker` stack that
+# holds real data. A target is live when the compose project these scripts
+# would act on is rag-docker, or when RAG_API uses the live port 8080.
+
+# Prints why the current target is the live stack, or nothing.
+live_target_reason() {
+  local project="${COMPOSE_PROJECT_NAME:-}" root port
+  if [ -z "$project" ]; then
+    # What compose would use: a `name:` in the compose file, else the folder
+    # name, lowercased with everything outside [a-z0-9_-] dropped.
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
+    [ -n "$project" ] || project=$(basename "$root")
+  fi
+  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+  port=$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+try:
+    port = url.port
+except ValueError:
+    port = None
+print(port if port is not None else (443 if url.scheme == "https" else 80))' "$API" 2>/dev/null)
+  if [ "$project" = "rag-docker" ]; then
+    printf 'the compose project is rag-docker, the live rag-docker stack'
+  elif [ "$port" = "8080" ]; then
+    printf 'RAG_API (%s) uses port 8080, the live rag-docker stack' "$API"
+  fi
+}
+
+# Refuses a live target unless RAG_VERIFY_LIVE=1, which only warns.
+live_guard() {
+  local reason
+  reason=$(live_target_reason)
+  [ -n "$reason" ] || return 0
+  if [ "${RAG_VERIFY_LIVE:-0}" = "1" ]; then
+    printf '\n  WARNING: RAG_VERIFY_LIVE=1, so this run targets the live rag-docker stack:\n  %s.\n\n' "$reason" >&2
+    return 0
+  fi
+  printf '\n  Refusing to verify against the live rag-docker stack: %s.\n' "$reason" >&2
+  printf '  Run it on the disposable verify project:  bash scripts/verify/stack.sh run\n' >&2
+  printf '  (RAG_VERIFY_LIVE=1 overrides this; see scripts/verify/README.md.)\n\n' >&2
+  exit 2
+}
+
+# Prints why a restart must not run here, or nothing. Restarts never reach the
+# live project, whatever RAG_VERIFY_LIVE says.
+restart_refusal_reason() {
+  local project
+  project=$(printf '%s' "${COMPOSE_PROJECT_NAME:-}" | tr '[:upper:]' '[:lower:]')
+  if [ -z "$project" ]; then
+    printf 'COMPOSE_PROJECT_NAME is not set, so a restart could reach the live rag-docker stack; run it through scripts/verify/stack.sh'
+  elif [ "$project" = "rag-docker" ]; then
+    printf 'restarts never run against the live rag-docker project (#152)'
+  fi
+}
+
+# Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
+# that borrow these helpers are not suites and are left alone.
+case "$(basename "$0")" in
+  [0-9][0-9]_*.sh) live_guard ;;
+esac
 ```
 
 ### scripts/verify/lock.sh
@@ -10922,7 +11480,11 @@ check_eq "a recreated collection does not inherit the retrieval config" \
   "$(api_get "/retrieval/config/$C" | jfield "['is_default']")" "True"
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Save a known config here, right before the restart: the section above ends
   # by recreating $C with no saved config, so relying on earlier state made
   # this check fail on every run (#73).
@@ -10931,9 +11493,9 @@ if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
     "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
-  # Name the project: from a checkout in a folder not called rag-docker,
-  # compose would otherwise act on a different project.
-  project="${COMPOSE_PROJECT_NAME:-rag-docker}"
+  # Name the project explicitly; restart_refusal_reason has already made sure
+  # it is set and is not the live rag-docker project.
+  project="$COMPOSE_PROJECT_NAME"
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
   elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
@@ -11746,7 +12308,11 @@ code=$(api_code "$API/goldstandard/download/definitely_not_here.json")
 check_eq "download of an unknown filename returns 404" "$code" "404"
 
 # ── sessions survive a restart ───────────────────────────────────────────────
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "sessions survive an API restart" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   (cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ../..)" && docker compose restart api >/dev/null 2>&1)
   for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
   api_get "/goldstandard/session/$SID" > /tmp/vfy_post.json
@@ -11793,7 +12359,8 @@ check "imported evaluation identity acceptance suite" $?
 bash ./14_reindex.sh
 check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
-EXPORTS="$REPO_ROOT/exports"
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
 
 section "Export, import and tuning"
 
@@ -12206,7 +12773,11 @@ sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "batch recovery across an API restart" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   RP="${PREFIX}BatchRecovery"
   (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
