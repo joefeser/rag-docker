@@ -11838,13 +11838,14 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                         cleanup_failures.append(f'{name}: {response.status_code} {response.text}')
             except Exception as error:
                 cleanup_failures.append(f'{name}: {error!r}')
+        if cleanup_failures:
+            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
         if recovery:
             with patch.object(settings,'upload_dir',persistent_upload):
                 for owner in owners:
                     recovery.discard(owner,wc.get_client())
         wc.close_client()
         if cleanup_failures:
-            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
             if sys.exc_info()[0] is None:  # Otherwise the original failure stays the raised error.
                 raise AssertionError('owned collection cleanup failed: '+'; '.join(cleanup_failures))
 assert all(not wc._collection_exists_sync(name) for name in collections)
@@ -13465,6 +13466,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     try {
       await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
       r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      r.check('initial metadata failure settles the pending read instead of leaving it stuck', !/Reading index details…/.test(await bodyText(s.page)) && /Index details are unavailable for this collection\./.test(await bodyText(s.page)));
       await clickByText(s.page, 'Refresh index details'); await sleep(500);
       const refreshed = await bodyText(s.page);
       r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
