@@ -15,8 +15,10 @@ Exits non-zero if any check fails.
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
-the stack built from a checkout, so verification never touches the live
-`rag-docker` stack and the data in it.
+the stack built from a checkout. `stack.sh` never builds, starts or stops the
+live `rag-docker` stack, and only reads its model volume, to copy the models.
+That guards against accidents, not hostile code (see "What it doesn't protect
+against" below).
 
 | Command | What it does |
 |---|---|
