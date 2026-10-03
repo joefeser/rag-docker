@@ -13,6 +13,7 @@ from typing import Any
 
 from services import collection_writes
 from config import settings
+from models.schemas import IngestConfig
 from services.chunker import chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
@@ -149,6 +150,12 @@ async def start_ingest_job(
     similarity_threshold: float,
     min_chunk_size: int,
 ) -> str:
+    config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                          chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                          min_chunk_size=min_chunk_size)
+    strategy, chunk_size, chunk_overlap, min_chunk_size = (
+        config.chunking_strategy, config.chunk_size, config.chunk_overlap, config.min_chunk_size)
+    similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     job_id = str(uuid.uuid4())[:8]
 
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))

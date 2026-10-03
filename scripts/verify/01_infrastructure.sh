@@ -10,7 +10,8 @@ C="${PREFIX}Infra"
 section "§10.5 Infrastructure"
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
-trap 'rm -rf "$RAG_INFRA_TMP"' EXIT
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$RAG_INFRA_TMP"; _rag_lock_release 2>/dev/null || true' EXIT
 EXPECTED_PORT="${RAG_EXPECTED_PROXY_PORT:-8080}"
 export EXPECTED_PORT
 engine=$(docker version --format '{{.Server.Version}}')
@@ -88,6 +89,39 @@ ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
 sys.exit(0 if ok else 1)"
 check "per-service status and latency are reported" $?
 
+# ── memory resource reporting (Issue #98) ────────────────────────────────────
+# Advisory only (see the comment in api/routers/health.py), so it never
+# affects overall_ok, but the report itself must be right: the configured
+# recommendation, and a flip to below_recommended -- with a note -- once the
+# recommendation exceeds what's actually allocated.
+check_eq "the recommended minimum defaults to 12.0 GB" \
+  "$(jfield "['resources']['memory']['recommended_minimum_gb']" < "$RAG_INFRA_TMP/vfy_health.json")" "12.0"
+# Whether this machine meets it depends on its Docker allocation, so check the
+# status agrees with the allocation /health reports, not that it is 'ok'.
+python3 -c "
+import json, os
+m = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['resources']['memory']
+want = 'ok' if m['allocated_gb'] >= m['recommended_minimum_gb'] * 0.95 else 'below_recommended'
+raise SystemExit(0 if m['status'] == want else 1)"
+check "the memory status agrees with the reported allocation" $?
+
+# Raise the recommendation past the actual allocation (in-process only --
+# neither the running server nor docker-compose.yml is touched) and confirm
+# the status flips and a note is attached.
+(cd "$REPO_ROOT" && docker compose exec -T api env RECOMMENDED_MEMORY_GB=13 python3 -c "
+import json
+from config import Settings
+from services import system_info
+print(json.dumps(system_info.memory_info(Settings().recommended_memory_gb)))
+") > "$RAG_INFRA_TMP/vfy_mem_override.json"
+check_eq "a recommendation above the allocation reports below_recommended" \
+  "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_mem_override.json")" "below_recommended"
+python3 -c "
+import json, os
+d = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_mem_override.json'))
+raise SystemExit(0 if d.get('note') and 'recommended' in d['note'] else 1)"
+check "the below-recommended report includes an explanatory note" $?
+
 # ── ingest config defaults ───────────────────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 check_eq "a fresh collection reports is_default true" \
@@ -113,9 +147,18 @@ check_eq "a recreated collection does not inherit the retrieval config" \
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  # Save a known config here, right before the restart: the section above ends
+  # by recreating $C with no saved config, so relying on earlier state made
+  # this check fail on every run (#73).
+  api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"semantic\",\"chunk_size\":800,\"chunk_overlap\":150,\"similarity_threshold\":0.9,\"min_chunk_size\":80}" >/dev/null
+  check_eq "a config saved before the restart reads back" \
+    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
-  (cd "$REPO_ROOT" && docker compose down >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1)
+  # Name the project: from a checkout in a folder not called rag-docker,
+  # compose would otherwise act on a different project.
+  project="${COMPOSE_PROJECT_NAME:-rag-docker}"
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
   elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
   [ "$elapsed" -le 120 ]
@@ -134,8 +177,11 @@ b={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_befor
 a={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_after.json'))['collections']}
 sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) else 1)"
   check "created_at is preserved across restart" $?
+  api_get "/ingest/config/$C" > "$RAG_INFRA_TMP/vfy_cfg_after.json"
   check_eq "saved ingest config survives restart" \
-    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
+    "$(jfield "['chunking_strategy']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "semantic"
+  check_eq "it is still the saved config, not the default" \
+    "$(jfield "['is_default']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "False"
 else
   skip "restart, persistence and timing" "set RAG_ALLOW_RESTART=1 to include them"
 fi
@@ -144,11 +190,17 @@ fi
 leftover=$( (cd "$REPO_ROOT" && docker compose exec -T api sh -c \
   'ls -d /app/uploads/import-* /app/uploads/rechunk-* 2>/dev/null | wc -l') | tr -d ' ')
 check_eq "no abandoned extraction directories" "${leftover:-0}" "0"
-staging=$(api_get "/collections" | python3 -c "
-import json,sys
-print(sum(1 for c in json.load(sys.stdin)['collections']
-          if '__importing_' in c['name'] or '__tuning_' in c['name']))")
-check_eq "no abandoned staging collections" "$staging" "0"
+staging=$( (cd "$REPO_ROOT" && docker compose exec -T api python -c '
+import json
+from services import collection_recovery as recovery, weaviate_client as wc
+try:
+    records = [json.loads(path.read_text()) for path in recovery._root().glob("*.json")]
+    print(sum(record.get("state") == "scratch" and wc.get_client().collections.exists(record["staging"])
+              for record in records))
+finally:
+    wc.close_client()
+'))
+check_eq "no abandoned owned scratch collections" "$staging" "0"
 
 drop_collection "$C"
 cleanup_prefixed

@@ -115,13 +115,14 @@ Use the Agent tool with `subagent_type: general-purpose` and the chosen `model`.
 
 > You are the {coding|security|testing} reviewer for rag-docker PR #N. Invoke the `rag-pr-review-{coding|security|tests}` skill with the Skill tool and follow it exactly. If the Skill tool can't find it, read `{skills}/rag-pr-review-{…}/SKILL.md` and `{skills}/rag-pr-review/reference.md` in full and follow them exactly. Wherever the skills say `.claude/skills/`, use `{skills}/`.
 > Reviewed SHA: {sha}. Evaluated commit: {evaluated-sha}, the reviewed SHA merged with `develop` at {develop-sha7}. Source-of-truth issue(s): #{n}{; Part of — deferred: …}. Context bundle: {path}. Worktree (reviewed SHA): {path}/worktree. Merged worktree (evaluated commit): {path}/merged. Cross-repository PR: {true|false}. Your model: {model}.
-> Write your findings file and return the result block, both as defined in `reference.md`. Post nothing on GitHub, apply no labels, and never change git config.
+> Write your findings file and return the result block, both as defined in `reference.md`. Post nothing on GitHub, apply no labels, and never change git config.{ For coding and security on a cross-repository PR: Run no command on the PR's files, not even `py_compile`, `bash -n` or `node --check`. Read them only.}{ For testing: Wait for long runs as the tests skill's "Waiting for long runs" says: never end your turn while a run is in progress, and never rely on a notification to resume you.}
 
 - Dispatch **coding** and **security** together, in the background.
 - Dispatch **testing** after them:
   - **Same-repository PR:** as soon as the other two are dispatched.
   - **Cross-repository PR:** only after security returns with no High findings, *and* the user confirms that code from this outside contributor may be built and run on this machine. Record the answer as the `rag-pr-review/go-ahead` status, with the develop SHA in its description (see `reference.md`). If security found a High, or the user declines, testing is not run: record `Tests: not run (<reason>)`.
 - As each specialist returns, check that its findings file exists and matches its result block, then update its status.
+- **A testing reviewer that returns without a result block** (it says it is waiting for a run to finish) has stalled: it won't resume on its own. Check its run the way the tests skill's "Waiting for long runs" does: `kill -0` on the process id in `<bundle>/verify-all.pid` (or, without that file, whether `/tmp/rag-verify.lock` exists and its `pid` is alive), and the end of `<bundle>/verify-all.log`. While the run is still going, wait for it the same way, with foreground calls, and check again. Once it has ended, send the reviewer a message to read the log and **finish every remaining step of its skill**: score the failures, write the findings file, restore the stack as "Restoring the stack" says, and return its result block.
 
 ### 8. Build and run check
 
@@ -154,7 +155,7 @@ The health response must report Weaviate, the LLM and the embedding model as ok.
 - **Passed:** the config is valid, every image builds, every service is healthy within the timeout, and every smoke check returns 200 within its retry window.
 - **FAILED:** anything else. Keep the failing step, its last 30 lines of output, and `docker compose -p rag-docker logs <service> --tail 50` for any unhealthy service, for the recap.
 
-Either way, afterwards restore the stack to `develop` from a worktree of `origin/develop` (`docker compose -p rag-docker build`, then `up -d --force-recreate`), confirm it's healthy with the same smoke checks, and remove that worktree.
+Either way, afterwards restore the stack to `develop` as "Restoring the stack" in `reference.md` describes, and confirm it's healthy with the same smoke checks.
 
 ### 9. Finish the evaluation
 
@@ -178,11 +179,11 @@ Either way, afterwards restore the stack to `develop` from a worktree of `origin
    | not run / not concluded | `error` |
 
    Then set the overall `rag-pr-review` status to `success` for READY TO MERGE or `failure` for NOT READY, with `-f target_url=<recap review URL>`.
-5. **Clean up:** remove both worktrees with `git worktree remove --force <bundle>/worktree` and `git worktree remove --force <bundle>/merged`. The evaluated commit was never on a branch, so git discards it in time.
+5. **Clean up,** only if the restore's mount check passed ("Restoring the stack" in `reference.md`): remove both worktrees with `git worktree remove --force <bundle>/worktree` and `git worktree remove --force <bundle>/merged`. The evaluated commit was never on a branch, so git discards it in time. If the restore failed, the stack is stopped and the worktrees stay.
 
 ### 10. Report to the user
 
-For each PR: the verdict per check, the High findings in one line each, whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. Merging is the user's call; tell them the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit.
+For each PR: the verdict per check, the High findings in one line each, any check Tests scored as flaky or environmental (with how many times it failed, so the user can overrule it), whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. Merging is the user's call; tell them the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit. For a PR by `joefeser` with Medium or Low findings, also offer the follow-up issue once it merges (see "Maintainer follow-ups" in `reference.md`).
 
 ## Common mistakes
 

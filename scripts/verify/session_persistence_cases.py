@@ -1,0 +1,329 @@
+"""Durable acknowledged mutations and controlled failure/interleaving acceptance."""
+import asyncio,json,os,sys,tempfile,threading,unittest,subprocess,time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import AsyncMock,MagicMock,patch
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+import httpx
+from config import settings
+from main import app
+from services import goldstandard as gs
+
+
+def fixture():
+    return {'session_id':'gs_450abcde','collection':'OwnedPersistence','status':'completed','pairs_total':2,'pairs_completed':2,'pairs':[{'pair_id':'p_'+str(i),'question':'Original','answer':'Original','contexts':['Inert'],'ground_truth':'Original','source_file':'inert.txt','chunk_index':i,'status':'pending'} for i in range(2)]}
+
+class PersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        patches=[(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{})]
+        if hasattr(gs,'_diagnostics'):patches.append((gs,'_diagnostics',{}))
+        for obj,key,value in patches:
+            change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
+        self.data=fixture();gs.store_session(self.data)
+
+    def restart(self):
+        gs._sessions={};gs.load_sessions_from_disk();return gs.get_session(self.data['session_id'])
+
+    def test_parallel_acknowledged_fields_survive_restart(self):
+        data=fixture();data["pairs"]=[{**data["pairs"][0],"pair_id":"p_"+str(i)} for i in range(8)];data.update(pairs_total=8,pairs_completed=8);gs.store_session(data)
+        barrier=threading.Barrier(16)
+        def edit(i):
+            barrier.wait();return asyncio.run(gs.update_pair(self.data['session_id'],'p_'+str(i//2),{('question' if i%2==0 else 'answer'):str(i)}))
+        with ThreadPoolExecutor(max_workers=16) as pool:results=list(pool.map(edit,range(16)))
+        self.assertTrue(all(results));state=self.restart()
+        for i in range(16):self.assertEqual(state['pairs'][i//2]['question' if i%2==0 else 'answer'],str(i))
+
+    def test_slow_first_write_cannot_replace_later_acknowledged_edit(self):
+        path=gs._session_path(self.data['session_id'])
+        entered=threading.Event();calls=0
+        original_write=Path.write_text;original_replace=os.replace
+        def pause_first_write():
+            nonlocal calls
+            calls+=1
+            if calls==1:
+                entered.set();time.sleep(0.8)
+        def write_text(target,*args,**kwargs):
+            if Path(target)==path:pause_first_write()
+            return original_write(target,*args,**kwargs)
+        def replace(src,dst):
+            if Path(dst)==path:pause_first_write()
+            return original_replace(src,dst)
+        async def run():
+            with patch.object(Path,'write_text',write_text),patch.object(os,'replace',side_effect=replace):
+                first=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'question':'First acknowledged'}))
+                self.assertTrue(await asyncio.to_thread(entered.wait,5))
+                second=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Second acknowledged'}))
+                return await asyncio.gather(first,second)
+        results=asyncio.run(run())
+        self.assertEqual(len(results),2)
+        pair=self.restart()['pairs'][0]
+        self.assertEqual((pair['question'],pair['answer']),('First acknowledged','Second acknowledged'))
+
+    def test_replace_failure_leaves_previous_snapshot_and_reports_failure(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes()
+        with patch.object(gs.os,'replace',side_effect=OSError('Controlled replace fault')):
+            with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Failed edit'}))
+        self.assertEqual(error.exception.code,'SESSION_WRITE_FAILED')
+        self.assertEqual(path.read_bytes(),before);self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+        self.assertFalse(list(path.parent.glob('*.tmp')))
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Accepted edit'}));self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_file_fsync_failure_leaves_old_snapshot(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes()
+        with patch.object(gs.os,'fsync',side_effect=OSError('Controlled file fsync')):
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Not accepted'}))
+        self.assertEqual(path.read_bytes(),before);self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+
+    def test_after_replace_failure_is_uncertain_and_cache_matches_disk(self):
+        with patch.object(gs,'_sync_directory',side_effect=OSError('Controlled directory fsync')):
+            with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Replaced'}))
+        self.assertEqual(error.exception.code,'SESSION_DURABILITY_UNCERTAIN')
+        self.assertEqual(json.loads(gs._session_path(self.data['session_id']).read_text()),gs.get_session(self.data['session_id']))
+        self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Replaced')
+
+    def test_unreadable_and_invalid_files_are_preserved_reported(self):
+        files={'gs_450bad00.json':'{incomplete','gs_450bad01.json':'[]','gs_450bad02.json':'{"session_id":"gs_450bad02","pairs":[]}'}
+        for name,text in files.items():(gs._sessions_dir()/name).write_text(text)
+        self.assertEqual(len(gs.session_diagnostics()),3)
+        for name,text in files.items():self.assertEqual((gs._sessions_dir()/name).read_text(),text)
+        self.assertEqual(len(gs.sessions_for('OwnedPersistence')),1)
+
+    def test_no_mutable_aliases_from_storage_reads_or_exports(self):
+        self.data['pairs'][0]['answer']='Caller mutation'
+        gs.get_session(self.data['session_id'])['pairs'][0]['answer']='Reader mutation'
+        gs.sessions_for('OwnedPersistence')[0]['pairs'].clear()
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Original')
+
+    def test_generation_review_flags_interleave_without_lost_updates(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            initial=fixture();initial.update(status='generating',pairs_total=3);gs.store_session(initial)
+            async def pair(chunk):pending.set();await release.wait();return {**initial['pairs'][0],'pair_id':'p_generated'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs._run_generation(initial['session_id'],[{'content':'Inert'}]));await pending.wait()
+                await asyncio.gather(gs.update_pair(initial['session_id'],'p_0',{'answer':'Reviewed answer'}),gs.update_pair(initial['session_id'],'p_1',{'question':'Reviewed question'}))
+                await asyncio.to_thread(gs.mark_stale,'OwnedPersistence','Controlled identity change')
+                release.set();await task
+        asyncio.run(run());state=self.restart();self.assertEqual(state['status'],'completed');self.assertEqual(len(state['pairs']),3)
+        self.assertEqual(state['pairs'][0]['answer'],'Reviewed answer');self.assertEqual(state['pairs'][1]['question'],'Reviewed question');self.assertTrue(state['stale']);self.assertEqual(state['pairs_attempted'],1)
+
+    def test_regeneration_rejects_changed_target_preserving_acknowledged_edit(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            async def pair(chunk):pending.set();await release.wait();return {**fixture()['pairs'][0],'answer':'Generated replacement'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs.regenerate_pair(self.data['session_id'],'p_0'));await pending.wait()
+                await gs.update_pair(self.data['session_id'],'p_0',{'answer':'Acknowledged review'});release.set()
+                with self.assertRaises(gs.GoldStandardError) as error:await task
+                self.assertEqual(error.exception.code,'PAIR_CHANGED_DURING_REGENERATION')
+        asyncio.run(run());self.assertEqual(self.restart()['pairs'][0]['answer'],'Acknowledged review')
+
+    def test_regeneration_preserves_other_pair_edits_and_history_flags(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            async def pair(chunk):pending.set();await release.wait();return {**fixture()['pairs'][0],'answer':'Generated replacement'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs.regenerate_pair(self.data['session_id'],'p_0'));await pending.wait()
+                await gs.update_pair(self.data['session_id'],'p_1',{'answer':'Other review'})
+                gs.mark_orphaned('OwnedPersistence','Controlled deletion');release.set();await task
+        asyncio.run(run());state=self.restart();self.assertTrue(state['orphaned']);self.assertEqual([p['answer'] for p in state['pairs']],['Generated replacement','Other review'])
+
+    def test_hard_killed_writer_preserves_valid_snapshot_reports_owned_temporary(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes();marker=Path(self.tmp.name)/'replace-boundary'
+        code="""import sys,time,asyncio
+from pathlib import Path
+from config import settings
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+def stopped(src,dst):
+    Path(sys.argv[2]).write_text('ready')
+    time.sleep(30)
+gs.os.replace=stopped
+asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
+"""
+        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+        child=subprocess.Popen([sys.executable,'-c',code,self.tmp.name,str(marker)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            deadline=time.monotonic()+5
+            while not marker.exists() and child.poll() is None and time.monotonic()<deadline:time.sleep(0.02)
+            self.assertTrue(marker.exists(),'Owned child did not reach replace boundary')
+            child.kill();child.communicate(timeout=5)
+            self.assertEqual(path.read_bytes(),before);self.assertEqual(self.restart(),self.data)
+            issues=gs.session_diagnostics();self.assertEqual(len(issues),1);self.assertEqual(issues[0]['code'],'SESSION_INTERRUPTED_WRITE')
+            self.assertTrue(list(path.parent.glob('.gs_450abcde-*.tmp')))
+        finally:
+            if child.poll() is None:child.kill();child.communicate(timeout=5)
+
+    def test_export_keeps_captured_snapshot_while_new_edit_commits(self):
+        initial=fixture();initial['pairs'][0]['status']='approved';gs.store_session(initial)
+        started=threading.Event();release=threading.Event();original=gs._save_export_sync
+        def delayed(path,rows):
+            started.set()
+            if not release.wait(5):raise AssertionError('Owned export was not released')
+            original(path,rows)
+        async def run():
+            with patch.object(gs,'_save_export_sync',side_effect=delayed):
+                task=asyncio.create_task(gs.save_session(initial['session_id'],'snapshot.json'))
+                self.assertTrue(await asyncio.to_thread(started.wait,5))
+                try:await gs.update_pair(initial['session_id'],'p_0',{'answer':'Later acknowledged edit'})
+                finally:release.set()
+                result=await task;self.assertEqual(result['pairs_saved'],1)
+        asyncio.run(run())
+        self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
+
+    def test_scan_of_missing_storage_does_not_create_directory(self):
+        with tempfile.TemporaryDirectory() as missing:
+            with patch.object(settings,'upload_dir',missing):
+                self.assertEqual(gs.session_diagnostics(),[])
+                self.assertFalse((Path(missing)/'goldstandard_sessions').exists())
+
+    def test_storage_scan_failure_reports_without_destroying_cached_state(self):
+        before=gs.get_session(self.data['session_id'])
+        with patch.object(gs.os,'scandir',side_effect=OSError('Owned storage read failure')):
+            gs.load_sessions_from_disk()
+            self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_STORAGE_UNAVAILABLE')
+        self.assertEqual(gs.get_session(self.data['session_id']),before)
+        self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_model_failure_and_cancellation_status_are_persisted(self):
+        async def run():
+            initial=fixture();initial.update(status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+            with patch.object(gs,'_generate_pair',new=AsyncMock(side_effect=ValueError('Controlled model failure'))):await gs._run_generation(initial['session_id'],[{}])
+            self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
+            initial['status']='generating';gs.store_session(initial);pending=asyncio.Event()
+            async def wait(chunk):pending.set();await asyncio.Event().wait()
+            with patch.object(gs,'_generate_pair',side_effect=wait):
+                task=asyncio.create_task(gs._run_generation(initial['session_id'],[{}]));await pending.wait();task.cancel()
+                with self.assertRaises(asyncio.CancelledError):await task
+        asyncio.run(run());self.assertEqual(self.restart()['status'],'cancelled')
+
+    def test_removed_read_and_temporary_issues_clear_but_write_failure_remains(self):
+        root=gs._sessions_dir();bad=root/'gs_450bad00.json';temporary=root/'.gs_450abcde-owned.tmp'
+        bad.write_text('{');temporary.write_text('unpublished');self.assertEqual(len(gs.session_diagnostics()),2)
+        with patch.object(gs.os,'replace',side_effect=OSError('Owned replacement failure')):
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Rejected'}))
+        bad.unlink();temporary.unlink();issues=gs.session_diagnostics()
+        self.assertEqual([issue['code'] for issue in issues],['SESSION_WRITE_FAILED'])
+
+    def test_scan_does_not_block_edit_or_publish_stale_read_failure(self):
+        path=gs._session_path(self.data['session_id']);path.write_text('{')
+        entered=threading.Event();release=threading.Event();original=Path.read_text
+        def read(p,*args,**kwargs):
+            text=original(p,*args,**kwargs)
+            if p==path:
+                entered.set()
+                if not release.wait(5):raise AssertionError('Owned scan was not released')
+            return text
+        with ThreadPoolExecutor(max_workers=2) as pool,patch.object(Path,'read_text',read):
+            scan=pool.submit(gs.session_diagnostics);self.assertTrue(entered.wait(5))
+            edit=pool.submit(lambda:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Committed during scan'})))
+            try:self.assertEqual(edit.result(timeout=2)['answer'],'Committed during scan')
+            finally:release.set()
+            self.assertEqual(scan.result(timeout=5),[])
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Committed during scan')
+
+    def test_marker_failure_continues_other_sessions_without_primary_failure(self):
+        second=fixture();second['session_id']='gs_450abcdf';gs.store_session(second);original=gs.os.replace
+        def replace(src,dst):
+            if Path(dst).stem==self.data['session_id']:raise OSError('Owned marker failure')
+            return original(src,dst)
+        with patch.object(gs.os,'replace',side_effect=replace):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),1)
+        self.assertTrue(gs.get_session(self.data['session_id'])['orphaned'])
+        self.assertNotIn('orphaned',json.loads(gs._session_path(self.data['session_id']).read_text()))
+        self.assertTrue(gs.get_session(second['session_id'])['orphaned'])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    def test_failed_orphan_marker_refuses_current_export(self):
+        with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        async def request():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+                return await client.post('/goldstandard/save',json={'session_id':self.data['session_id'],'filename':'owned-review.json'})
+        response=asyncio.run(request())
+        self.assertEqual(response.status_code,409,response.text)
+        self.assertEqual(response.json()['error']['code'],'HISTORICAL_SESSION')
+        self.assertFalse((Path(self.tmp.name)/'owned-review.json').exists())
+
+    def test_generation_commit_failure_retains_code_after_followup_status_writes(self):
+        async def run():
+            initial=fixture();initial.update(status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+            original=gs.os.replace;calls=0
+            def replace(src,dst):
+                nonlocal calls
+                calls+=1
+                if calls==1:raise OSError('Owned first pair commit failure')
+                return original(src,dst)
+            with patch.object(gs,'_generate_pair',new=AsyncMock(return_value=fixture()['pairs'][0])),patch.object(gs.os,'replace',side_effect=replace):
+                with self.assertRaises(gs.GoldStandardError):await gs._run_generation(initial['session_id'],[{}])
+                await gs._record_generation_failure(initial['session_id'],gs.GoldStandardError('SESSION_WRITE_FAILED','Session update could not be persisted. The previous snapshot is unchanged.',503))
+        asyncio.run(run());state=self.restart();self.assertEqual(state['status'],'failed')
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED');self.assertIn('SESSION_WRITE_FAILED',state['errors'][0])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    def test_generation_failure_reporter_keeps_event_loop_responsive(self):
+        async def run():
+            entered=threading.Event();release=threading.Event();original=gs._update_session_sync
+            def delayed(sid,change):
+                entered.set()
+                if not release.wait(5):raise AssertionError('Owned failure reporter was not released')
+                return original(sid,change)
+            with patch.object(gs,'_update_session_sync',side_effect=delayed):
+                task=asyncio.create_task(gs._record_generation_failure(self.data['session_id'],RuntimeError('Owned unexpected failure')))
+                self.assertTrue(await asyncio.to_thread(entered.wait,5))
+                try:await asyncio.wait_for(asyncio.sleep(0.02),0.5)
+                finally:release.set()
+                await task
+        asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
+
+    def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
+        from services import tuning
+        job={'status':'queued'};jobid='owned-marker-job'
+        with patch.dict(tuning._jobs,{jobid:job}),patch.object(tuning.sources,'has_sources',return_value=False),patch.object(tuning,'_existing_chunks',return_value=[{'content':'Inert'}]),patch.object(tuning,'_rebuild',side_effect=lambda *args,**kwargs:(kwargs['before_replace'](),1)[1]) as rebuild,patch.object(gs.os,'replace',side_effect=OSError('Owned marker failure')):
+            tuning._run(jobid,'OwnedPersistence','reembed',{})
+        rebuild.assert_called_once();self.assertEqual(job['status'],'completed');self.assertEqual(job['chunks_written'],1)
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+
+    def test_replace_import_continues_after_marker_failure_and_reports_retention_truthfully(self):
+        from services import importer
+        job={'status':'queued'};jobid='owned-import-marker-job';pkg=Path(self.tmp.name)
+        manifest={'collection':{'name':'OwnedPersistence','chunk_count':1}}
+        client=MagicMock();client.collections.exists.side_effect=lambda name:name=='OwnedPersistence'
+        original_replace=gs.os.replace
+        def failed_marker(src,dst):
+            if Path(dst).stem==self.data['session_id']:raise OSError('Owned marker failure')
+            return original_replace(src,dst)
+        def deleted(name):
+            gs.mark_orphaned(name,'Owned completed primary replacement')
+            return 1
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(importer._jobs,{jobid:job}))
+            for obj,name,kwargs in [
+                (importer.packager,'exports_dir',{'return_value':pkg}),
+                (importer.packager,'open_package',{'return_value':(pkg,manifest)}),
+                (importer.packager,'verify_digests',{'return_value':None}),
+                (importer.packager,'sha256_file',{'return_value':'01234567'*8}),
+                (importer,'_check_embedding',{'return_value':None}),
+                (importer,'_ensure_models',{'return_value':[]}),
+                (importer,'_restore_sidecars',{'return_value':[]}),
+                (importer,'_mark_started',{'return_value':None}),
+                (importer,'_mark_finished',{'return_value':None}),
+                (importer.wc,'_collection_exists_sync',{'side_effect':lambda name:name=='OwnedPersistence'}),
+                (importer.wc,'_delete_collection_sync',{'side_effect':deleted}),
+                (importer.wc,'get_client',{'return_value':client}),
+                (gs.os,'replace',{'side_effect':failed_marker})]:
+                stack.enter_context(patch.object(obj,name,**kwargs))
+            build=stack.enter_context(patch.object(importer,'_build',return_value=1))
+            importer._run(jobid,'owned-package.tar.gz','replace')
+        self.assertEqual(build.call_count,2);self.assertEqual(job['status'],'completed')
+        self.assertIn('inspect session recovery diagnostics',job['notes'][0]);self.assertNotIn('marked orphaned',job['notes'][0])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+if __name__ == '__main__':
+    unittest.main()

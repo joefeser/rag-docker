@@ -41,9 +41,9 @@ class Collections:
         def iterator(include_vector=False):
             for record in self.data[name]:
                 yield SimpleNamespace(uuid=record['id'], properties=copy.deepcopy(record['properties']), vector={'default':copy.deepcopy(record['vector'])} if include_vector else None)
-        return SimpleNamespace(iterator=iterator, batch=SimpleNamespace(dynamic=lambda: Batch(self, name)))
+        return SimpleNamespace(iterator=iterator, batch=SimpleNamespace(dynamic=lambda: Batch(self, name), failed_objects=[]), aggregate=SimpleNamespace(over_all=lambda **kwargs: SimpleNamespace(total_count=len(self.data[name]))))
     def delete(self, name): self.deleted.append(name); del self.data[name]
-    def create(self, name, index, distance, hnsw):
+    def create(self, name, index, distance, hnsw, **kwargs):
         self.created.append((name,index,distance,copy.deepcopy(hnsw))); self.data[name] = []
 
 

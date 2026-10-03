@@ -7,8 +7,10 @@ or vector width changes and Weaviate cannot alter either in place.
 collection first, and the live one is replaced only once that succeeds. Weaviate
 has no rename (see `importer.py`), so the final step copies vectors out of the
 staging collection rather than re-embedding — one embedding pass, not two. A
-preparation failure leaves the original collection untouched. Replacement can
-still fail after cutover; reindex then marks retained evaluation pairs stale.
+failure before replacement leaves the original untouched. After replacement
+starts, a verified recovery copy and its sidecars survive failure and restart.
+Identity-changing operations flag retained evaluations before replacement;
+failed reindex cutovers flag them when exact identity cannot be verified.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -28,11 +30,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from services import collection_writes, collection_recovery
+from services import collection_writes
 from config import settings
 from services import goldstandard
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
 from services.ingest_pipeline import _parse_file
 from services.packager import PackageError
@@ -180,12 +183,9 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress, *, records: list[dict] | None = None, source_collection: str | None = None) -> int:
-    """Stage the new chunks, then swap them into place.
-
-    Re-chunk/re-embed use the embedding insert path. Reindex supplies original
-    records and verifies them before replacement and after the final copy.
-    """
+             distance_metric: str | None, progress, *, records: list[dict] | None = None,
+             source_collection: str | None = None, before_replace=None) -> int:
+    """Stage and verify, then replace the live collection under its writer guard."""
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     if records is not None:
@@ -194,58 +194,49 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
-
     client = wc.get_client()
-    ownership = collection_recovery.begin(collection_writes.canonical(collection), "tune", client)
+    ownership = collection_recovery.begin(collection, "tune", client)
     staging = ownership["staging"]
     cutover_started = False
     completed = False
     original_intact = False
     try:
-        wc._create_collection_sync(staging, new_index, new_distance, hnsw)
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
         if records is not None:
             _write_records(staging, records)
-            # Application writers share the held guard. Also refuse a source
-            # change from an independently connected backend writer.
+            # The guard covers application writers; independently connected
+            # backend writers are detected by comparing the source again.
             _verify_records(collection, records)
+        else:
+            wc._insert_chunks_sync(staging, properties)
+            staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+            if staged_count != len(properties):
+                raise RuntimeError(f"staged {staged_count} chunks but expected {len(properties)}")
+        if source_collection != collection:
             collection_recovery.retain(ownership, source_collection=source_collection)
-            cutover_started = True
-            client.collections.delete(collection)
-            wc._create_collection_sync(collection, new_index, new_distance, hnsw)
-            _write_records(collection, records)
-            if progress:
-                progress(len(records))
-            completed = True
-            return len(records)
-        wc._insert_chunks_sync(staging, properties)
-        staged = [
-            {"id": str(o.uuid),
-             "vector": (o.vector or {}).get("default"),
-             "properties": dict(o.properties or {})}
-            for o in client.collections.get(staging).iterator(include_vector=True)
-        ]
-        if len(staged) != len(properties):
-            raise RuntimeError(
-                f"staged {len(staged)} chunks but expected {len(properties)}")
-        if progress:
-            progress(len(staged))
-
-        collection_recovery.retain(ownership, source_collection=source_collection)
+        else:
+            collection_recovery.retain(ownership)
+        if before_replace:
+            before_replace()
         cutover_started = True
-        # Past this point the original is replaced. Everything that could fail
-        # has already run against the staging collection.
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw)
-        target = client.collections.get(collection)
-        with target.batch.dynamic() as batch:
-            for record in staged:
-                batch.add_object(properties=record["properties"],
-                                 uuid=record["id"], vector=record["vector"])
-            if batch.number_errors > 0:
-                raise RuntimeError(
-                    f"{batch.number_errors} error(s) writing the rebuilt collection")
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
+        if records is not None:
+            _write_records(collection, records)
+            written = len(records)
+        else:
+            def staged():
+                return (
+                    {"id": str(obj.uuid), "vector": (obj.vector or {}).get("default"),
+                     "properties": dict(obj.properties or {})}
+                    for obj in client.collections.get(staging).iterator(include_vector=True)
+                )
+            written = batch_write.insert(client.collections.get(collection), staged,
+                                         expected_count=len(properties))
+        if progress:
+            progress(written)
         completed = True
-        return len(staged)
+        return written
     except Exception as exc:
         if records is not None and cutover_started:
             try:
@@ -258,22 +249,23 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                     goldstandard.mark_stale(source_collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
                 except Exception:
                     _log.exception("Could not mark evaluation historical after failed reindex")
-                if ownership["state"] == "recovery":
-                    raise PackageError("TUNE_FAILED", str(exc) + f" Verified data retained as '{staging}'.",
-                                       {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
-        elif cutover_started and ownership["state"] == "recovery":
-            raise PackageError("TUNE_FAILED", str(exc) + f" Verified data retained as '{staging}'.",
-                               {"recovered_as": staging, "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
+        elif cutover_started:
+            try:
+                goldstandard.mark_stale(source_collection, "collection replacement failed after cutover began; retained pairs require historical review")
+            except Exception:
+                _log.exception("Could not mark evaluation historical after failed rebuild")
+        if cutover_started and not original_intact and ownership["state"] == "recovery":
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified data is retained as '{staging}'.",
+                {"recovered_as": staging,
+                 "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
         raise
     finally:
-        try:
-            if ownership:
-                if completed or original_intact or ownership["state"] == "scratch":
-                    collection_recovery.discard(ownership, client)
-            else:
-                client.collections.delete(staging)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove owned staging collection %r", staging)
+        if completed or original_intact or ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, client)
+            except Exception:
+                _log.exception("Could not remove owned staging collection %r", staging)
 
 
 @collection_writes.serialized("collection")
@@ -333,16 +325,21 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
 
         job["chunks_total"] = len(properties)
-        rebuild_args = (collection, properties, params.get("index_type"),
-                        params.get("distance_metric"), progress)
-        written = (_rebuild(*rebuild_args, records=records, source_collection=source_collection) if records is not None
-                   else _rebuild(*rebuild_args, source_collection=source_collection))
+        stale_count = 0
+
+        def mark_before_replace() -> None:
+            nonlocal stale_count
+            stale_count = goldstandard.mark_stale(source_collection, reason)
+
+        written = _rebuild(
+            collection, properties, params.get("index_type"), params.get("distance_metric"),
+            progress, records=records, source_collection=source_collection,
+            before_replace=mark_before_replace if reason else None)
 
         notes = []
         if reason:
-            stale = goldstandard.mark_stale(source_collection, reason)
-            if stale:
-                notes.append(f"{stale} gold-standard session(s) marked stale")
+            if stale_count:
+                notes.append(f"{stale_count} gold-standard session(s) marked stale")
         else:
             notes.append("UUIDs, properties and vectors verified unchanged after reindex; "
                          "gold-standard sessions were left alone")
