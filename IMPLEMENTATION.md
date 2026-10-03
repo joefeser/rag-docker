@@ -3710,12 +3710,34 @@ def _failed_generation(current: dict, exc: Exception) -> None:
         current["persistence_error"] = {"code": exc.code, "message": exc.message}
 
 
+def _publish_generation_failure(session_id: str, exc: Exception, write_error: Exception) -> None:
+    """Publish a failed status the store could not save, as marker failures do."""
+    global _store_revision
+    with _state_lock:
+        current = _sessions.get(session_id)
+        if current is None:
+            return
+        snapshot = copy.deepcopy(current)
+        _failed_generation(snapshot, exc)
+        _failed_generation(snapshot, write_error)
+        _sessions[session_id] = snapshot
+        _store_revision += 1
+
+
 async def _record_generation_failure(session_id: str, exc: Exception) -> None:
     try:
         await asyncio.to_thread(_update_session_sync, session_id,
                                 lambda current: _failed_generation(current, exc))
-    except Exception:
+    except Exception as write_error:
         log.exception("Could not durably report failed generation for %s", session_id)
+        # Otherwise `generating` stays in the cache for as long as the fault
+        # lasts, and the UI polls it forever. The cache runs ahead of disk;
+        # the next successful write of this session saves the failed status.
+        # The lock can be held through fsync, so this stays off the event loop.
+        try:
+            await asyncio.to_thread(_publish_generation_failure, session_id, exc, write_error)
+        except Exception:
+            log.exception("Could not publish failed generation for %s", session_id)
 
 
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
@@ -14400,6 +14422,90 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 finally:release.set()
                 await task
         asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
+
+    async def generate(self,pair):
+        # The real task, done-callback and reporter run; only the model and sampling are owned.
+        chunk={'content':'Inert','source_file':'inert.txt','chunk_index':0}
+        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
+            sid=(await gs.start_generation('OwnedPersistence',1,None))['session_id']
+            deadline=time.monotonic()+5
+            while gs._tasks:
+                if time.monotonic()>deadline:raise AssertionError('Owned generation did not finish')
+                await asyncio.sleep(0.01)
+        return sid
+
+    async def fetch(self,sid):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+            return await client.get('/goldstandard/session/'+sid)
+
+    def test_persistent_replace_failure_ends_generation_failed(self):
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def pair(chunk):fault.set();return fixture()['pairs'][0]
+        async def run():
+            with patch.object(gs.os,'replace',side_effect=replace):
+                sid=await self.generate(pair);return sid,await self.fetch(sid)
+        sid,response=asyncio.run(run());state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed')
+        self.assertTrue(any('SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
+        self.assertEqual(json.loads(gs._session_path(sid).read_text())['status'],'generating')
+
+    def test_directory_at_session_path_ends_generation_failed(self):
+        async def pair(chunk):
+            # The only generating session is the one this case started.
+            sid=next(key for key,value in gs._sessions.items() if value['status']=='generating')
+            path=gs._session_path(sid);path.unlink();path.mkdir()
+            return fixture()['pairs'][0]
+        async def run():
+            sid=await self.generate(pair);return sid,await self.fetch(sid)
+        sid,response=asyncio.run(run());state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed')
+        self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
+        # Untyped on develop; #127 types the same fault as SESSION_WRITE_FAILED.
+        self.assertTrue(any('not a regular file' in e or 'SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+
+    def test_cancelled_generation_with_failing_final_write_ends_failed(self):
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def run():
+            waiting=asyncio.Event()
+            async def pair(chunk):fault.set();waiting.set();await asyncio.Event().wait()
+            async def cancel():
+                await waiting.wait()
+                for task in list(gs._tasks):task.cancel()
+            with patch.object(gs.os,'replace',side_effect=replace):
+                canceller=asyncio.create_task(cancel())
+                sid=await self.generate(pair);await canceller;return sid
+        self.assertEqual(gs.get_session(asyncio.run(run()))['status'],'failed')
+
+    def test_cache_fallback_keeps_event_loop_responsive(self):
+        initial=fixture();initial.update(session_id='gs_450abcd1',status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+        written=threading.Event();held=threading.Event();release=threading.Event();seen=[]
+        def failing(sid,change):
+            written.set();raise gs.GoldStandardError('SESSION_WRITE_FAILED','Owned persistent write fault',503)
+        def hold():
+            with gs._state_lock:
+                held.set();seen.append(release.wait(5))
+        holder=threading.Thread(target=hold);holder.start();self.assertTrue(held.wait(5))
+        async def run():
+            with patch.object(gs,'_update_session_sync',side_effect=failing):
+                task=asyncio.create_task(gs._record_generation_failure(initial['session_id'],RuntimeError('Owned unexpected failure')))
+                try:
+                    self.assertTrue(await asyncio.to_thread(written.wait,5))
+                    # Long enough for the reporter to reach its fallback; on the loop it would block here.
+                    await asyncio.sleep(0.05)
+                finally:release.set()
+                await task
+        try:asyncio.run(run())
+        finally:release.set();holder.join(5)
+        self.assertEqual(seen,[True])
+        self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
 
     def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
         from services import tuning

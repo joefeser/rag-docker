@@ -502,12 +502,34 @@ def _failed_generation(current: dict, exc: Exception) -> None:
         current["persistence_error"] = {"code": exc.code, "message": exc.message}
 
 
+def _publish_generation_failure(session_id: str, exc: Exception, write_error: Exception) -> None:
+    """Publish a failed status the store could not save, as marker failures do."""
+    global _store_revision
+    with _state_lock:
+        current = _sessions.get(session_id)
+        if current is None:
+            return
+        snapshot = copy.deepcopy(current)
+        _failed_generation(snapshot, exc)
+        _failed_generation(snapshot, write_error)
+        _sessions[session_id] = snapshot
+        _store_revision += 1
+
+
 async def _record_generation_failure(session_id: str, exc: Exception) -> None:
     try:
         await asyncio.to_thread(_update_session_sync, session_id,
                                 lambda current: _failed_generation(current, exc))
-    except Exception:
+    except Exception as write_error:
         log.exception("Could not durably report failed generation for %s", session_id)
+        # Otherwise `generating` stays in the cache for as long as the fault
+        # lasts, and the UI polls it forever. The cache runs ahead of disk;
+        # the next successful write of this session saves the failed status.
+        # The lock can be held through fsync, so this stays off the event loop.
+        try:
+            await asyncio.to_thread(_publish_generation_failure, session_id, exc, write_error)
+        except Exception:
+            log.exception("Could not publish failed generation for %s", session_id)
 
 
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
