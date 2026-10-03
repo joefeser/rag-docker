@@ -42,7 +42,7 @@ A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Neve
 1. Start the run in the background, with its output going to a file in the bundle and its process id saved next to it:
 
    ```bash
-   bash scripts/verify/all.sh > <bundle>/verify-all.log 2>&1 & echo $! > <bundle>/verify-all.pid
+   (bash scripts/verify/all.sh; echo "all.sh exit=$?") > <bundle>/verify-all.log 2>&1 & echo $! > <bundle>/verify-all.pid
    ```
 
 2. Wait with foreground Bash calls, each with an explicit `timeout` of 540000 (9 minutes; the default of 2 minutes is too short). Each call loops until the run's process has exited or the time is nearly up:
@@ -52,7 +52,7 @@ A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Neve
    ```
 
    If it didn't print `ended`, make the same call again. Never check for the run by process name: `pgrep -f "bash all.sh"` doesn't match `bash scripts/verify/all.sh`, and would report a running suite as finished.
-3. Read the finished log yourself (`tail`, `grep`). `all.sh` ends with `All suites passed.` or `At least one suite failed.`; a log without either line means the run died, which is a failure to report, not a pass. Then carry on with the remaining steps.
+3. Read the finished log yourself (`tail`, `grep`). `all.sh` ends with `All suites passed.` or `At least one suite failed.`, followed by `all.sh exit=<code>`; a log without them means the run died, which is a failure to report, not a pass, and only `exit=0` is a passing run. Then carry on with the remaining steps.
 
 ## Severity guidance
 
