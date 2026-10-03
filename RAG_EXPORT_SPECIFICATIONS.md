@@ -102,7 +102,7 @@ carry the corpus's parameters.
 | `retrieval_mode` | enum `hnsw`\|`flat`\|`hybrid`\|`semantic` | `hnsw` |
 | `top_k` | integer 1–50 | `5` |
 | `alpha` | number 0–1 | `0.75` |
-| `ef` | integer 16–512, optional | — |
+| `ef` | integer 16–512, optional; legacy and inactive: stored and exported in `retrieval_config.json`, but neither query execution nor the exported `retrieve.py` applies it | — |
 | `response_format` | enum `end_user`\|`engineer` | `end_user` |
 
 ### 3.2 Endpoints
@@ -328,7 +328,7 @@ Checks run in this order and stop at the first failure:
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
-| 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; its resolved storage destination is contained | `PACKAGE_CORRUPT`, naming the sidecar |
+| 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; the local session storage directory is a regular directory inside the upload directory | `PACKAGE_CORRUPT`, naming the sidecar |
 | 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
 
@@ -345,7 +345,9 @@ Check 4a runs before bundled-model installation, collection creation/deletion,
 or restoring any sidecar. All sessions MUST be preflighted together, including
 later files, and the validated snapshots used for restoration. Invalid JSON or
 metadata is a refusal, not a skipped session. Session IDs use the locally
-generated `gs_[0-9a-f]{8}` grammar; malformed IDs are never rewritten. The
+generated `gs_[0-9a-f]{8}` grammar; malformed IDs are refused, never rewritten.
+A well-formed ID that is already used locally is kept as import provenance and
+the restored session gets a new local ID (`SPECIFICATIONS.md` §3.1.5). The
 persistence boundary also enforces resolved-path containment and refuses
 redirected storage directories and non-regular destinations. Archive extraction
 accepts only regular files and directories, so special members cannot block a

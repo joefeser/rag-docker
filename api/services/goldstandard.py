@@ -169,10 +169,6 @@ def _save_session_sync(session: dict) -> None:
                     log.exception("Could not remove owned session temporary file %s", temporary.name)
 
 
-async def _save_session(session: dict) -> None:
-    await asyncio.to_thread(store_session, session)
-
-
 def _scan_sessions() -> None:
     """Inspect disk without blocking writers, then publish only a current scan."""
     global _store_revision
@@ -307,12 +303,14 @@ def _identity_available(session_id: str) -> bool:
     return False
 
 
-def _allocate_identity(preferred: str | None = None) -> str:
+def _allocate_identity(preferred: str | None = None, tried: list[str] | None = None) -> str:
     # Callers hold _state_lock across allocation and durable publication.
     if preferred is not None and _identity_available(preferred):
         return preferred
     for _ in range(128):
         candidate = f"gs_{uuid.uuid4().hex[:8]}"
+        if tried is not None:
+            tried.append(candidate)
         if _identity_available(candidate):
             return candidate
     raise RuntimeError("Could not allocate an unoccupied session identity")
@@ -321,7 +319,14 @@ def _allocate_identity(preferred: str | None = None) -> str:
 def _store_generated_session(session: dict) -> dict:
     snapshot = copy.deepcopy(session)
     with _state_lock:
-        snapshot["session_id"] = _allocate_identity()
+        tried: list[str] = []
+        try:
+            snapshot["session_id"] = _allocate_identity(tried=tried)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Nothing was written. Report it like the writer's own prepare
+            # failure, under the candidate being checked or the last one tried.
+            _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (tried[-1] + ".json"), "SESSION_WRITE_FAILED")
+            raise GoldStandardError("SESSION_WRITE_FAILED", "Session storage could not be inspected to allocate an identity. No session was written.", 503) from exc
         store_session(snapshot)
     return copy.deepcopy(snapshot)
 
@@ -329,8 +334,8 @@ def _store_generated_session(session: dict) -> dict:
 def store_imported_session(session: dict, source_collection: str) -> dict:
     """Serialize source-ID collision handling with generation and other imports."""
     snapshot = copy.deepcopy(session)
-    # The source ID can be historical, but the rest of the session must still
-    # satisfy the strict schema before it is given a canonical local ID.
+    # Import preflight (check 4a) has already refused noncanonical source IDs.
+    # Allocation keeps the source ID only when it is free; it stays provenance.
     SessionResponse.model_validate(snapshot, strict=True)
     source_id = snapshot["session_id"]
     with _state_lock:

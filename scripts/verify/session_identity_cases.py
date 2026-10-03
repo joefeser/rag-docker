@@ -1,6 +1,7 @@
 """Owned import identity preservation; run by13_identity.sh in the API image."""
-import asyncio,copy,json,os,subprocess,sys,tempfile,threading,unittest
+import asyncio,copy,json,os,subprocess,sys,tempfile,threading,time,unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
@@ -112,17 +113,14 @@ class IdentityTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
         self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
 
-    def test_historical_source_identity_gets_safe_local_id_and_usable_provenance(self):
-        from models.schemas import SessionResponse
+    def test_noncanonical_source_identity_is_refused_before_restoration(self):
         package=Path(self.tmp.name)/'legacy-package';gold=package/'goldstandard';gold.mkdir(parents=True)
         data=fixture();data['session_id']='legacy-review-2024';(gold/'legacy.json').write_text(json.dumps(data))
-        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
-        importer._restore_sidecars('OwnedLegacy',package,'OwnedOriginal',validated,mappings)
-        local=mappings[0]['session_id'];self.assertRegex(local,r'^gs_[0-9a-f]{8}$')
-        loaded=gs.get_session(local);self.assertEqual(loaded['imported_from']['session_id'],data['session_id'])
-        self.assertEqual(SessionResponse.model_validate(loaded).imported_from.session_id,data['session_id'])
-        self.assertFalse((gs._sessions_dir()/'legacy-review-2024.json').exists())
-        result=asyncio.run(gs.save_session(local,'legacy-rows.json'));self.assertEqual(json.loads((Path(self.tmp.name)/result['filename']).read_text())[0]['answer'],'Original answer')
+        before=self.path.read_bytes()
+        with self.assertRaises(importer.PackageError) as caught:importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        self.assertEqual((caught.exception.code,caught.exception.detail),('PACKAGE_CORRUPT',{'file':'goldstandard/legacy.json'}))
+        self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(len(list(self.path.parent.glob('*.json'))),1)
 
     def test_cache_iteration_serializes_with_generation_insertion(self):
         entered=threading.Event();release=threading.Event();started=threading.Event();mutated=threading.Event()
@@ -143,5 +141,58 @@ class IdentityTests(unittest.TestCase):
             finally:release.set()
             self.assertEqual(len(reading.result(timeout=2)),1);self.assertRegex(writing.result(timeout=2)['session_id'],r'^gs_[0-9a-f]{8}$')
 
+
+    # Reviewer-added: forced candidate collisions under real thread contention.
+    def test_reviewer_forced_duplicate_candidates_race_never_share_or_overwrite(self):
+        before=self.path.read_bytes();shared='gs_460abc01';draw=threading.Lock();counter=[0]
+        def duplicated():
+            with draw:
+                n=counter[0];counter[0]+=1
+            return SimpleNamespace(hex='%08x'%(0x46100000+n//2)+'0'*24)
+        original_save=gs._save_session_sync
+        def slow_save(session):
+            time.sleep(.02);return original_save(session)
+        def run(i):
+            data=fixture();data['collection']='OwnedRace'+str(i)
+            if i%3==0:return gs._store_generated_session(data)['session_id']
+            data['session_id']=shared if i%3==1 else self.original['session_id']
+            return gs.store_imported_session(data,'OwnedOriginal')['session_id']
+        with patch.object(gs.uuid,'uuid4',side_effect=duplicated),patch.object(gs,'_save_session_sync',side_effect=slow_save):
+            with ThreadPoolExecutor(max_workers=12) as pool:identities=list(pool.map(run,range(24)))
+        self.assertEqual(len(set(identities)),24,identities);self.assertNotIn(self.original['session_id'],identities)
+        self.assertEqual(identities.count(shared),1,'exactly one concurrent import keeps a free shared source ID')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(list(self.path.parent.glob('*.json'))),25)
+        for sid in identities:self.assertEqual(json.loads((self.path.parent/(sid+'.json')).read_text())['session_id'],sid)
+
+    def test_reviewer_replace_import_into_same_collection_keeps_newer_original(self):
+        package=Path(self.tmp.name)/'owned-replace-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        (gold/(self.original['session_id']+'.json')).write_text(json.dumps(self.original))
+        asyncio.run(gs.update_pair(self.original['session_id'],'p_owned',{'answer':'Newer human review','status':'edited'}));before=self.path.read_bytes()
+        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        importer._restore_sidecars('OwnedOriginal',package,'OwnedOriginal',validated,mappings)
+        self.assertNotEqual(mappings[0]['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(gs.get_session(self.original['session_id'])['pairs'][0]['answer'],'Newer human review')
+
+    def test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503(self):
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+                with self.assertRaises(gs.GoldStandardError) as caught:await gs.start_generation('OwnedGeneration',1,None)
+                generate.assert_not_called()
+            return caught.exception
+        error=asyncio.run(run())
+        self.assertEqual((error.code,error.status),('SESSION_WRITE_FAILED',503));self.assertEqual(self.path.read_bytes(),before)
+
+    def test_generation_allocation_failure_records_diagnostic_for_candidate(self):
+        storage=Path(settings.upload_dir)/'goldstandard_sessions';before=self.path.read_bytes()
+        for name,changes,expected in [('inspection',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcdf'+'0'*24)),patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure'))],'gs_460abcdf.json'),
+                                      ('exhaustion',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcde'+'0'*24))],'gs_460abcde.json')]:
+            with self.subTest(case=name),patch.object(gs,'_diagnostics',{}):
+                with ExitStack() as stack:
+                    for change in changes:stack.enter_context(change)
+                    with self.assertRaises(gs.GoldStandardError) as caught:gs._store_generated_session(fixture())
+                self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
+                self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/expected):'SESSION_WRITE_FAILED'})
+                self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
 
 if __name__=='__main__':unittest.main()
