@@ -623,7 +623,6 @@ settings = Settings()
 ### api/models/__init__.py
 
 ```python
-
 ```
 
 ### api/models/schemas.py
@@ -1160,7 +1159,6 @@ class ErrorResponse(BaseModel):
 ### api/services/__init__.py
 
 ```python
-
 ```
 
 ### api/services/sources.py
@@ -3342,10 +3340,6 @@ def _save_session_sync(session: dict) -> None:
                     log.exception("Could not remove owned session temporary file %s", temporary.name)
 
 
-async def _save_session(session: dict) -> None:
-    await asyncio.to_thread(store_session, session)
-
-
 def _scan_sessions() -> None:
     """Inspect disk without blocking writers, then publish only a current scan."""
     global _store_revision
@@ -3480,12 +3474,14 @@ def _identity_available(session_id: str) -> bool:
     return False
 
 
-def _allocate_identity(preferred: str | None = None) -> str:
+def _allocate_identity(preferred: str | None = None, tried: list[str] | None = None) -> str:
     # Callers hold _state_lock across allocation and durable publication.
     if preferred is not None and _identity_available(preferred):
         return preferred
     for _ in range(128):
         candidate = f"gs_{uuid.uuid4().hex[:8]}"
+        if tried is not None:
+            tried.append(candidate)
         if _identity_available(candidate):
             return candidate
     raise RuntimeError("Could not allocate an unoccupied session identity")
@@ -3494,7 +3490,14 @@ def _allocate_identity(preferred: str | None = None) -> str:
 def _store_generated_session(session: dict) -> dict:
     snapshot = copy.deepcopy(session)
     with _state_lock:
-        snapshot["session_id"] = _allocate_identity()
+        tried: list[str] = []
+        try:
+            snapshot["session_id"] = _allocate_identity(tried=tried)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Nothing was written. Report it like the writer's own prepare
+            # failure, under the candidate being checked or the last one tried.
+            _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (tried[-1] + ".json"), "SESSION_WRITE_FAILED")
+            raise GoldStandardError("SESSION_WRITE_FAILED", "Session storage could not be inspected to allocate an identity. No session was written.", 503) from exc
         store_session(snapshot)
     return copy.deepcopy(snapshot)
 
@@ -3502,8 +3505,8 @@ def _store_generated_session(session: dict) -> dict:
 def store_imported_session(session: dict, source_collection: str) -> dict:
     """Serialize source-ID collision handling with generation and other imports."""
     snapshot = copy.deepcopy(session)
-    # The source ID can be historical, but the rest of the session must still
-    # satisfy the strict schema before it is given a canonical local ID.
+    # Import preflight (check 4a) has already refused noncanonical source IDs.
+    # Allocation keeps the source ID only when it is free; it stays provenance.
     SessionResponse.model_validate(snapshot, strict=True)
     source_id = snapshot["session_id"]
     with _state_lock:
@@ -4601,7 +4604,6 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
-from models.schemas import SessionResponse
 from services import goldstandard
 from services import model_bundle
 from services import packager
@@ -5029,10 +5031,10 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(path.read_text())
-            # A historical source ID is provenance, not a local destination.
-            # Validate its type and all content, then check the guarded root
-            # without turning the source ID into a filesystem path.
-            SessionResponse.model_validate(data, strict=True)
+            # Source IDs must use the generated grammar. An occupied one is
+            # kept as provenance at restore, so only the guarded root is
+            # checked here, not the source ID's own file.
+            goldstandard.validate_session(data)
             if canonical(data["collection"]) != canonical(original):
                 raise ValueError("Evaluation session belongs to a different collection.")
             if data["session_id"] in identities:
@@ -5934,7 +5936,6 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
 ### api/routers/__init__.py
 
 ```python
-
 ```
 
 ### api/services/system_info.py
@@ -9973,7 +9974,7 @@ curl -s localhost:8080/api/collections | python3 -c \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
 
-`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes fourteen owned cache/disk/collision/redirected-slot/historical-ID/concurrent-insertion cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes eighteen owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 
 The infrastructure suite requires Docker Engine 28.0.0+ and checks both resolved Compose and live Docker bindings for a single loopback proxy publication. When deploying an alternate host port for testing, set `RAG_EXPECTED_PROXY_PORT` to that port as well as `RAG_API`. Its inspection files are kept in a private temporary directory removed on exit. The local profile assumes standard bridge/NAT routing.
 
@@ -13956,6 +13957,8 @@ bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$bindings" || exit 2
 require_stack
 section "Imported evaluation session identities"
+python3 ../tests/test_session_identity.py
+check "embedded identity sources match" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/session_identity_cases.py)
 check "owned identity collision, preservation and allocation regressions" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_identity.py)
@@ -13967,8 +13970,9 @@ summary
 
 ```python
 """Owned import identity preservation; run by13_identity.sh in the API image."""
-import asyncio,copy,json,os,subprocess,sys,tempfile,threading,unittest
+import asyncio,copy,json,os,subprocess,sys,tempfile,threading,time,unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
@@ -14080,17 +14084,14 @@ class IdentityTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
         self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
 
-    def test_historical_source_identity_gets_safe_local_id_and_usable_provenance(self):
-        from models.schemas import SessionResponse
+    def test_noncanonical_source_identity_is_refused_before_restoration(self):
         package=Path(self.tmp.name)/'legacy-package';gold=package/'goldstandard';gold.mkdir(parents=True)
         data=fixture();data['session_id']='legacy-review-2024';(gold/'legacy.json').write_text(json.dumps(data))
-        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
-        importer._restore_sidecars('OwnedLegacy',package,'OwnedOriginal',validated,mappings)
-        local=mappings[0]['session_id'];self.assertRegex(local,r'^gs_[0-9a-f]{8}$')
-        loaded=gs.get_session(local);self.assertEqual(loaded['imported_from']['session_id'],data['session_id'])
-        self.assertEqual(SessionResponse.model_validate(loaded).imported_from.session_id,data['session_id'])
-        self.assertFalse((gs._sessions_dir()/'legacy-review-2024.json').exists())
-        result=asyncio.run(gs.save_session(local,'legacy-rows.json'));self.assertEqual(json.loads((Path(self.tmp.name)/result['filename']).read_text())[0]['answer'],'Original answer')
+        before=self.path.read_bytes()
+        with self.assertRaises(importer.PackageError) as caught:importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        self.assertEqual((caught.exception.code,caught.exception.detail),('PACKAGE_CORRUPT',{'file':'goldstandard/legacy.json'}))
+        self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(len(list(self.path.parent.glob('*.json'))),1)
 
     def test_cache_iteration_serializes_with_generation_insertion(self):
         entered=threading.Event();release=threading.Event();started=threading.Event();mutated=threading.Event()
@@ -14111,6 +14112,59 @@ class IdentityTests(unittest.TestCase):
             finally:release.set()
             self.assertEqual(len(reading.result(timeout=2)),1);self.assertRegex(writing.result(timeout=2)['session_id'],r'^gs_[0-9a-f]{8}$')
 
+
+    # Reviewer-added: forced candidate collisions under real thread contention.
+    def test_reviewer_forced_duplicate_candidates_race_never_share_or_overwrite(self):
+        before=self.path.read_bytes();shared='gs_460abc01';draw=threading.Lock();counter=[0]
+        def duplicated():
+            with draw:
+                n=counter[0];counter[0]+=1
+            return SimpleNamespace(hex='%08x'%(0x46100000+n//2)+'0'*24)
+        original_save=gs._save_session_sync
+        def slow_save(session):
+            time.sleep(.02);return original_save(session)
+        def run(i):
+            data=fixture();data['collection']='OwnedRace'+str(i)
+            if i%3==0:return gs._store_generated_session(data)['session_id']
+            data['session_id']=shared if i%3==1 else self.original['session_id']
+            return gs.store_imported_session(data,'OwnedOriginal')['session_id']
+        with patch.object(gs.uuid,'uuid4',side_effect=duplicated),patch.object(gs,'_save_session_sync',side_effect=slow_save):
+            with ThreadPoolExecutor(max_workers=12) as pool:identities=list(pool.map(run,range(24)))
+        self.assertEqual(len(set(identities)),24,identities);self.assertNotIn(self.original['session_id'],identities)
+        self.assertEqual(identities.count(shared),1,'exactly one concurrent import keeps a free shared source ID')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(list(self.path.parent.glob('*.json'))),25)
+        for sid in identities:self.assertEqual(json.loads((self.path.parent/(sid+'.json')).read_text())['session_id'],sid)
+
+    def test_reviewer_replace_import_into_same_collection_keeps_newer_original(self):
+        package=Path(self.tmp.name)/'owned-replace-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        (gold/(self.original['session_id']+'.json')).write_text(json.dumps(self.original))
+        asyncio.run(gs.update_pair(self.original['session_id'],'p_owned',{'answer':'Newer human review','status':'edited'}));before=self.path.read_bytes()
+        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        importer._restore_sidecars('OwnedOriginal',package,'OwnedOriginal',validated,mappings)
+        self.assertNotEqual(mappings[0]['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(gs.get_session(self.original['session_id'])['pairs'][0]['answer'],'Newer human review')
+
+    def test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503(self):
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+                with self.assertRaises(gs.GoldStandardError) as caught:await gs.start_generation('OwnedGeneration',1,None)
+                generate.assert_not_called()
+            return caught.exception
+        error=asyncio.run(run())
+        self.assertEqual((error.code,error.status),('SESSION_WRITE_FAILED',503));self.assertEqual(self.path.read_bytes(),before)
+
+    def test_generation_allocation_failure_records_diagnostic_for_candidate(self):
+        storage=Path(settings.upload_dir)/'goldstandard_sessions';before=self.path.read_bytes()
+        for name,changes,expected in [('inspection',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcdf'+'0'*24)),patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure'))],'gs_460abcdf.json'),
+                                      ('exhaustion',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcde'+'0'*24))],'gs_460abcde.json')]:
+            with self.subTest(case=name),patch.object(gs,'_diagnostics',{}):
+                with ExitStack() as stack:
+                    for change in changes:stack.enter_context(change)
+                    with self.assertRaises(gs.GoldStandardError) as caught:gs._store_generated_session(fixture())
+                self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
+                self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/expected):'SESSION_WRITE_FAILED'})
+                self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
 
 if __name__=='__main__':unittest.main()
 ```
@@ -14153,7 +14207,7 @@ def legacy_archive(archive,root,identity,source_id):
         with tarfile.open(output,'w:gz') as package:package.add(package_root,arcname=package_root.name)
         return output.name
 
-async def completed(client,path,timeout=300):
+async def completed(client,path,timeout=300,expected='completed'):
     deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
     while True:
         remaining=deadline-asyncio.get_running_loop().time()
@@ -14163,7 +14217,7 @@ async def completed(client,path,timeout=300):
         assert response.status_code==200,response.text
         job=response.json();last=job.get('status','missing')
         if last not in ('queued','running'):
-            assert last=='completed',job
+            assert last==expected,job
             return job
         await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
 
@@ -14256,19 +14310,10 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 print('PASS re-export uses the allocated session filename/provenance and the original package remains byte-identical',flush=True)
                 source_id='legacy-review-2024';legacy_filename=await asyncio.to_thread(legacy_archive,archive,root,sid,source_id)
                 start=await client.post('/import',json={'filename':legacy_filename,'on_conflict':'rename'});assert start.status_code==202,start.text
-                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'])
-                mapping=legacy['restored_sessions'][0];local=mapping['session_id']
-                assert mapping['source_session_id']==source_id and local.startswith('gs_') and len(local)==11
-                response=await client.get('/goldstandard/session/'+local);assert response.status_code==200,response.text
-                assert response.json()['imported_from']['session_id']==source_id
-                print('PASS digest-valid historical-ID archive completes actual import with canonical local lookup and original provenance',flush=True)
-                saved=await client.post('/goldstandard/save',json={'session_id':local,'filename':'owned-legacy-rows.json'});assert saved.status_code==200,saved.text
-                download=await client.get('/goldstandard/download/'+saved.json()['filename']);assert download.status_code==200,download.text
-                assert download.json()[0]['answer']=='Original exported answer'
-                reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),local],text=True,capture_output=True,check=True)
-                assert json.loads(reload.stdout)[0]['imported_from']['session_id']==source_id
+                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'],expected='failed')
+                assert legacy['error_code']=='PACKAGE_CORRUPT' and legacy['error_detail']=={'file':'goldstandard/'+sid+'.json'} and not legacy['restored_sessions'],legacy
                 assert await asyncio.to_thread(original_path.read_bytes)==original_bytes
-                print('PASS historical imported session keeps usable HTTP/RAGAS/restart state while original newer review remains unchanged',flush=True)
+                print('PASS digest-valid noncanonical-ID archive is refused PACKAGE_CORRUPT naming the sidecar, restores nothing and leaves the original newer review unchanged',flush=True)
 
 
         async def owned():
