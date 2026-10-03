@@ -8719,6 +8719,7 @@ export default function RetrievalPage() {
   const [alpha, setAlpha] = useState(config.alpha)
   const [indexError, setIndexError] = useState('')
   const [indexLoading, setIndexLoading] = useState(false)
+  const [indexRead, setIndexRead] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
   const indexRequest = useRef(0)
@@ -8729,8 +8730,9 @@ export default function RetrievalPage() {
       if (ticket !== indexRequest.current) return
       setIndexError('')
       setCollections(r.collections)
+      setIndexRead(true)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => { if (ticket === indexRequest.current) setIndexError('Could not read the current physical index.') })
+    }).catch(() => { if (ticket === indexRequest.current) { setIndexError('Could not read the current physical index.'); setIndexRead(true) } })
     return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -8783,7 +8785,7 @@ export default function RetrievalPage() {
       if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
     }
     catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
-    finally { if (ticket === indexRequest.current) setIndexLoading(false) }
+    finally { if (ticket === indexRequest.current) { setIndexLoading(false); setIndexRead(true) } }
   }
 
   return (
@@ -8853,7 +8855,7 @@ export default function RetrievalPage() {
           <p>Type: {physicalIndex.index_type} · Distance: {physicalIndex.distance_metric}</p>
           {physicalIndex.hnsw_config && <p className="mt-1">ef: {physicalIndex.hnsw_config.ef} · efConstruction: {physicalIndex.hnsw_config.efConstruction} · maxConnections: {physicalIndex.hnsw_config.maxConnections}</p>}
           <p className="text-xs text-gray-500 mt-1">Observed when index details were last refreshed. Saved query methods do not rebuild the index.</p>
-        </> : <p>Index details are unavailable for this collection.</p>}
+        </> : <p>{indexRead ? 'Index details are unavailable for this collection.' : 'Reading index details…'}</p>}
         {config.ef !== null && <p className="text-xs text-amber-700 mt-2">The legacy saved ef override ({config.ef}) is inactive. Queries use the physical index settings; saving here clears that override.</p>}
         <button onClick={refreshIndex} disabled={indexLoading} className="mt-2 border rounded px-2 py-1 text-xs disabled:opacity-50">Refresh index details</button>
       </div>
@@ -9920,9 +9922,9 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 
 `12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. The same registered script executes `session_persistence_cases.py` in the API image: owned filesystem/concurrency cases additionally hard-kill an owned writer at the replace boundary, pause archive inspection during a concurrent commit, retain generation failure codes and test marker-failure continuation. Native browser criteria verify pending, failed and out-of-order diagnostic refreshes using isolated HTTP responses. The in-container script rejects remote or mismatched `RAG_API` targets before health/backend execution.
 
-The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
+The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K 1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
 
-`11_retrieval.sh` is called by03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
+`11_retrieval.sh` is called by 03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
 
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
@@ -11174,12 +11176,17 @@ Inside disposable API: python - < scripts/verify/retrieval_controls.py
 Actual SDK/backend storage and vector queries; only Ollama reformulation,
 embedding and answer calls are controlled. No startup sweep/model calls.
 """
-import importlib.util,json,os,tempfile,uuid
-from unittest.mock import AsyncMock,patch
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import uuid
+from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 from config import settings
 from main import app
-from services import weaviate_client as wc,rag_pipeline as rag
+from services import weaviate_client as wc, rag_pipeline as rag
 
 prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
 collections=[]
@@ -11197,17 +11204,20 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
             if recovery:
                 with patch.object(settings,'upload_dir',persistent_upload):
                     owner=recovery.begin(prefix+index,'tune',wc.get_client())
-                owners.append(owner);name=owner['staging']
+                owners.append(owner)
+                name=owner['staging']
             else:
                 name=prefix+index+'__tuning_'+uuid.uuid4().hex
-            assert not wc._collection_exists_sync(name);collections.append(name)
+            assert not wc._collection_exists_sync(name)
+            collections.append(name)
             response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
             assert response.status_code==201,response.text
             if os.environ.get('RAG_VERIFY_INTERRUPT_AFTER_CREATE')=='1':
                 print('OWNED_INTERRUPTED_FIXTURE '+json.dumps({'name':name,'owner':owners[-1] if owners else None}),flush=True)
                 os._exit(86)  # Acceptance injection: skips finally like a hard kill.
             coll=wc.get_client().collections.get(name)
-            for i in range(1,11):coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            for i in range(1,11):
+                coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
             row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert row['index_type']==index and row['distance_metric']=='cosine'
             assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
@@ -11216,7 +11226,8 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                 with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
                     response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
                 assert response.status_code==200,response.text
-                body=response.json();assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
+                body=response.json()
+                assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
             after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
             print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
@@ -11236,13 +11247,31 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                 assert invalid.status_code==422,invalid.text
             print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
     finally:
+        # Every owned fixture gets a cleanup attempt; failures are reported
+        # together afterwards so they never hide a failure from the checks.
+        cleanup_failures=[]
         for name in collections:
-            if wc._collection_exists_sync(name):
-                response=client.delete('/collections/'+name+'?confirm=true');assert response.status_code==200,response.text
+            try:
+                if wc._collection_exists_sync(name):
+                    response=client.delete('/collections/'+name+'?confirm=true')
+                    if response.status_code!=200:
+                        cleanup_failures.append(f'delete {name}: {response.status_code} {response.text}')
+            except Exception as error:
+                cleanup_failures.append(f'delete {name}: {error!r}')
         if recovery:
             with patch.object(settings,'upload_dir',persistent_upload):
-                for owner in owners:recovery.discard(owner,wc.get_client())
+                for owner in owners:
+                    try:
+                        recovery.discard(owner,wc.get_client())
+                    except Exception as error:
+                        cleanup_failures.append(f"discard {owner['staging']}: {error!r}")
         wc.close_client()
+        if cleanup_failures:
+            message='Cleanup failed: '+'; '.join(cleanup_failures)
+            if sys.exc_info()[0]:
+                print(message,file=sys.stderr,flush=True)  # The original failure stays the raised error.
+            else:
+                raise AssertionError(message)
 assert all(not wc._collection_exists_sync(name) for name in collections)
 wc.close_client()
 print('PASS owned synthetic collections/config/files removed',flush=True)
@@ -12884,12 +12913,39 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     try {
       await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
       if (!initial) throw new Error('Initial metadata request was not observed');
+      if (!lateFailure) {
+        const pending = await bodyText(s.page);
+        r.check('pending initial read says it is reading, not that details are unavailable', pending.includes('Reading index details…') && !/Index details are unavailable/.test(pending));
+      }
       await clickByText(s.page, 'Refresh index details'); await sleep(300);
       const freshVisible = /ef: 191/.test(await bodyText(s.page));
       await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
       await sleep(300);
       const after = await bodyText(s.page);
       r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
+  }
+
+  // ── Q&A page shares the accurate query-method label ─────────────────────
+  r.section('Q&A accurate method label');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedQaLabelFixture';
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name, object_count: 4, index_type: 'flat', distance_metric: 'cosine', hnsw_config: null }] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(700);
+      const labels = await s.page.evaluate(() => [...document.querySelectorAll('select[disabled] option')].map(o => o.textContent));
+      r.check('Q&A shows the same "Vector — existing index" label for a saved flat alias', labels.includes('Vector — existing index') && !labels.includes('flat'), JSON.stringify(labels));
     } finally { await s.ctx.close(); }
   }
 

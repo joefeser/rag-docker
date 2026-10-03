@@ -1,11 +1,19 @@
 """Observed physical-index reporting and executed query-method controls."""
-import asyncio,os,sys,tempfile,unittest
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import runpy
+import sys
+import tempfile
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock,MagicMock,patch
+from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
 from config import settings
-from services import weaviate_client as wc,rag_pipeline as rag,retrieval_config as saved
+from services import weaviate_client as wc, rag_pipeline as rag, retrieval_config as saved
 from weaviate.classes.config import VectorDistances
 
 class ReportingTests(unittest.TestCase):
@@ -32,18 +40,27 @@ class ReportingTests(unittest.TestCase):
         flat=type('ObservedFlat',(),{'distance_metric':VectorDistances.L2_SQUARED})()
         collections={}
         for name,config in [('SyntheticHnsw',hnsw),('SyntheticFlat',flat)]:
-            coll=MagicMock();coll.config.get.return_value=SimpleNamespace(vector_index_config=config)
-            coll.aggregate.over_all.return_value=SimpleNamespace(total_count=3);collections[name]=coll
-        client=MagicMock();client.collections.list_all.return_value=collections;client.collections.get.side_effect=collections.__getitem__
-        with patch.object(wc,'get_client',return_value=client):rows=wc._get_collections_sync()
+            coll=MagicMock()
+            coll.config.get.return_value=SimpleNamespace(vector_index_config=config)
+            coll.aggregate.over_all.return_value=SimpleNamespace(total_count=3)
+            collections[name]=coll
+        client=MagicMock()
+        client.collections.list_all.return_value=collections
+        client.collections.get.side_effect=collections.__getitem__
+        with patch.object(wc,'get_client',return_value=client):
+            rows=wc._get_collections_sync()
         self.assertEqual(rows[0]['hnsw_config'],{'ef':-1,'efConstruction':1000,'maxConnections':256})
-        self.assertEqual(rows[0]['distance_metric'],'dot');self.assertEqual(rows[1]['index_type'],'flat')
-        self.assertEqual(rows[1]['distance_metric'],'l2-squared');self.assertIsNone(rows[1]['hnsw_config'])
+        self.assertEqual(rows[0]['distance_metric'],'dot')
+        self.assertEqual(rows[1]['index_type'],'flat')
+        self.assertEqual(rows[1]['distance_metric'],'l2-squared')
+        self.assertIsNone(rows[1]['hnsw_config'])
 
 
 class BackendControlTests(unittest.TestCase):
     def test_hybrid_weight_and_semantic_top_k_reach_supported_sdk_calls(self):
-        client=MagicMock();coll=MagicMock();client.collections.get.return_value=coll
+        client=MagicMock()
+        coll=MagicMock()
+        client.collections.get.return_value=coll
         coll.query.hybrid.return_value=SimpleNamespace(objects=[])
         coll.query.near_text.return_value=SimpleNamespace(objects=[])
         with patch.object(wc,'get_client',return_value=client):
@@ -88,7 +105,8 @@ class TargetTests(unittest.TestCase):
     def test_in_container_target_cannot_silently_select_another_stack(self):
         import importlib.util
         spec=importlib.util.spec_from_file_location('compose_target',Path(__file__).resolve().parents[1]/'verify/compose_target.py')
-        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        module=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
         match=module.matches_local_proxy
         for api in ('http://localhost:18080/api','http://127.0.0.1:18080/api/'):
             self.assertTrue(match(api,'127.0.0.1:18080'))
@@ -97,12 +115,107 @@ class TargetTests(unittest.TestCase):
             self.assertFalse(match(api,'127.0.0.1:18080'))
         self.assertFalse(match('http://localhost:18080/api',''))
 
+class VerifierCleanupTests(unittest.TestCase):
+    """The live verifier's cleanup, run against a fake API and backend."""
+
+    def run_verifier(self, fail_query_on=None, fail_delete_on=None):
+        created, deleted, saved_configs = {}, [], {}
+
+        class Response:
+            def __init__(self, status_code, body=None):
+                self.status_code = status_code
+                self.text = json.dumps(body)
+                self._body = body
+
+            def json(self):
+                return self._body
+
+        class FakeClient:
+            def __init__(self, app):
+                pass
+
+            def post(self, path, json):
+                if path == '/collections':
+                    created[json['name']] = json['index_type']
+                    return Response(201)
+                if path == '/query':
+                    if created[json['collection']] == fail_query_on:
+                        raise RuntimeError('original verifier failure')
+                    count = min(json['top_k'], 10)
+                    return Response(200, {'chunks_retrieved': count, 'citations': [{}] * count})
+                if not 1 <= json['top_k'] <= 50:
+                    return Response(422)
+                saved_configs[json['collection']] = dict(json)
+                return Response(201)
+
+            def get(self, path):
+                if path == '/collections':
+                    hnsw = {'ef': 72, 'efConstruction': 160, 'maxConnections': 32}
+                    rows = [{'name': name, 'index_type': index, 'distance_metric': 'cosine', 'hnsw_config': hnsw if index == 'hnsw' else None} for name, index in created.items()]
+                    return Response(200, {'collections': rows})
+                return Response(200, saved_configs[path.rsplit('/', 1)[1]])
+
+            def delete(self, path):
+                name = path.split('/')[2].split('?')[0]
+                deleted.append(name)
+                return Response(500, {'error': 'synthetic delete failure'}) if created[name] == fail_delete_on else Response(200)
+
+        recovery = importlib.import_module('services.collection_recovery')
+        script = Path(__file__).resolve().parents[1] / 'verify/retrieval_controls.py'
+        stderr = io.StringIO()
+        with patch('fastapi.testclient.TestClient', FakeClient), \
+             patch.object(wc, '_collection_exists_sync', side_effect=lambda name: name in created and name not in deleted), \
+             patch.object(wc, 'get_client', return_value=MagicMock()), \
+             patch.object(wc, 'close_client') as close, \
+             patch.object(recovery, 'begin', side_effect=lambda target, operation, client: {'staging': target + '__tuning_owned'}), \
+             patch.object(recovery, 'discard') as discard, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            try:
+                runpy.run_path(str(script))
+                error = None
+            except BaseException as raised:
+                error = raised
+        return error, created, deleted, discard, close, stderr.getvalue()
+
+    def test_cleanup_failure_does_not_replace_original_error(self):
+        error, created, deleted, discard, close, stderr = self.run_verifier(fail_query_on='flat', fail_delete_on='hnsw')
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(str(error), 'original verifier failure')
+        self.assertEqual(deleted, list(created))
+        self.assertEqual(discard.call_count, 2)
+        close.assert_called()
+        hnsw_name = next(name for name, index in created.items() if index == 'hnsw')
+        self.assertIn(hnsw_name, stderr)
+        self.assertIn('500', stderr)
+
+    def test_cleanup_failure_is_reported_after_every_deletion(self):
+        error, created, deleted, discard, close, stderr = self.run_verifier(fail_delete_on='hnsw')
+        self.assertIsInstance(error, AssertionError)
+        hnsw_name = next(name for name, index in created.items() if index == 'hnsw')
+        self.assertIn(hnsw_name, str(error))
+        self.assertEqual(deleted, list(created))
+        self.assertEqual(discard.call_count, 2)
+        close.assert_called()
+
+    def test_clean_run_still_passes(self):
+        error, created, deleted, discard, close, stderr = self.run_verifier()
+        self.assertIsNone(error)
+        self.assertEqual(deleted, list(created))
+        self.assertEqual(len(created), 2)
+
+
 class DocumentationTests(unittest.TestCase):
     def test_changed_embedded_sources_match_runtime(self):
-        root=Path(__file__).resolve().parents[2];text=(root/'IMPLEMENTATION.md').read_text()
+        root=Path(__file__).resolve().parents[2]
+        text=(root/'IMPLEMENTATION.md').read_text()
         for name in ('api/models/schemas.py','api/routers/collections.py','api/services/weaviate_client.py','ui/src/api/client.ts','ui/src/pages/RetrievalPage.tsx','ui/src/pages/QAPage.tsx','scripts/verify/03_query.sh','scripts/verify/11_retrieval.sh','scripts/verify/retrieval_controls.py','scripts/verify/README.md','scripts/verify/compose_target.py','scripts/verify/browser/ui_criteria.js'):
-            lang='typescript' if name.endswith(('.ts','.tsx')) else 'bash' if name.endswith('.sh') else 'markdown' if name.endswith('.md') else 'javascript' if name.endswith('.js') else 'python';fence='````' if name.endswith('.md') else '```';h='### '+name+'\n\n'+fence+lang+'\n'
-            a=text.index(h)+len(h);b=text.index('\n'+fence+'\n',a)
-            with self.subTest(file=name):self.assertEqual(text[a:b],(root/name).read_text().rstrip('\n'))
+            lang='typescript' if name.endswith(('.ts','.tsx')) else 'bash' if name.endswith('.sh') else 'markdown' if name.endswith('.md') else 'javascript' if name.endswith('.js') else 'python'
+            fence='````' if name.endswith('.md') else '```'
+            h='### '+name+'\n\n'+fence+lang+'\n'
+            a=text.index(h)+len(h)
+            b=text.index('\n'+fence+'\n',a)
+            with self.subTest(file=name):
+                self.assertEqual(text[a:b],(root/name).read_text().rstrip('\n'))
 
-if __name__=='__main__':unittest.main()
+if __name__=='__main__':
+    unittest.main()

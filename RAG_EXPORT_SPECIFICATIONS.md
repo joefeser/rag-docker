@@ -102,7 +102,7 @@ carry the corpus's parameters.
 | `retrieval_mode` | enum `hnsw`\|`flat`\|`hybrid`\|`semantic` | `hnsw` |
 | `top_k` | integer 1–50 | `5` |
 | `alpha` | number 0–1 | `0.75` |
-| `ef` | integer, optional | — |
+| `ef` | integer, optional; legacy and inactive: kept for compatibility, never applied to queries | — |
 | `response_format` | enum `end_user`\|`engineer` | `end_user` |
 
 ### 3.2 Endpoints
