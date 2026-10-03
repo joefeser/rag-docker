@@ -147,9 +147,18 @@ check_eq "a recreated collection does not inherit the retrieval config" \
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  # Save a known config here, right before the restart: the section above ends
+  # by recreating $C with no saved config, so relying on earlier state made
+  # this check fail on every run (#73).
+  api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"semantic\",\"chunk_size\":800,\"chunk_overlap\":150,\"similarity_threshold\":0.9,\"min_chunk_size\":80}" >/dev/null
+  check_eq "a config saved before the restart reads back" \
+    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
-  (cd "$REPO_ROOT" && docker compose down >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1)
+  # Name the project: from a checkout in a folder not called rag-docker,
+  # compose would otherwise act on a different project.
+  project="${COMPOSE_PROJECT_NAME:-rag-docker}"
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
   elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
   [ "$elapsed" -le 120 ]
@@ -168,8 +177,11 @@ b={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_befor
 a={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_after.json'))['collections']}
 sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) else 1)"
   check "created_at is preserved across restart" $?
+  api_get "/ingest/config/$C" > "$RAG_INFRA_TMP/vfy_cfg_after.json"
   check_eq "saved ingest config survives restart" \
-    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
+    "$(jfield "['chunking_strategy']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "semantic"
+  check_eq "it is still the saved config, not the default" \
+    "$(jfield "['is_default']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "False"
 else
   skip "restart, persistence and timing" "set RAG_ALLOW_RESTART=1 to include them"
 fi
