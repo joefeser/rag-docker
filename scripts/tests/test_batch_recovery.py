@@ -640,18 +640,35 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(self.cols.exists('Corpus'))
         self.assertTrue(importer._marker_path('Corpus').exists())
 
-    def test_marker_without_instance_identity_never_deletes(self):
+    def legacy_marker(self, state):
         self.created_by_import(importer._mark_started('Corpus', 2, 'job', self.original))
         marker = importer._marker_path('Corpus')
         legacy = json.loads(marker.read_text())
         legacy['version'] = 3
+        legacy['state'] = state
         legacy.pop('instance')
         marker.write_text(json.dumps(legacy))
+        return marker, importer._markers_dir() / legacy['expected_snapshot']['file']
+
+    def test_marker_without_instance_identity_never_deletes(self):
+        marker, snapshot = self.legacy_marker('building')
         self.cols.get('Corpus').rows.clear()
         self.assertEqual(importer.sweep_interrupted_imports(), [])
         self.assertTrue(self.cols.exists('Corpus'))
         self.assertTrue(marker.exists())
-        self.assertTrue((importer._markers_dir() / legacy['expected_snapshot']['file']).exists())
+        self.assertTrue(snapshot.exists())
+        logged = [str(call) for call in importer._log.warning.call_args_list]
+        self.assertTrue(any('no instance identity' in line and str(marker) in line for line in logged), logged)
+        importer._log.exception.assert_not_called()
+
+    def test_legacy_marker_in_cleanup_is_finished_without_deleting(self):
+        marker, snapshot = self.legacy_marker('cleanup')
+        self.cols.get('Corpus').rows.clear()
+        self.assertEqual(importer.sweep_interrupted_imports(), [])
+        self.assertTrue(self.cols.exists('Corpus'))
+        self.assertNotIn('Corpus', self.cols.deleted)
+        self.assertFalse(marker.exists())
+        self.assertFalse(snapshot.exists())
 
     def test_import_creates_its_target_with_the_marker_identity(self):
         pkg, manifest = self.package()
@@ -699,6 +716,60 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(job['error_detail']['sidecar_snapshots'],
                          'collection_operations/' + record['operation_id'])
         self.assertTrue((Path(settings.upload_dir) / job['error_detail']['sidecar_snapshots']).is_dir())
+
+    def test_absolute_sidecar_path_goes_to_the_server_log_only(self):
+        # Covers tuning and both import failure branches: a general exception
+        # (rejected batch) and a PackageError from the final insert.
+        actual_insert = importer._insert_chunks
+        def package_error(name, *args, **kwargs):
+            if name == 'Corpus':
+                raise importer.PackageError('IMPORT_FAILED', 'injected final insert failure')
+            return actual_insert(name, *args, **kwargs)
+        self.cols.create_failure = True
+        with self.assertRaises(importer.PackageError) as error:
+            self.rebuild()
+        details = [error.exception.detail]
+        records = [self.recovery_record()]
+        self.cols.create_failure = False
+        recovery.discard(records[-1], self.client)
+        for fault in ('reject', 'package_error'):
+            with self.subTest(fault=fault):
+                self.cols.final_fault = 'reject' if fault == 'reject' else None
+                self.cols.items['Corpus'] = Collection('Corpus')
+                if fault == 'package_error':
+                    with patch.object(importer, '_insert_chunks', side_effect=package_error):
+                        job = self.import_replace()
+                    self.assertEqual(job['error_code'], 'IMPORT_FAILED')
+                    self.assertIn('injected final insert failure', job['error'])
+                else:
+                    job = self.import_replace()
+                details.append(job['error_detail'])
+                records.append(self.recovery_record())
+                recovery.discard(records[-1], self.client)
+        logged = ' '.join(str(call) for call in recovery.log.warning.call_args_list)
+        for detail, record in zip(details, records):
+            absolute = str(Path(settings.upload_dir) / 'collection_operations' / record['operation_id'])
+            self.assertEqual(detail['sidecar_snapshots'], 'collection_operations/' + record['operation_id'])
+            self.assertNotIn(settings.upload_dir, json.dumps(detail))
+            self.assertIn(absolute, logged)
+
+    def test_stale_marking_discard_failure_is_logged_and_resumed_at_startup(self):
+        def fail_marking():
+            raise RuntimeError('session store unavailable')
+        with patch.object(recovery.shutil, 'rmtree', side_effect=OSError('metadata cleanup failed')), \
+                patch.object(tuning, '_log') as log, self.assertRaises(importer.PackageError) as error:
+            tuning._rebuild('Corpus', [r['properties'] for r in self.original], None, None, None,
+                            before_replace=fail_marking)
+        self.assertIn('original collection is unchanged', error.exception.message)
+        log.exception.assert_called_once()
+        paths = list(recovery._root().glob('*.json'))
+        self.assertEqual(len(paths), 1)
+        record = json.loads(paths[0].read_text())
+        self.assertEqual(record['state'], 'cleanup')
+        self.assertEqual(recovery.sweep(self.client), [record['staging']])
+        self.assertEqual(list(recovery._root().iterdir()), [])
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertNotIn('Corpus', self.cols.deleted)
 
     def test_stale_marking_failure_before_cutover_discards_copy_and_keeps_original(self):
         def fail_marking():

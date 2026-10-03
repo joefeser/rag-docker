@@ -90,17 +90,16 @@ def _read_marker(path: Path) -> tuple[dict, Path]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
         raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
     data = json.loads(path.read_text())
-    if data.get("version") == 3:
-        # Written before markers carried an instance identity; it cannot tell
-        # this import's collection from a later one, so it never deletes.
-        raise ValueError("Import ownership has no instance identity")
     collection, count = data["collection"], data["expected_chunks"]
     snapshot = data["expected_snapshot"]
-    if (type(data.get("version")) is not int or data["version"] != 4
+    # Version 3 predates the instance identity: it is read so that its cleanup
+    # can finish and its snapshot stays named, but it never authorizes deletion.
+    if (type(data.get("version")) is not int or data["version"] not in (3, 4)
             or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
             or path.name != f"{collection}.json" or type(count) is not int or count < 0
             or data["state"] not in ("building", "cleanup")
-            or type(data["instance"]) is not str or not re.fullmatch(r"[0-9a-f]{32}", data["instance"])
+            or (data["version"] == 4 and (type(data["instance"]) is not str
+                                          or not re.fullmatch(r"[0-9a-f]{32}", data["instance"])))
             or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
         raise ValueError("Invalid import ownership")
@@ -188,6 +187,12 @@ def sweep_interrupted_imports() -> list[str]:
         try:
             data, snapshot = _read_marker(marker)
             collection = data["collection"]
+            if data["state"] == "building" and data["version"] == 3:
+                # No instance identity: it cannot tell this import's collection
+                # from a later one under the same name, so it never deletes.
+                _log.warning("Import marker %s has no instance identity; kept, and never "
+                             "used to delete %r", marker, collection)
+                continue
             if data["state"] == "building":
                 if snapshot.is_symlink() or not snapshot.is_file():
                     raise ValueError("Expected-record snapshot is not a regular file")
