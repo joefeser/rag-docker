@@ -18,6 +18,7 @@ export default function RetrievalPage() {
   const [alpha, setAlpha] = useState(config.alpha)
   const [indexError, setIndexError] = useState('')
   const [indexLoading, setIndexLoading] = useState(false)
+  const [indexRead, setIndexRead] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
   const indexRequest = useRef(0)
@@ -28,8 +29,9 @@ export default function RetrievalPage() {
       if (ticket !== indexRequest.current) return
       setIndexError('')
       setCollections(r.collections)
+      setIndexRead(true)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => { if (ticket === indexRequest.current) setIndexError('Could not read the current physical index.') })
+    }).catch(() => { if (ticket === indexRequest.current) { setIndexError('Could not read the current physical index.'); setIndexRead(true) } })
     return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -82,7 +84,7 @@ export default function RetrievalPage() {
       if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
     }
     catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
-    finally { if (ticket === indexRequest.current) setIndexLoading(false) }
+    finally { if (ticket === indexRequest.current) { setIndexLoading(false); setIndexRead(true) } }
   }
 
   return (
@@ -152,7 +154,7 @@ export default function RetrievalPage() {
           <p>Type: {physicalIndex.index_type} · Distance: {physicalIndex.distance_metric}</p>
           {physicalIndex.hnsw_config && <p className="mt-1">ef: {physicalIndex.hnsw_config.ef} · efConstruction: {physicalIndex.hnsw_config.efConstruction} · maxConnections: {physicalIndex.hnsw_config.maxConnections}</p>}
           <p className="text-xs text-gray-500 mt-1">Observed when index details were last refreshed. Saved query methods do not rebuild the index.</p>
-        </> : <p>Index details are unavailable for this collection.</p>}
+        </> : <p>{indexRead ? 'Index details are unavailable for this collection.' : 'Reading index details…'}</p>}
         {config.ef !== null && <p className="text-xs text-amber-700 mt-2">The legacy saved ef override ({config.ef}) is inactive. Queries use the physical index settings; saving here clears that override.</p>}
         <button onClick={refreshIndex} disabled={indexLoading} className="mt-2 border rounded px-2 py-1 text-xs disabled:opacity-50">Refresh index details</button>
       </div>

@@ -623,7 +623,6 @@ settings = Settings()
 ### api/models/__init__.py
 
 ```python
-
 ```
 
 ### api/models/schemas.py
@@ -631,7 +630,7 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
 
 
 def _numeric(value):
@@ -658,6 +657,7 @@ MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
+OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -740,7 +740,7 @@ class IngestConfig(BaseModel):
     @model_validator(mode="after")
     def _relationships(self):
         if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+            raise ValueError(OVERLAP_RULE)
         return self
 
 
@@ -874,9 +874,6 @@ class PackageListResponse(BaseModel):
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
-
-
 class _ChunkingFields(BaseModel):
     chunking_strategy: Optional[ChunkingStrategy] = None
     chunk_size: Optional[ChunkSize] = None
@@ -886,8 +883,13 @@ class _ChunkingFields(BaseModel):
 
     @model_validator(mode="after")
     def _relationships(self):
-        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
-                        if getattr(self, name) is not None})
+        # Fields are already checked, so only the overlap rule can fail here.
+        # A plain ValueError keeps the nested model's input out of the error.
+        try:
+            IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                            if getattr(self, name) is not None})
+        except ValidationError:
+            raise ValueError(OVERLAP_RULE) from None
         return self
 
     def has_chunking(self) -> bool:
@@ -1160,7 +1162,6 @@ class ErrorResponse(BaseModel):
 ### api/services/__init__.py
 
 ```python
-
 ```
 
 ### api/services/sources.py
@@ -2060,7 +2061,7 @@ def _create_collection_sync(
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
-                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+                       distance_metric=distance_metric, hnsw_config=hnsw_config)
     hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
     dist = DISTANCE_MAP[validated.distance_metric]
@@ -3342,10 +3343,6 @@ def _save_session_sync(session: dict) -> None:
                     log.exception("Could not remove owned session temporary file %s", temporary.name)
 
 
-async def _save_session(session: dict) -> None:
-    await asyncio.to_thread(store_session, session)
-
-
 def _scan_sessions() -> None:
     """Inspect disk without blocking writers, then publish only a current scan."""
     global _store_revision
@@ -3480,12 +3477,14 @@ def _identity_available(session_id: str) -> bool:
     return False
 
 
-def _allocate_identity(preferred: str | None = None) -> str:
+def _allocate_identity(preferred: str | None = None, tried: list[str] | None = None) -> str:
     # Callers hold _state_lock across allocation and durable publication.
     if preferred is not None and _identity_available(preferred):
         return preferred
     for _ in range(128):
         candidate = f"gs_{uuid.uuid4().hex[:8]}"
+        if tried is not None:
+            tried.append(candidate)
         if _identity_available(candidate):
             return candidate
     raise RuntimeError("Could not allocate an unoccupied session identity")
@@ -3494,7 +3493,14 @@ def _allocate_identity(preferred: str | None = None) -> str:
 def _store_generated_session(session: dict) -> dict:
     snapshot = copy.deepcopy(session)
     with _state_lock:
-        snapshot["session_id"] = _allocate_identity()
+        tried: list[str] = []
+        try:
+            snapshot["session_id"] = _allocate_identity(tried=tried)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Nothing was written. Report it like the writer's own prepare
+            # failure, under the candidate being checked or the last one tried.
+            _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (tried[-1] + ".json"), "SESSION_WRITE_FAILED")
+            raise GoldStandardError("SESSION_WRITE_FAILED", "Session storage could not be inspected to allocate an identity. No session was written.", 503) from exc
         store_session(snapshot)
     return copy.deepcopy(snapshot)
 
@@ -3502,8 +3508,8 @@ def _store_generated_session(session: dict) -> dict:
 def store_imported_session(session: dict, source_collection: str) -> dict:
     """Serialize source-ID collision handling with generation and other imports."""
     snapshot = copy.deepcopy(session)
-    # The source ID can be historical, but the rest of the session must still
-    # satisfy the strict schema before it is given a canonical local ID.
+    # Import preflight (check 4a) has already refused noncanonical source IDs.
+    # Allocation keeps the source ID only when it is free; it stays provenance.
     SessionResponse.model_validate(snapshot, strict=True)
     source_id = snapshot["session_id"]
     with _state_lock:
@@ -4601,7 +4607,6 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
-from models.schemas import SessionResponse
 from services import goldstandard
 from services import model_bundle
 from services import packager
@@ -5029,10 +5034,10 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(path.read_text())
-            # A historical source ID is provenance, not a local destination.
-            # Validate its type and all content, then check the guarded root
-            # without turning the source ID into a filesystem path.
-            SessionResponse.model_validate(data, strict=True)
+            # Source IDs must use the generated grammar. An occupied one is
+            # kept as provenance at restore, so only the guarded root is
+            # checked here, not the source ID's own file.
+            goldstandard.validate_session(data)
             if canonical(data["collection"]) != canonical(original):
                 raise ValueError("Evaluation session belongs to a different collection.")
             if data["session_id"] in identities:
@@ -5934,7 +5939,6 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
 ### api/routers/__init__.py
 
 ```python
-
 ```
 
 ### api/services/system_info.py
@@ -6244,16 +6248,18 @@ class SaveIngestConfigBody(IngestConfig):
 async def ingest_upload(
     collection: str = Form(...),
     strategy: str = Form("overlap"),
-    chunk_size: int = Form(1000),
-    chunk_overlap: int = Form(200),
-    similarity_threshold: float = Form(0.85),
-    min_chunk_size: int = Form(100),
+    # Strings, so IngestConfig parses them and a non-numeric value is
+    # INVALID_SETTINGS like any other invalid setting, not a form error.
+    chunk_size: str = Form("1000"),
+    chunk_overlap: str = Form("200"),
+    similarity_threshold: str = Form("0.85"),
+    min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
     try:
-        IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
-                     chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
-                     min_chunk_size=min_chunk_size)
+        config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                              chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                              min_chunk_size=min_chunk_size)
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
@@ -6264,11 +6270,11 @@ async def ingest_upload(
         job_id = await ingest_pipeline.start_ingest_job(
             files=files,
             collection=collection,
-            strategy=strategy,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            similarity_threshold=similarity_threshold,
-            min_chunk_size=min_chunk_size,
+            strategy=config.chunking_strategy,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            similarity_threshold=config.similarity_threshold,
+            min_chunk_size=config.min_chunk_size,
         )
     except ValueError as exc:
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
@@ -8741,6 +8747,7 @@ export default function RetrievalPage() {
   const [alpha, setAlpha] = useState(config.alpha)
   const [indexError, setIndexError] = useState('')
   const [indexLoading, setIndexLoading] = useState(false)
+  const [indexRead, setIndexRead] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
   const indexRequest = useRef(0)
@@ -8751,8 +8758,9 @@ export default function RetrievalPage() {
       if (ticket !== indexRequest.current) return
       setIndexError('')
       setCollections(r.collections)
+      setIndexRead(true)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => { if (ticket === indexRequest.current) setIndexError('Could not read the current physical index.') })
+    }).catch(() => { if (ticket === indexRequest.current) { setIndexError('Could not read the current physical index.'); setIndexRead(true) } })
     return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -8805,7 +8813,7 @@ export default function RetrievalPage() {
       if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
     }
     catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
-    finally { if (ticket === indexRequest.current) setIndexLoading(false) }
+    finally { if (ticket === indexRequest.current) { setIndexLoading(false); setIndexRead(true) } }
   }
 
   return (
@@ -8875,7 +8883,7 @@ export default function RetrievalPage() {
           <p>Type: {physicalIndex.index_type} · Distance: {physicalIndex.distance_metric}</p>
           {physicalIndex.hnsw_config && <p className="mt-1">ef: {physicalIndex.hnsw_config.ef} · efConstruction: {physicalIndex.hnsw_config.efConstruction} · maxConnections: {physicalIndex.hnsw_config.maxConnections}</p>}
           <p className="text-xs text-gray-500 mt-1">Observed when index details were last refreshed. Saved query methods do not rebuild the index.</p>
-        </> : <p>Index details are unavailable for this collection.</p>}
+        </> : <p>{indexRead ? 'Index details are unavailable for this collection.' : 'Reading index details…'}</p>}
         {config.ef !== null && <p className="text-xs text-amber-700 mt-2">The legacy saved ef override ({config.ef}) is inactive. Queries use the physical index settings; saving here clears that override.</p>}
         <button onClick={refreshIndex} disabled={indexLoading} className="mt-2 border rounded px-2 py-1 text-xs disabled:opacity-50">Refresh index details</button>
       </div>
@@ -9847,6 +9855,18 @@ uv run --no-project --python 3.11 \
   python scripts/tests/test_session_import.py
 ```
 
+`scripts/tests/test_settings_validation.py` checks that invalid settings are
+refused before backend, model or staging work, with every backend mocked. Its
+embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository:
+
+```bash
+docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
+  api python scripts/tests/test_settings_validation.py
+```
+
+With only `scripts/tests` mounted (as for `test_session_import.py` above) the
+other tests still run and the embedded-source check is skipped.
+
 ## Why integration tests
 
 Every defect this project has actually produced was invisible to a unit test of
@@ -9942,9 +9962,9 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 
 `12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. The same registered script executes `session_persistence_cases.py` in the API image: owned filesystem/concurrency cases additionally hard-kill an owned writer at the replace boundary, pause archive inspection during a concurrent commit, retain generation failure codes and test marker-failure continuation. Native browser criteria verify pending, failed and out-of-order diagnostic refreshes using isolated HTTP responses. The in-container script rejects remote or mismatched `RAG_API` targets before health/backend execution.
 
-The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
+The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K 1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
 
-`11_retrieval.sh` is called by03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
+`11_retrieval.sh` is called by 03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
 
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
@@ -9995,7 +10015,7 @@ curl -s localhost:8080/api/collections | python3 -c \
   | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
 ```
 
-`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It executes fourteen owned cache/disk/collision/redirected-slot/historical-ID/concurrent-insertion cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance and original-package byte equality. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes eighteen owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 
 The infrastructure suite requires Docker Engine 28.0.0+ and checks both resolved Compose and live Docker bindings for a single loopback proxy publication. When deploying an alternate host port for testing, set `RAG_EXPECTED_PROXY_PORT` to that port as well as `RAG_API`. Its inspection files are kept in a private temporary directory removed on exit. The local profile assumes standard bridge/NAT routing.
 
@@ -11218,7 +11238,12 @@ Inside disposable API: python - < scripts/verify/retrieval_controls.py
 Actual SDK/backend storage and vector queries; only Ollama reformulation,
 embedding and answer calls are controlled. No startup sweep/model calls.
 """
-import importlib.util,json,os,tempfile,uuid
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import uuid
 from unittest.mock import AsyncMock,patch
 from fastapi.testclient import TestClient
 from config import settings
@@ -11241,17 +11266,20 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
             if recovery:
                 with patch.object(settings,'upload_dir',persistent_upload):
                     owner=recovery.begin(prefix+index,'tune',wc.get_client())
-                owners.append(owner);name=owner['staging']
+                owners.append(owner)
+                name=owner['staging']
             else:
                 name=prefix+index+'__tuning_'+uuid.uuid4().hex
-            assert not wc._collection_exists_sync(name);collections.append(name)
+            assert not wc._collection_exists_sync(name)
+            collections.append(name)
             response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
             assert response.status_code==201,response.text
             if os.environ.get('RAG_VERIFY_INTERRUPT_AFTER_CREATE')=='1':
                 print('OWNED_INTERRUPTED_FIXTURE '+json.dumps({'name':name,'owner':owners[-1] if owners else None}),flush=True)
                 os._exit(86)  # Acceptance injection: skips finally like a hard kill.
             coll=wc.get_client().collections.get(name)
-            for i in range(1,11):coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            for i in range(1,11):
+                coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
             row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert row['index_type']==index and row['distance_metric']=='cosine'
             assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
@@ -11260,7 +11288,8 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                 with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
                     response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
                 assert response.status_code==200,response.text
-                body=response.json();assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
+                body=response.json()
+                assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
             after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
             assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
             print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
@@ -11280,13 +11309,26 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                 assert invalid.status_code==422,invalid.text
             print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
     finally:
+        # Every owned collection gets a deletion attempt; failures are reported
+        # together afterwards so they never hide a failure from the checks.
+        cleanup_failures=[]
         for name in collections:
-            if wc._collection_exists_sync(name):
-                response=client.delete('/collections/'+name+'?confirm=true');assert response.status_code==200,response.text
+            try:
+                if wc._collection_exists_sync(name):
+                    response=client.delete('/collections/'+name+'?confirm=true')
+                    if response.status_code!=200:
+                        cleanup_failures.append(f'{name}: {response.status_code} {response.text}')
+            except Exception as error:
+                cleanup_failures.append(f'{name}: {error!r}')
         if recovery:
             with patch.object(settings,'upload_dir',persistent_upload):
-                for owner in owners:recovery.discard(owner,wc.get_client())
+                for owner in owners:
+                    recovery.discard(owner,wc.get_client())
         wc.close_client()
+        if cleanup_failures:
+            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
+            if sys.exc_info()[0] is None:  # Otherwise the original failure stays the raised error.
+                raise AssertionError('owned collection cleanup failed: '+'; '.join(cleanup_failures))
 assert all(not wc._collection_exists_sync(name) for name in collections)
 wc.close_client()
 print('PASS owned synthetic collections/config/files removed',flush=True)
@@ -13120,12 +13162,39 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     try {
       await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
       if (!initial) throw new Error('Initial metadata request was not observed');
+      if (!lateFailure) {
+        const pending = await bodyText(s.page);
+        r.check('pending initial read says it is reading, not that details are unavailable', pending.includes('Reading index details…') && !/Index details are unavailable/.test(pending));
+      }
       await clickByText(s.page, 'Refresh index details'); await sleep(300);
       const freshVisible = /ef: 191/.test(await bodyText(s.page));
       await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
       await sleep(300);
       const after = await bodyText(s.page);
       r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
+  }
+
+  // ── Q&A page shares the accurate query-method label ─────────────────────
+  r.section('Q&A accurate method label');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedQaLabelFixture';
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name, object_count: 4, index_type: 'flat', distance_metric: 'cosine', hnsw_config: null }] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(700);
+      const labels = await s.page.evaluate(() => [...document.querySelectorAll('select[disabled] option')].map(o => o.textContent));
+      r.check('Q&A shows the same "Vector — existing index" label for a saved flat alias', labels.includes('Vector — existing index') && !labels.includes('flat'), JSON.stringify(labels));
     } finally { await s.ctx.close(); }
   }
 
@@ -14192,6 +14261,8 @@ bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$bindings" || exit 2
 require_stack
 section "Imported evaluation session identities"
+python3 ../tests/test_session_identity.py
+check "embedded identity sources match" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/session_identity_cases.py)
 check "owned identity collision, preservation and allocation regressions" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_identity.py)
@@ -14203,8 +14274,9 @@ summary
 
 ```python
 """Owned import identity preservation; run by13_identity.sh in the API image."""
-import asyncio,copy,json,os,subprocess,sys,tempfile,threading,unittest
+import asyncio,copy,json,os,subprocess,sys,tempfile,threading,time,unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
@@ -14316,17 +14388,14 @@ class IdentityTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
         self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
 
-    def test_historical_source_identity_gets_safe_local_id_and_usable_provenance(self):
-        from models.schemas import SessionResponse
+    def test_noncanonical_source_identity_is_refused_before_restoration(self):
         package=Path(self.tmp.name)/'legacy-package';gold=package/'goldstandard';gold.mkdir(parents=True)
         data=fixture();data['session_id']='legacy-review-2024';(gold/'legacy.json').write_text(json.dumps(data))
-        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
-        importer._restore_sidecars('OwnedLegacy',package,'OwnedOriginal',validated,mappings)
-        local=mappings[0]['session_id'];self.assertRegex(local,r'^gs_[0-9a-f]{8}$')
-        loaded=gs.get_session(local);self.assertEqual(loaded['imported_from']['session_id'],data['session_id'])
-        self.assertEqual(SessionResponse.model_validate(loaded).imported_from.session_id,data['session_id'])
-        self.assertFalse((gs._sessions_dir()/'legacy-review-2024.json').exists())
-        result=asyncio.run(gs.save_session(local,'legacy-rows.json'));self.assertEqual(json.loads((Path(self.tmp.name)/result['filename']).read_text())[0]['answer'],'Original answer')
+        before=self.path.read_bytes()
+        with self.assertRaises(importer.PackageError) as caught:importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        self.assertEqual((caught.exception.code,caught.exception.detail),('PACKAGE_CORRUPT',{'file':'goldstandard/legacy.json'}))
+        self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(len(list(self.path.parent.glob('*.json'))),1)
 
     def test_cache_iteration_serializes_with_generation_insertion(self):
         entered=threading.Event();release=threading.Event();started=threading.Event();mutated=threading.Event()
@@ -14347,6 +14416,59 @@ class IdentityTests(unittest.TestCase):
             finally:release.set()
             self.assertEqual(len(reading.result(timeout=2)),1);self.assertRegex(writing.result(timeout=2)['session_id'],r'^gs_[0-9a-f]{8}$')
 
+
+    # Reviewer-added: forced candidate collisions under real thread contention.
+    def test_reviewer_forced_duplicate_candidates_race_never_share_or_overwrite(self):
+        before=self.path.read_bytes();shared='gs_460abc01';draw=threading.Lock();counter=[0]
+        def duplicated():
+            with draw:
+                n=counter[0];counter[0]+=1
+            return SimpleNamespace(hex='%08x'%(0x46100000+n//2)+'0'*24)
+        original_save=gs._save_session_sync
+        def slow_save(session):
+            time.sleep(.02);return original_save(session)
+        def run(i):
+            data=fixture();data['collection']='OwnedRace'+str(i)
+            if i%3==0:return gs._store_generated_session(data)['session_id']
+            data['session_id']=shared if i%3==1 else self.original['session_id']
+            return gs.store_imported_session(data,'OwnedOriginal')['session_id']
+        with patch.object(gs.uuid,'uuid4',side_effect=duplicated),patch.object(gs,'_save_session_sync',side_effect=slow_save):
+            with ThreadPoolExecutor(max_workers=12) as pool:identities=list(pool.map(run,range(24)))
+        self.assertEqual(len(set(identities)),24,identities);self.assertNotIn(self.original['session_id'],identities)
+        self.assertEqual(identities.count(shared),1,'exactly one concurrent import keeps a free shared source ID')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(list(self.path.parent.glob('*.json'))),25)
+        for sid in identities:self.assertEqual(json.loads((self.path.parent/(sid+'.json')).read_text())['session_id'],sid)
+
+    def test_reviewer_replace_import_into_same_collection_keeps_newer_original(self):
+        package=Path(self.tmp.name)/'owned-replace-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        (gold/(self.original['session_id']+'.json')).write_text(json.dumps(self.original))
+        asyncio.run(gs.update_pair(self.original['session_id'],'p_owned',{'answer':'Newer human review','status':'edited'}));before=self.path.read_bytes()
+        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        importer._restore_sidecars('OwnedOriginal',package,'OwnedOriginal',validated,mappings)
+        self.assertNotEqual(mappings[0]['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(gs.get_session(self.original['session_id'])['pairs'][0]['answer'],'Newer human review')
+
+    def test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503(self):
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+                with self.assertRaises(gs.GoldStandardError) as caught:await gs.start_generation('OwnedGeneration',1,None)
+                generate.assert_not_called()
+            return caught.exception
+        error=asyncio.run(run())
+        self.assertEqual((error.code,error.status),('SESSION_WRITE_FAILED',503));self.assertEqual(self.path.read_bytes(),before)
+
+    def test_generation_allocation_failure_records_diagnostic_for_candidate(self):
+        storage=Path(settings.upload_dir)/'goldstandard_sessions';before=self.path.read_bytes()
+        for name,changes,expected in [('inspection',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcdf'+'0'*24)),patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure'))],'gs_460abcdf.json'),
+                                      ('exhaustion',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcde'+'0'*24))],'gs_460abcde.json')]:
+            with self.subTest(case=name),patch.object(gs,'_diagnostics',{}):
+                with ExitStack() as stack:
+                    for change in changes:stack.enter_context(change)
+                    with self.assertRaises(gs.GoldStandardError) as caught:gs._store_generated_session(fixture())
+                self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
+                self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/expected):'SESSION_WRITE_FAILED'})
+                self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
 
 if __name__=='__main__':unittest.main()
 ```
@@ -14389,7 +14511,7 @@ def legacy_archive(archive,root,identity,source_id):
         with tarfile.open(output,'w:gz') as package:package.add(package_root,arcname=package_root.name)
         return output.name
 
-async def completed(client,path,timeout=300):
+async def completed(client,path,timeout=300,expected='completed'):
     deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
     while True:
         remaining=deadline-asyncio.get_running_loop().time()
@@ -14399,7 +14521,7 @@ async def completed(client,path,timeout=300):
         assert response.status_code==200,response.text
         job=response.json();last=job.get('status','missing')
         if last not in ('queued','running'):
-            assert last=='completed',job
+            assert last==expected,job
             return job
         await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
 
@@ -14492,19 +14614,10 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 print('PASS re-export uses the allocated session filename/provenance and the original package remains byte-identical',flush=True)
                 source_id='legacy-review-2024';legacy_filename=await asyncio.to_thread(legacy_archive,archive,root,sid,source_id)
                 start=await client.post('/import',json={'filename':legacy_filename,'on_conflict':'rename'});assert start.status_code==202,start.text
-                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'])
-                mapping=legacy['restored_sessions'][0];local=mapping['session_id']
-                assert mapping['source_session_id']==source_id and local.startswith('gs_') and len(local)==11
-                response=await client.get('/goldstandard/session/'+local);assert response.status_code==200,response.text
-                assert response.json()['imported_from']['session_id']==source_id
-                print('PASS digest-valid historical-ID archive completes actual import with canonical local lookup and original provenance',flush=True)
-                saved=await client.post('/goldstandard/save',json={'session_id':local,'filename':'owned-legacy-rows.json'});assert saved.status_code==200,saved.text
-                download=await client.get('/goldstandard/download/'+saved.json()['filename']);assert download.status_code==200,download.text
-                assert download.json()[0]['answer']=='Original exported answer'
-                reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),local],text=True,capture_output=True,check=True)
-                assert json.loads(reload.stdout)[0]['imported_from']['session_id']==source_id
+                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'],expected='failed')
+                assert legacy['error_code']=='PACKAGE_CORRUPT' and legacy['error_detail']=={'file':'goldstandard/'+sid+'.json'} and not legacy['restored_sessions'],legacy
                 assert await asyncio.to_thread(original_path.read_bytes)==original_bytes
-                print('PASS historical imported session keeps usable HTTP/RAGAS/restart state while original newer review remains unchanged',flush=True)
+                print('PASS digest-valid noncanonical-ID archive is refused PACKAGE_CORRUPT naming the sidecar, restores nothing and leaves the original newer review unchanged',flush=True)
 
 
         async def owned():
