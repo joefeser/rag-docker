@@ -429,15 +429,16 @@ replacing a collection marks its sessions `orphaned` and reports how many.
 ## Verifying a change
 
 ```bash
-docker compose up -d
-bash scripts/verify/all.sh                  # everything, ~20 min
-RAG_SKIP_SLOW=1 bash scripts/verify/all.sh  # skip LLM work, ~3 min
+bash scripts/verify/stack.sh run                  # everything, ~20 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skip LLM work, ~3 min plus start-up
 ```
 
-Runs the acceptance criteria in this project's specifications against the live
-stack — ingest, retrieval, gold standard, export/import, tuning, and the UI in a
-real headless browser. Exits non-zero on the first failure, so it can gate a
-commit.
+Runs the acceptance criteria in this project's specifications — ingest,
+retrieval, gold standard, export/import, tuning, and the UI in a real headless
+browser — on a disposable verify project: the checkout is built as compose
+project `rag-verify` on port 8081, with its own empty volumes, and removed after
+the run. Your own stack and its data are never touched. Exits non-zero if any
+check fails, so it can gate a commit.
 
 These are integration tests on purpose. Every defect this project has produced
 was invisible to a unit test of the same function: a parser dependency missing
