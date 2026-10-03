@@ -1896,7 +1896,9 @@ def sidecar_reference(record: dict) -> str:
     """
     metadata = _root() / record["operation_id"]
     log.warning("Recovery collection %r keeps sidecar snapshots in %s", record["staging"], metadata)
-    return str(metadata.relative_to(Path(settings.upload_dir)))
+    # Built, not derived with relative_to: the root needn't resolve under
+    # UPLOAD_DIR (a symlinked mount, or the reindex verifier's own root).
+    return "collection_operations/" + record["operation_id"]
 
 
 def discard(record: dict, client) -> None:

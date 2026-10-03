@@ -753,6 +753,14 @@ class RecoveryTests(unittest.TestCase):
             self.assertNotIn(settings.upload_dir, json.dumps(detail))
             self.assertIn(absolute, logged)
 
+    def test_sidecar_reference_does_not_depend_on_where_the_root_resolves(self):
+        # The reindex verifier keeps recovery records outside UPLOAD_DIR. The
+        # reference must still be the documented form, not a failed relative_to.
+        with tempfile.TemporaryDirectory() as outside, \
+                patch.object(recovery, '_root', return_value=Path(outside) / 'owned'):
+            self.assertEqual(recovery.sidecar_reference({'operation_id': 'op1', 'staging': 'S'}),
+                             'collection_operations/op1')
+
     def test_stale_marking_discard_failure_is_logged_and_resumed_at_startup(self):
         def fail_marking():
             raise RuntimeError('session store unavailable')
