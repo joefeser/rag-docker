@@ -372,7 +372,7 @@ Accepts one or more files. For ZIP uploads, extracts and processes all supported
 |---|---|---|---|
 | `files` | file[] | Yes | One or more files (PDF, DOCX, TXT, MD, CSV, JSON) or a single ZIP |
 | `collection` | string | Yes | Target Weaviate collection name |
-| `chunking_strategy` | string | Yes | One of: `fixed`, `overlap`, `semantic`, `context_aware`, `language` |
+| `strategy` | string | No | Default: `overlap`. One of: `fixed`, `overlap`, `semantic`, `context_aware`, `language` |
 | `chunk_size` | int | No | Default: 1000 (characters). All size parameters are in characters, not tokens. |
 | `chunk_overlap` | int | No | Default: 200 (characters). Ignored by `semantic` and `context_aware`. |
 | `similarity_threshold` | float | No | Default: 0.85. Used by `semantic` only. Range: 0.0–1.0. |

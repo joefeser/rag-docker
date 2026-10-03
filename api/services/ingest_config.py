@@ -17,8 +17,6 @@ from config import settings
 
 log = logging.getLogger(__name__)
 
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
-
 DEFAULTS = {
     "chunking_strategy": "overlap",
     "chunk_size": 1000,
