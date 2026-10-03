@@ -287,9 +287,61 @@ def sessions_for(collection: str) -> list[dict]:
 
 
 def store_session(session: dict) -> None:
-    """Explicit whole-session storage; publishes cache only after replacement."""
+    """Write through the durable store so the cache cannot undo an import."""
     validate_session(session)
     _save_session_sync(session)
+
+
+def _identity_available(session_id: str) -> bool:
+    """Treat every existing directory entry as occupied, even unreadable bytes."""
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        # Source identities are provenance, never local filesystem addresses.
+        return False
+    if session_id in _sessions:
+        return False
+    path = _session_storage_root() / f"{session_id}.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _allocate_identity(preferred: str | None = None) -> str:
+    # Callers hold _state_lock across allocation and durable publication.
+    if preferred is not None and _identity_available(preferred):
+        return preferred
+    for _ in range(128):
+        candidate = f"gs_{uuid.uuid4().hex[:8]}"
+        if _identity_available(candidate):
+            return candidate
+    raise RuntimeError("Could not allocate an unoccupied session identity")
+
+
+def _store_generated_session(session: dict) -> dict:
+    snapshot = copy.deepcopy(session)
+    with _state_lock:
+        snapshot["session_id"] = _allocate_identity()
+        store_session(snapshot)
+    return copy.deepcopy(snapshot)
+
+
+def store_imported_session(session: dict, source_collection: str) -> dict:
+    """Serialize source-ID collision handling with generation and other imports."""
+    snapshot = copy.deepcopy(session)
+    # The source ID can be historical, but the rest of the session must still
+    # satisfy the strict schema before it is given a canonical local ID.
+    SessionResponse.model_validate(snapshot, strict=True)
+    source_id = snapshot["session_id"]
+    with _state_lock:
+        snapshot["session_id"] = _allocate_identity(source_id)
+        snapshot["imported_from"] = {
+            "session_id": source_id,
+            "collection": source_collection,
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+        }
+        store_session(snapshot)
+    return copy.deepcopy(snapshot)
 
 
 def _update_session_sync(session_id: str, change):
@@ -504,9 +556,8 @@ async def start_generation(
     all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
     actual_size = len(all_chunks)
 
-    session_id = f"gs_{uuid.uuid4().hex[:8]}"
     session = {
-        "session_id": session_id,
+        "session_id": "",
         "collection": collection,
         "status": "generating",
         "pairs_total": actual_size,
@@ -518,7 +569,8 @@ async def start_generation(
         "pairs_failed": 0,
         "pairs": [],
     }
-    await _save_session(session)
+    session = await asyncio.to_thread(_store_generated_session, session)
+    session_id = session["session_id"]
 
     task = asyncio.create_task(_run_generation(session_id, all_chunks))
     _tasks.add(task)

@@ -146,7 +146,7 @@ class SessionImportTests(unittest.TestCase):
 
     def test_all_sessions_preflight_before_models_build_or_replacement(self):
         self.sidecar('first.json', self.original)
-        self.sidecar('second.json', session('not-a-generated-id'))
+        self.sidecar('second.json', session(123))
         manifest = {'collection': {'name': 'Corpus'}, 'embedding': {'model': settings.embed_model}}
         (self.pkg / 'manifest.json').write_text(json.dumps(manifest))
         for conflict in ('abort', 'rename', 'replace'):
@@ -175,7 +175,7 @@ class SessionImportTests(unittest.TestCase):
         saved = gs._session_path(self.original['session_id'])
         original_bytes = saved.read_bytes()
         self.sidecar('first.json', self.original)
-        self.sidecar('second.json', session('not-a-generated-id'))
+        self.sidecar('second.json', session(123))
         self.archive()
         for conflict in ('abort', 'rename', 'replace'):
             with self.subTest(conflict=conflict), ExitStack() as mocks:
@@ -201,8 +201,10 @@ class SessionImportTests(unittest.TestCase):
             importer._jobs['test'] = {'status': 'queued'}
             importer._run('test', 'fixture.tar.gz', 'abort')
         self.assertEqual(importer._jobs['test']['status'], 'completed')
-        self.assertEqual(json.loads(gs._session_path(self.original['session_id']).read_text()),
-                         self.original)
+        saved = json.loads(gs._session_path(self.original['session_id']).read_text())
+        self.assertEqual({key: saved[key] for key in self.original}, self.original)
+        self.assertEqual(saved['imported_from']['session_id'], self.original['session_id'])
+        self.assertEqual(saved['imported_from']['collection'], 'Corpus')
 
     def test_redirected_storage_root_is_refused_by_import_store_and_load(self):
         outside = self.root / 'existing-storage'

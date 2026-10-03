@@ -200,6 +200,12 @@ class ImportStartResponse(BaseModel):
     filename: str
 
 
+class ImportedSessionMapping(BaseModel):
+    source_session_id: str
+    session_id: str
+    collection: str
+
+
 class ImportJobStatusResponse(BaseModel):
     job_id: str
     status: str
@@ -213,6 +219,7 @@ class ImportJobStatusResponse(BaseModel):
     fidelity: Optional[str]
     renamed: bool
     notes: list[str]
+    restored_sessions: list[ImportedSessionMapping] = Field(default_factory=list)
     error: Optional[str]
     error_code: Optional[str]
     error_detail: Optional[dict]
@@ -394,6 +401,12 @@ class SessionValidity(BaseModel):
     orphaned_at: Optional[str] = None
 
 
+class SessionImportProvenance(BaseModel):
+    session_id: str
+    collection: str
+    imported_at: str
+
+
 class SessionResponse(SessionValidity):
     session_id: str
     status: str
@@ -406,6 +419,7 @@ class SessionResponse(SessionValidity):
     pairs: list[GoldPair]
     collection: str
     errors: list[str] = []
+    imported_from: SessionImportProvenance | None = None
 
 
 class PatchPairRequest(BaseModel):

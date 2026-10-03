@@ -5,6 +5,8 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./13_identity.sh
+check "imported evaluation identity acceptance suite" $?
 C="${PREFIX}Transfer"
 EXPORTS="$REPO_ROOT/exports"
 
@@ -81,7 +83,7 @@ make_gs_pkg() {   # make_gs_pkg <session-id> <suffix>; prints the new filename
   python3 - "$EXPORTS/$PKG" "$1" "$2" "$C" <<'ENDPY'
 import hashlib, json, pathlib, sys, tarfile, tempfile
 src, sid, suffix, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-session = {"session_id": sid, "collection": coll, "status": "completed",
+session = {"session_id": 123 if sid == "__invalid_type__" else sid, "collection": coll, "status": "completed",
            "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
            "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
                       "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
@@ -107,7 +109,7 @@ ENDPY
 count_of() { api_get "/collections" | python3 -c "
 import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
 
-BADGS=$(make_gs_pkg "not-a-generated-id" badgs)
+BADGS=$(make_gs_pkg "__invalid_type__" badgs)
 api_post "/import" "{\"filename\":\"$BADGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
 wait_for_job "/import/job/$ijob" 900 >/dev/null
@@ -119,8 +121,8 @@ import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
 sys.exit(0 if 'goldstandard/session.json' in json.dumps(d) else 1)"
 check "E23: the refusal names the offending sidecar" $?
 check_eq "E23: replace left the existing collection untouched" "$(count_of "$C")" "$chunks_before"
-code=$(api_code "$API/goldstandard/session/not-a-generated-id")
-check_eq "E23: no session was restored from the refused package" "$code" "404"
+check_eq "E23: no session was restored from the refused package" \
+  "$(jfield "['restored_sessions']" < /tmp/vfy_gsjob.json)" "[]"
 rm -f "$EXPORTS/$BADGS"
 
 # A refused package must change no live state at all. A replace from this

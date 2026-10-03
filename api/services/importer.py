@@ -34,6 +34,7 @@ import uuid
 from pathlib import Path
 
 from config import settings
+from models.schemas import SessionResponse
 from services import goldstandard
 from services import model_bundle
 from services import packager
@@ -461,14 +462,15 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(path.read_text())
-            goldstandard.validate_session(data)
+            # A historical source ID is provenance, not a local destination.
+            # Validate its type and all content, then check the guarded root
+            # without turning the source ID into a filesystem path.
+            SessionResponse.model_validate(data, strict=True)
             if canonical(data["collection"]) != canonical(original):
                 raise ValueError("Evaluation session belongs to a different collection.")
             if data["session_id"] in identities:
                 raise ValueError("Duplicate evaluation session identity.")
-            # Check the live write boundary too, before any collection/model
-            # mutation. This catches pre-existing redirected destinations.
-            goldstandard._session_path(data["session_id"])
+            goldstandard._session_storage_root()
         except (OSError, ValueError, RuntimeError) as exc:
             raise PackageError(
                 "PACKAGE_CORRUPT", "Invalid evaluation session metadata.",
@@ -479,7 +481,8 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
 
 
 def _restore_sidecars(target: str, pkg: Path, original: str,
-                      validated_sessions: list[dict]) -> list[str]:
+                      validated_sessions: list[dict],
+                      restored_sessions: list[dict] | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -524,7 +527,13 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
             # Write through the service: a direct file write leaves the
             # in-memory cache holding the old version, which the next flagging
             # pass would write straight back over this one.
-            goldstandard.store_session(data)
+            saved = goldstandard.store_imported_session(data, original)
+            mapping = {"source_session_id": session["session_id"],
+                       "session_id": saved["session_id"], "collection": target}
+            if restored_sessions is not None:
+                restored_sessions.append(mapping)
+            notes.append(f"evaluation session '{mapping['source_session_id']}' "
+                         f"restored as local '{mapping['session_id']}' for '{target}'")
             restored += 1
         if restored:
             notes.append(f"{restored} gold-standard session(s) restored")
@@ -623,8 +632,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         written = _build(target, pkg, manifest, progress)
         _mark_finished(target)
         marked = None
+        job.setdefault("restored_sessions", [])
         notes = model_notes + replace_notes + _restore_sidecars(
-            target, pkg, original, validated_sessions)
+            target, pkg, original, validated_sessions, job["restored_sessions"])
 
         if staged and temp_collection:
             try:
@@ -693,6 +703,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         "fidelity": None,
         "renamed": False,
         "notes": [],
+        "restored_sessions": [],
         "error": None,
         "error_code": None,
         "error_detail": None,

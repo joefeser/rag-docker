@@ -153,19 +153,19 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_seed_reaches_sampler_actual_size_drives_generation(self):
         chosen=[{'object_id':identity,'content':'Synthetic','source_file':'inert.txt','chunk_index':0} for identity in sample.select_chunk_ids(objects(3),20,7)]
         with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=chosen)) as sampler, \
-             patch.object(gs,'_save_session',new=AsyncMock()) as save, \
+             patch.object(gs,'_store_generated_session',side_effect=lambda session:{**session,'session_id':'gs_460abcdf'}) as save, \
              patch.object(gs,'_run_generation',new=AsyncMock()) as generate:
             result=await gs.start_generation('Inert',20,7)
             await asyncio.sleep(0)
             sampler.assert_awaited_once_with('Inert',limit=20,seed=7)
             self.assertEqual(result['pairs_total'],3)
-            self.assertEqual(save.await_args.args[0]['pairs_total'],3)
-            save.assert_awaited_once()
+            self.assertEqual(save.call_args.args[0]['pairs_total'],3)
+            save.assert_called_once()
             generate.assert_awaited_once_with(result['session_id'],chosen)
 
     async def test_invalid_settings_and_selection_failure_prevent_session_and_model_work(self):
         with patch.object(gs.wc,'sample_chunks',new=AsyncMock(side_effect=ValueError('bad identity'))) as sampler, \
-             patch.object(gs,'_save_session',new=AsyncMock()) as save, \
+             patch.object(gs,'_store_generated_session') as save, \
              patch.object(gs,'_run_generation',new=AsyncMock()) as generate:
             for limit,seed in ((0,7),(101,7),(3,True),(3,float('inf'))):
                 with self.subTest(settings=(limit,seed)), self.assertRaises(ValueError):
@@ -174,7 +174,7 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await gs.start_generation('Inert',3,7)
             self.assertEqual(gs._sessions,{})
-            save.assert_not_awaited(); generate.assert_not_called()
+            save.assert_not_called(); generate.assert_not_called()
 
 
 class RequestTests(unittest.TestCase):
