@@ -119,7 +119,7 @@ def _process_job_sync(
                         path.read_bytes(),
                         mimetypes.guess_type(path.name)[0],
                     )
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.

@@ -297,16 +297,19 @@ def build(
 
         # 5. sources, when they exist
         index = sources.load_index(collection)
-        fidelity = "with-sources" if index["documents"] else "chunks-only"
-        source_document_count = len(index["documents"])
+        shipped = {}
+        for digest, entry in index["documents"].items():
+            blob = sources.blob_path(collection, digest)
+            if not blob.exists():
+                warnings.append(f"retained source {digest[:12]} is missing on disk")
+                continue
+            shipped[digest] = entry
+        fidelity = "with-sources" if shipped else "chunks-only"
+        source_document_count = len(shipped)
         if fidelity == "with-sources":
-            b.add_json("sources/index.json", index)
-            src_dir = sources.collection_dir(collection)
-            for digest in index["documents"]:
-                blob = src_dir / digest
-                if not blob.exists():
-                    warnings.append(f"retained source {digest[:12]} is missing on disk")
-                    continue
+            b.add_json("sources/index.json", {**index, "documents": shipped})
+            for digest in shipped:
+                blob = sources.blob_path(collection, digest)
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest

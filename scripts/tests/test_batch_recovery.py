@@ -68,7 +68,7 @@ class Collection:
         self.rows = {}
         self.fault = fault
         self.description = description
-        self.config = SimpleNamespace(get=lambda: SimpleNamespace(description=self.description, vectorizer=None))
+        self.config = SimpleNamespace(get=lambda: SimpleNamespace(name=self.name, description=self.description, vectorizer=None))
         self.batch = Batch(self)
         self.query = SimpleNamespace(fetch_objects=lambda filters, **kwargs: SimpleNamespace(
             objects=[obj for obj in self.iterator(include_vector=True) if str(obj.uuid) in filters.value]))
