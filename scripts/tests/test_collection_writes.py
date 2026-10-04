@@ -116,7 +116,7 @@ class ImportCutoverTests(unittest.TestCase):
             if name=='OwnedImport':backend.remove(name);raise RuntimeError('Owned final insertion failed')
         module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
         module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');retained=job['error_detail']['recovered_as']
-        self.assertIn(retained,backend);self.assertTrue(Path(job['error_detail']['sidecar_snapshots']).is_dir())
+        self.assertIn(retained,backend);self.assertFalse(Path(job['error_detail']['sidecar_snapshots']).is_absolute());self.assertTrue((root/job['error_detail']['sidecar_snapshots']).is_dir())
         self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
 
 

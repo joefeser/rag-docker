@@ -339,7 +339,9 @@ redirected storage directories and non-regular destinations. Archive extraction
 accepts only regular files and directories, so special members cannot block a
 later metadata read. Existing review work remains unchanged on validation
 failure, including `replace`. Optional legacy progress fields retain their
-existing defaults, and historical validity metadata is preserved.
+existing defaults, and historical validity metadata is preserved. A restored
+session's `persistence_error` is removed: a write failure on the source system
+says nothing about this instance's storage.
 
 Startup loading, collection flagging and export use the same session-record
 validation. Invalid legacy files (including filename/identity mismatch) remain
@@ -507,7 +509,8 @@ first request, which is what makes this safe.
 | Verified recovery | a durable record with state `recovery`, written before deleting the target | preserve the collection and all sidecars; log its identity and metadata snapshot directory |
 | Successful/intentional cleanup interrupted by I/O failure | durable `cleanup` phase, written before deletion | retry only that authorized backend/sidecar/metadata cleanup until complete |
 | Unowned marker-like name or unreadable ownership | insufficient ownership evidence | preserve; a substring or age is never deletion authority |
-| New-target partial import | a small version-3 marker bound by SHA-256 to a compact SQLite expectation snapshot | verify the full stored records; delete a proven mismatch, preserve on unreadable/legacy metadata or backend read failure |
+| New-target partial import | a small version-4 marker bound by SHA-256 to a compact SQLite expectation snapshot, and by a random instance token to the schema description (`rag-import:<token>`) the import gives the collection it creates | only for the collection carrying the marker's token: verify the full stored records and delete a proven mismatch. A collection without the token was created later under that name: keep it and retire the marker. Preserve on unreadable/legacy metadata or backend read failure. A version-3 marker carries no token and never deletes: in state `building` it is kept and logged; in state `cleanup` its cleanup is finished |
+| Orphaned expectation snapshot | a `<32 hex>.sqlite3` file in the markers folder that no marker names | delete it; if any marker cannot be parsed, delete none |
 | Extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete the abandoned workspace; recovery sidecars are stored outside it |
 
 Recovery ownership is atomic and flushed before the destructive step. Cleanup
@@ -520,7 +523,9 @@ source bytes and ingest/retrieval configs are copied under the recovery collecti
 name; evaluation JSON is copied to the operation's metadata snapshot directory
 without overwriting live session identity. An imported recovery also retains its
 manifest and collection config. The error detail includes `recovered_as` and
-`sidecar_snapshots`. A recovery record remains preserved even if its backend
+`sidecar_snapshots`, the snapshot directory relative to `UPLOAD_DIR`
+(`collection_operations/<operation-id>`); the absolute path appears only in the
+server log. A recovery record remains preserved even if its backend
 collection is later missing, since its sidecars may still be useful.
 
 The owner can export the named recovery collection, inspect its metadata snapshots,
@@ -589,7 +594,10 @@ Before deleting the original, tuning MUST verify the staged rebuild and durably
 retain its source/config/evaluation sidecars. Final-create, batch and verification
 failures MUST report the recovery collection and preserve it across restart,
 including chunks-only data. Cleanup may delete scratch while the original remains
-safe, or delete recovery only after final persisted-record verification succeeds.
+safe, or delete recovery only after final persisted-record verification succeeds
+or when a step fails before the original is deleted. If marking gold-standard
+sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
+the original collection is unchanged, and the retained copy is discarded.
 
 ---
 

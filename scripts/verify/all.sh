@@ -3,12 +3,12 @@
 # Run every verification suite against a running stack.
 #
 #   bash scripts/verify/all.sh              # everything (~20 min, LLM-bound)
-#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~3 min)
+#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~8 min)
 #   RAG_ALLOW_RESTART=1 bash scripts/verify/all.sh  # also restart the stack
+#   bash scripts/verify/all.sh 02 04        # only the named suites
 #
 # Normally started by scripts/verify/stack.sh run, on the disposable verify
 # project. It refuses the live rag-docker stack (#152).
-#   bash scripts/verify/all.sh 02 04        # only the named suites
 #
 # Exits non-zero if any check fails, so it can gate a commit or a release.
 #
