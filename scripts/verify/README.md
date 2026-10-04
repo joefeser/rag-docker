@@ -342,6 +342,8 @@ The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping
 
 Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
 
+Issue #140 deletion coverage exercises canonical and accepted lowercase-alias HTTP deletion, both source/config sidecar spellings, durable orphan flags for both session spellings, and unrelated collection preservation. Controlled writer cases also cover backend deletion failure and retained recovery behavior; the controlled verifier invokes the actual deletion handler without a live backend.
+
 ## Deferred query configuration browser checks
 
 `browser/query_config.js` runs against the real UI with all API calls stubbed
