@@ -11,7 +11,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,MagicMock,patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
+api_dir=os.environ.get('RAG_TEST_API_DIR')
+sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
 from config import settings
 from services import weaviate_client as wc,rag_pipeline as rag,retrieval_config as saved
 from weaviate.classes.config import VectorDistances
