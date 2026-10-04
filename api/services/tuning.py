@@ -128,13 +128,12 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    src_dir = sources.collection_dir(collection)
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
         for digest, entry in sorted(documents.items()):
-            blob = src_dir / digest
+            blob = sources.blob_path(collection, digest)
             if not blob.is_file():
                 raise PackageError(
                     "SOURCES_REQUIRED",
@@ -287,7 +286,9 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         job["chunks_written"] = n
 
     try:
-        has_sources = sources.has_sources(source_collection)
+        needs_sources = operation == "rechunk" or (
+            operation == "reembed" and params.get("chunking") is not None)
+        has_sources = sources.has_sources(source_collection) if needs_sources else False
         records = None
 
         if operation == "rechunk":
