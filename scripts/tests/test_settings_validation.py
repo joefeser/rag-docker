@@ -1,5 +1,7 @@
 """Direct/saved settings reject invalid inputs before model/backend work."""
+import ast
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -7,11 +9,13 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
 api_dir = os.environ.get('RAG_TEST_API_DIR')
 sys.path.insert(0, api_dir or str(Path(__file__).resolve().parents[2] / 'api'))
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from pydantic.fields import FieldInfo
 from config import settings
 from main import app
 from models.schemas import CreateCollectionRequest, HnswConfig, IngestConfig, QueryRequest, RechunkRequest, ReembedRequest, SaveRetrievalConfigBody
@@ -19,6 +23,13 @@ from routers import collections, ingest, tuning as tuning_router, query, retriev
 from services import weaviate_client as wc, chunker, rag_pipeline, ingest_config, retrieval_config, ingest_pipeline, packager
 
 OVERLAP_RULE = 'chunk_overlap must be smaller than chunk_size for overlap/language'
+NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
+
+
+def repository_root():
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else None
+    return root if root is not None and (root / 'IMPLEMENTATION.md').is_file() else None
 
 
 class SettingsTests(unittest.TestCase):
@@ -308,6 +319,53 @@ class InternalBoundaryTests(unittest.TestCase):
         with patch.object(rag_pipeline.ollama, 'chat', new=AsyncMock()) as chat:
             with self.assertRaises(ValidationError): asyncio.run(rag_pipeline.run_query('synthetic','ReviewSettings','unknown',5,0.5,False,'end_user'))
             chat.assert_not_called()
+
+
+class ApiPathFallbackTests(unittest.TestCase):
+    # #135: the repository fallback was computed even with RAG_TEST_API_DIR set.
+    def api_path_setup(self, source):
+        tree = ast.parse(source)
+        start = next(i for i, node in enumerate(tree.body) if 'RAG_TEST_API_DIR' in ast.get_source_segment(source, node))
+        for end in range(start, len(tree.body)):
+            node = tree.body[end]
+            if isinstance(node, ast.Expr) and ast.get_source_segment(source, node.value.func) == 'sys.path.insert':
+                return ast.Module(body=tree.body[start:end + 1], type_ignores=[])
+        self.fail('no sys.path.insert after RAG_TEST_API_DIR')
+
+    def test_fallback_is_only_computed_when_the_variable_is_unset(self):
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        def evaluated(*args): raise AssertionError('fallback evaluated')
+        cases = (('set', {'RAG_TEST_API_DIR': '/synthetic/api'}, evaluated, ['/synthetic/api']),
+                 ('empty', {'RAG_TEST_API_DIR': ''}, Path, ['/synthetic/repo/api']),
+                 ('unset', {}, Path, ['/synthetic/repo/api']))
+        for name in ('scripts/verify/reindex_verifier_cases.py', 'scripts/tests/test_retrieval_controls.py'):
+            setup = compile(self.api_path_setup((root / name).read_text()), name, 'exec')
+            for case, environ, path, expected in cases:
+                with self.subTest(file=name, case=case):
+                    namespace = {'os': SimpleNamespace(environ=environ), 'sys': SimpleNamespace(path=[]),
+                                 'Path': path, '__file__': '/synthetic/repo/scripts/x/file.py'}
+                    exec(setup, namespace)
+                    self.assertEqual(namespace['sys'].path, expected)
+
+
+class SpecificationTests(unittest.TestCase):
+    def test_upload_form_fields_match_the_route(self):
+        # #135: the spec named the strategy field chunking_strategy and required it.
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        lines = (root / 'SPECIFICATIONS.md').read_text().splitlines()
+        start = lines.index('**Form fields:**', lines.index('POST /ingest/upload'))
+        documented = {}
+        for line in lines[start + 1:]:
+            if documented and not line.startswith('|'): break
+            if line.startswith('| `'):
+                cells = [cell.strip() for cell in line.strip('|').split('|')]
+                documented[cells[0].strip('`')] = {'Yes': True, 'No': False}[cells[2]]
+        route = {name: parameter.default.is_required()
+                 for name, parameter in inspect.signature(ingest.ingest_upload).parameters.items()
+                 if isinstance(parameter.default, FieldInfo)}
+        self.assertEqual(documented, route)
 
 
 class ImplementationTests(unittest.TestCase):

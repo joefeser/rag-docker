@@ -137,6 +137,16 @@ uv run --no-project --python 3.11 \
   python scripts/tests/test_session_import.py
 ```
 
+`scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
+retrieval package rejection before model, backend, recovery, or sidecar mutation;
+historical defaults/coercion and `ef` round trips; and generated Python literal
+regressions. Run it with the same API dependencies as the session import test.
+`05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
+15 malformed settings imports across abort/rename/replace and verifies live
+collection counts and saved settings are unchanged. The normal rename import
+also checks all saved retrieval fields round-trip. Controlled tests complement,
+and do not replace, this live acceptance.
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -318,7 +328,7 @@ was killed, remove what is left with:
 bash scripts/verify/stack.sh down
 ```
 
-`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes eighteen owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes twenty-one owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 
 The infrastructure suite requires Docker Engine 28.0.0+ and checks both resolved Compose and live Docker bindings for a single loopback proxy publication. When deploying an alternate host port for testing, set `RAG_EXPECTED_PROXY_PORT` to that port as well as `RAG_API`. Its inspection files are kept in a private temporary directory removed on exit. The local profile assumes standard bridge/NAT routing.
 
@@ -330,3 +340,25 @@ Run `python3 scripts/tests/test_loopback_verification.py` from the repository ro
 The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
 
 Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
+
+## Deferred query configuration browser checks
+
+`browser/query_config.js` runs against the real UI with all API calls stubbed
+before startup. It explicitly holds and releases responses to cover a delayed
+A save arriving before/after B's load, B's failed load, an A→B→A selection,
+concurrent saves in both response orders, and save failure. Every case checks
+the actual next Q&A request payload. These fixtures are included in `06_ui.sh`
+through `ui_criteria.js`, and can also run without a backend or model:
+
+```bash
+# Start the UI separately: cd ui && npm ci && npm run dev -- --host 127.0.0.1
+# With puppeteer-core available to Node and a local Chromium installation:
+RAG_UI_BASE=http://127.0.0.1:3000 \
+RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/query_config.js
+```
+
+The standalone runner uses the existing browser verification dependency
+`puppeteer-core` (also available in the verification browser image); set
+`NODE_PATH` if it is installed outside normal Node module resolution. This
+isolated fixture run does not replace the required full live-stack suite.
