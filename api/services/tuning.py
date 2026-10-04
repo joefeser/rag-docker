@@ -258,10 +258,17 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             raise PackageError(
                 "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified data is retained as '{staging}'.",
                 {"recovered_as": staging,
-                 "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
+                 "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}) from exc
+        if not cutover_started and ownership["state"] == "recovery":
+            # Only before_replace runs between retain and cutover. The original
+            # was never deleted, so the copy is discarded below.
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Gold-standard sessions could not be "
+                "marked stale before replacement, so the original collection is unchanged.") from exc
         raise
     finally:
-        if completed or original_intact or ownership["state"] == "scratch":
+        # Before cutover the original is intact, so a retained copy is not needed.
+        if completed or original_intact or not cutover_started or ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, client)
             except Exception:

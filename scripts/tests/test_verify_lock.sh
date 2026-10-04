@@ -98,18 +98,30 @@ check "T4: the pid file is rewritten with the new holder's pid" "$?" "old=$dead_
 # drops Vfy* collections), so it holds the real verify lock throughout: it is
 # skipped while a real verify run holds it, and a run started during T5 waits
 # for it instead of losing its collections.
+# It runs only where the live-stack guard lets 01 run (#152): on the verify
+# project, with the environment `bash scripts/verify/stack.sh up` prints. With
+# no such environment it is skipped, and it never targets the live rag-docker
+# stack, even with RAG_VERIFY_LIVE=1.
 section "verify/lock.sh vs. 01_infrastructure.sh's own EXIT trap"
 API="${RAG_API:-http://localhost:8080/api}"
-health_code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
 L5="$TESTLOCK_HOME/t5.lock"
 T5_OUT="$TESTLOCK_HOME/t5.out"
-if [ "$health_code" != "200" ]; then
-  skip "T5: 01_infrastructure.sh EXIT-trap interaction" "no live stack at $API (HTTP $health_code)"
+target5=$(live_target_reason)
+if [ -z "${COMPOSE_PROJECT_NAME:-}" ] || [ -n "$target5" ]; then
+  health_code=skip
+  skip "T5: 01_infrastructure.sh EXIT-trap interaction" \
+    "needs the verify project's environment (bash scripts/verify/stack.sh up)${target5:+: $target5}"
+else
+  health_code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
+fi
+if [ "$health_code" = "skip" ]; then
+  :
+elif [ "$health_code" != "200" ]; then
+  skip "T5: 01_infrastructure.sh EXIT-trap interaction" "no stack at $API (HTTP $health_code)"
 else
   # The outer shell takes the real lock, then runs 01 as a standalone suite on
-  # its own scratch lock. 01 inspects the stack's containers through compose,
-  # which would otherwise name the project after whatever folder this is in.
-  held5=$(RAG_VERIFY_LOCK="$REAL_LOCK" RAG_API="$API" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-rag-docker}" \
+  # its own scratch lock, in the caller's (verify project) environment.
+  held5=$(RAG_VERIFY_LOCK="$REAL_LOCK" RAG_API="$API" COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" \
     bash -c '. "'"$VERIFY"'/lock.sh" 2>/dev/null
       echo held
       env -u RAG_VERIFY_LOCK_HELD RAG_VERIFY_LOCK="'"$L5"'" bash "'"$VERIFY"'/01_infrastructure.sh" >"'"$T5_OUT"'" 2>&1

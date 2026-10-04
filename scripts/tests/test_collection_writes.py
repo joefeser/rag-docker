@@ -116,7 +116,7 @@ class ImportCutoverTests(unittest.TestCase):
             if name=='OwnedImport':backend.remove(name);raise RuntimeError('Owned final insertion failed')
         module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
         module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');retained=job['error_detail']['recovered_as']
-        self.assertIn(retained,backend);self.assertTrue(Path(job['error_detail']['sidecar_snapshots']).is_dir())
+        self.assertIn(retained,backend);self.assertFalse(Path(job['error_detail']['sidecar_snapshots']).is_absolute());self.assertTrue((root/job['error_detail']['sidecar_snapshots']).is_dir())
         self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
 
 
@@ -182,8 +182,25 @@ class DeletedRecoveryTests(unittest.TestCase):
         sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
         gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
         with patch.object(sources,'delete',wraps=sources.delete) as cleanup:
-            self.assertEqual(self.wc._delete_collection_sync(name),3);self.assertEqual(cleanup.call_args_list,[call(name)])
+            self.assertEqual(self.wc._delete_collection_sync(name),3);self.assertEqual(cleanup.call_args_list,[call(name),call('ownedRecovery')])
         self.assertTrue(gs.get_session(sid)['orphaned']);self.assertFalse(sources.collection_dir(name).exists());self.assertIsNone(ingest_config.load(name));self.assertIsNone(retrieval_config.load(name))
+    def test_canonical_delete_cleans_historical_alias_sidecars_and_sessions(self):
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        canonical,alias,neighbor='OwnedRecovery','ownedRecovery','Ownedrecovery'
+        self.backend.add(neighbor);identities={alias:'gs_14000006',neighbor:'gs_14000007'}
+        for spelling,sid in identities.items():
+            sources.store(spelling,'owned.txt',b'Owned historical original')
+            ingest_config.save({'collection':spelling});retrieval_config.save({'collection':spelling})
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(sources,'delete',wraps=sources.delete) as originals:
+            self.assertEqual(self.wc._delete_collection_sync(canonical),3)
+            self.assertEqual(originals.call_args_list,[call(canonical),call(alias)])
+        self.assertFalse(sources.collection_dir(alias).exists())
+        self.assertIsNone(ingest_config.load(alias));self.assertIsNone(retrieval_config.load(alias))
+        self.assertTrue(gs.get_session(identities[alias]).get('orphaned',False))
+        self.assertTrue(sources.collection_dir(neighbor).exists());self.assertIsNotNone(ingest_config.load(neighbor))
+        self.assertFalse(gs.get_session(identities[neighbor]).get('orphaned',False))
     def test_failed_backend_delete_preserves_sidecars_and_current_session(self):
         from unittest.mock import patch
         from services import sources,ingest_config,retrieval_config,goldstandard as gs

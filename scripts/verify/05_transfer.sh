@@ -10,12 +10,15 @@ check "imported evaluation identity acceptance suite" $?
 bash ./14_reindex.sh
 check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
-EXPORTS="$REPO_ROOT/exports"
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
 
 section "Export, import and tuning"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
 check "evaluation import and generated-session regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
+check "retrieval import and generated-script trust-boundary regressions" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -76,6 +79,10 @@ import json,sys; d=json.load(sys.stdin)
 sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
 check "the corruption error names the offending file" $?
 rm -f "$EXPORTS/$CORRUPT"
+
+# Digest-valid malformed retrieval settings must fail before every conflict path.
+python3 ./retrieval_settings.py "$API" "$C" "$EXPORTS/$PKG"
+check "invalid retrieval imports preserve live collections and settings" $?
 
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
@@ -220,6 +227,12 @@ check_eq "rename imports alongside the original" "$istat" "completed"
 [ "$irenamed" = "True" ] && [ "$iname" != "$C" ]
 check "the renamed collection has a new name" $? "imported as $iname"
 check_eq "every chunk is imported" "$iwritten" "$chunks_before"
+api_get "/retrieval/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
+check "renamed import preserves every saved retrieval setting" $?
 
 # A successful destructive replace must be exercised as well as abort/rename.
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
@@ -423,8 +436,17 @@ sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
-  RP="${PREFIX}BatchRecovery"
+RP="${PREFIX}BatchRecovery"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "batch recovery across an API restart" 1 "$restart_refusal"
+elif ! [[ "$RP" =~ ^Vfy[A-Za-z0-9_]+$ ]]; then
+  # batch_recovery.py refuses any other prefix, as a guard on its destructive phases.
+  skip "batch recovery across an API restart" "batch_recovery.py accepts only Vfy… prefixes; RAG_TEST_PREFIX='$PREFIX' gives '$RP'"
+else
   (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
   check "batch faults fail truthfully and retain verified recovery" $? \
@@ -438,8 +460,6 @@ if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
   check "recovery acceptance fixtures are removed" $?
-else
-  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 rm -f "$EXPORTS/$PKG"

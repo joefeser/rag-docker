@@ -3,7 +3,8 @@ import ast,asyncio,json,os,subprocess,sys,tempfile,threading,unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
+api_dir=os.environ.get('RAG_TEST_API_DIR')
+sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
 # Loaded from the host script on stdin with its helper passed alongside it.
 source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE',str(Path(__file__).with_name('reindex.py'))))
 tree=ast.parse(source.read_text());assert isinstance(tree.body[-1],ast.Expr);tree.body.pop()
@@ -45,9 +46,10 @@ class LifecycleTests(unittest.TestCase):
         async def run(directory):
             async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),base_url='http://owned') as api:
                 await ns['collection_deletion_checks'](api,client,'OwnedVerifier',directory,check)
-        with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
+        from routers import collections as collections_router
+        with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(collections_router,'_REGISTRY_FILE',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
             asyncio.run(run(directory))
-        self.assertEqual(len(checks),10);self.assertEqual(set(backend),{'OwnedVerifierAliasDeleteNeighbor','OwnedVerifierCanonicalDeleteNeighbor'});self.assertEqual(len(created),4)
+        self.assertEqual(len(checks),12);self.assertEqual(set(backend),{'OwnedVerifierAliasDeleteNeighbor','OwnedVerifierCanonicalDeleteNeighbor'});self.assertEqual(len(created),4)
     def test_client_failure_still_cleans_temporary_directory(self):
         original_temp=tempfile.TemporaryDirectory;temps=[]
         def create(*args,**kwargs):result=original_temp(*args,**kwargs);temps.append(result.name);return result

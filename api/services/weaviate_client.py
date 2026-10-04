@@ -92,6 +92,7 @@ def _create_collection_sync(
     hnsw_config: dict,
     *,
     preserve_hnsw: bool = False,
+    description: str | None = None,
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
@@ -118,6 +119,8 @@ def _create_collection_sync(
 
     client.collections.create(
         name=name,
+        # Set only by import, to bind its in-progress marker to this instance.
+        description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
         properties=COLLECTION_PROPERTIES,
@@ -153,12 +156,11 @@ def _delete_collection_sync(name: str) -> int:
     collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
-    # Older writers saved sidecars under the accepted caller spelling. Only
-    # include that spelling when it is the same first-character backend alias;
-    # case-folding the whole name could delete another collection's data.
-    spellings = [canonical_name]
-    if name != canonical_name and collection_writes.canonical(name) == canonical_name:
-        spellings.append(name)
+    # Older writers saved sidecars under the first-character backend alias.
+    # The caller can use either spelling, so clean both after backend deletion.
+    # Other case changes can name distinct collections and must be preserved.
+    alias = canonical_name[:1].lower() + canonical_name[1:]
+    spellings = list(dict.fromkeys((canonical_name, alias)))
     for spelling in spellings:
         sources.delete(spelling)
         retrieval_config.delete(spelling)

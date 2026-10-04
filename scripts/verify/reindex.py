@@ -109,7 +109,7 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     paths=await asyncio.to_thread(lambda:list(tuning.collection_recovery._root().glob('*.json')));assert len(paths)==1
     owner=await asyncio.to_thread(lambda:json.loads(paths[0].read_text()))
     check(owner['state']=='recovery' and owner['target']==collection and owner['staging']==stage,'durable recovery ownership binds the original and retained copy')
-    snapshot=Path(result['error_detail']['sidecar_snapshots'])/'goldstandard'/(sid+'.json')
+    snapshot=Path(settings.upload_dir)/result['error_detail']['sidecar_snapshots']/'goldstandard'/(sid+'.json')
     check(await asyncio.to_thread(snapshot.read_bytes)==session_bytes,'pre-cutover evaluation snapshot is retained byte-identically')
     check(await asyncio.to_thread(lambda:gs.get_session(sid).get('stale')),'failed cutover marks its retained evaluation historical')
     await asyncio.to_thread(wc._sweep_staging_sync)
@@ -171,12 +171,13 @@ async def collection_deletion_checks(api,client,name,temp,check):
     # Exercise both aliases on the Linux volume, with separate physical paths.
     for use_alias in (True,False):
         canonical=name+('AliasDelete' if use_alias else 'CanonicalDelete')
-        caller=canonical[:1].lower()+canonical[1:] if use_alias else canonical
+        alias=canonical[:1].lower()+canonical[1:]
+        caller=alias if use_alias else canonical
         neighbor=canonical+'Neighbor'
         for collection in (canonical,neighbor):
             await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
             await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
-        identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in dict.fromkeys((canonical,caller,neighbor))}
+        identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in (canonical,alias,neighbor)}
         for spelling,sid in identities.items():
             await asyncio.to_thread(sources.store,spelling,'owned.txt',b'Owned deletion original')
             await asyncio.to_thread(ingest_config.save,{'collection':spelling})
@@ -184,7 +185,7 @@ async def collection_deletion_checks(api,client,name,temp,check):
             await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
         response=await api.delete('/collections/'+caller)
         check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
-        for spelling in dict.fromkeys((canonical,caller)):
+        for spelling in (canonical,alias):
             check(await asyncio.to_thread(lambda:not sources.collection_dir(spelling).exists() and not (Path(temp)/'ingest_configs'/(spelling+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(spelling+'.json')).exists()),'deletion cleans exact source/ingest/retrieval spelling '+spelling)
             check(await asyncio.to_thread(lambda:gs.get_session(identities[spelling])['orphaned'] and json.loads(gs._session_path(identities[spelling]).read_text())['orphaned']),'deletion persists orphan status for '+spelling)
         check(await asyncio.to_thread(lambda:client.collections.exists(neighbor) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves unrelated collection sidecars and current session')

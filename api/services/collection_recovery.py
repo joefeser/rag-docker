@@ -127,6 +127,19 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     record.update(updated)
 
 
+def sidecar_reference(record: dict) -> str:
+    """The snapshot directory relative to UPLOAD_DIR, for job error details.
+
+    Job results are served without authentication, so the absolute path stays
+    in the server log.
+    """
+    metadata = _root() / record["operation_id"]
+    log.warning("Recovery collection %r keeps sidecar snapshots in %s", record["staging"], metadata)
+    # Built, not derived with relative_to: the root needn't resolve under
+    # UPLOAD_DIR (a symlinked mount, or the reindex verifier's own root).
+    return "collection_operations/" + record["operation_id"]
+
+
 def discard(record: dict, client) -> None:
     """Delete an owned copy after success, or scratch while the target is safe."""
     # Persist intent before the first deletion. Startup can finish this exact
