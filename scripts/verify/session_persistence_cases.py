@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock,MagicMock,patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 import httpx
 from config import settings
 from main import app
@@ -15,7 +15,7 @@ def fixture():
     return {'session_id':'gs_450abcde','collection':'OwnedPersistence','status':'completed','pairs_total':2,'pairs_completed':2,'pairs':[{'pair_id':'p_'+str(i),'question':'Original','answer':'Original','contexts':['Inert'],'ground_truth':'Original','source_file':'inert.txt','chunk_index':i,'status':'pending'} for i in range(2)]}
 
 def child_env():
-    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
 
 def client():
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
@@ -152,7 +152,7 @@ def stopped(src,dst):
 gs.os.replace=stopped
 asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
 """
-        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
         child=subprocess.Popen([sys.executable,'-c',code,self.tmp.name,str(marker)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
             deadline=time.monotonic()+5

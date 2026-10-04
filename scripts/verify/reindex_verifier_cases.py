@@ -6,7 +6,7 @@ from unittest.mock import patch
 api_dir=os.environ.get('RAG_TEST_API_DIR')
 sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
 # Loaded from the host script on stdin with its helper passed alongside it.
-source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE',str(Path(__file__).with_name('reindex.py'))))
+source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE') or str(Path(__file__).with_name('reindex.py')))
 tree=ast.parse(source.read_text());assert isinstance(tree.body[-1],ast.Expr);tree.body.pop()
 ns={'__file__':str(source),'__name__':'owned_verifier'};exec(compile(tree,str(source),'exec'),ns)
 
@@ -48,7 +48,7 @@ class LifecycleTests(unittest.TestCase):
             root=Path(directory);fixture=root/'collections.json';fixture.write_text(json.dumps({'collections':[{'name':name} for name in [owned,probe,parent]]}))
             receipt=ns['preserve_receipt'](directory,[owned,probe],[('tuning','owned-job','running')]);data=json.loads(Path(receipt).read_text())
             self.assertEqual(data['created_collections'],[owned,probe]);self.assertEqual(data['pending_jobs'],[['tuning','owned-job','running']])
-            lib=Path(os.environ.get('RAG_VERIFIER_LIB',str(source.with_name('lib.sh'))))
+            lib=Path(os.environ.get('RAG_VERIFIER_LIB') or str(source.with_name('lib.sh')))
             code='source "$1"; PREFIX="$2"; REPO_ROOT="$3"; api_get(){ cat "$4"; }; drop_collection(){ printf "%s\\n" "$1"; }; cleanup_prefixed'
             # api_get's function arguments differ from the script's, so retain
             # the controlled input path in a distinct variable before defining it.

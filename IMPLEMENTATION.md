@@ -14646,7 +14646,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock,MagicMock,patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 import httpx
 from config import settings
 from main import app
@@ -14657,7 +14657,7 @@ def fixture():
     return {'session_id':'gs_450abcde','collection':'OwnedPersistence','status':'completed','pairs_total':2,'pairs_completed':2,'pairs':[{'pair_id':'p_'+str(i),'question':'Original','answer':'Original','contexts':['Inert'],'ground_truth':'Original','source_file':'inert.txt','chunk_index':i,'status':'pending'} for i in range(2)]}
 
 def child_env():
-    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
 
 def client():
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
@@ -14794,7 +14794,7 @@ def stopped(src,dst):
 gs.os.replace=stopped
 asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
 """
-        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
         child=subprocess.Popen([sys.executable,'-c',code,self.tmp.name,str(marker)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
             deadline=time.monotonic()+5
@@ -15301,7 +15301,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
 from config import settings
 from services import goldstandard as gs,importer
 
@@ -15733,7 +15733,7 @@ import copy, math, os, sys, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 from services import tuning
 validate_vectorizer = tuning.wc._validate_reindex_vectorizer_sync
 
@@ -16342,7 +16342,7 @@ def serialized(argument):
 import os,sys,threading,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
 from services import collection_writes as writes
 
 class WriterTests(unittest.TestCase):
@@ -16523,7 +16523,7 @@ from unittest.mock import patch
 api_dir=os.environ.get('RAG_TEST_API_DIR')
 sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
 # Loaded from the host script on stdin with its helper passed alongside it.
-source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE',str(Path(__file__).with_name('reindex.py'))))
+source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE') or str(Path(__file__).with_name('reindex.py')))
 tree=ast.parse(source.read_text());assert isinstance(tree.body[-1],ast.Expr);tree.body.pop()
 ns={'__file__':str(source),'__name__':'owned_verifier'};exec(compile(tree,str(source),'exec'),ns)
 
@@ -16565,7 +16565,7 @@ class LifecycleTests(unittest.TestCase):
             root=Path(directory);fixture=root/'collections.json';fixture.write_text(json.dumps({'collections':[{'name':name} for name in [owned,probe,parent]]}))
             receipt=ns['preserve_receipt'](directory,[owned,probe],[('tuning','owned-job','running')]);data=json.loads(Path(receipt).read_text())
             self.assertEqual(data['created_collections'],[owned,probe]);self.assertEqual(data['pending_jobs'],[['tuning','owned-job','running']])
-            lib=Path(os.environ.get('RAG_VERIFIER_LIB',str(source.with_name('lib.sh'))))
+            lib=Path(os.environ.get('RAG_VERIFIER_LIB') or str(source.with_name('lib.sh')))
             code='source "$1"; PREFIX="$2"; REPO_ROOT="$3"; api_get(){ cat "$4"; }; drop_collection(){ printf "%s\\n" "$1"; }; cleanup_prefixed'
             # api_get's function arguments differ from the script's, so retain
             # the controlled input path in a distinct variable before defining it.

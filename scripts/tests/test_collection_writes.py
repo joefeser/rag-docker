@@ -2,7 +2,7 @@
 import os,sys,threading,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
 from services import collection_writes as writes
 
 class WriterTests(unittest.TestCase):
