@@ -26,7 +26,8 @@ ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
 MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
-SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
+SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
+SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
 OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
 
 
@@ -126,6 +127,9 @@ class IngestConfigResponse(BaseModel):
 
 # ── Retrieval config ──────────────────────────────────────────────────────────
 
+# These bounds apply to saves. A saved or packaged ef that is an integer outside
+# SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
+# export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
     collection: str
     retrieval_mode: RetrievalMode = "hnsw"
