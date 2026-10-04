@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from services import batch_write, collection_recovery as recovery, importer, tuning, weaviate_client as wc
 

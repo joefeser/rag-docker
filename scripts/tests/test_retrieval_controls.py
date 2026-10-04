@@ -16,6 +16,12 @@ sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
 from config import settings
 from services import weaviate_client as wc,rag_pipeline as rag,retrieval_config as saved
 from weaviate.classes.config import VectorDistances
+NEEDS_REPOSITORY='needs the whole repository mounted (see scripts/verify/README.md)'
+
+def repository_root():
+    parents=Path(__file__).resolve().parents
+    root=parents[2] if len(parents)>2 else None
+    return root if root is not None and (root/'IMPLEMENTATION.md').is_file() else None
 
 class ReportingTests(unittest.TestCase):
     def test_unrecognized_index_does_not_break_collection_listing(self):
@@ -104,6 +110,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
 class TargetTests(unittest.TestCase):
     def test_in_container_target_cannot_silently_select_another_stack(self):
+        if repository_root() is None:self.skipTest(NEEDS_REPOSITORY)
         spec=importlib.util.spec_from_file_location('compose_target',Path(__file__).resolve().parents[1]/'verify/compose_target.py')
         module=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -117,6 +124,10 @@ class TargetTests(unittest.TestCase):
 
 class VerifierCleanupTests(unittest.TestCase):
     """The live verifier's cleanup, run against a fake API and backend."""
+
+    def setUp(self):
+        if repository_root() is None:
+            self.skipTest(NEEDS_REPOSITORY)
 
     def run_verifier(self, fail_query_on=None, fail_delete_on=None, raise_delete_on=None, fail_discard=False):
         created, deleted, saved_configs = {}, [], {}
@@ -242,7 +253,8 @@ class VerifierCleanupTests(unittest.TestCase):
 
 class DocumentationTests(unittest.TestCase):
     def test_changed_embedded_sources_match_runtime(self):
-        root=Path(__file__).resolve().parents[2]
+        root=repository_root()
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
         text=(root/'IMPLEMENTATION.md').read_text()
         for name in ('api/models/schemas.py','api/routers/collections.py','api/services/weaviate_client.py','ui/src/api/client.ts','ui/src/pages/RetrievalPage.tsx','ui/src/pages/QAPage.tsx','scripts/verify/03_query.sh','scripts/verify/11_retrieval.sh','scripts/verify/retrieval_controls.py','scripts/verify/README.md','scripts/verify/compose_target.py','scripts/verify/browser/ui_criteria.js'):
             lang='typescript' if name.endswith(('.ts','.tsx')) else 'bash' if name.endswith('.sh') else 'markdown' if name.endswith('.md') else 'javascript' if name.endswith('.js') else 'python'

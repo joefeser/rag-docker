@@ -11,11 +11,19 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
 from fastapi.testclient import TestClient
 from main import app
 from models.schemas import GenerateRequest
 from services import chunk_sampling as sample, goldstandard as gs, weaviate_client as wc
+
+NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
+
+
+def repository_root():
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else None
+    return root if root is not None and (root / 'IMPLEMENTATION.md').is_file() else None
 
 
 def objects(count=20):
@@ -205,7 +213,8 @@ class RequestTests(unittest.TestCase):
 
 class VerificationBoundaryTests(unittest.TestCase):
     def test_failed_backend_creation_still_cleans_owned_custom_prefix(self):
-        root=Path(__file__).resolve().parents[2];exists=False;names=[]
+        root=repository_root();exists=False;names=[]
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
         def create(name,*args):
             nonlocal exists
             names.append(name);exists=True
@@ -225,7 +234,8 @@ class VerificationBoundaryTests(unittest.TestCase):
             self.assertFalse(exists)
 
     def test_parked_mcp_function_validates_before_api_call(self):
-        root=Path(__file__).resolve().parents[2]
+        root=repository_root()
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
         source=ast.parse((root/'mcp/tools/goldstandard.py').read_text())
         function=next(node for node in source.body if isinstance(node,ast.AsyncFunctionDef) and node.name=='rag_generate_goldstandard')
         function.decorator_list=[]
@@ -242,7 +252,8 @@ class VerificationBoundaryTests(unittest.TestCase):
 
 class ImplementationTests(unittest.TestCase):
     def test_changed_embedded_sources_match_runtime(self):
-        root=Path(__file__).resolve().parents[2]
+        root=repository_root()
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
         text=(root/'IMPLEMENTATION.md').read_text()
         names=('api/main.py','api/models/schemas.py','api/services/weaviate_client.py',
                'api/services/goldstandard.py','api/services/chunk_sampling.py',
