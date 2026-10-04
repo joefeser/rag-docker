@@ -273,11 +273,20 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
       "object_count": 1842,
       "index_type": "hnsw",
       "distance_metric": "cosine",
+      "hnsw_config": {
+        "ef": 64,
+        "efConstruction": 128,
+        "maxConnections": 64
+      },
       "created_at": "2026-09-10T14:23:00Z"
     }
   ]
 }
 ```
+
+`index_type`: `"hnsw"`, `"flat"`, `"dynamic"`, or `"unknown"` when the collection has no recognized vector index configuration (for example, named vectors).  
+`distance_metric`: `"cosine"`, `"dot"`, `"l2-squared"`, or `"unknown"` when the distance is unavailable.  
+`hnsw_config`: the actual HNSW settings `{ef, efConstruction, maxConnections}` when `index_type` is `"hnsw"`; `null` otherwise.
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
@@ -382,8 +391,8 @@ values are not numeric settings. Strategies must be one of the documented five.
 Ignored overlap settings remain ignored for fixed/context-aware/semantic; the
 context-aware fallback uses language splitting with zero overlap.
 
-Invalid multipart settings return **422 `INVALID_SETTINGS` before collection
-lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
+Invalid multipart settings, including values that aren't numbers, return **422
+`INVALID_SETTINGS` before collection lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
 sanitized field errors in `error.detail`. Raw input/error-context values are omitted from validation replies
 so non-finite input also produces a serializable 422. Defaults remain unchanged.
 
@@ -502,7 +511,6 @@ POST /query
 | `collection` | string | required | Weaviate collection to query |
 | `retrieval_mode` | string | `"hnsw"` | One of: `"hnsw"`, `"flat"`, `"hybrid"`, `"semantic"` |
 | `top_k` | int | 5 | Number of chunks to retrieve |
-
 | `alpha` | float | 0.75 | Hybrid mode only: 0.0 = pure BM25, 1.0 = pure vector |
 | `include_citations` | bool | false | Whether to return source document citations |
 | `response_format` | string | `"end_user"` | `"end_user"` (plain language) or `"engineer"` (verbose, with chunk details) |
@@ -1118,8 +1126,12 @@ ingest default.
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured.
 
-Each rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failure leaves the original untouched. Vectors are copied out of
+Each rebuild is staged into a temporary collection and verified before the
+original is deleted, so a failure before replacement leaves the original
+untouched. Weaviate has no atomic swap: once replacement starts, a failure can
+leave the original name missing or partial. A verified recovery copy and its
+sidecars are then kept across restarts and named in the job error
+(`RAG_EXPORT_SPECIFICATIONS.md` §7.4). Vectors are copied out of
 the staging collection rather than regenerated, so the corpus is embedded once.
 
 Any operation that changes chunk identity marks the collection's gold-standard
@@ -1873,7 +1885,7 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
-      *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K1/50 save payloads, initial/refresh failures and late initial responses. Suite11 (called by03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows72/160/32 backend settings, labels saved ef96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
+      *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
 
 ### 10.3 Gold Standard
 

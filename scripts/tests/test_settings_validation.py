@@ -8,7 +8,8 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+api_dir = os.environ.get('RAG_TEST_API_DIR')
+sys.path.insert(0, api_dir or str(Path(__file__).resolve().parents[2] / 'api'))
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from config import settings
@@ -16,6 +17,8 @@ from main import app
 from models.schemas import CreateCollectionRequest, HnswConfig, IngestConfig, QueryRequest, RechunkRequest, ReembedRequest, SaveRetrievalConfigBody
 from routers import collections, ingest, tuning as tuning_router, query, retrieval_config as retrieval_router
 from services import weaviate_client as wc, chunker, rag_pipeline, ingest_config, retrieval_config, ingest_pipeline, packager
+
+OVERLAP_RULE = 'chunk_overlap must be smaller than chunk_size for overlap/language'
 
 
 class SettingsTests(unittest.TestCase):
@@ -80,6 +83,35 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(response.status_code, 422, response.text)
             self.exists.assert_not_called(); self.ingest_job.assert_not_called()
             self.assertEqual(list(Path(self.temp).iterdir()), [])
+
+    def test_multipart_non_numeric_settings_are_invalid_settings(self):
+        # #108: these used to fail form parsing first, as INVALID_PARAMETER.
+        for update in ({'chunk_size': 'abc'}, {'chunk_size': '1.5'}, {'chunk_overlap': 'abc'},
+                       {'min_chunk_size': 'abc'}, {'similarity_threshold': 'abc'}):
+            with self.subTest(update=update):
+                self.exists.reset_mock(); self.ingest_job.reset_mock()
+                response = self.client.post('/ingest/upload', data={'collection': 'ReviewSettings', **update}, files={'files': ('source.txt', b'inert synthetic text')})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()['error']['code'], 'INVALID_SETTINGS')
+                self.exists.assert_not_called(); self.ingest_job.assert_not_called()
+                self.assertEqual(list(Path(self.temp).iterdir()), [])
+
+    def test_valid_multipart_values_reach_job_as_numbers(self):
+        data = {'collection': 'ReviewSettings', 'chunk_size': '800', 'chunk_overlap': '100', 'similarity_threshold': '0.5', 'min_chunk_size': '50'}
+        response = self.client.post('/ingest/upload', data=data, files={'files': ('source.txt', b'inert synthetic text')})
+        self.assertEqual(response.status_code, 202, response.text)
+        kwargs = self.ingest_job.call_args.kwargs
+        self.assertEqual([(kwargs[k], type(kwargs[k])) for k in ('chunk_size', 'chunk_overlap', 'similarity_threshold', 'min_chunk_size')],
+                         [(800, int), (100, int), (0.5, float), (50, int)])
+
+    def test_tuning_relationship_reply_is_the_fixed_message(self):
+        for route in ('/tune/rechunk', '/tune/reembed'):
+            with self.subTest(route=route):
+                response = self.client.post(route, json={'collection': 'ReviewSettings', 'chunk_size': 100, 'chunk_overlap': 500})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()['error']['code'], 'INVALID_PARAMETER')
+                self.assertEqual(response.json()['error']['detail'], [{'type': 'value_error', 'loc': ['body'], 'msg': 'Value error, ' + OVERLAP_RULE}])
+                self.tune_job.assert_not_called()
 
     def test_nonfinite_json_is_a_serializable_422(self):
         for token in ('NaN', 'Infinity', '-Infinity'):
@@ -193,6 +225,17 @@ class InternalBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValidationError): wc._create_collection_sync('ReviewSettings', index, distance, config)
                 client.assert_not_called()
 
+    def test_tuning_relationship_error_is_a_plain_value_error(self):
+        # #108: a nested ValidationError carried the inner model's input and text.
+        for model in (RechunkRequest, ReembedRequest):
+            with self.subTest(model=model.__name__):
+                with self.assertRaises(ValidationError) as caught: model(collection='ReviewSettings', chunk_size=100, chunk_overlap=500)
+                errors = caught.exception.errors()
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]['input']['collection'], 'ReviewSettings')
+                self.assertIs(type(errors[0]['ctx']['error']), ValueError)
+                self.assertEqual(str(errors[0]['ctx']['error']), OVERLAP_RULE)
+
     def test_stored_hnsw_settings_are_preserved_while_new_requests_remain_strict(self):
         legacy={'efConstruction':1000,'maxConnections':256,'ef':-1}
         with self.assertRaises(ValidationError):
@@ -219,7 +262,7 @@ class InternalBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(wc,'_create_collection_sync') as create:
             pkg=Path(directory);(pkg/'collection.json').write_text(json.dumps({'hnsw_config':legacy}))
             importer._create_from_package('ReviewStored',pkg)
-            create.assert_called_once_with('ReviewStored','hnsw','cosine',legacy,preserve_hnsw=True)
+            create.assert_called_once_with('ReviewStored','hnsw','cosine',legacy,preserve_hnsw=True,description=None)
 
     def test_rebuild_preserves_stored_hnsw_for_staging_and_replacement(self):
         from services import tuning
@@ -269,7 +312,10 @@ class InternalBoundaryTests(unittest.TestCase):
 
 class ImplementationTests(unittest.TestCase):
     def test_embedded_changed_sources_match_runtime(self):
-        root = Path(__file__).resolve().parents[2]
+        parents = Path(__file__).resolve().parents
+        root = parents[2] if len(parents) > 2 else None
+        if root is None or not (root / 'IMPLEMENTATION.md').is_file():
+            self.skipTest('needs the whole repository mounted (see scripts/verify/README.md)')
         text = (root / 'IMPLEMENTATION.md').read_text()
         names = ['api/models/schemas.py', 'api/main.py', 'api/routers/ingest.py',
                  'api/services/chunker.py', 'api/services/ingest_pipeline.py',
