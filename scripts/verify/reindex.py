@@ -109,7 +109,7 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     paths=await asyncio.to_thread(lambda:list(tuning.collection_recovery._root().glob('*.json')));assert len(paths)==1
     owner=await asyncio.to_thread(lambda:json.loads(paths[0].read_text()))
     check(owner['state']=='recovery' and owner['target']==collection and owner['staging']==stage,'durable recovery ownership binds the original and retained copy')
-    snapshot=Path(result['error_detail']['sidecar_snapshots'])/'goldstandard'/(sid+'.json')
+    snapshot=Path(settings.upload_dir)/result['error_detail']['sidecar_snapshots']/'goldstandard'/(sid+'.json')
     check(await asyncio.to_thread(snapshot.read_bytes)==session_bytes,'pre-cutover evaluation snapshot is retained byte-identically')
     check(await asyncio.to_thread(lambda:gs.get_session(sid).get('stale')),'failed cutover marks its retained evaluation historical')
     await asyncio.to_thread(wc._sweep_staging_sync)

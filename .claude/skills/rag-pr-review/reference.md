@@ -123,11 +123,11 @@ An evaluation never builds, starts, stops or recreates the live `rag-docker` sta
    ```bash
    main=$(git worktree list --porcelain | awk 'NR==1 {print $2}')
    git -C "$main" fetch -q origin develop
-   git -C "$main" diff --quiet origin/develop -- scripts/verify/stack.sh scripts/verify/lock.sh docker-compose.verify.yml
+   git -C "$main" diff --quiet origin/develop -- scripts/verify/stack.sh scripts/verify/lock.sh docker-compose.verify.yml docker-compose.yml || { echo "STOP: the harness isn't develop's"; exit 1; }
    ```
 
-   A non-zero exit means it isn't: stop, run nothing, and tell the user.
-2. **The configuration check.** Before building anything, `stack.sh up` checks the checkout's resolved compose configuration. It refuses a volume other than the project's own or the model copy, a `rag-docker-*` image, any published port other than the proxy on loopback at the verify port, a bind outside the checkout or the exports folder, and a Docker socket mount; nothing is then built or started. The refusal fails the check that ran it.
+   The main checkout's `docker-compose.yml` is checked because `stack.sh` takes the image that copies the models from it; the checkout under test's own `docker-compose.yml` is still the one that gets built. A non-zero exit means the harness isn't `develop`'s: it ends that shell, so nothing after it runs. Stop the evaluation, run nothing, and tell the user.
+2. **The configuration check.** Before building anything, `stack.sh up` checks the checkout's resolved compose configuration against an allow-list of what the base file and the overlay need (#154). It refuses any other top-level or service key (such as `volumes_from`, `network_mode`, `privileged`, `secrets`); a build with options other than a context and Dockerfile inside the checkout, or one that would write a tag other than `rag-verify-<service>`; a `rag-docker-*` image under any registry name; a network or volume other than the project's own or the model copy; any published port other than the proxy on loopback at the verify port; a mount other than a volume or a read-only bind from inside the checkout (never its `exports` folder), apart from the api's own exports folder; and a Docker socket mount. Nothing is then built or started. The refusal fails the check that ran it. It can't see `env_file`, which compose merges into the environment.
 3. **Tear it down.** `stack.sh run` tears the project down itself; after `stack.sh up`, run `bash "$main/scripts/verify/stack.sh" down`. It removes the project's containers, network, volumes, images and exports folder, keeps the model copy, and prints `verify project rag-verify removed` only when nothing is left. Confirm that both of these print nothing:
 
    ```bash

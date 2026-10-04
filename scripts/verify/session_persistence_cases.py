@@ -14,11 +14,18 @@ from services import goldstandard as gs
 def fixture():
     return {'session_id':'gs_450abcde','collection':'OwnedPersistence','status':'completed','pairs_total':2,'pairs_completed':2,'pairs':[{'pair_id':'p_'+str(i),'question':'Original','answer':'Original','contexts':['Inert'],'ground_truth':'Original','source_file':'inert.txt','chunk_index':i,'status':'pending'} for i in range(2)]}
 
+def child_env():
+    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+
+def client():
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
+
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         patches=[(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{})]
         if hasattr(gs,'_diagnostics'):patches.append((gs,'_diagnostics',{}))
+        if hasattr(gs,'_scan_cache'):patches.append((gs,'_scan_cache',{}))
         for obj,key,value in patches:
             change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
         self.data=fixture();gs.store_session(self.data)
@@ -408,6 +415,163 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         self.assertEqual(build.call_count,2);self.assertEqual(job['status'],'completed')
         self.assertIn('inspect session recovery diagnostics',job['notes'][0]);self.assertNotIn('marked orphaned',job['notes'][0])
         self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    # #127 follow-ups.
+    def pending(self):
+        return Path(self.tmp.name)/'goldstandard_sessions'/'pending_markers'/(self.data['session_id']+'.json')
+
+    def fail_session_file_replace(self):
+        path=gs._session_path(self.data['session_id']);original=gs.os.replace
+        def replace(src,dst):
+            if Path(dst)==path:raise OSError('Owned session-file marker fault')
+            return original(src,dst)
+        return patch.object(gs.os,'replace',side_effect=replace)
+
+    def test_session_poll_does_not_block_event_loop_during_slow_commit(self):
+        async def run():
+            inside=threading.Event();real_fsync=os.fsync
+            def slow_fsync(fd):
+                inside.set();time.sleep(1.5);return real_fsync(fd)
+            with patch.object(gs.os,'fsync',side_effect=slow_fsync):
+                writer=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'status':'edited','answer':'Slow commit'}))
+                self.assertTrue(await asyncio.to_thread(inside.wait,5))
+                gaps=[]
+                async def ticker():
+                    last=time.monotonic()
+                    for _ in range(30):
+                        await asyncio.sleep(0.02);now=time.monotonic();gaps.append(now-last);last=now
+                tick=asyncio.create_task(ticker());await asyncio.sleep(0.05)
+                async with client() as c:response=await c.get('/goldstandard/session/'+self.data['session_id'])
+                await tick;await writer
+            self.assertEqual(response.status_code,200)
+            self.assertLess(max(gaps),0.5,'event loop stalled %.2fs while a poll waited for the writer lock'%max(gaps))
+        asyncio.run(run())
+
+    def test_failed_marker_survives_restart_and_refuses_current_export(self):
+        first="""import sys
+from unittest.mock import patch
+from config import settings
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
+    gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+"""
+        second="""import sys,asyncio,json,httpx
+from config import settings
+from main import app
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+async def run():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as c:
+        r=await c.post('/goldstandard/save',json={'session_id':'gs_450abcde','filename':'owned-restart.json'})
+        return r.status_code,r.json()
+print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_diagnostics()}))
+"""
+        one=subprocess.run([sys.executable,'-c',first,self.tmp.name],env=child_env(),capture_output=True,text=True,timeout=60)
+        self.assertEqual(one.returncode,0,one.stderr[-2000:])
+        two=subprocess.run([sys.executable,'-c',second,self.tmp.name],env=child_env(),capture_output=True,text=True,timeout=60)
+        self.assertEqual(two.returncode,0,two.stderr[-2000:])
+        observed=json.loads(two.stdout.strip().splitlines()[-1])
+        self.assertEqual(observed['export'][0],409,observed)
+        self.assertEqual(observed['export'][1]['error']['code'],'HISTORICAL_SESSION')
+        issues=[i for i in observed['diagnostics'] if i['filename']=='gs_450abcde.json']
+        self.assertEqual([i['code'] for i in issues],['SESSION_WRITE_FAILED'],observed['diagnostics'])
+        self.assertIn('pending marker',issues[0]['message'])
+
+    def test_failed_marker_is_applied_to_package_snapshots(self):
+        with self.fail_session_file_replace():
+            self.assertEqual(gs.mark_stale('OwnedPersistence','Owned rebuild'),0)
+        self.assertNotIn('stale',json.loads(gs._session_path(self.data['session_id']).read_text()))
+        exported=[s for s in gs._sessions_on_disk() if s['session_id']==self.data['session_id']]
+        self.assertTrue(exported[0].get('stale'));self.assertEqual(exported[0]['stale_reason'],'Owned rebuild')
+        self.assertNotIn('stale',json.loads(gs._session_path(self.data['session_id']).read_text()))
+
+    def test_next_successful_write_persists_marker_and_removes_pending_file(self):
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertTrue(self.pending().is_file())
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}))
+        self.assertTrue(json.loads(gs._session_path(self.data['session_id']).read_text())['orphaned'])
+        self.assertFalse(self.pending().exists());self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_both_failed_markers_are_kept_pending(self):
+        with self.fail_session_file_replace():
+            gs.mark_stale('OwnedPersistence','Owned rebuild');gs.mark_orphaned('OwnedPersistence','Owned deletion')
+        state=self.restart();self.assertTrue(state['stale']);self.assertTrue(state['orphaned'])
+        self.assertEqual((state['stale_reason'],state['orphaned_reason']),('Owned rebuild','Owned deletion'))
+
+    def test_unreadable_pending_marker_is_preserved_and_reported(self):
+        self.pending().parent.mkdir();self.pending().write_text('{')
+        state=self.restart();self.assertFalse(state.get('orphaned'))
+        self.assertEqual([(i['filename'],i['code']) for i in gs.session_diagnostics()],[('pending_markers/gs_450abcde.json','SESSION_READ_FAILED')])
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}));self.assertEqual(self.pending().read_text(),'{')
+
+    def test_pending_marker_write_failure_keeps_guard_until_restart(self):
+        with patch.object(gs.os,'replace',side_effect=OSError('Owned storage fault')):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        self.assertFalse(self.pending().exists())
+        with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.save_session(self.data['session_id'],'owned.json'))
+        self.assertEqual(error.exception.code,'HISTORICAL_SESSION')
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_WRITE_FAILED');self.assertIn('until restart',issue['message'])
+
+    def test_unknown_persistence_error_does_not_fail_writes_or_markers(self):
+        for value in ({'code':'BOGUS','message':'Owned'},'Owned text'):
+            with self.subTest(value=value):
+                data=fixture();data['persistence_error']=value;gs.store_session(data)
+                self.assertEqual(gs.session_diagnostics(),[])
+                self.assertEqual(asyncio.run(gs.update_pair(data['session_id'],'p_0',{'answer':'Edit'}))['answer'],'Edit')
+                self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned deletion'),1)
+
+    def test_import_restore_strips_persistence_error(self):
+        from services import importer
+        source=fixture();source.update(session_id='gs_450abcd9',errors=['Owned kept reason'],persistence_error={'code':'SESSION_WRITE_FAILED','message':'Owned source failure'})
+        pkg=Path(self.tmp.name)/'owned-package';pkg.mkdir();restored=[]
+        importer._restore_sidecars('OwnedPersistence',pkg,'OwnedPersistence',[source],restored)
+        stored=gs.get_session(restored[0]['session_id'])
+        self.assertNotIn('persistence_error',stored);self.assertEqual(stored['errors'],['Owned kept reason'])
+        self.assertNotIn('persistence_error',json.loads(gs._session_path(stored['session_id']).read_text()))
+        self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_nonregular_session_destination_is_typed_write_failure(self):
+        path=gs._session_path(self.data['session_id']);path.unlink();path.mkdir()
+        async def run():
+            async with client() as c:
+                return await c.patch('/goldstandard/session/'+self.data['session_id']+'/pair/p_0',json={'status':'edited','answer':'Refused'})
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code,503,response.text);self.assertEqual(response.json()['error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+
+    def test_cached_read_failure_uses_one_absolute_diagnostic_key(self):
+        sid='gs_450bad05';(gs._sessions_dir()/(sid+'.json')).write_text('{')
+        gs._sessions[sid]={'session_id':sid,'collection':'OwnedPersistence'}
+        self.assertEqual(len(gs.sessions_for('OwnedPersistence')),1)
+        self.assertTrue(all(Path(key).is_absolute() for key in gs._diagnostics),list(gs._diagnostics))
+        names=[i['filename'] for i in gs.session_diagnostics()]
+        self.assertEqual(names,[sid+'.json'])
+
+    def test_marker_failure_wording_differs_from_edit_failure(self):
+        with self.fail_session_file_replace():
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Rejected'}))
+            self.assertIn('previous snapshot remains authoritative',gs.session_diagnostics()[0]['message'])
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_WRITE_FAILED')
+        self.assertIn('pending marker',issue['message']);self.assertNotIn('previous snapshot remains authoritative',issue['message'])
+
+    def test_scan_cache_skips_unchanged_and_reflects_changes(self):
+        path=gs._session_path(self.data['session_id']);original=Path.read_text;reads=[]
+        def read(p,*args,**kwargs):
+            if p==path:reads.append(1)
+            return original(p,*args,**kwargs)
+        with patch.object(Path,'read_text',read):
+            gs.session_diagnostics();reads.clear()
+            gs.session_diagnostics();self.assertEqual(reads,[],'an unchanged session file was read again')
+            changed=fixture();changed['pairs'][0]['answer']='Changed';gs.store_session(changed)
+            gs._sessions={};gs.load_sessions_from_disk();self.assertEqual(len(reads),1)
+            self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Changed')
+        bad=gs._sessions_dir()/'gs_450bad00.json';bad.write_text('{')
+        self.assertEqual(len(gs.session_diagnostics()),1);bad.unlink();self.assertEqual(gs.session_diagnostics(),[])
 
 if __name__ == '__main__':
     unittest.main()

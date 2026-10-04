@@ -262,7 +262,7 @@ class InternalBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(wc,'_create_collection_sync') as create:
             pkg=Path(directory);(pkg/'collection.json').write_text(json.dumps({'hnsw_config':legacy}))
             importer._create_from_package('ReviewStored',pkg)
-            create.assert_called_once_with('ReviewStored','hnsw','cosine',legacy,preserve_hnsw=True)
+            create.assert_called_once_with('ReviewStored','hnsw','cosine',legacy,preserve_hnsw=True,description=None)
 
     def test_rebuild_preserves_stored_hnsw_for_staging_and_replacement(self):
         from services import tuning
