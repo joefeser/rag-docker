@@ -22,7 +22,7 @@ documentation improvements are all welcome.
 
    ```bash
    bash scripts/verify/stack.sh run                  # everything, ~20 min plus start-up
-   RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skip LLM work, ~3 min plus start-up
+   RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skip LLM work, ~8 min, start-up included
    ```
 
    The suite exits non-zero if any check fails. See

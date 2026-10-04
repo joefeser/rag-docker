@@ -130,32 +130,49 @@ Do this yourself, after **all** specialists have returned. It proves the evaluat
 
 It runs code, so the same rule as testing applies: for a cross-repository PR, only after security has no High findings and the user has said yes. If it can't run, record `Build: not run (<reason>)`.
 
-First reset the merged worktree to the evaluated commit (`git -C <bundle>/merged checkout -- . && git -C <bundle>/merged clean -fdq -e node_modules`), because the testing reviewer may have left test edits there. Then check that the main checkout's harness is `develop`'s, as "The verify project" in `reference.md` says, and bring the verify project up from the merged worktree with it:
+First reset the merged worktree to the evaluated commit (`git -C <bundle>/merged checkout -- . && git -C <bundle>/merged clean -fdq -e node_modules`), because the testing reviewer may have left test edits there.
+
+The whole check runs as **one script that holds the verify lock** from before `up` until after `down`, so no other verify run can remove the project under the smoke checks (#154). `stack.sh` sees that the lock is already held (`RAG_VERIFY_LOCK_HELD`) and neither takes nor releases it. Write the script to the bundle:
 
 ```bash
+cat > <bundle>/build-check.sh <<'EOF'
+set -u
 main=$(git worktree list --porcelain | awk 'NR==1 {print $2}')
-git -C "$main" fetch -q origin develop
-git -C "$main" diff --quiet origin/develop -- scripts/verify/stack.sh scripts/verify/lock.sh docker-compose.verify.yml || echo "STOP: the harness isn't develop's"
-bash "$main/scripts/verify/stack.sh" up --checkout <bundle>/merged --pull
+# The trusted harness: the main checkout's must be develop's ("The verify project" in reference.md).
+git -C "$main" fetch -q origin develop || { echo "STOP: could not fetch develop"; exit 1; }
+git -C "$main" diff --quiet origin/develop -- scripts/verify/stack.sh scripts/verify/lock.sh docker-compose.verify.yml docker-compose.yml || { echo "STOP: the harness isn't develop's"; exit 1; }
+# Held until this script exits; exits 3 if another verify run holds it.
+. "$main/scripts/verify/lock.sh"
+smoke() { for i in $(seq 1 60); do c=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$1"); [ "$c" = 200 ] && { echo "200 after ${i}s"; return 0; }; sleep 1; done; echo "$c: no 200 in 60 s"; return 1; }
+rc=0
+if bash "$main/scripts/verify/stack.sh" up --checkout <bundle>/merged --pull; then
+  smoke http://localhost:8081/api/health || rc=1
+  smoke http://localhost:8081/ || rc=1
+  curl -s http://localhost:8081/api/health | python3 -c 'import json,sys; print(json.load(sys.stdin))' || rc=1
+else
+  echo "stack.sh up failed"; rc=1
+fi
+bash "$main/scripts/verify/stack.sh" down || rc=1
+exit "$rc"
+EOF
 ```
 
-`stack.sh up` checks the resolved compose configuration (a refusal is FAILED, with the message it prints), builds every image from the merged worktree (`--pull`), starts the whole project and waits up to 15 minutes for every service with a healthcheck to report healthy (with one retry, #130), and confirms `/api/health` answers on the verify port. On a failed start it prints the last 50 log lines of each service that isn't up; get more with `docker compose -p rag-verify logs <service> --tail 50`.
-
-Then run the smoke checks through the verify project's proxy, on port 8081 (or `RAG_VERIFY_PORT`). **Retry each for up to 60 seconds**: services without a healthcheck (`ui`, `proxy`) take a moment to accept connections, and the first request can return 502.
+Run it in the background and wait for it as "Waiting for long runs" in `.claude/skills/rag-pr-review-tests/SKILL.md` says, with this script's log and pid file in place of `verify-all.*`:
 
 ```bash
-smoke() { for i in $(seq 1 60); do c=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$1"); [ "$c" = 200 ] && { echo "200 after ${i}s"; return 0; }; sleep 1; done; echo "$c: no 200 in 60 s"; return 1; }
-smoke http://localhost:8081/api/health
-smoke http://localhost:8081/
-curl -s http://localhost:8081/api/health | python3 -c 'import json,sys; print(json.load(sys.stdin))'
+(bash <bundle>/build-check.sh; echo "build-check exit=$?") > <bundle>/build-check.log 2>&1 & echo $! > <bundle>/build-check.pid
 ```
 
-The health response must report Weaviate, the LLM and the embedding model as ok.
+Then read the finished log:
 
-- **Passed:** the configuration is accepted, every image builds, every service is healthy within the timeout, and every smoke check returns 200 within its retry window.
+- **`STOP:` then `build-check exit=1`, with no `stack.sh` output:** the harness isn't `develop`'s, or `develop` couldn't be fetched. Nothing was built or started. Stop the evaluation, run nothing more, and tell the user.
+- **`Another verify run …` then `build-check exit=3`:** another verify run holds the lock, so the check didn't start. Wait for that run to end, then run the script again.
+- **Anything else** is the check's result. `stack.sh up` checks the resolved compose configuration (a refusal is FAILED, with the message it prints), builds every image from the merged worktree (`--pull`), starts the whole project and waits up to 15 minutes for every service with a healthcheck to report healthy (with one retry, #130), and confirms `/api/health` answers on the verify port. On a failed start it prints the last 50 log lines of each service that isn't up. The smoke checks go through the verify project's proxy on port 8081 and **retry for up to 60 seconds** each: services without a healthcheck (`ui`, `proxy`) take a moment to accept connections, and the first request can return 502. The health response must report Weaviate, the LLM and the embedding model as ok.
+
+- **Passed:** the configuration is accepted, every image builds, every service is healthy within the timeout, every smoke check returns 200 within its retry window, and `down` printed `verify project rag-verify removed`.
 - **FAILED:** anything else. Keep the failing step, its last 30 lines of output, and the logs of any unhealthy service, for the recap.
 
-Either way, afterwards tear the verify project down with `bash "$main/scripts/verify/stack.sh" down`, and confirm it as "The verify project" in `reference.md` describes.
+Either way, the script has already torn the verify project down: confirm it as "The verify project" in `reference.md` describes. If `down` reported anything left, follow "If the teardown fails" there.
 
 ### 9. Finish the evaluation
 
