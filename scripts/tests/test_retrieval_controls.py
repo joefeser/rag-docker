@@ -104,7 +104,6 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
 class TargetTests(unittest.TestCase):
     def test_in_container_target_cannot_silently_select_another_stack(self):
-        import importlib.util
         spec=importlib.util.spec_from_file_location('compose_target',Path(__file__).resolve().parents[1]/'verify/compose_target.py')
         module=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -217,6 +216,19 @@ class VerifierCleanupTests(unittest.TestCase):
         self.assertEqual(discard.call_count, 1)
         close.assert_not_called()
         self.assertNotIn('FAIL owned collection cleanup', stdout)
+
+    def test_cleanup_failure_is_reported_when_discard_fails(self):
+        error, created, deleted, discard, close, stdout = self.run_verifier(fail_delete_on='hnsw', fail_discard=True)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(str(error), 'synthetic discard failure')
+        self.assertEqual(deleted, list(created))
+        self.assertEqual(discard.call_count, 1)
+        close.assert_not_called()
+        hnsw_name = next(name for name, index in created.items() if index == 'hnsw')
+        report = [line for line in stdout.splitlines() if line.startswith('FAIL owned collection cleanup: ')]
+        self.assertEqual(len(report), 1, stdout)
+        self.assertIn(hnsw_name, report[0])
+        self.assertIn('500', report[0])
 
     def test_clean_run_still_passes(self):
         error, created, deleted, discard, close, stdout = self.run_verifier()
