@@ -372,7 +372,7 @@ Accepts one or more files. For ZIP uploads, extracts and processes all supported
 |---|---|---|---|
 | `files` | file[] | Yes | One or more files (PDF, DOCX, TXT, MD, CSV, JSON) or a single ZIP |
 | `collection` | string | Yes | Target Weaviate collection name |
-| `chunking_strategy` | string | Yes | One of: `fixed`, `overlap`, `semantic`, `context_aware`, `language` |
+| `strategy` | string | No | Default: `overlap`. One of: `fixed`, `overlap`, `semantic`, `context_aware`, `language` |
 | `chunk_size` | int | No | Default: 1000 (characters). All size parameters are in characters, not tokens. |
 | `chunk_overlap` | int | No | Default: 200 (characters). Ignored by `semantic` and `context_aware`. |
 | `similarity_threshold` | float | No | Default: 0.85. Used by `semantic` only. Range: 0.0–1.0. |
@@ -708,13 +708,13 @@ The `pairs` array contains only pairs whose generation has completed so far. Dur
 { "error": { "code": "SESSION_NOT_FOUND", "message": "Session 'gs_abc123' not found.", "detail": null } }
 ```
 
-**Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. The API loads existing session files on startup into an in-memory dict. The local deployment uses one API process. A process-wide reentrant lock serializes each session mutation, snapshot and durable write across generation, review, regeneration, import storage and history markers. Files use unique temporary names, file fsync, atomic replacement and directory fsync. Readers receive independent snapshots; no lock is held across model calls. Concurrent edits to distinct fields retain each acknowledged change; edits to the same field follow the serialized commit order. Review during generation remains supported.
+**Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. The API loads existing session files on startup into an in-memory dict. The local deployment uses one API process. A process-wide reentrant lock serializes each session mutation, snapshot and durable write across generation, review, regeneration, import storage and history markers. Files use unique temporary names, file fsync, atomic replacement and directory fsync. Readers receive independent snapshots; no lock is held across model calls. Concurrent edits to distinct fields retain each acknowledged change; edits to the same field follow the serialized commit order. Review during generation remains supported. Session files are owner-only (mode 0600); only the API process reads them.
 
 Imported sessions keep a free source identity or receive a new local `gs_` identity when the cache or any existing session file occupies it. Import refuses a source identity that is not `gs_[0-9a-f]{8}` (`PACKAGE_CORRUPT`, export check 4a). Concurrent imports and generation starts share the same process lock for identity selection and durable publication. If identity selection at generation start cannot inspect session storage, or runs out of attempts, generation returns 503 `SESSION_WRITE_FAILED` without writing, and the diagnostic names the candidate session file being checked (or the last one tried). The original session and its newer human edits remain intact. Imported sessions retain `imported_from` (`session_id`, `collection`, `imported_at` UTC); GET session exposes that provenance. Import job `restored_sessions` maps source IDs to local lookup IDs and collections, and the UI notes display those IDs. RAGAS rows keep their four fields.
 
 Regeneration compares the target pair after the model call. If the target changed, it returns 409 `PAIR_CHANGED_DURING_REGENERATION` and preserves the acknowledged edit; updates to other pairs and validity flags are retained. A write failure before replacement returns 503 `SESSION_WRITE_FAILED`, leaving the prior cache/disk snapshot intact. A directory fsync failure after replacement returns 503 `SESSION_DURABILITY_UNCERTAIN`: cache reflects the replacement, but the caller must refresh and inspect storage before retrying. These errors are not acknowledged edits.
 
-`GET /goldstandard/diagnostics` returns `{"issues": [{"filename": "...", "code": "...", "message": "..."}]}`. Unreadable/invalid session files are preserved and reported as `SESSION_READ_FAILED`, rather than silently omitted. An unavailable or unreadable storage directory is reported as `SESSION_STORAGE_UNAVAILABLE` without aborting startup or erasing the cached last valid state. Recovery scans do not create a missing directory. Owned unpublished temporary snapshots left by interruption are preserved and reported as `SESSION_INTERRUPTED_WRITE`; the final JSON remains authoritative. A valid restored file needs API restart to reload its cache. Health displays diagnostic filenames, codes and recovery messages, plus a warning if diagnostics cannot refresh. Diagnostic issues do not change dependency health. Pending refreshes label retained results as previous; failed refreshes clear them, and responses from older refresh requests cannot overwrite newer results. Removed unreadable files or inspected temporary snapshots clear their file-read diagnostics on the next successful scan. Write failures keep their separate successful-write recovery policy; failed generation persists its original code/reason and keeps its warning through status updates and restart. File inspection occurs outside the writer lock; a scan that races a durable commit is discarded. Session marker write failures are individually reported without aborting the already completed primary delete/import/tuning operation; marker counts include only durably acknowledged updates. This is a single-process session-store contract, not cross-process locking, historical-export policy (#47), or a collection-wide export snapshot.
+`GET /goldstandard/diagnostics` returns `{"issues": [{"filename": "...", "code": "...", "message": "..."}]}`. Unreadable/invalid session files are preserved and reported as `SESSION_READ_FAILED`, rather than silently omitted. An unavailable or unreadable storage directory is reported as `SESSION_STORAGE_UNAVAILABLE` without aborting startup or erasing the cached last valid state. Recovery scans do not create a missing directory. Owned unpublished temporary snapshots left by interruption are preserved and reported as `SESSION_INTERRUPTED_WRITE`; the final JSON remains authoritative. A valid restored file needs API restart to reload its cache. Health displays diagnostic filenames, codes and recovery messages, plus a warning if diagnostics cannot refresh. Diagnostic issues do not change dependency health. Pending refreshes label retained results as previous; failed refreshes clear them, and responses from older refresh requests cannot overwrite newer results. Removed unreadable files or inspected temporary snapshots clear their file-read diagnostics on the next successful scan. Write failures keep their separate successful-write recovery policy; failed generation persists its original code/reason and keeps its warning through status updates and restart. File inspection occurs outside the writer lock; a scan that races a durable commit is discarded. Session marker write failures are individually reported without aborting the already completed primary delete/import/tuning operation; marker counts include only durably acknowledged updates. A stale/orphaned marker that cannot be written to its session file is saved as a pending marker in `goldstandard_sessions/pending_markers/{session_id}.json`; it is applied when the session loads at startup and to the copies in collection export packages, keeps the session's `SESSION_WRITE_FAILED` diagnostic with marker wording, and is removed by the next successful write of that session. An unreadable pending marker is preserved and reported. If the pending marker cannot be written either, the historical guard lasts only until restart. This is a single-process session-store contract, not cross-process locking, historical-export policy (#47), or a collection-wide export snapshot.
 
 ---
 
@@ -1134,8 +1134,12 @@ ingest default.
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured.
 
-Each rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failure leaves the original untouched. Vectors are copied out of
+Each rebuild is staged into a temporary collection and verified before the
+original is deleted, so a failure before replacement leaves the original
+untouched. Weaviate has no atomic swap: once replacement starts, a failure can
+leave the original name missing or partial. A verified recovery copy and its
+sidecars are then kept across restarts and named in the job error
+(`RAG_EXPORT_SPECIFICATIONS.md` §7.4). Vectors are copied out of
 the staging collection rather than regenerated, so the corpus is embedded once.
 
 Any operation that changes chunk identity marks the collection's gold-standard
@@ -1481,6 +1485,16 @@ Visible on all pages post-role-selection. Contents vary by role:
 - Retrieval mode selector — visible to Engineer and Developer roles only. Hidden for End User. Read-only: it displays the mode saved for the selected collection, which is changed on the Retrieval Config page. The settings are fetched from `GET /retrieval/config/{collection}` whenever the selected collection changes; if nothing is saved for that collection the API returns the defaults (`hnsw`, `top_k: 5`).
 
 The collection selection is shared with the Retrieval Config page, because retrieval settings are stored per collection and must follow the selection.
+
+Loads and saves belong to the collection selection generation that started
+them. Changing the selection (including leaving and returning to the same
+collection) invalidates pending responses for the prior selection. A stale
+save may finish persisting its original collection, but must not change the
+active settings, loading/error state, or invalidate the new collection's load.
+Within the current generation, only the latest initiated save may publish; a
+successful current save supersedes a pending older load for that collection.
+After the selected collection's load resolves, the next Q&A request uses its
+settings, regardless of when a prior collection's save completes.
 
 **Response format** sent to API:
 - End User role → `response_format: "end_user"`
@@ -1931,6 +1945,8 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`).
 - [x] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
       *Registered `13_identity.sh` exercises controlled collision, concurrent creation, guarded reads, and actual package/HTTP/backend/fresh-process acceptance. The exact current-head counts and full-suite result are recorded in PR #69.*
+- [x] Generation start returns 503 `SESSION_WRITE_FAILED`, writes nothing and records a diagnostic for the candidate session file when identity selection cannot inspect session storage (including a redirected storage directory) or runs out of attempts. Import refuses a source session ID that is not `gs_[0-9a-f]{8}` with `PACKAGE_CORRUPT` naming the sidecar, before restoring anything.
+      *Registered `13_identity.sh` runs 21 owned cases in `session_identity_cases.py`. Generation start: `test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503`, `test_generation_allocation_failure_records_diagnostic_for_candidate` (inspection failure and exhaustion), `test_reviewer_generation_redirected_storage_root_is_session_write_failed_503` and `test_reviewer_generate_route_returns_503_session_write_failed_envelope`. Source IDs: `test_noncanonical_source_identity_is_refused_before_restoration` and `test_reviewer_preflight_refuses_near_canonical_and_unbounded_source_ids` (near misses, a 10,003-character ID, an empty string and an integer are refused; `gs_0123abcd` is accepted). The live check in `session_identity.py` imports a digest-valid package with a noncanonical source ID and expects `PACKAGE_CORRUPT` naming the sidecar, nothing restored and the original unchanged. The redirected-storage and route cases fail on the code before #148.*
 - [x] Concurrent edits survive generation, independent-field updates and restart; write faults are not acknowledged, and changed regeneration targets are rejected.
       *Registered `12_persistence.sh` runs owned concurrency, interruption and failure-path cases plus real backend/HTTP/fresh-process checks. Exact counts and initial full-suite failures are retained in the PR; this is single-process acceptance.*
 - [x] Recovery diagnostics preserve unreadable bytes, clear removed-file warnings, retain generation failure codes, and do not hold the writer lock while reading the archive.

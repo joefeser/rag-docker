@@ -123,13 +123,18 @@ summary() {
 live_target_reason() {
   local project="${COMPOSE_PROJECT_NAME:-}" root port
   if [ -z "$project" ]; then
-    # What compose would use: a `name:` in the compose file, else the folder
-    # name, lowercased with everything outside [a-z0-9_-] dropped.
+    # What compose would use: COMPOSE_PROJECT_NAME from the checkout's .env
+    # (optionally after `export `; the last one wins; quotes removed), else
+    # a `name:` in the compose file, else the folder name (#154).
     root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
+    project=$(sed -n 's/^\(export[[:space:]]\{1,\}\)\{0,1\}COMPOSE_PROJECT_NAME=//p' "$root/.env" 2>/dev/null | tail -1 \
+      | sed -e 's/^"\(.*\)"$/\1/' -e t -e "s/^'\(.*\)'\$/\1/")
+    [ -n "$project" ] || project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
     [ -n "$project" ] || project=$(basename "$root")
   fi
-  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+  # Lowercased, everything outside [a-z0-9_-] dropped, and leading `-` and
+  # `_` stripped, as compose normalises a name.
+  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[-_]*//')
   port=$(python3 -c '
 import sys
 from urllib.parse import urlsplit

@@ -102,7 +102,7 @@ carry the corpus's parameters.
 | `retrieval_mode` | enum `hnsw`\|`flat`\|`hybrid`\|`semantic` | `hnsw` |
 | `top_k` | integer 1–50 | `5` |
 | `alpha` | number 0–1 | `0.75` |
-| `ef` | integer, optional; legacy and inactive: stored and exported in `retrieval_config.json`, but neither query execution nor the exported `retrieve.py` applies it | — |
+| `ef` | integer 16–512, optional; legacy and inactive: stored and exported in `retrieval_config.json`, but neither query execution nor the exported `retrieve.py` applies it | — |
 | `response_format` | enum `end_user`\|`engineer` | `end_user` |
 
 ### 3.2 Endpoints
@@ -238,7 +238,11 @@ One JSON object per line:
 ## 5. The Retrieval Script
 
 `retrieve.py` is generated at export from `manifest.json` and
-`retrieval_config.json`.
+`retrieval_config.json`. Saved settings MUST satisfy the same typed contract as
+`POST /retrieval/config` before export. Invalid saved settings fail the export
+without publishing a package; they are not copied into executable syntax.
+All generated Python defaults and package metadata MUST be encoded Python
+literals, and substitution MUST NOT interpret tokens inside inserted data.
 
 ### 5.1 Requirements
 
@@ -325,7 +329,17 @@ Checks run in this order and stop at the first failure:
 | 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
 | 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; the local session storage directory is a regular directory inside the upload directory | `PACKAGE_CORRUPT`, naming the sidecar |
+| 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
+
+Check 4b runs before model installation, collection creation/replacement, recovery
+ownership, or sidecar publication. Keep its normalized snapshot for restoration;
+do not reread unvalidated settings after building the collection. Rebind the
+collection to the actual import target. Missing fields retain API defaults,
+valid historical `ef` values are preserved, and unknown fields are ignored as
+on API saves. A missing settings file remains supported. Invalid JSON, non-object
+settings, invalid enum values, booleans in numeric fields, out-of-range values,
+and non-finite alpha are refusals in every conflict mode.
 
 Check 4a runs before bundled-model installation, collection creation/deletion,
 or restoring any sidecar. All sessions MUST be preflighted together, including
@@ -339,7 +353,9 @@ redirected storage directories and non-regular destinations. Archive extraction
 accepts only regular files and directories, so special members cannot block a
 later metadata read. Existing review work remains unchanged on validation
 failure, including `replace`. Optional legacy progress fields retain their
-existing defaults, and historical validity metadata is preserved.
+existing defaults, and historical validity metadata is preserved. A restored
+session's `persistence_error` is removed: a write failure on the source system
+says nothing about this instance's storage.
 
 Startup loading, collection flagging and export use the same session-record
 validation. Invalid legacy files (including filename/identity mismatch) remain
@@ -507,7 +523,8 @@ first request, which is what makes this safe.
 | Verified recovery | a durable record with state `recovery`, written before deleting the target | preserve the collection and all sidecars; log its identity and metadata snapshot directory |
 | Successful/intentional cleanup interrupted by I/O failure | durable `cleanup` phase, written before deletion | retry only that authorized backend/sidecar/metadata cleanup until complete |
 | Unowned marker-like name or unreadable ownership | insufficient ownership evidence | preserve; a substring or age is never deletion authority |
-| New-target partial import | a small version-3 marker bound by SHA-256 to a compact SQLite expectation snapshot | verify the full stored records; delete a proven mismatch, preserve on unreadable/legacy metadata or backend read failure |
+| New-target partial import | a small version-4 marker bound by SHA-256 to a compact SQLite expectation snapshot, and by a random instance token to the schema description (`rag-import:<token>`) the import gives the collection it creates | only for the collection carrying the marker's token: verify the full stored records and delete a proven mismatch. A collection without the token was created later under that name: keep it and retire the marker. Preserve on unreadable/legacy metadata or backend read failure. A version-3 marker carries no token and never deletes: in state `building` it is kept and logged; in state `cleanup` its cleanup is finished |
+| Orphaned expectation snapshot | a `<32 hex>.sqlite3` file in the markers folder that no marker names | delete it; if any marker cannot be parsed, delete none |
 | Extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete the abandoned workspace; recovery sidecars are stored outside it |
 
 Recovery ownership is atomic and flushed before the destructive step. Cleanup
@@ -520,7 +537,9 @@ source bytes and ingest/retrieval configs are copied under the recovery collecti
 name; evaluation JSON is copied to the operation's metadata snapshot directory
 without overwriting live session identity. An imported recovery also retains its
 manifest and collection config. The error detail includes `recovered_as` and
-`sidecar_snapshots`. A recovery record remains preserved even if its backend
+`sidecar_snapshots`, the snapshot directory relative to `UPLOAD_DIR`
+(`collection_operations/<operation-id>`); the absolute path appears only in the
+server log. A recovery record remains preserved even if its backend
 collection is later missing, since its sidecars may still be useful.
 
 The owner can export the named recovery collection, inspect its metadata snapshots,
@@ -589,7 +608,10 @@ Before deleting the original, tuning MUST verify the staged rebuild and durably
 retain its source/config/evaluation sidecars. Final-create, batch and verification
 failures MUST report the recovery collection and preserve it across restart,
 including chunks-only data. Cleanup may delete scratch while the original remains
-safe, or delete recovery only after final persisted-record verification succeeds.
+safe, or delete recovery only after final persisted-record verification succeeds
+or when a step fails before the original is deleted. If marking gold-standard
+sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
+the original collection is unchanged, and the retained copy is discarded.
 
 ---
 
@@ -713,6 +735,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
+| E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip and generated script defaults/metadata remain encoded typed literals |
 
 ---
 
