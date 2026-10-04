@@ -22,7 +22,15 @@ INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
            {'top_k': True}, {'top_k': 0}, {'top_k': 51}, {'top_k': 1.5},
            {'alpha': False}, {'alpha': -0.1}, {'alpha': 1.1},
            {'alpha': float('nan')}, {'alpha': float('inf')},
-           {'ef': True}, {'ef': 15}, {'ef': 513}]
+           {'ef': True}, {'ef': '10000'}, {'ef': 64.5}]
+# Integer ef values outside 16-512 that the API stored before PR #108. ef is
+# inactive, so export and import clear them to null instead of refusing.
+LEGACY_EF = [-1, 0, 15, 513, 10000]
+EXPORT_WARNING = ('saved retrieval setting ef={} is outside 16-512 and was exported as null; '
+                  "ef is no longer used. Save this collection's settings on the Retrieval "
+                  'page to clear it.')
+IMPORT_NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was restored "
+               'as null; ef is no longer used.')
 
 
 class RetrievalImportTests(unittest.TestCase):
@@ -97,6 +105,36 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertEqual(importer._jobs['test']['status'], 'completed')
                 self.assertEqual(retrieval_config.load('Corpus'), expected)
 
+    def test_legacy_ef_is_normalised_and_reported(self):
+        for value in LEGACY_EF:
+            with self.subTest(ef=value):
+                cfg, cleared = retrieval_config.normalize({'ef': value, 'top_k': 7}, 'Corpus')
+                self.assertIsNone(cfg['ef'])
+                self.assertEqual(cfg['top_k'], 7)
+                self.assertEqual(cleared, value)
+        for value, kept in [(16, 16), (512, 512), (64, 64), (None, None), ('64', 64)]:
+            with self.subTest(ef=value):
+                cfg, cleared = retrieval_config.normalize({'ef': value}, 'Corpus')
+                self.assertEqual(cfg['ef'], kept)
+                self.assertIsNone(cleared)
+                self.assertEqual(retrieval_config.validate({'ef': value}, 'Corpus'), cfg)
+
+    def test_legacy_ef_import_completes_with_note(self):
+        for value in LEGACY_EF:
+            with self.subTest(ef=value):
+                self.archive(json.dumps({'ef': value, 'top_k': 7}))
+                with patch.object(importer, '_ensure_models', return_value=[]), \
+                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
+                     patch.object(importer, '_build', return_value=0):
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', 'abort')
+                job = importer._jobs['test']
+                self.assertEqual(job['status'], 'completed')
+                restored = retrieval_config.load('Corpus')
+                self.assertIsNone(restored['ef'])
+                self.assertEqual(restored['top_k'], 7)
+                self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+
     def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
         self.archive(json.dumps({'top_k': '8', 'ef': 64}))
         validated = importer._read_retrieval_config(self.pkg, 'Corpus')
@@ -156,18 +194,62 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(namespace['DEFAULT_ALPHA'], 0.5)
         self.assertEqual(namespace['PACKAGE_METADATA']['package_filename'], result['filename'])
 
+    def test_export_clears_legacy_ef_with_warning(self):
+        retrieval_config.save({'collection': 'Corpus', 'top_k': 7, 'ef': 10000})
+        saved = retrieval_config._path('Corpus')
+        before = saved.read_bytes()
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            manifest = json.load(archive.extractfile(members['manifest.json']))
+        self.assertIsNone(cfg['ef'])
+        self.assertEqual(cfg['top_k'], 7)
+        self.assertIn('retrieve.py', members)
+        warning = EXPORT_WARNING.format(10000)
+        self.assertEqual(result['warnings'].count(warning), 1)
+        self.assertEqual(manifest['warnings'].count(warning), 1)
+        self.assertEqual(saved.read_bytes(), before)
+
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:
+            if value is None:  # None denotes no saved file, not an invalid saved config.
+                continue
             with self.subTest(value=value), ExitStack() as mocks:
-                mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+                chunks = mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
                 mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={}))
                 mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
                 mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
-                if value is None:  # None denotes no saved file, not an invalid saved config.
-                    continue
-                with self.assertRaises((ValueError, TypeError)):
+                with self.assertRaises(ValueError) as caught:
                     packager.build('Corpus')
+                message = str(caught.exception)
+                self.assertIn("'Corpus'", message)
+                self.assertIn('Retrieval page', message)
+                if isinstance(value, dict):
+                    self.assertIn(next(iter(value)), message)
+                else:
+                    self.assertIn('not a JSON object', message)
+                chunks.assert_not_called()
                 self.assertEqual(list(self.exports.iterdir()), [])
+
+    def test_symlinked_settings_fail_with_package_corrupt(self):
+        target = self.root / 'outside.json'
+        target.write_text('{}')
+        (self.pkg / 'retrieval_config.json').symlink_to(target)
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_retrieval_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'retrieval_config.json'})
+
+    def test_render_refuses_a_template_token_without_a_value(self):
+        with self.assertRaises(RuntimeError):
+            packager._render('retrieve.py.tmpl', {'COLLECTION_NAME': repr('Corpus')})
 
 
 if __name__ == '__main__':

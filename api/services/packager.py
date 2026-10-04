@@ -19,7 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from pydantic import ValidationError
+
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -192,6 +195,34 @@ def render_help(embed_dimensions: int | str) -> str:
     })
 
 
+def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[dict, bool]:
+    """The settings to package, and whether they are defaults.
+
+    Runs before any chunk is read, so bad settings fail the export early with
+    a next step instead of a raw validation message. A legacy ef is cleared
+    with a warning; the saved file itself is left alone.
+    """
+    try:
+        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, cleared = retrieval_config.normalize(cfg, collection)
+    except TypeError as exc:          # resolve(): the saved JSON is not an object
+        problems, cause = "the settings file is not a JSON object", exc
+    except ValidationError as exc:
+        problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
+                             for error in exc.errors())
+        cause = exc
+    else:
+        if cleared is not None:
+            warnings.append(f"saved retrieval setting ef={cleared} is outside "
+                            f"{SEARCH_EF_MIN}-{SEARCH_EF_MAX} and was exported as null; ef is "
+                            "no longer used. Save this collection's settings on the Retrieval "
+                            "page to clear it.")
+        return cfg, is_default
+    raise ValueError(f"Saved retrieval settings for '{collection}' are invalid: {problems}. "
+                     "Open the Retrieval page, save this collection's settings, then "
+                     "export again.") from cause
+
+
 def _ingest_config(collection: str) -> dict | None:
     """The collection's saved chunking settings, or None."""
     return ingest_config.load(collection)
@@ -252,6 +283,9 @@ def build(
     try:
         b = _Builder(stage)
 
+        # Settings first: a bad config fails before any chunk is streamed.
+        retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -286,8 +320,6 @@ def build(
         if ingest_cfg is not None:
             b.add_json("ingest_config.json", ingest_cfg)
 
-        retrieval_cfg, is_default = retrieval_config.resolve(collection)
-        retrieval_cfg = retrieval_config.validate(retrieval_cfg, collection)
         has_saved_retrieval = not is_default
         b.add_json("retrieval_config.json", retrieval_cfg)
 
