@@ -156,9 +156,15 @@ check_eq "a recreated collection does not inherit the retrieval config" \
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
   check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ "$restart_limit_ok" != 0 ]; then
+  check "restart, persistence and timing" 1 "$restart_limit"
 elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Save a known config here, right before the restart: the section above ends
   # by recreating $C with no saved config, so relying on earlier state made
@@ -172,10 +178,9 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # it is set and is not the live rag-docker project.
   project="$COMPOSE_PROJECT_NAME"
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
-  for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
-  elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
-  [ "$elapsed" -le 120 ]
-  check "restart reaches healthy within 120s" $? "took ${elapsed}s"
+  # Wait up to twice the limit, so a slow restart is still timed (#130).
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  restart_timing_check "$restart_limit" "$elapsed"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os

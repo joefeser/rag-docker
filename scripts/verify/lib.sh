@@ -178,6 +178,49 @@ restart_refusal_reason() {
   fi
 }
 
+# Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
+# docker-compose.yml plus 60s for `down` and the api's own start.
+RESTART_LIMIT_DEFAULT_S=240
+
+# Prints the restart limit in seconds, or, with status 1, why the value of
+# RAG_RESTART_LIMIT_S is refused. Empty means unset.
+restart_limit() {
+  local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
+  case "$value" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+  esac
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  return 1
+}
+
+# wait_healthy_timed <started-epoch> <cap-seconds>: polls /health every 2s.
+# Prints the whole seconds since <started> once it returns 200, or nothing
+# once <cap> seconds have passed.
+wait_healthy_timed() {
+  local started="$1" cap="$2" code now
+  while :; do
+    code=$(api_code "$API/health")
+    now=$(python3 -c "import time;print(int(time.time()-$started))")
+    if [ "$code" = "200" ]; then printf '%s' "$now"; return 0; fi
+    [ "$now" -lt "$cap" ] || return 0
+    sleep 2
+  done
+}
+
+# restart_timing_check <limit> <elapsed, or empty if never healthy>: the
+# restart timing result, with the measured time on a pass and on a fail.
+restart_timing_check() {
+  local limit="$1" elapsed="$2"
+  if [ -n "$elapsed" ] && [ "$elapsed" -le "$limit" ]; then
+    check "restart reaches healthy within ${limit}s (took ${elapsed}s)" 0
+  elif [ -n "$elapsed" ]; then
+    check "restart reaches healthy within ${limit}s" 1 "took ${elapsed}s"
+  else
+    check "restart reaches healthy within ${limit}s" 1 "not healthy after $((limit * 2))s"
+  fi
+}
+
 # Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
 # that borrow these helpers are not suites and are left alone.
 case "$(basename "$0")" in

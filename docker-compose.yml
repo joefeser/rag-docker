@@ -24,10 +24,15 @@ services:
     networks: [rag-internal]
     healthcheck:
       # The weaviate image has no curl; busybox wget is what it ships.
+      # A cold start replays Weaviate's schema history and loads its indexes
+      # before /ready answers. On a copy of real data that took up to 156s
+      # (#130); without start_period, compose marks Weaviate unhealthy after
+      # ~100s and fails the api, ui and proxy behind it.
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/.well-known/ready"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 180s
 
   ollama:
     image: ollama/ollama:0.3.14

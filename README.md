@@ -682,6 +682,8 @@ docker compose up -d
 
 This discards ingested documents; re-ingest after it comes back up. The `ollama_models` volume is untouched, so models are not re-downloaded.
 
+**`docker compose up -d` fails with `dependency failed to start: container rag-docker-weaviate-1 is unhealthy`** — Weaviate takes longer to start as its volume grows: every start replays the history of collections created and deleted on it before `/v1/.well-known/ready` answers. The health check allows 180 seconds for that (`start_period` in `docker-compose.yml`) before failures count, so this should be rare. If `up` still gives up, the api, ui and proxy are left stopped, but Weaviate keeps starting. Wait until `docker compose ps` shows weaviate as healthy, then run `docker compose up -d` again; it starts the rest.
+
 **A healthcheck never passes and the service sits in `health: starting` forever** — Check that the probe binary exists in that image. The `ollama` image ships only the `ollama` binary and the `weaviate` image has busybox `wget` but no `curl`, so `curl`-based healthchecks can never succeed there. Only the `api` image installs `curl`. Verify with:
 
 ```bash
