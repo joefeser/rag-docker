@@ -86,13 +86,14 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                         cleanup_failures.append(f'{name}: {response.status_code} {response.text}')
             except Exception as error:
                 cleanup_failures.append(f'{name}: {error!r}')
+        if cleanup_failures:
+            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
         if recovery:
             with patch.object(settings,'upload_dir',persistent_upload):
                 for owner in owners:
                     recovery.discard(owner,wc.get_client())
         wc.close_client()
         if cleanup_failures:
-            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
             if sys.exc_info()[0] is None:  # Otherwise the original failure stays the raised error.
                 raise AssertionError('owned collection cleanup failed: '+'; '.join(cleanup_failures))
 assert all(not wc._collection_exists_sync(name) for name in collections)
