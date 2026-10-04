@@ -365,6 +365,8 @@ The package is validated before anything touches the database: the archive must
 be readable, the format understood, every digest must match, and the embedding
 model must be the one this instance runs. Chunk UUIDs are preserved, so
 gold-standard sessions keep pointing at the right chunks after the move.
+Retained-source indexes and blobs are validated before the embedding check;
+invalid source metadata fails with `PACKAGE_CORRUPT` before any live mutation.
 
 Evaluation-session metadata is also validated before importing models or
 changing a collection. Invalid session JSON, identities or schemas fail the

@@ -341,7 +341,7 @@ Deletes a collection and all its objects. Requires `confirm=true` query paramete
 { "name": "Documents", "status": "deleted", "objects_removed": 1842 }
 ```
 
-Also removes the entry from `{UPLOAD_DIR}/collection_registry.json` and deletes `{UPLOAD_DIR}/ingest_configs/{collection}.json` if it exists.
+Before deletion, resolves the backend's canonical collection name. After successful backend deletion, removes retained source documents and ingest/retrieval configurations for both the canonical name and its lowercase-first-character alias, regardless of the spelling used in the request. Only that first-character alias matches; distinct collection names are not case-folded or swept. Matching sessions for both spellings are preserved and durably marked orphaned. Also removes the caller's entry from `collection_registry.json`. Deleting an original collection preserves distinct retained recovery copies; explicitly deleting a retained recovery collection retires only its matching ownership journal and snapshots.
 
 **Response 404** if the collection does not exist:
 ```json
@@ -1840,6 +1840,8 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
+- [x] Deleting a collection by either its canonical name or first-character alias removes both spellings' retained sources and configurations, durably orphans both spellings' sessions, and preserves case-distinct neighbours and retained recovery copies.
+      *`test_collection_writes.py` covers both deletion spellings and a case-distinct neighbour; `reindex.py` runs both deletion paths through the HTTP handler against owned backend and sidecar fixtures, with `reindex_verifier_cases.py` checking registration.*
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
       *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
 - [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).

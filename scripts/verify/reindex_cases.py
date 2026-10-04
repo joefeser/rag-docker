@@ -3,7 +3,7 @@ import copy, math, os, sys, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 from services import tuning
 validate_vectorizer = tuning.wc._validate_reindex_vectorizer_sync
 

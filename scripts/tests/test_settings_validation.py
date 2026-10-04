@@ -348,6 +348,59 @@ class ApiPathFallbackTests(unittest.TestCase):
                     exec(setup, namespace)
                     self.assertEqual(namespace['sys'].path, expected)
 
+    # #155: the remaining defaults were computed even with their variable set.
+    def test_listed_defaults_are_lazy(self):
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        def evaluated(*args): raise AssertionError('fallback evaluated')
+        api, repo = '/synthetic/repo/api', '/synthetic/repo/scripts/x/'
+        rows = (('scripts/tests/test_overlap_chunks.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_insert_chunks.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_model_bundle.py', 'RAG_TEST_API_DIR', 2, False, api),
+                ('scripts/tests/test_session_validity.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_chunk_sampling.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_batch_recovery.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_collection_writes.py', 'RAG_TEST_API_DIR', 1, True, api),
+                ('scripts/verify/reindex_cases.py', 'RAG_TEST_API_DIR', 1, True, api),
+                ('scripts/verify/session_identity_cases.py', 'RAG_TEST_API_DIR', 1, True, api),
+                ('scripts/verify/session_persistence_cases.py', 'RAG_TEST_API_DIR', 3, True, api),
+                ('scripts/verify/reindex_verifier_cases.py', 'RAG_REINDEX_VERIFIER_SOURCE', 1, False, repo + 'reindex.py'),
+                ('scripts/verify/reindex_verifier_cases.py', 'RAG_VERIFIER_LIB', 1, False, repo + 'lib.sh'))
+        for name, variable, occurrences, guarded, unset in rows:
+            source = (root / name).read_text()
+            tree = ast.parse(source)
+            def reads(node):
+                return (isinstance(node, ast.Call) and ast.get_source_segment(source, node.func) == 'os.environ.get'
+                        and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == variable)
+            calls = [node for node in ast.walk(tree) if reads(node)]
+            lazy = [node for node in ast.walk(tree) if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+                    and reads(node.values[0]) and len(node.values[0].args) == 1]
+            with self.subTest(file=name, variable=variable):
+                self.assertEqual(len(calls), occurrences)
+                self.assertEqual(len(lazy), occurrences, 'os.environ.get(name, fallback) computes the fallback')
+            # Only the repository's own fallback expression runs, against fake os/Path.
+            for expression in lazy:
+                code = compile(ast.fix_missing_locations(ast.Expression(body=expression)), name, 'eval')
+                cases = [('set', {variable: '/synthetic/value'}, evaluated, '/synthetic/value'),
+                         ('empty', {variable: ''}, Path, unset), ('unset', {}, Path, unset)]
+                if guarded: cases.append(('stdin', {}, Path, '/app'))
+                for case, environ, path, expected in cases:
+                    with self.subTest(file=name, variable=variable, line=expression.lineno, case=case):
+                        script = '<stdin>' if case == 'stdin' else repo + 'file.py'
+                        reference = SimpleNamespace(with_name=evaluated) if path is evaluated else Path(repo + 'reindex.py')
+                        namespace = {'os': SimpleNamespace(environ=environ), 'Path': path, '__file__': script, 'source': reference}
+                        self.assertEqual(eval(code, namespace), expected)
+
+    def test_no_environment_default_is_computed(self):
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        for path in sorted([*(root / 'scripts/tests').glob('*.py'), *(root / 'scripts/verify').glob('*.py')]):
+            source = path.read_text()
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.Call) and ast.get_source_segment(source, node.func) == 'os.environ.get' and len(node.args) > 1:
+                    with self.subTest(file=str(path.relative_to(root)), line=node.lineno):
+                        self.assertIsInstance(node.args[1], ast.Constant, ast.get_source_segment(source, node))
+
 
 class SpecificationTests(unittest.TestCase):
     def test_upload_form_fields_match_the_route(self):
