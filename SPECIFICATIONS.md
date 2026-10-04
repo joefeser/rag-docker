@@ -1126,8 +1126,12 @@ ingest default.
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured.
 
-Each rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failure leaves the original untouched. Vectors are copied out of
+Each rebuild is staged into a temporary collection and verified before the
+original is deleted, so a failure before replacement leaves the original
+untouched. Weaviate has no atomic swap: once replacement starts, a failure can
+leave the original name missing or partial. A verified recovery copy and its
+sidecars are then kept across restarts and named in the job error
+(`RAG_EXPORT_SPECIFICATIONS.md` §7.4). Vectors are copied out of
 the staging collection rather than regenerated, so the corpus is embedded once.
 
 Any operation that changes chunk identity marks the collection's gold-standard

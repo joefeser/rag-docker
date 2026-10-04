@@ -176,13 +176,26 @@ Run the controlled regressions with the API dependencies installed:
 python -m unittest discover -s scripts/tests -p 'test_batch*.py'
 ```
 
-For a **disposable stack**, the following fault acceptance uses real Weaviate,
-synthetic `VfyBatchRecovery*` collections and the real embedding model. It injects
-final-create failures into the test process, retains import/tuning recovery,
-restarts the API, then verifies exact UUIDs, properties, vectors and sources.
-It also checks real completed-batch rejection/partial acceptance, ingestion UUID
-rollback after a post-write read fault, resumption of metadata cleanup after backend
-deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack: run it on the verify project.
+`batch_recovery.py` is the fault acceptance. It uses real Weaviate, synthetic
+collections and the real embedding model. It injects final-create failures into
+the test process, retains import/tuning recovery, restarts the API, then verifies
+exact UUIDs, properties, vectors and sources. It also checks real completed-batch
+rejection/partial acceptance, ingestion UUID rollback after a post-write read fault,
+resumption of metadata cleanup after backend deletion, owned scratch cleanup and
+retention of an unowned marker-like collection. It must not run against a
+user's data stack: run it on the verify project.
+
+`05_transfer.sh` runs it when `RAG_ALLOW_RESTART=1`: prepare, `docker compose
+restart api`, check, then cleanup. It creates and deletes only the
+`${RAG_TEST_PREFIX}BatchRecovery*` collections, archive and package folder it
+records in its state file. The restart ends any job in progress on the stack.
+Cleanup always runs, even after a failed check; the phase logs stay in
+`/tmp/vfy_recovery_prepare.log`, `/tmp/vfy_recovery_check.log` and
+`/tmp/vfy_recovery_cleanup.log`. The script accepts only a prefix starting with
+`Vfy` (a guard on its destructive phases), so with any other `RAG_TEST_PREFIX`
+the suite skips these checks and says why.
+
+To run the phases by hand on a disposable stack:
 
 ```bash
 bash scripts/verify/stack.sh up      # then paste the export lines it prints
@@ -194,8 +207,8 @@ docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
 bash scripts/verify/stack.sh down
 ```
 
-If interrupted, keep the recorded fixtures and run `check` after restarting; run
-`cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
+In a manual run, if interrupted, keep the recorded fixtures and run `check` after
+restarting; run `cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
 live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 
 ## Layout
@@ -241,7 +254,7 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |

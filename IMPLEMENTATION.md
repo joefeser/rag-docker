@@ -1923,6 +1923,19 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     record.update(updated)
 
 
+def sidecar_reference(record: dict) -> str:
+    """The snapshot directory relative to UPLOAD_DIR, for job error details.
+
+    Job results are served without authentication, so the absolute path stays
+    in the server log.
+    """
+    metadata = _root() / record["operation_id"]
+    log.warning("Recovery collection %r keeps sidecar snapshots in %s", record["staging"], metadata)
+    # Built, not derived with relative_to: the root needn't resolve under
+    # UPLOAD_DIR (a symlinked mount, or the reindex verifier's own root).
+    return "collection_operations/" + record["operation_id"]
+
+
 def discard(record: dict, client) -> None:
     """Delete an owned copy after success, or scratch while the target is safe."""
     # Persist intent before the first deletion. Startup can finish this exact
@@ -2092,6 +2105,7 @@ def _create_collection_sync(
     hnsw_config: dict,
     *,
     preserve_hnsw: bool = False,
+    description: str | None = None,
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
@@ -2118,6 +2132,8 @@ def _create_collection_sync(
 
     client.collections.create(
         name=name,
+        # Set only by import, to bind its in-progress marker to this instance.
+        description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
         properties=COLLECTION_PROPERTIES,
@@ -4673,7 +4689,9 @@ def get_job(job_id: str) -> dict | None:
 # staging name for the startup sweep to recognise. A SIGKILL during the insert
 # would leave a half-filled collection that looks like a real one. A marker
 # written before the build, and removed after it, lets the next start tell the
-# two apart.
+# two apart. The marker's instance token is also written into the collection's
+# schema description, so a collection created later under the same name is
+# never mistaken for the interrupted import.
 
 def _markers_dir() -> Path:
     d = Path(settings.upload_dir) / "imports_in_progress"
@@ -4685,23 +4703,33 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
+def _instance_description(instance: str) -> str:
+    return f"rag-import:{instance}"
+
+
 def _read_marker(path: Path) -> tuple[dict, Path]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
         raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
     data = json.loads(path.read_text())
     collection, count = data["collection"], data["expected_chunks"]
     snapshot = data["expected_snapshot"]
-    if (type(data.get("version")) is not int or data["version"] != 3
+    # Version 3 predates the instance identity: it is read so that its cleanup
+    # can finish and its snapshot stays named, but it never authorizes deletion.
+    if (type(data.get("version")) is not int or data["version"] not in (3, 4)
             or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
             or path.name != f"{collection}.json" or type(count) is not int or count < 0
             or data["state"] not in ("building", "cleanup")
+            or (data["version"] == 4 and (type(data["instance"]) is not str
+                                          or not re.fullmatch(r"[0-9a-f]{32}", data["instance"])))
             or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
         raise ValueError("Invalid import ownership")
     return data, _markers_dir() / snapshot["file"]
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> None:
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> str:
+    """Publish the marker; returns the instance token the target must carry."""
+    instance = uuid.uuid4().hex
     snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
     try:
         with batch_write.ExpectedRecords() as expected:
@@ -4715,8 +4743,8 @@ def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -
         collection_recovery._sync_dir(_markers_dir())
         collection_recovery._sync_dir(Path(settings.upload_dir))
         collection_recovery.atomic_json(_marker_path(collection), {
-            "version": 3, "collection": collection, "expected_chunks": expected_chunks,
-            "job_id": job_id, "state": "building",
+            "version": 4, "collection": collection, "expected_chunks": expected_chunks,
+            "job_id": job_id, "state": "building", "instance": instance,
             "expected_snapshot": {"file": snapshot.name, "sha256": packager.sha256_file(snapshot)},
         })
     except Exception:
@@ -4725,6 +4753,7 @@ def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -
         except OSError:
             _log.exception("Could not remove unpublished expectation snapshot %s", snapshot)
         raise
+    return instance
 
 
 def _mark_finished(collection: str) -> None:
@@ -4770,13 +4799,21 @@ def sweep_interrupted_imports() -> list[str]:
     """Remove collections left half-built by a killed import.
 
     Compare the expected identities, properties and vectors, not just count.
-    Unreadable or legacy ownership cannot authorize destructive cleanup.
+    Only the collection instance the import created, identified by the token
+    in its schema description, can be deleted. Unreadable or legacy ownership
+    cannot authorize destructive cleanup.
     """
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
         try:
             data, snapshot = _read_marker(marker)
             collection = data["collection"]
+            if data["state"] == "building" and data["version"] == 3:
+                # No instance identity: it cannot tell this import's collection
+                # from a later one under the same name, so it never deletes.
+                _log.warning("Import marker %s has no instance identity; kept, and never "
+                             "used to delete %r", marker, collection)
+                continue
             if data["state"] == "building":
                 if snapshot.is_symlink() or not snapshot.is_file():
                     raise ValueError("Expected-record snapshot is not a regular file")
@@ -4786,18 +4823,57 @@ def sweep_interrupted_imports() -> list[str]:
                     expected.load_snapshot(snapshot, data["expected_chunks"])
                     if wc._collection_exists_sync(collection):
                         col = wc.get_client().collections.get(collection)
-                        try:
-                            expected.verify(col, exact=True)
-                        except batch_write.BatchVerificationError:
-                            wc.get_client().collections.delete(collection)
-                            removed.append(f"{collection} (persisted records did not match import)")
+                        if col.config.get().description != _instance_description(data["instance"]):
+                            # Created after the import stopped, for example while
+                            # an earlier start could not resolve this marker.
+                            _log.warning("Collection %r is not the one the interrupted import "
+                                         "created; kept, and its import marker retired", collection)
+                        else:
+                            try:
+                                expected.verify(col, exact=True)
+                            except batch_write.BatchVerificationError:
+                                wc.get_client().collections.delete(collection)
+                                removed.append(f"{collection} (persisted records did not match import)")
             # Cleanup is an explicit durable phase: failure here never converts
             # a verified target back into a candidate for backend deletion.
             _mark_finished(collection)
         except Exception:
             _log.exception("Could not resolve import ownership %s; preserved", marker)
             continue
+    _sweep_orphaned_snapshots()
     return removed
+
+
+def _sweep_orphaned_snapshots() -> None:
+    """Remove expectation snapshots that no marker names.
+
+    A kill between writing the snapshot and publishing its marker, or a new
+    import overwriting a marker, leaves one behind. A marker that cannot be
+    parsed might name any of them, so then nothing is removed.
+    """
+    directory = _markers_dir()
+    referenced: set[str] = set()
+    for marker in directory.glob("*.json"):
+        try:
+            if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
+                raise ValueError("not a bounded regular file")
+            data = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            _log.warning("Unreadable import marker %s; expectation snapshots preserved", marker)
+            return
+        snapshot = data.get("expected_snapshot") if isinstance(data, dict) else None
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("file"), str):
+            referenced.add(snapshot["file"])
+    for path in sorted(directory.glob("*.sqlite3")):
+        if (path.name in referenced or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", path.name)
+                or path.is_symlink() or not path.is_file()):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            _log.exception("Could not remove orphaned expectation snapshot %s", path)
+            continue
+        _log.warning("Removed orphaned import expectation snapshot %s", path.name)
 
 
 def canonical(name: str) -> str:
@@ -5000,7 +5076,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
 # ── Building ──────────────────────────────────────────────────────────────────
 
-def _create_from_package(name: str, pkg: Path) -> None:
+def _create_from_package(name: str, pkg: Path, instance: str | None = None) -> None:
     cfg_path = pkg / "collection.json"
     cfg = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
     wc._create_collection_sync(
@@ -5009,6 +5085,7 @@ def _create_from_package(name: str, pkg: Path) -> None:
         cfg.get("distance_metric", "cosine"),
         cfg.get("hnsw_config") or {},
         preserve_hnsw=True,
+        description=_instance_description(instance) if instance else None,
     )
 
 
@@ -5149,9 +5226,9 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
 
 
 @collection_writes.serialized("target")
-def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
+def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | None = None) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
-    _create_from_package(target, pkg)
+    _create_from_package(target, pkg, instance)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
     except Exception as original:
@@ -5236,9 +5313,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                         "if an orphan marker could not be persisted")
 
             expected = manifest.get("collection", {}).get("chunk_count", -1)
-            _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
+            instance = _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
             marked = target
-            written = _build(target, pkg, manifest, progress)
+            written = _build(target, pkg, manifest, progress, instance)
             _mark_finished(target)
             marked = None
             job.setdefault("restored_sessions", [])
@@ -5265,7 +5342,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
             job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
-                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
+                                   "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -5274,7 +5351,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
             job["error_detail"] = {"recovered_as": temp_collection,
-                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
+                                   "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
@@ -5845,10 +5922,17 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             raise PackageError(
                 "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified data is retained as '{staging}'.",
                 {"recovered_as": staging,
-                 "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
+                 "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}) from exc
+        if not cutover_started and ownership["state"] == "recovery":
+            # Only before_replace runs between retain and cutover. The original
+            # was never deleted, so the copy is discarded below.
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Gold-standard sessions could not be "
+                "marked stale before replacement, so the original collection is unchanged.") from exc
         raise
     finally:
-        if completed or original_intact or ownership["state"] == "scratch":
+        # Before cutover the original is intact, so a retained copy is not needed.
+        if completed or original_intact or not cutover_started or ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, client)
             except Exception:
@@ -10004,13 +10088,26 @@ Run the controlled regressions with the API dependencies installed:
 python -m unittest discover -s scripts/tests -p 'test_batch*.py'
 ```
 
-For a **disposable stack**, the following fault acceptance uses real Weaviate,
-synthetic `VfyBatchRecovery*` collections and the real embedding model. It injects
-final-create failures into the test process, retains import/tuning recovery,
-restarts the API, then verifies exact UUIDs, properties, vectors and sources.
-It also checks real completed-batch rejection/partial acceptance, ingestion UUID
-rollback after a post-write read fault, resumption of metadata cleanup after backend
-deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack: run it on the verify project.
+`batch_recovery.py` is the fault acceptance. It uses real Weaviate, synthetic
+collections and the real embedding model. It injects final-create failures into
+the test process, retains import/tuning recovery, restarts the API, then verifies
+exact UUIDs, properties, vectors and sources. It also checks real completed-batch
+rejection/partial acceptance, ingestion UUID rollback after a post-write read fault,
+resumption of metadata cleanup after backend deletion, owned scratch cleanup and
+retention of an unowned marker-like collection. It must not run against a
+user's data stack: run it on the verify project.
+
+`05_transfer.sh` runs it when `RAG_ALLOW_RESTART=1`: prepare, `docker compose
+restart api`, check, then cleanup. It creates and deletes only the
+`${RAG_TEST_PREFIX}BatchRecovery*` collections, archive and package folder it
+records in its state file. The restart ends any job in progress on the stack.
+Cleanup always runs, even after a failed check; the phase logs stay in
+`/tmp/vfy_recovery_prepare.log`, `/tmp/vfy_recovery_check.log` and
+`/tmp/vfy_recovery_cleanup.log`. The script accepts only a prefix starting with
+`Vfy` (a guard on its destructive phases), so with any other `RAG_TEST_PREFIX`
+the suite skips these checks and says why.
+
+To run the phases by hand on a disposable stack:
 
 ```bash
 bash scripts/verify/stack.sh up      # then paste the export lines it prints
@@ -10022,8 +10119,8 @@ docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
 bash scripts/verify/stack.sh down
 ```
 
-If interrupted, keep the recorded fixtures and run `check` after restarting; run
-`cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
+In a manual run, if interrupted, keep the recorded fixtures and run `check` after
+restarting; run `cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
 live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 
 ## Layout
@@ -10069,7 +10166,7 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
@@ -12941,12 +13038,17 @@ sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
+RP="${PREFIX}BatchRecovery"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
   check "batch recovery across an API restart" 1 "$restart_refusal"
-elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
-  RP="${PREFIX}BatchRecovery"
+elif ! [[ "$RP" =~ ^Vfy[A-Za-z0-9_]+$ ]]; then
+  # batch_recovery.py refuses any other prefix, as a guard on its destructive phases.
+  skip "batch recovery across an API restart" "batch_recovery.py accepts only Vfy… prefixes; RAG_TEST_PREFIX='$PREFIX' gives '$RP'"
+else
   (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
   check "batch faults fail truthfully and retain verified recovery" $? \
@@ -12960,8 +13062,6 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
   check "recovery acceptance fixtures are removed" $?
-else
-  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 rm -f "$EXPORTS/$PKG"
@@ -15558,7 +15658,7 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     paths=await asyncio.to_thread(lambda:list(tuning.collection_recovery._root().glob('*.json')));assert len(paths)==1
     owner=await asyncio.to_thread(lambda:json.loads(paths[0].read_text()))
     check(owner['state']=='recovery' and owner['target']==collection and owner['staging']==stage,'durable recovery ownership binds the original and retained copy')
-    snapshot=Path(result['error_detail']['sidecar_snapshots'])/'goldstandard'/(sid+'.json')
+    snapshot=Path(settings.upload_dir)/result['error_detail']['sidecar_snapshots']/'goldstandard'/(sid+'.json')
     check(await asyncio.to_thread(snapshot.read_bytes)==session_bytes,'pre-cutover evaluation snapshot is retained byte-identically')
     check(await asyncio.to_thread(lambda:gs.get_session(sid).get('stale')),'failed cutover marks its retained evaluation historical')
     await asyncio.to_thread(wc._sweep_staging_sync)
@@ -15901,7 +16001,7 @@ class ImportCutoverTests(unittest.TestCase):
             if name=='OwnedImport':backend.remove(name);raise RuntimeError('Owned final insertion failed')
         module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
         module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');retained=job['error_detail']['recovered_as']
-        self.assertIn(retained,backend);self.assertTrue(Path(job['error_detail']['sidecar_snapshots']).is_dir())
+        self.assertIn(retained,backend);self.assertFalse(Path(job['error_detail']['sidecar_snapshots']).is_absolute());self.assertTrue((root/job['error_detail']['sidecar_snapshots']).is_dir())
         self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
 
 
