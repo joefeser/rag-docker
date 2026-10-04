@@ -3,7 +3,8 @@ import ast,asyncio,json,os,subprocess,sys,tempfile,threading,unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
+api_dir=os.environ.get('RAG_TEST_API_DIR')
+sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
 # Loaded from the host script on stdin with its helper passed alongside it.
 source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE',str(Path(__file__).with_name('reindex.py'))))
 tree=ast.parse(source.read_text());assert isinstance(tree.body[-1],ast.Expr);tree.body.pop()
