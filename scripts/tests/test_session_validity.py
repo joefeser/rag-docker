@@ -8,10 +8,18 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
 from config import settings
 from models.schemas import SessionResponse
 from services import goldstandard as gs
+
+NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
+
+
+def repository_root():
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else None
+    return root if root is not None and (root / 'IMPLEMENTATION.md').is_file() else None
 
 
 def session():
@@ -116,7 +124,9 @@ class ValidityServiceTests(unittest.TestCase):
 
 class ImplementationTests(unittest.TestCase):
     def test_changed_embedded_sources_match_runtime(self):
-        root=Path(__file__).resolve().parents[2];text=(root/'IMPLEMENTATION.md').read_text()
+        root=repository_root()
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
+        text=(root/'IMPLEMENTATION.md').read_text()
         for name in ('api/main.py','api/models/schemas.py','api/routers/goldstandard.py',
                      'api/services/goldstandard.py','api/services/tuning.py','ui/src/api/client.ts','ui/src/pages/GoldStandardPage.tsx','scripts/verify/session_validity.py','scripts/verify/10_validity.sh','scripts/verify/05_transfer.sh','scripts/verify/README.md','scripts/verify/browser/ui_criteria.js'):
             language='typescript' if name.endswith(('.ts','.tsx')) else 'javascript' if name.endswith('.js') else 'bash' if name.endswith('.sh') else 'markdown' if name.endswith('.md') else 'python'
