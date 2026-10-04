@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -116,5 +117,4 @@ async def download(filename: str):
 
 @router.get("/diagnostics")
 async def diagnostics():
-    import asyncio
     return {"issues": await asyncio.to_thread(gs.session_diagnostics)}
