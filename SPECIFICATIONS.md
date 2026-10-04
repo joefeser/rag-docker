@@ -285,7 +285,7 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
 ```
 
 `index_type`: `"hnsw"`, `"flat"`, `"dynamic"`, or `"unknown"` when the collection has no recognized vector index configuration (for example, named vectors).  
-`distance_metric`: `"cosine"`, `"dot"`, `"l2-squared"`, or `"unknown"` when the distance is unavailable.  
+`distance_metric`: `"cosine"`, `"dot"`, `"l2-squared"`, or `"unknown"` when the distance is unavailable or isn't one of these three.  
 `hnsw_config`: the actual HNSW settings `{ef, efConstruction, maxConnections}` when `index_type` is `"hnsw"`; `null` otherwise.
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).

@@ -165,6 +165,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     try {
       await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
       r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      r.check('initial metadata failure settles the pending read instead of leaving it stuck', !/Reading index details…/.test(await bodyText(s.page)) && /Index details are unavailable for this collection\./.test(await bodyText(s.page)));
       await clickByText(s.page, 'Refresh index details'); await sleep(500);
       const refreshed = await bodyText(s.page);
       r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
