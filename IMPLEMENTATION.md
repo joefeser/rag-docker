@@ -1440,6 +1440,7 @@ import re
 from pathlib import Path
 
 from config import settings
+from models.schemas import SaveRetrievalConfigBody
 
 log = logging.getLogger(__name__)
 
@@ -1495,6 +1496,18 @@ def resolve(collection: str) -> tuple[dict, bool]:
     merged = {"collection": collection, **DEFAULTS, **saved}
     merged["collection"] = collection
     return merged, False
+
+
+def validate(config: dict, collection: str) -> dict:
+    """Apply the API save contract, binding settings to the actual collection.
+
+    Older packages may omit defaulted fields or carry an obsolete collection
+    name. Extra fields are ignored just as they are for API saves.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Retrieval settings must be an object")
+    return SaveRetrievalConfigBody.model_validate(
+        {**config, "collection": collection}).model_dump()
 
 
 def save(config: dict) -> dict:
@@ -3920,12 +3933,34 @@ def _failed_generation(current: dict, exc: Exception) -> None:
         current["persistence_error"] = {"code": exc.code, "message": exc.message}
 
 
+def _publish_generation_failure(session_id: str, exc: Exception, write_error: Exception) -> None:
+    """Publish a failed status the store could not save, as marker failures do."""
+    global _store_revision
+    with _state_lock:
+        current = _sessions.get(session_id)
+        if current is None:
+            return
+        snapshot = copy.deepcopy(current)
+        _failed_generation(snapshot, exc)
+        _failed_generation(snapshot, write_error)
+        _sessions[session_id] = snapshot
+        _store_revision += 1
+
+
 async def _record_generation_failure(session_id: str, exc: Exception) -> None:
     try:
         await asyncio.to_thread(_update_session_sync, session_id,
                                 lambda current: _failed_generation(current, exc))
-    except Exception:
+    except Exception as write_error:
         log.exception("Could not durably report failed generation for %s", session_id)
+        # Otherwise `generating` stays in the cache for as long as the fault
+        # lasts, and the UI polls it forever. The cache runs ahead of disk;
+        # the next successful write of this session saves the failed status.
+        # The lock can be held through fsync, so this stays off the event loop.
+        try:
+            await asyncio.to_thread(_publish_generation_failure, session_id, exc, write_error)
+        except Exception:
+            log.exception("Could not publish failed generation for %s", session_id)
 
 
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
@@ -4293,12 +4328,27 @@ def _resolve_includes(text: str, depth: int = 0) -> str:
 
 def _render(template: str, values: dict[str, str]) -> str:
     text = _resolve_includes((_TEMPLATE_DIR / template).read_text())
-    for key, value in values.items():
-        text = text.replace(f"@@{key}@@", str(value))
-    left = re.findall(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", text)
-    if left:
-        raise RuntimeError(f"{template}: unsubstituted placeholders {sorted(set(left))}")
-    return text
+    # Substitute only original template tokens. Inserted data can itself contain
+    # token-shaped text and must never be interpreted as another substitution.
+    def substitute(match):
+        key = match.group()[2:-2]
+        if key not in values:
+            raise RuntimeError(f"{template}: unsubstituted placeholder {match.group()}")
+        return str(values[key])
+    return re.sub(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", substitute, text)
+
+
+def _render_retrieve(collection: str, cfg: dict, metadata: dict) -> str:
+    """Only validated, encoded Python literals may cross into script source."""
+    cfg = retrieval_config.validate(cfg, collection)
+    return _render("retrieve.py.tmpl", {
+        "PACKAGE_METADATA": repr(metadata),
+        "COLLECTION_NAME": repr(collection),
+        "RETRIEVAL_MODE": repr(cfg["retrieval_mode"]),
+        "TOP_K": repr(cfg["top_k"]),
+        "ALPHA": repr(cfg["alpha"]),
+        "RESPONSE_FORMAT": repr(cfg["response_format"]),
+    })
 
 
 def render_help(embed_dimensions: int | str) -> str:
@@ -4409,6 +4459,7 @@ def build(
             b.add_json("ingest_config.json", ingest_cfg)
 
         retrieval_cfg, is_default = retrieval_config.resolve(collection)
+        retrieval_cfg = retrieval_config.validate(retrieval_cfg, collection)
         has_saved_retrieval = not is_default
         b.add_json("retrieval_config.json", retrieval_cfg)
 
@@ -4522,17 +4573,12 @@ def build(
             contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
-            (stage / "retrieve.py").write_text(_render("retrieve.py.tmpl", {
-                "COLLECTION_NAME": collection,
-                "PACKAGE_FILENAME": filename,
-                "ID8": id8,
-                "CREATED_AT": created_at,
-                "EMBED_MODEL": settings.embed_model,
-                "EMBED_DIMENSIONS": dimensions if dimensions is not None else "unknown",
-                "RETRIEVAL_MODE": retrieval_cfg["retrieval_mode"],
-                "TOP_K": retrieval_cfg["top_k"],
-                "ALPHA": retrieval_cfg["alpha"],
-                "RESPONSE_FORMAT": retrieval_cfg["response_format"],
+            (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
+                "package_filename": filename,
+                "id8": id8,
+                "created_at": created_at,
+                "embed_model": settings.embed_model,
+                "embed_dimensions": dimensions,
             }))
             (stage / "retrieve.py").chmod(0o755)
 
@@ -5357,9 +5403,24 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     return sessions
 
 
+def _read_retrieval_config(pkg: Path, original: str) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot."""
+    path = pkg / "retrieval_config.json"
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Retrieval settings must be a regular file")
+        return retrieval_config.validate(json.loads(path.read_text()), original)
+    except (OSError, ValueError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retrieval settings.",
+                           {"file": "retrieval_config.json"}) from exc
+
+
 def _restore_sidecars(target: str, pkg: Path, original: str,
                       validated_sessions: list[dict],
-                      restored_sessions: list[dict] | None = None) -> list[str]:
+                      restored_sessions: list[dict] | None = None,
+                      validated_retrieval: dict | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -5379,10 +5440,8 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
         out.mkdir(parents=True, exist_ok=True)
         (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
 
-    retrieval_cfg = pkg / "retrieval_config.json"
-    if retrieval_cfg.is_file():
-        data = json.loads(retrieval_cfg.read_text())
-        data["collection"] = target
+    if validated_retrieval is not None:
+        data = {**validated_retrieval, "collection": target}
         try:
             retrieval_config.save(data)
         except Exception as exc:                      # noqa: BLE001
@@ -5473,6 +5532,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                {"name": original})
 
         validated_sessions = _read_goldstandard_sessions(pkg, original)
+        validated_retrieval = _read_retrieval_config(pkg, original)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -5517,7 +5577,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             marked = None
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
-                target, pkg, original, validated_sessions, job["restored_sessions"])
+                target, pkg, original, validated_sessions, job["restored_sessions"],
+                validated_retrieval)
 
             if staged and temp_collection:
                 try:
@@ -7346,12 +7407,7 @@ This package is:
 
 ```python
 #!/usr/bin/env python3
-"""Query the "@@COLLECTION_NAME@@" collection through a rag-docker API.
-
-Generated with the RAG package @@PACKAGE_FILENAME@@
-  package id : @@ID8@@
-  created    : @@CREATED_AT@@
-  embedding  : @@EMBED_MODEL@@ (@@EMBED_DIMENSIONS@@ dimensions)
+"""Query the packaged collection through a rag-docker API.
 
 The defaults below are the settings this collection was tuned with. Every one
 can be overridden with a flag. Standard library only, on purpose: this has to
@@ -7368,12 +7424,13 @@ import urllib.error
 import urllib.request
 
 # ── Baked in at export from the collection's saved retrieval settings ─────────
-COLLECTION = "@@COLLECTION_NAME@@"
+PACKAGE_METADATA = @@PACKAGE_METADATA@@
+COLLECTION = @@COLLECTION_NAME@@
 DEFAULT_API_URL = "http://localhost:8080/api"
-DEFAULT_MODE = "@@RETRIEVAL_MODE@@"
+DEFAULT_MODE = @@RETRIEVAL_MODE@@
 DEFAULT_TOP_K = @@TOP_K@@
 DEFAULT_ALPHA = @@ALPHA@@
-DEFAULT_RESPONSE_FORMAT = "@@RESPONSE_FORMAT@@"
+DEFAULT_RESPONSE_FORMAT = @@RESPONSE_FORMAT@@
 
 MODES = ("hnsw", "flat", "hybrid", "semantic")
 # Generous by default: the answer is generated by an LLM on CPU, which can take
@@ -8079,7 +8136,7 @@ function fromResponse(r: RetrievalConfig): QueryConfig {
 }
 
 export function QueryConfigProvider({ children }: { children: ReactNode }) {
-  const [collection, setCollection] = useState('')
+  const [collection, setCollectionState] = useState('')
   const [config, setConfigState] = useState<QueryConfig>(DEFAULT_CONFIG)
   const [isDefault, setIsDefault] = useState(true)
   const [loading, setLoading] = useState(false)
@@ -8088,8 +8145,20 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   // the user has already navigated away from must not overwrite the current
   // one. Every load carries a ticket; only the latest ticket may apply.
   const requestId = useRef(0)
+  const selectedCollection = useRef('')
+  const saveId = useRef(0)
+
+  const setCollection = useCallback((name: string) => {
+    if (name === selectedCollection.current) return
+    selectedCollection.current = name
+    // Invalidate immediately, before the next effect runs. A -> B -> A is
+    // also a new generation even though the collection name matches again.
+    requestId.current++
+    setCollectionState(name)
+  }, [])
 
   useEffect(() => {
+    const ticket = ++requestId.current
     if (!collection) {
       setConfigState(DEFAULT_CONFIG)
       setIsDefault(true)
@@ -8097,7 +8166,6 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
       setLoading(false)
       return
     }
-    const ticket = ++requestId.current
     setLoading(true)
     setError('')
     api
@@ -8117,12 +8185,23 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
         setError(e instanceof Error ? e.message : String(e))
         setLoading(false)
       })
+    return () => { requestId.current++ }
   }, [collection])
 
   const saveConfig = useCallback(
     async (next: QueryConfig) => {
       if (!collection) throw new Error('Select a collection before saving retrieval settings.')
+      const ticket = requestId.current
+      const saveTicket = ++saveId.current
       const saved = await api.saveRetrievalConfig({ collection, ...next })
+      // A save belongs to the selection generation that started it. An old
+      // save must not publish into another collection or cancel its load.
+      // Of concurrent saves, only the latest started may publish.
+      if (
+        collection !== selectedCollection.current ||
+        ticket !== requestId.current ||
+        saveTicket !== saveId.current
+      ) return
       // A completed save supersedes any load still in flight for this
       // collection, which would otherwise land afterwards with stale values.
       requestId.current++
@@ -10246,6 +10325,16 @@ uv run --no-project --python 3.11 \
   python scripts/tests/test_session_import.py
 ```
 
+`scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
+retrieval package rejection before model, backend, recovery, or sidecar mutation;
+historical defaults/coercion and `ef` round trips; and generated Python literal
+regressions. Run it with the same API dependencies as the session import test.
+`05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
+15 malformed settings imports across abort/rename/replace and verifies live
+collection counts and saved settings are unchanged. The normal rename import
+also checks all saved retrieval fields round-trip. Controlled tests complement,
+and do not replace, this live acceptance.
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -10439,6 +10528,28 @@ Run `python3 scripts/tests/test_loopback_verification.py` from the repository ro
 The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
 
 Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
+
+## Deferred query configuration browser checks
+
+`browser/query_config.js` runs against the real UI with all API calls stubbed
+before startup. It explicitly holds and releases responses to cover a delayed
+A save arriving before/after B's load, B's failed load, an A→B→A selection,
+concurrent saves in both response orders, and save failure. Every case checks
+the actual next Q&A request payload. These fixtures are included in `06_ui.sh`
+through `ui_criteria.js`, and can also run without a backend or model:
+
+```bash
+# Start the UI separately: cd ui && npm ci && npm run dev -- --host 127.0.0.1
+# With puppeteer-core available to Node and a local Chromium installation:
+RAG_UI_BASE=http://127.0.0.1:3000 \
+RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/query_config.js
+```
+
+The standalone runner uses the existing browser verification dependency
+`puppeteer-core` (also available in the verification browser image); set
+`NODE_PATH` if it is installed outside normal Node module resolution. This
+isolated fixture run does not replace the required full live-stack suite.
 ````
 
 ### scripts/verify/all.sh
@@ -12829,6 +12940,8 @@ section "Export, import and tuning"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
 check "evaluation import and generated-session regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
+check "retrieval import and generated-script trust-boundary regressions" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -12889,6 +13002,10 @@ import json,sys; d=json.load(sys.stdin)
 sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
 check "the corruption error names the offending file" $?
 rm -f "$EXPORTS/$CORRUPT"
+
+# Digest-valid malformed retrieval settings must fail before every conflict path.
+python3 ./retrieval_settings.py "$API" "$C" "$EXPORTS/$PKG"
+check "invalid retrieval imports preserve live collections and settings" $?
 
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
@@ -13033,6 +13150,12 @@ check_eq "rename imports alongside the original" "$istat" "completed"
 [ "$irenamed" = "True" ] && [ "$iname" != "$C" ]
 check "the renamed collection has a new name" $? "imported as $iname"
 check_eq "every chunk is imported" "$iwritten" "$chunks_before"
+api_get "/retrieval/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
+check "renamed import preserves every saved retrieval setting" $?
 
 # A successful destructive replace must be exercised as well as abort/rename.
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
@@ -13763,6 +13886,196 @@ const clickByText = (page, text) => page.evaluate(t => {
 module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, clickByText };
 ```
 
+### scripts/verify/browser/query_config.js
+
+```javascript
+// Deferred responses exercise the real provider, Retrieval page, and Q&A page.
+// All API calls are intercepted before application startup; no backend is used.
+const assert = require('node:assert/strict');
+const { makeReporter, setValue, clickByText } = require('./lib');
+
+const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
+const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
+const DEFAULT = { ...B, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, is_default: true };
+
+async function fixture(browser, base) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.evaluateOnNewDocument((a, b) => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realFetch = window.fetch.bind(window);
+    const requests = [];
+    window.queryConfigFixture = { requests };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      const method = init.method || 'GET';
+      const body = init.body ? JSON.parse(init.body) : null;
+      const entry = { path, method, body, done: false };
+      requests.push(entry);
+      const response = data => new Response(JSON.stringify(data), { status: 200 });
+      if (path === '/api/collections') {
+        entry.done = true;
+        return Promise.resolve(response({ collections: [a, b].map(c => ({ name: c.collection, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) }));
+      }
+      if (path === '/api/retrieval/config/FixtureA' && requests.filter(r => r.path === path).length === 1) {
+        entry.done = true;
+        return Promise.resolve(response(a));
+      }
+      if (path === '/api/query') {
+        entry.done = true;
+        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+      }
+      if (path.startsWith('/api/retrieval/config')) {
+        return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
+      }
+      return Promise.reject(new Error('Unexpected fixture API call: ' + method + ' ' + path));
+    };
+  }, A, B);
+  await page.goto(base + '/retrieval', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.body.innerText.includes('Top-K Results: 11') && !document.body.innerText.includes('Loading saved settings'));
+  return { ctx, page, errors };
+}
+
+async function pending(page, path, method = 'GET', count = 1) {
+  await page.waitForFunction((p, m, n) => window.queryConfigFixture.requests.filter(r => r.path === p && r.method === m && !r.done).length >= n, {}, path, method, count);
+}
+
+async function release(page, path, data, { method = 'GET', status = 200, last = false } = {}) {
+  await pending(page, path, method);
+  await page.evaluate(async (p, m, d, s, latest) => {
+    const waiting = window.queryConfigFixture.requests.filter(r => r.path === p && r.method === m && !r.done);
+    (latest ? waiting[waiting.length - 1] : waiting[0]).resolve(d, s);
+    // Drain fetch/text microtasks and React's committed effects without sleeps.
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }, path, method, data, status, last);
+}
+
+async function save(page) {
+  assert.equal(await clickByText(page, 'Save for this collection'), true);
+  await pending(page, '/api/retrieval/config', 'POST');
+}
+
+async function select(page, name) {
+  await page.select('select', name);
+  await pending(page, '/api/retrieval/config/' + name);
+}
+
+async function assertSettings(page, config) {
+  assert.deepEqual(await page.evaluate(() => ({
+    collection: document.querySelector('select').value,
+    top_k: Number(document.querySelector('input[type=range]').value),
+    retrieval_mode: document.querySelector('input[name=mode]:checked').value,
+    loading: document.body.innerText.includes('Loading saved settings'),
+  })), { collection: config.collection, top_k: config.top_k, retrieval_mode: config.retrieval_mode, loading: false });
+}
+
+async function assertQuery(page, config) {
+  assert.equal(await clickByText(page, 'Q&A'), true);
+  await page.waitForSelector('textarea');
+  await setValue(page, '() => document.querySelector("textarea")', 'Which settings are active?');
+  assert.equal(await clickByText(page, 'Ask'), true);
+  await page.waitForFunction(() => window.queryConfigFixture.requests.some(r => r.path === '/api/query'));
+  const body = await page.evaluate(() => window.queryConfigFixture.requests.find(r => r.path === '/api/query').body);
+  assert.deepEqual(body, {
+    question: 'Which settings are active?', collection: config.collection,
+    retrieval_mode: config.retrieval_mode, top_k: config.top_k, alpha: config.alpha,
+    include_citations: false, response_format: 'engineer',
+  });
+}
+
+async function runQueryConfigTests(browser, base, reporter) {
+  reporter.section('collection-bound query configuration (deferred API fixtures)');
+  const cases = [];
+  for (const saveFirst of [true, false]) {
+    cases.push([`A save ${saveFirst ? 'before' : 'after'} B load preserves B settings and next query`, async page => {
+      await save(page);
+      await select(page, B.collection);
+      if (saveFirst) {
+        await release(page, '/api/retrieval/config', A, { method: 'POST' });
+        assert.equal(await page.evaluate(() => document.body.innerText.includes('Loading saved settings')), true);
+      }
+      await release(page, '/api/retrieval/config/' + B.collection, B);
+      if (!saveFirst) await release(page, '/api/retrieval/config', A, { method: 'POST' });
+      await assertSettings(page, B);
+      await assertQuery(page, B);
+    }]);
+  }
+  cases.push(['B load failure remains authoritative after stale A save', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, { error: { message: 'Fixture B unavailable' } }, { status: 500 });
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture B unavailable') && document.body.innerText.includes('showing defaults')), true);
+    await assertSettings(page, DEFAULT);
+    await assertQuery(page, DEFAULT);
+  }]);
+  cases.push(['A -> B -> A does not revive the first A save or stale B load', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await select(page, A.collection);
+    const current = { ...A, retrieval_mode: 'semantic', top_k: 31, alpha: 0.9 };
+    await release(page, '/api/retrieval/config/' + A.collection, current);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  for (const latestFirst of [true, false]) {
+    cases.push([`concurrent saves keep latest submitted values (${latestFirst ? 'latest' : 'oldest'} response first)`, async page => {
+      await save(page);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+      await save(page);
+      await pending(page, '/api/retrieval/config', 'POST', 2);
+      const current = { ...A, top_k: 17 };
+      const bodies = await page.evaluate(() => window.queryConfigFixture.requests.filter(r => r.method === 'POST').map(r => r.body.top_k));
+      assert.deepEqual(bodies, [11, 17]);
+      await release(page, '/api/retrieval/config', latestFirst ? current : A, { method: 'POST', last: latestFirst });
+      await release(page, '/api/retrieval/config', latestFirst ? A : current, { method: 'POST' });
+      await assertSettings(page, current);
+      await assertQuery(page, current);
+    }]);
+  }
+  cases.push(['current save failure still reaches the caller and preserves saved settings', async page => {
+    await save(page);
+    await release(page, '/api/retrieval/config', { error: { message: 'Fixture save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture save failed')), true);
+    await assertSettings(page, A);
+    await assertQuery(page, A);
+  }]);
+  for (const [name, test] of cases) {
+    let s;
+    try {
+      s = await fixture(browser, base);
+      await test(s.page);
+      assert.deepEqual(s.errors, []);
+      reporter.check(name, true);
+    } catch (error) {
+      reporter.check(name, false, error.stack || error.message);
+    } finally {
+      if (s) await s.ctx.close();
+    }
+  }
+}
+
+module.exports = { runQueryConfigTests };
+
+if (require.main === module) {
+  (async () => {
+    const browser = await require('puppeteer-core').launch({
+      executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser',
+      headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    const reporter = makeReporter();
+    try { await runQueryConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+    finally { await browser.close(); }
+    process.exitCode = reporter.summary() ? 0 : 1;
+  })().catch(error => { console.error(error); process.exitCode = 2; });
+}
+```
+
 ### scripts/verify/browser/ui_criteria.js
 
 ```javascript
@@ -13781,6 +14094,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 (async () => {
   const browser = await launch();
   const r = makeReporter();
+
+  await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
@@ -14874,6 +15189,90 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 finally:release.set()
                 await task
         asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
+
+    async def generate(self,pair):
+        # The real task, done-callback and reporter run; only the model and sampling are owned.
+        chunk={'content':'Inert','source_file':'inert.txt','chunk_index':0}
+        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
+            sid=(await gs.start_generation('OwnedPersistence',1,None))['session_id']
+            deadline=time.monotonic()+5
+            while gs._tasks:
+                if time.monotonic()>deadline:raise AssertionError('Owned generation did not finish')
+                await asyncio.sleep(0.01)
+        return sid
+
+    async def fetch(self,sid):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+            return await client.get('/goldstandard/session/'+sid)
+
+    def test_persistent_replace_failure_ends_generation_failed(self):
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def pair(chunk):fault.set();return fixture()['pairs'][0]
+        async def run():
+            with patch.object(gs.os,'replace',side_effect=replace):
+                sid=await self.generate(pair);return sid,await self.fetch(sid)
+        sid,response=asyncio.run(run());state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed')
+        self.assertTrue(any('SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
+        self.assertEqual(json.loads(gs._session_path(sid).read_text())['status'],'generating')
+
+    def test_directory_at_session_path_ends_generation_failed(self):
+        async def pair(chunk):
+            # The only generating session is the one this case started.
+            sid=next(key for key,value in gs._sessions.items() if value['status']=='generating')
+            path=gs._session_path(sid);path.unlink();path.mkdir()
+            return fixture()['pairs'][0]
+        async def run():
+            sid=await self.generate(pair);return sid,await self.fetch(sid)
+        sid,response=asyncio.run(run());state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed')
+        self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
+        # Untyped on develop; #127 types the same fault as SESSION_WRITE_FAILED.
+        self.assertTrue(any('not a regular file' in e or 'SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+
+    def test_cancelled_generation_with_failing_final_write_ends_failed(self):
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def run():
+            waiting=asyncio.Event()
+            async def pair(chunk):fault.set();waiting.set();await asyncio.Event().wait()
+            async def cancel():
+                await waiting.wait()
+                for task in list(gs._tasks):task.cancel()
+            with patch.object(gs.os,'replace',side_effect=replace):
+                canceller=asyncio.create_task(cancel())
+                sid=await self.generate(pair);await canceller;return sid
+        self.assertEqual(gs.get_session(asyncio.run(run()))['status'],'failed')
+
+    def test_cache_fallback_keeps_event_loop_responsive(self):
+        initial=fixture();initial.update(session_id='gs_450abcd1',status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+        written=threading.Event();held=threading.Event();release=threading.Event();seen=[]
+        def failing(sid,change):
+            written.set();raise gs.GoldStandardError('SESSION_WRITE_FAILED','Owned persistent write fault',503)
+        def hold():
+            with gs._state_lock:
+                held.set();seen.append(release.wait(5))
+        holder=threading.Thread(target=hold);holder.start();self.assertTrue(held.wait(5))
+        async def run():
+            with patch.object(gs,'_update_session_sync',side_effect=failing):
+                task=asyncio.create_task(gs._record_generation_failure(initial['session_id'],RuntimeError('Owned unexpected failure')))
+                try:
+                    self.assertTrue(await asyncio.to_thread(written.wait,5))
+                    # Long enough for the reporter to reach its fallback; on the loop it would block here.
+                    await asyncio.sleep(0.05)
+                finally:release.set()
+                await task
+        try:asyncio.run(run())
+        finally:release.set();holder.join(5)
+        self.assertEqual(seen,[True])
+        self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
 
     def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
         from services import tuning
@@ -16520,4 +16919,260 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):ns['owned_name']('','owned')
 
 if __name__=='__main__':unittest.main()
+```
+
+### scripts/tests/test_retrieval_import.py
+
+```python
+"""Controlled package preflight and generated-script trust-boundary regressions."""
+import ast
+import json
+import os
+import sys
+import tarfile
+import tempfile
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
+from config import settings
+from models.schemas import SaveRetrievalConfigBody
+from services import importer, packager, retrieval_config
+
+
+INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
+           {'retrieval_mode': 'hybrid"; injected = True #'},
+           {'response_format': 'engineer"; injected = True #'},
+           {'top_k': True}, {'top_k': 0}, {'top_k': 51}, {'top_k': 1.5},
+           {'alpha': False}, {'alpha': -0.1}, {'alpha': 1.1},
+           {'alpha': float('nan')}, {'alpha': float('inf')},
+           {'ef': True}, {'ef': 15}, {'ef': 513}]
+
+
+class RetrievalImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pkg = self.root / 'package'
+        self.pkg.mkdir()
+        self.uploads = self.root / 'uploads'
+        self.uploads.mkdir()
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.uploads), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.dict(importer._jobs, {}, clear=True))
+        self.stack.enter_context(patch.object(importer, '_log'))
+
+    def archive(self, data):
+        (self.pkg / 'retrieval_config.json').write_text(data)
+        (self.pkg / 'chunks.jsonl').write_text('')
+        manifest = {'package_format': 1, 'collection': {'name': 'Corpus', 'chunk_count': 0},
+                    'embedding': {'model': settings.embed_model},
+                    'files': {p.name: 'sha256:' + packager.sha256_file(p)
+                              for p in self.pkg.iterdir() if p.name != 'manifest.json'}}
+        (self.pkg / 'manifest.json').write_text(json.dumps(manifest))
+        with tarfile.open(self.exports / 'fixture.tar.gz', 'w:gz') as tar:
+            tar.add(self.pkg, arcname='package')
+
+    def test_digest_valid_bad_settings_refused_before_any_live_mutation(self):
+        original = retrieval_config.validate({'top_k': 9}, 'Corpus')
+        retrieval_config.save(original)
+        saved = retrieval_config._path('Corpus')
+        before = saved.read_bytes()
+        for data in [json.dumps(value) for value in INVALID] + ['{']:
+            self.archive(data)
+            for conflict in ('abort', 'rename', 'replace'):
+                with self.subTest(data=data, conflict=conflict), ExitStack() as mocks:
+                    operations = [mocks.enter_context(patch.object(module, name)) for module, name in [
+                        (importer, '_ensure_models'), (importer, '_build'),
+                        (importer.wc, '_collection_exists_sync'), (importer.wc, '_delete_collection_sync'),
+                        (importer.wc, 'get_client'), (importer, '_restore_sidecars'),
+                        (importer, '_mark_started'), (importer.collection_recovery, 'begin')]]
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', conflict)
+                    result = importer._jobs['test']
+                    self.assertEqual(result['status'], 'failed')
+                    self.assertEqual(result['error_code'], 'PACKAGE_CORRUPT')
+                    self.assertEqual(result['error_detail'], {'file': 'retrieval_config.json'})
+                    for operation in operations:
+                        operation.assert_not_called()
+                    self.assertEqual(saved.read_bytes(), before)
+                    self.assertFalse((self.root / 'sources').exists())
+                    self.assertFalse(list(self.uploads.glob('import-*')))
+
+    def test_valid_historical_defaults_coercion_and_ef_match_api_and_roundtrip(self):
+        for data in [{}, {'collection': 'OldName', 'top_k': '7', 'alpha': '0.5', 'ef': '64'},
+                     {'retrieval_mode': 'flat', 'top_k': 50, 'alpha': 0, 'ef': 512,
+                      'response_format': 'engineer', 'legacy_field': 'ignored'}]:
+            with self.subTest(data=data):
+                self.archive(json.dumps(data))
+                expected = SaveRetrievalConfigBody.model_validate({**data, 'collection': 'Corpus'}).model_dump()
+                with patch.object(importer, '_ensure_models', return_value=[]), \
+                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
+                     patch.object(importer, '_build', return_value=0):
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', 'abort')
+                self.assertEqual(importer._jobs['test']['status'], 'completed')
+                self.assertEqual(retrieval_config.load('Corpus'), expected)
+
+    def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
+        self.archive(json.dumps({'top_k': '8', 'ef': 64}))
+        validated = importer._read_retrieval_config(self.pkg, 'Corpus')
+        (self.pkg / 'retrieval_config.json').write_text('{')
+        importer._restore_sidecars('Renamed', self.pkg, 'Corpus', [], validated_retrieval=validated)
+        self.assertEqual(retrieval_config.load('Renamed'), {**validated, 'collection': 'Renamed'})
+        self.assertEqual(validated['collection'], 'Corpus')
+
+    def test_absent_settings_remain_optional_and_nonregular_settings_fail(self):
+        self.assertIsNone(importer._read_retrieval_config(self.pkg, 'Corpus'))
+        (self.pkg / 'retrieval_config.json').mkdir()
+        with self.assertRaises(packager.PackageError):
+            importer._read_retrieval_config(self.pkg, 'Corpus')
+
+    def test_saved_invalid_settings_cannot_generate_script(self):
+        for data in INVALID:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                packager._render_retrieve('Corpus', data, {})
+
+    def test_generated_script_defaults_are_literals_and_metadata_stays_data(self):
+        malicious = '\"\"\"\nraise RuntimeError("injected")\n#\\\n@@TOP_K@@'
+        cfg = {'retrieval_mode': 'hybrid', 'top_k': '8', 'alpha': '0.25',
+               'response_format': 'engineer', 'ef': 64, 'unknown': malicious}
+        source = packager._render_retrieve(malicious, cfg, {'embed_model': malicious})
+        tree = ast.parse(source)
+        literals = {node.targets[0].id: ast.literal_eval(node.value)
+                    for node in tree.body if isinstance(node, ast.Assign)}
+        self.assertEqual(literals['COLLECTION'], malicious)
+        self.assertEqual(literals['PACKAGE_METADATA'], {'embed_model': malicious})
+        self.assertEqual(literals['DEFAULT_TOP_K'], 8)
+        self.assertIs(type(literals['DEFAULT_TOP_K']), int)
+        self.assertEqual(literals['DEFAULT_ALPHA'], 0.25)
+        namespace = {'__name__': 'retrieval_import_test'}
+        exec(compile(tree, 'retrieve.py', 'exec'), namespace)
+        args = namespace['build_parser']().parse_args(['a question'])
+        self.assertEqual((args.mode, args.top_k, args.alpha, args.response_format),
+                         ('hybrid', 8, 0.25, 'engineer'))
+
+    def test_export_emits_normalized_settings_and_executable_defaults(self):
+        saved = {'collection': 'Corpus', 'top_k': '7', 'alpha': '0.5', 'ef': 64}
+        retrieval_config.save(saved)
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            source = archive.extractfile(members['retrieve.py']).read().decode()
+        self.assertEqual(cfg, SaveRetrievalConfigBody.model_validate(saved).model_dump())
+        namespace = {'__name__': 'retrieval_import_test'}
+        exec(compile(source, 'retrieve.py', 'exec'), namespace)
+        self.assertEqual(namespace['DEFAULT_TOP_K'], 7)
+        self.assertEqual(namespace['DEFAULT_ALPHA'], 0.5)
+        self.assertEqual(namespace['PACKAGE_METADATA']['package_filename'], result['filename'])
+
+    def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
+        for value in INVALID:
+            with self.subTest(value=value), ExitStack() as mocks:
+                mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={}))
+                mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+                mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
+                if value is None:  # None denotes no saved file, not an invalid saved config.
+                    continue
+                with self.assertRaises((ValueError, TypeError)):
+                    packager.build('Corpus')
+                self.assertEqual(list(self.exports.iterdir()), [])
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+### scripts/verify/retrieval_settings.py
+
+```python
+"""Live transfer regression: digest-valid invalid settings cannot replace a corpus."""
+import hashlib
+import json
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+
+def run(api, collection, package):
+    def request(path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(api.rstrip('/') + path, data=data,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+
+    def collections():
+        return sorted((c['name'], c['object_count'])
+                      for c in request('/collections')['collections'])
+
+    package = Path(package)
+    saved = request('/retrieval/config/' + collection)
+    baseline = collections()
+    marker = {**saved, 'top_k': 9 if saved['top_k'] != 9 else 10}
+    try:
+        request('/retrieval/config', marker)
+        expected = request('/retrieval/config/' + collection)
+        invalid = [[], {'top_k': '5; raise RuntimeError("injected")'},
+                   {'retrieval_mode': 'hybrid"; raise RuntimeError("injected") #'},
+                   {'alpha': 2}, {'ef': True}]
+        for value in invalid:
+            with tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                with tarfile.open(package) as archive:
+                    archive.extractall(work, filter='data')
+                root = next(p for p in work.iterdir() if p.is_dir())
+                side = root / 'retrieval_config.json'
+                side.write_text(json.dumps(value))
+                manifest_path = root / 'manifest.json'
+                manifest = json.loads(manifest_path.read_text())
+                manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
+                manifest_path.write_text(json.dumps(manifest))
+                with tempfile.NamedTemporaryFile(prefix='vfy-retrieval-', suffix='.tar.gz',
+                                                 dir=package.parent) as output:
+                    with tarfile.open(output.name, 'w:gz') as archive:
+                        archive.add(root, arcname=root.name)
+                    for conflict in ('abort', 'rename', 'replace'):
+                        job_id = request('/import', {'filename': Path(output.name).name,
+                                                     'on_conflict': conflict})['job_id']
+                        deadline = time.monotonic() + 120
+                        while True:
+                            job = request('/import/job/' + job_id)
+                            if job['status'] in ('failed', 'completed'):
+                                break
+                            if time.monotonic() >= deadline:
+                                raise AssertionError('Retrieval settings import timed out')
+                            time.sleep(0.2)
+                        assert job['status'] == 'failed', job
+                        assert job['error_code'] == 'PACKAGE_CORRUPT', job
+                        assert job['error_detail'] == {'file': 'retrieval_config.json'}, job
+                        assert request('/retrieval/config/' + collection) == expected
+                        assert collections() == baseline
+        print('15 digest-valid malformed retrieval imports rejected; live collections/settings preserved')
+    finally:
+        request('/retrieval/config', saved)
+
+
+if __name__ == '__main__':
+    run(*sys.argv[1:])
 ```
