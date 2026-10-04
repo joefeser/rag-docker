@@ -32,7 +32,7 @@ class TransferPrefixTests(unittest.TestCase):
              'api_code(){ echo 200; }\n'
              'sleep(){ :; }\n')
 
-    def run_block(self, prefix, allow_restart):
+    def run_block(self, prefix, allow_restart, refusal=''):
         script = (ROOT / 'scripts/verify/05_transfer.sh').read_text()
         start = script.index('# ── verified recovery across an API restart')
         end = script.index('rm -f "$EXPORTS/$PKG"', start)
@@ -42,9 +42,13 @@ class TransferPrefixTests(unittest.TestCase):
             trace = Path(work) / 'trace'
             env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'REPO_ROOT': str(ROOT), 'TRACE': str(trace),
                    'API': 'http://127.0.0.1:9/api', 'PREFIX': prefix, 'RAG_ALLOW_RESTART': allow_restart}
-            result = subprocess.run(['bash', '-c', self.STUBS + block], env=env,
+            # lib.sh's guard, stubbed so the block never depends on it being undefined.
+            stubs = self.STUBS + "restart_refusal_reason(){ printf '%s' \"$REFUSAL\"; }\n"
+            env['REFUSAL'] = refusal
+            result = subprocess.run(['bash', '-c', stubs + block], env=env,
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('command not found', result.stderr)
             calls = trace.read_text().splitlines() if trace.exists() else []
         return result.stdout.splitlines() + calls
 
@@ -67,6 +71,13 @@ class TransferPrefixTests(unittest.TestCase):
     def test_restart_not_allowed_keeps_the_existing_skip(self):
         self.assertEqual(self.run_block('Vfy', '0'), [
             'SKIP batch recovery across an API restart | set RAG_ALLOW_RESTART=1 to include it'])
+
+    def test_restart_refusal_fails_the_check_and_never_restarts(self):
+        # Reviewer-added: the #152 guard still wins over the prefix checks.
+        for prefix in ('Vfy', 'Custom'):
+            with self.subTest(prefix=prefix):
+                lines = self.run_block(prefix, '1', refusal='restarts never run against the live rag-docker project (#152)')
+                self.assertEqual(lines, ['CHECK batch recovery across an API restart'], lines)
 
 
 if __name__ == '__main__':
