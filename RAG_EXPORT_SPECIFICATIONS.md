@@ -63,6 +63,19 @@ proportional to the corpus rather than to upload count, and it makes "have we
 seen this document?" answerable. The cost is that the original upload filename is
 no longer the storage key, which `index.json` exists to solve.
 
+An imported source index MUST name blobs only by lowercase SHA-256 digest.
+Import validates the index and its regular content-addressed files before
+model installation, collection mutation, or sidecar restoration; a mismatch is
+`PACKAGE_CORRUPT`. Export and re-chunking refuse invalid identities or linked
+blobs at their read boundaries, so source metadata cannot select an arbitrary
+filesystem path. If an indexed blob is missing on disk, export warns and omits
+that entry from the shipped index; the package remains importable with its
+available sources and chunks. Existing valid indexes keep their original fidelity.
+An invalid on-disk index makes tuning options return a typed 409
+`SOURCE_INDEX_INVALID`; re-embedding from stored chunks and re-indexing do not
+need to read retained sources. A failed retention write after chunk storage does
+not misreport the ingested file as failed.
+
 Retention MUST NOT change chunking, embedding, or any existing response shape.
 
 ### 2.3 Deletion
@@ -332,12 +345,13 @@ Checks run in this order and stop at the first failure:
 | 1 | File exists and is a readable `.tar.gz` | `PACKAGE_UNREADABLE` |
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
+| 3a | Retained-source index names only valid digest identities and matching regular blobs | `PACKAGE_CORRUPT`, naming `sources/index.json` |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
 | 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; the local session storage directory is a regular directory inside the upload directory | `PACKAGE_CORRUPT`, naming the sidecar |
 | 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
 
-Check 4b runs before model installation, collection creation/replacement, recovery
+Check 3a runs before embedding-model checks and all live mutation. Check 4b runs before model installation, collection creation/replacement, recovery
 ownership, or sidecar publication. Keep its normalized snapshot for restoration;
 do not reread unvalidated settings after building the collection. Rebind the
 collection to the actual import target. Missing fields retain API defaults,
@@ -684,7 +698,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
-| `PACKAGE_CORRUPT` | digest mismatch or invalid evaluation-session metadata (check 4a); names the file |
+| `PACKAGE_CORRUPT` | digest mismatch, invalid retained sources (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
@@ -743,6 +757,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths |
 
 ---
 
