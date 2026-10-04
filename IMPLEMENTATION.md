@@ -13743,6 +13743,7 @@ No production fault switches are added to the server.
 """
 import argparse
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -13760,6 +13761,28 @@ def require(condition, message):
     if not condition:
         raise AssertionError(message)
     print('PASS ' + message)
+
+
+def write_import_package(package, name, rows, dimensions):
+    """Write the replace-import fixture into an existing directory; return its manifest."""
+    (package / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    (package / 'collection.json').write_text('{}')
+    source_dir = package / 'sources'
+    source_dir.mkdir()
+    # Retained sources as an export ships them: digest-named blobs and their index.
+    blob = b'synthetic imported source'
+    digest = hashlib.sha256(blob).hexdigest()
+    (source_dir / digest).write_bytes(blob)
+    seen = '2026-09-27T00:00:00Z'
+    (source_dir / sources.INDEX_NAME).write_text(json.dumps({'version': sources.INDEX_VERSION, 'documents': {
+        digest: {'filenames': ['synthetic.txt'], 'size': len(blob), 'media_type': 'text/plain',
+                 'first_seen': seen, 'last_seen': seen}}}, indent=2, sort_keys=True))
+    manifest = {'package_format': 1, 'collection': {'name': name, 'chunk_count': len(rows)},
+                'embedding': {'model': settings.embed_model, 'dimensions': dimensions},
+                'fidelity': 'with-sources', 'files': {str(p.relative_to(package)): 'sha256:' + packager.sha256_file(p)
+                    for p in package.rglob('*') if p.is_file()}}
+    (package / 'manifest.json').write_text(json.dumps(manifest))
+    return manifest
 
 
 def prepare(prefix, state_path):
@@ -13842,16 +13865,7 @@ def prepare(prefix, state_path):
     import_name = collection('Import')
     package = Path(settings.upload_dir) / (prefix + '-package')
     package.mkdir()
-    (package / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
-    (package / 'collection.json').write_text('{}')
-    source_dir = package / 'sources'
-    source_dir.mkdir()
-    (source_dir / 'synthetic-source').write_bytes(b'synthetic imported source')
-    manifest = {'package_format': 1, 'collection': {'name': import_name, 'chunk_count': 2},
-                'embedding': {'model': settings.embed_model, 'dimensions': len(vector)},
-                'fidelity': 'with-sources', 'files': {str(p.relative_to(package)): 'sha256:' + packager.sha256_file(p)
-                    for p in package.rglob('*') if p.is_file()}}
-    (package / 'manifest.json').write_text(json.dumps(manifest))
+    write_import_package(package, import_name, rows, len(vector))
     archive = packager.exports_dir() / (prefix + '-fixture.tar.gz')
     state['archives'].append(str(archive))
     save()
