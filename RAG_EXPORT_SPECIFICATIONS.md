@@ -115,7 +115,7 @@ carry the corpus's parameters.
 | `retrieval_mode` | enum `hnsw`\|`flat`\|`hybrid`\|`semantic` | `hnsw` |
 | `top_k` | integer 1–50 | `5` |
 | `alpha` | number 0–1 | `0.75` |
-| `ef` | integer 16–512, optional; legacy and inactive: stored and exported in `retrieval_config.json`, but neither query execution nor the exported `retrieve.py` applies it | — |
+| `ef` | integer 16–512, optional; legacy and inactive: stored and exported in `retrieval_config.json`, but neither query execution nor the exported `retrieve.py` applies it. An integer outside 16–512, which the API stored before PR #108, is exported and imported as `null`, with an export warning or an import note | — |
 | `response_format` | enum `end_user`\|`engineer` | `end_user` |
 
 ### 3.2 Endpoints
@@ -252,8 +252,12 @@ One JSON object per line:
 
 `retrieve.py` is generated at export from `manifest.json` and
 `retrieval_config.json`. Saved settings MUST satisfy the same typed contract as
-`POST /retrieval/config` before export. Invalid saved settings fail the export
-without publishing a package; they are not copied into executable syntax.
+`POST /retrieval/config` before export, checked before any chunk is read. Invalid
+saved settings fail the export without publishing a package; they are not copied
+into executable syntax. The job error names each failing field and says to open
+the Retrieval page, save the collection's settings and export again. A legacy
+out-of-range integer `ef` (§3.1) is not a failure: it is exported as `null` with a
+warning.
 All generated Python defaults and package metadata MUST be encoded Python
 literals, and substitution MUST NOT interpret tokens inside inserted data.
 
@@ -275,8 +279,9 @@ python retrieve.py --timeout 900 "..."
    Defaults: collection and parameters from the package; `--api-url` defaults to
    `http://localhost:8080/api`; `--timeout` defaults to 600 seconds, because
    generation runs on CPU and a single answer was measured at 236 s.
-4. **Records its provenance** — the source manifest's `id8` and `created_at` in a
-   header comment, so a script separated from its package can still be traced.
+4. **Records its provenance** — the source manifest's `id8` and `created_at` in the
+   script's `PACKAGE_METADATA` literal, beside `package_filename`, `embed_model` and
+   `embed_dimensions`, so a script separated from its package can still be traced.
 5. **Exit codes:** `0` success, `2` bad usage, `3` API unreachable, `4` collection
    absent, `5` API returned an error.
 
@@ -351,9 +356,11 @@ ownership, or sidecar publication. Keep its normalized snapshot for restoration;
 do not reread unvalidated settings after building the collection. Rebind the
 collection to the actual import target. Missing fields retain API defaults,
 valid historical `ef` values are preserved, and unknown fields are ignored as
-on API saves. A missing settings file remains supported. Invalid JSON, non-object
-settings, invalid enum values, booleans in numeric fields, out-of-range values,
-and non-finite alpha are refusals in every conflict mode.
+on API saves. A legacy integer `ef` outside 16–512 (§3.1) is restored as `null`,
+and the completed job notes it. A missing settings file remains supported.
+Invalid JSON, non-object settings, invalid enum values, booleans in numeric fields
+(including `ef`), other out-of-range values, and non-finite alpha are refusals in
+every conflict mode.
 
 Check 4a runs before bundled-model installation, collection creation/deletion,
 or restoring any sidecar. All sessions MUST be preflighted together, including
@@ -749,7 +756,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
-| E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip and generated script defaults/metadata remain encoded typed literals |
+| E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals |
 | E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths |
 
 ---

@@ -35,6 +35,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import model_bundle
 from services import packager
@@ -570,18 +571,28 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     return sessions
 
 
-def _read_retrieval_config(pkg: Path, original: str) -> dict | None:
-    """Validate once before live mutation; restore this normalized snapshot."""
+def _read_retrieval_config(pkg: Path, original: str,
+                           notes: list[str] | None = None) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot.
+
+    A legacy ef (an integer outside the save bounds, from before PR #108) is
+    cleared to null, and `notes` records it for the completed job.
+    """
     path = pkg / "retrieval_config.json"
     if not path.exists():
         return None
     try:
         if path.is_symlink() or not path.is_file():
             raise ValueError("Retrieval settings must be a regular file")
-        return retrieval_config.validate(json.loads(path.read_text()), original)
+        validated, cleared = retrieval_config.normalize(json.loads(path.read_text()), original)
     except (OSError, ValueError) as exc:
         raise PackageError("PACKAGE_CORRUPT", "Invalid retrieval settings.",
                            {"file": "retrieval_config.json"}) from exc
+    if cleared is not None and notes is not None:
+        notes.append(f"the package's retrieval setting ef={cleared} is outside "
+                     f"{SEARCH_EF_MIN}-{SEARCH_EF_MAX} and was restored as null; "
+                     "ef is no longer used.")
+    return validated
 
 
 def _restore_sidecars(target: str, pkg: Path, original: str,
@@ -700,7 +711,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                {"name": original})
 
         validated_sessions = _read_goldstandard_sessions(pkg, original)
-        validated_retrieval = _read_retrieval_config(pkg, original)
+        retrieval_notes: list[str] = []
+        validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -746,7 +758,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
                 target, pkg, original, validated_sessions, job["restored_sessions"],
-                validated_retrieval)
+                validated_retrieval) + retrieval_notes
 
             if staged and temp_collection:
                 try:
