@@ -342,3 +342,25 @@ The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping
 Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
 
 Issue #140 deletion coverage exercises canonical and accepted lowercase-alias HTTP deletion, both source/config sidecar spellings, durable orphan flags for both session spellings, and unrelated collection preservation. Controlled writer cases also cover backend deletion failure and retained recovery behavior; the controlled verifier invokes the actual deletion handler without a live backend.
+
+## Deferred query configuration browser checks
+
+`browser/query_config.js` runs against the real UI with all API calls stubbed
+before startup. It explicitly holds and releases responses to cover a delayed
+A save arriving before/after B's load, B's failed load, an A→B→A selection,
+concurrent saves in both response orders, and save failure. Every case checks
+the actual next Q&A request payload. These fixtures are included in `06_ui.sh`
+through `ui_criteria.js`, and can also run without a backend or model:
+
+```bash
+# Start the UI separately: cd ui && npm ci && npm run dev -- --host 127.0.0.1
+# With puppeteer-core available to Node and a local Chromium installation:
+RAG_UI_BASE=http://127.0.0.1:3000 \
+RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/query_config.js
+```
+
+The standalone runner uses the existing browser verification dependency
+`puppeteer-core` (also available in the verification browser image); set
+`NODE_PATH` if it is installed outside normal Node module resolution. This
+isolated fixture run does not replace the required full live-stack suite.
