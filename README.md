@@ -365,6 +365,8 @@ The package is validated before anything touches the database: the archive must
 be readable, the format understood, every digest must match, and the embedding
 model must be the one this instance runs. Chunk UUIDs are preserved, so
 gold-standard sessions keep pointing at the right chunks after the move.
+Retained-source indexes and blobs are validated before the embedding check;
+invalid source metadata fails with `PACKAGE_CORRUPT` before any live mutation.
 
 Evaluation-session metadata is also validated before importing models or
 changing a collection. Invalid session JSON, identities or schemas fail the
@@ -429,15 +431,18 @@ replacing a collection marks its sessions `orphaned` and reports how many.
 ## Verifying a change
 
 ```bash
-docker compose up -d
-bash scripts/verify/all.sh                  # everything, ~20 min
-RAG_SKIP_SLOW=1 bash scripts/verify/all.sh  # skip LLM work, ~3 min
+bash scripts/verify/stack.sh run                  # everything, ~20 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skip LLM work, ~8 min, start-up included
 ```
 
-Runs the acceptance criteria in this project's specifications against the live
-stack — ingest, retrieval, gold standard, export/import, tuning, and the UI in a
-real headless browser. Exits non-zero on the first failure, so it can gate a
-commit.
+Runs the acceptance criteria in this project's specifications — ingest,
+retrieval, gold standard, export/import, tuning, and the UI in a real headless
+browser — on a disposable verify project: the checkout is built as compose
+project `rag-verify` on port 8081, with its own empty volumes, and removed after
+the run. `stack.sh` doesn't build, start or stop your own stack, and only
+reads its model volume, to copy the models. That guards against accidents,
+not hostile code: a branch's scripts run on your host with full access to
+Docker. Exits non-zero if any check fails, so it can gate a commit.
 
 These are integration tests on purpose. Every defect this project has produced
 was invisible to a unit test of the same function: a parser dependency missing

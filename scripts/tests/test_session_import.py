@@ -75,7 +75,7 @@ class SessionImportTests(unittest.TestCase):
         directory = self.root / 'uploads' / 'goldstandard_sessions'
         directory.mkdir()
         (directory / 'gs_0123abcd.json').symlink_to(outside)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(gs.GoldStandardError):
             gs.store_session(self.original)
         self.assertEqual(outside.read_text(), 'existing')
         self.assertNotIn('gs_0123abcd', gs._sessions)
@@ -214,7 +214,7 @@ class SessionImportTests(unittest.TestCase):
         self.sidecar('session.json', self.original)
         with self.assertRaises(packager.PackageError):
             importer._read_goldstandard_sessions(self.pkg, 'Corpus')
-        with self.assertRaises(ValueError):
+        with self.assertRaises(gs.GoldStandardError):
             gs.store_session(self.original)
         with self.assertLogs(gs.log, level='WARNING'):
             gs.load_sessions_from_disk()
@@ -286,7 +286,7 @@ class SessionImportTests(unittest.TestCase):
         directory.mkdir()
         dest = directory / (self.original['session_id'] + '.json')
         os.mkfifo(dest)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(gs.GoldStandardError):
             gs.store_session(self.original)
         self.assertFalse(gs._sessions)
 

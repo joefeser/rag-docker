@@ -180,6 +180,40 @@ networks:
     driver: bridge
 ```
 
+### docker-compose.verify.yml
+
+```yaml
+# Overlay for the disposable verify project (#152). Used only by
+# scripts/verify/stack.sh, which runs it as compose project `rag-verify` on top
+# of the docker-compose.yml of the checkout under test, and sets the two
+# variables below. Run any other way, it refuses to resolve.
+#
+# Everything here keeps verification away from the live `rag-docker` stack:
+services:
+  proxy:
+    # Replace the base list rather than add to it (compose merges `ports`
+    # otherwise), so the live port 8080 is never published by this project.
+    ports: !override
+      - "127.0.0.1:${RAG_VERIFY_PORT:?set by scripts/verify/stack.sh}:80"
+  api:
+    # Own image tags: building with the base file's rag-docker-api:latest would
+    # move the live stack's tag to the code under test.
+    image: rag-verify-api:latest
+    volumes:
+      # Same container path as the base file's ./exports, so this entry
+      # replaces it: from the main checkout, ./exports is the live exports folder.
+      - ${RAG_EXPORTS_DIR:?set by scripts/verify/stack.sh}:/app/exports
+  ui:
+    image: rag-verify-ui:latest
+
+volumes:
+  # A copy of the live models that stack.sh keeps in step with
+  # rag-docker_ollama_models (read-only there). External, so `down -v` keeps it.
+  ollama_models:
+    external: true
+    name: rag-verify-ollama-models
+```
+
 ### ollama/entrypoint.sh
 
 ```bash
@@ -1348,8 +1382,6 @@ from config import settings
 
 log = logging.getLogger(__name__)
 
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
-
 DEFAULTS = {
     "chunking_strategy": "overlap",
     "chunk_size": 1000,
@@ -1442,6 +1474,7 @@ import re
 from pathlib import Path
 
 from config import settings
+from models.schemas import SaveRetrievalConfigBody
 
 log = logging.getLogger(__name__)
 
@@ -1497,6 +1530,18 @@ def resolve(collection: str) -> tuple[dict, bool]:
     merged = {"collection": collection, **DEFAULTS, **saved}
     merged["collection"] = collection
     return merged, False
+
+
+def validate(config: dict, collection: str) -> dict:
+    """Apply the API save contract, binding settings to the actual collection.
+
+    Older packages may omit defaulted fields or carry an obsolete collection
+    name. Extra fields are ignored just as they are for API saves.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Retrieval settings must be an object")
+    return SaveRetrievalConfigBody.model_validate(
+        {**config, "collection": collection}).model_dump()
 
 
 def save(config: dict) -> dict:
@@ -1923,6 +1968,19 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     record.update(updated)
 
 
+def sidecar_reference(record: dict) -> str:
+    """The snapshot directory relative to UPLOAD_DIR, for job error details.
+
+    Job results are served without authentication, so the absolute path stays
+    in the server log.
+    """
+    metadata = _root() / record["operation_id"]
+    log.warning("Recovery collection %r keeps sidecar snapshots in %s", record["staging"], metadata)
+    # Built, not derived with relative_to: the root needn't resolve under
+    # UPLOAD_DIR (a symlinked mount, or the reindex verifier's own root).
+    return "collection_operations/" + record["operation_id"]
+
+
 def discard(record: dict, client) -> None:
     """Delete an owned copy after success, or scratch while the target is safe."""
     # Persist intent before the first deletion. Startup can finish this exact
@@ -2092,6 +2150,7 @@ def _create_collection_sync(
     hnsw_config: dict,
     *,
     preserve_hnsw: bool = False,
+    description: str | None = None,
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
@@ -2118,6 +2177,8 @@ def _create_collection_sync(
 
     client.collections.create(
         name=name,
+        # Set only by import, to bind its in-progress marker to this instance.
+        description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
         properties=COLLECTION_PROPERTIES,
@@ -2922,7 +2983,7 @@ def _process_job_sync(
                         path.read_bytes(),
                         mimetypes.guess_type(path.name)[0],
                     )
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.
@@ -3254,8 +3315,17 @@ _tasks: set[asyncio.Task] = set()
 _state_lock = threading.RLock()
 _diagnostics: dict[str, dict] = {}
 _scan_lock = threading.Lock()
+# Parse/validation results by path, keyed on (inode, mtime_ns, size); scans only.
+_scan_cache: dict[str, tuple[tuple[int, int, int], dict | None]] = {}
 _store_revision = 0
 _SESSION_ID = re.compile(r"gs_[0-9a-f]{8}")
+_PENDING_DIR = "pending_markers"
+_MARKER_FLAGS = ("stale", "orphaned")
+_PERSISTENCE_CODES = ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN")
+_MARKER_MESSAGES = {
+    True: "History marker could not be saved in the session file. A pending marker keeps the session historical after restart, and current export is refused. Check local storage; the next successful write of this session saves the marker.",
+    False: "History marker could not be saved. The session is treated as historical and current export is refused only until restart. Check local storage, then edit this session to save the marker.",
+}
 
 
 def validate_session_id(session_id: str) -> None:
@@ -3306,7 +3376,62 @@ def _session_path(session_id: str) -> Path:
     return target
 
 
-def _record_issue(path: Path, code: str) -> None:
+def _session_key(session_id: str) -> Path:
+    # The scan's diagnostic key form, without the storage checks that may be
+    # what failed; one key per file keeps Health's entries distinct.
+    return Path(settings.upload_dir).resolve() / "goldstandard_sessions" / f"{session_id}.json"
+
+
+def _pending_root() -> Path:
+    p = _session_storage_root() / _PENDING_DIR
+    if p.is_symlink() or (p.exists() and not p.is_dir()):
+        raise ValueError("Pending marker storage is not a regular directory.")
+    return p
+
+
+def _pending_path(session_id: str) -> Path:
+    validate_session_id(session_id)
+    root = _pending_root()
+    candidate = root / f"{session_id}.json"
+    if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+        raise ValueError("Pending marker destination is not a regular file.")
+    if candidate.resolve().parent != root.resolve():
+        raise ValueError("Pending marker destination is outside marker storage.")
+    return candidate
+
+
+def _load_pending(path: Path) -> dict:
+    """A pending marker holds only history flags that a session file could not take."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Pending marker must be a regular file.")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or data.get("session_id") != path.stem:
+        raise ValueError("Pending marker does not match its session.")
+    validate_session_id(data["session_id"])
+    allowed = {"session_id"} | {f"{flag}{suffix}" for flag in _MARKER_FLAGS for suffix in ("", "_reason", "_at")}
+    if set(data) - allowed or not any(flag in data for flag in _MARKER_FLAGS):
+        raise ValueError("Pending marker has unexpected fields.")
+    for flag in _MARKER_FLAGS:
+        if flag in data and data[flag] is not True:
+            raise ValueError("Pending marker flag must be true.")
+        for suffix in ("_reason", "_at"):
+            if not isinstance(data.get(flag + suffix), (str, type(None))):
+                raise ValueError("Pending marker metadata must be text.")
+    return data
+
+
+def _apply_pending(session: dict, pending: dict) -> bool:
+    changed = False
+    for flag in _MARKER_FLAGS:
+        if pending.get(flag) is True and session.get(flag) is not True:
+            session[flag] = True
+            session[f"{flag}_reason"] = pending.get(f"{flag}_reason")
+            session[f"{flag}_at"] = pending.get(f"{flag}_at")
+            changed = True
+    return changed
+
+
+def _record_issue(path: Path, code: str, message: str | None = None) -> None:
     changed = _diagnostics.get(str(path), {}).get("code") != code
     messages = {
         "SESSION_STORAGE_UNAVAILABLE": "Session storage could not be inspected. Existing files are preserved; inspect local storage and restart after recovery.",
@@ -3315,7 +3440,8 @@ def _record_issue(path: Path, code: str) -> None:
         "SESSION_WRITE_FAILED": "Update failed before replacement; the previous snapshot remains authoritative. Check local storage before retrying.",
         "SESSION_DURABILITY_UNCERTAIN": "Replacement occurred but directory durability could not be confirmed. Refresh the session and inspect local storage before retrying.",
     }
-    _diagnostics[str(path)] = {"filename": path.name, "code": code, "message": messages[code]}
+    filename = f"{_PENDING_DIR}/{path.name}" if path.parent.name == _PENDING_DIR else path.name
+    _diagnostics[str(path)] = {"filename": filename, "code": code, "message": message or messages[code]}
     if changed:
         log.error("Session persistence issue %s for %s", code, path.name)
 
@@ -3326,6 +3452,29 @@ def _sync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _replace_durably(path: Path, payload: str) -> None:
+    """Write a unique fsynced temporary file and replace `path` with it.
+
+    Returning means the replacement happened; raising means it did not. The
+    caller syncs the directory and decides what a failure means.
+    """
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                prefix="." + path.stem + "-", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                log.exception("Could not remove owned session temporary file %s", temporary.name)
 
 
 def _save_session_sync(session: dict) -> None:
@@ -3341,40 +3490,73 @@ def _save_session_sync(session: dict) -> None:
         try:
             path = _session_path(snapshot["session_id"])
             _sessions_dir()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (str(snapshot["session_id"]) + ".json"), "SESSION_WRITE_FAILED")
             raise GoldStandardError("SESSION_WRITE_FAILED", "Session directory could not be prepared. The previous snapshot is unchanged.", 503) from exc
-        temporary = None
         replaced = False
         try:
             payload = json.dumps(snapshot, indent=2, allow_nan=False)
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                    prefix="." + path.stem + "-", suffix=".tmp", delete=False) as output:
-                temporary = Path(output.name)
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, path)
+            _replace_durably(path, payload)
             replaced = True
             _sessions[snapshot["session_id"]] = snapshot
             _store_revision += 1
             _sync_directory(path.parent)
-            if snapshot.get("persistence_error"):
-                _record_issue(path, snapshot["persistence_error"]["code"])
+            # Only generation's own codes are evidence; an imported or edited
+            # value is not, and must not turn a completed write into an error.
+            error = snapshot.get("persistence_error")
+            if isinstance(error, dict) and error.get("code") in _PERSISTENCE_CODES:
+                _record_issue(path, error["code"])
             else:
                 _diagnostics.pop(str(path), None)
+            try:
+                _discard_pending_marker(snapshot)
+            except Exception:                         # noqa: BLE001
+                log.exception("Could not remove pending history marker for %s", snapshot["session_id"])
         except (OSError, ValueError, TypeError) as exc:
             code = "SESSION_DURABILITY_UNCERTAIN" if replaced else "SESSION_WRITE_FAILED"
             _record_issue(path, code)
             message = ("Session replacement occurred but durability could not be confirmed. Refresh the session and inspect diagnostics before retrying."
                        if replaced else "Session update could not be persisted. The previous snapshot is unchanged.")
             raise GoldStandardError(code, message, 503) from exc
-        finally:
-            if temporary is not None:
+
+
+def _write_pending_marker(session_id: str, fields: dict) -> bool:
+    """Keep a history flag across restart when its session file cannot take it."""
+    with _state_lock:
+        try:
+            path = _pending_path(session_id)
+            merged = {"session_id": session_id}
+            if path.exists():
                 try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    log.exception("Could not remove owned session temporary file %s", temporary.name)
+                    merged.update(_load_pending(path))
+                except (OSError, ValueError):
+                    # Nothing readable to keep; the new marker replaces it.
+                    pass
+            merged.update(fields)
+            if not path.parent.exists():
+                path.parent.mkdir()
+                _sync_directory(path.parent.parent)
+            _replace_durably(path, json.dumps(merged, indent=2))
+            _sync_directory(path.parent)
+            return True
+        except (OSError, ValueError):
+            log.exception("Could not save pending history marker for %s", session_id)
+            return False
+
+
+def _discard_pending_marker(snapshot: dict) -> None:
+    """A successful write that carries every pending flag makes the marker obsolete."""
+    path = _pending_path(snapshot["session_id"])
+    if not path.exists():
+        return
+    try:
+        pending = _load_pending(path)
+    except (OSError, ValueError):
+        # An unreadable marker is preserved and the scan reports it.
+        return
+    if not _apply_pending(copy.deepcopy(snapshot), pending):
+        path.unlink()
+        _sync_directory(path.parent)
 
 
 def _scan_sessions() -> None:
@@ -3399,39 +3581,80 @@ def _scan_sessions() -> None:
             return
         for path in paths:
             if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", path.name):
-                issues[path] = "SESSION_INTERRUPTED_WRITE"
+                issues[path] = ("SESSION_INTERRUPTED_WRITE", None)
             elif path.name.endswith(".json"):
                 try:
                     if path.is_symlink() or not path.is_file():
                         raise ValueError("Evaluation session must be a regular file.")
-                    data = json.loads(path.read_text())
-                    validate_session(data)
+                    stat = path.stat()
+                    signature = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                    cached = _scan_cache.get(str(path))
+                    if cached is not None and cached[0] == signature:
+                        if cached[1] is None:
+                            raise ValueError("Evaluation session is unchanged and still invalid.")
+                        data = copy.deepcopy(cached[1])
+                    else:
+                        # Only parse and validation outcomes are remembered; a
+                        # failed read is retried on the next scan.
+                        _scan_cache.pop(str(path), None)
+                        text = path.read_text()
+                        _scan_cache[str(path)] = (signature, None)
+                        data = json.loads(text)
+                        validate_session(data)
+                        _scan_cache[str(path)] = (signature, copy.deepcopy(data))
                     if path != _session_path(data["session_id"]):
                         raise ValueError("Evaluation session filename does not match its identity.")
                     loaded[data["session_id"]] = data
                     retained_error = data.get("persistence_error")
-                    if isinstance(retained_error, dict) and retained_error.get("code") in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
-                        issues[path] = retained_error["code"]
+                    if isinstance(retained_error, dict) and retained_error.get("code") in _PERSISTENCE_CODES:
+                        issues[path] = (retained_error["code"], None)
                 except (OSError, ValueError, TypeError):
-                    issues[path] = "SESSION_READ_FAILED"
+                    issues[path] = ("SESSION_READ_FAILED", None)
+        listed = {str(path) for path in paths}
+        for key in list(_scan_cache):
+            if key not in listed:
+                _scan_cache.pop(key, None)
+        pending_root = root / _PENDING_DIR
+        pending_paths = []
+        try:
+            if pending_root.is_symlink() or (pending_root.exists() and not pending_root.is_dir()):
+                raise ValueError("Pending marker storage is not a regular directory.")
+            with os.scandir(pending_root) as entries:
+                pending_paths = [Path(entry.path) for entry in entries]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            issues[pending_root] = ("SESSION_READ_FAILED", None)
+        for path in pending_paths:
+            if not re.fullmatch(r"gs_[0-9a-f]{8}\.json", path.name):
+                continue
+            try:
+                pending = _load_pending(path)
+            except (OSError, ValueError):
+                issues[path] = ("SESSION_READ_FAILED", None)
+                continue
+            data = loaded.get(pending["session_id"])
+            # A marker whose session file is missing has nothing to apply to.
+            if data is not None and _apply_pending(data, pending):
+                issues[root / path.name] = ("SESSION_WRITE_FAILED", _MARKER_MESSAGES[True])
         with _state_lock:
             # A concurrent durable commit wins over an older inspection, including
             # its cache and write-failure diagnostics. The next refresh rescans.
             if revision != _store_revision:
                 return
             _diagnostics.pop(str(storage_label), None)
-            present = {str(path) for path in paths}
+            present = {str(path) for path in paths + pending_paths} | {str(pending_root)}
             for key, issue in list(_diagnostics.items()):
-                if issue["code"] in ("SESSION_READ_FAILED", "SESSION_INTERRUPTED_WRITE") and Path(key).parent == root and (key not in present or Path(key) not in issues):
+                if issue["code"] in ("SESSION_READ_FAILED", "SESSION_INTERRUPTED_WRITE") and Path(key).parent in (root, pending_root) and (key not in present or Path(key) not in issues):
                     _diagnostics.pop(key, None)
             for sid, data in loaded.items():
                 if sid not in _sessions:
                     _sessions[sid] = data
                     _store_revision += 1
-            for path, code in issues.items():
+            for path, (code, message) in issues.items():
                 # Preserve the independent failed-write policy at the same path.
                 if _diagnostics.get(str(path), {}).get("code") not in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
-                    _record_issue(path, code)
+                    _record_issue(path, code, message)
 
 
 def load_sessions_from_disk() -> None:
@@ -3455,9 +3678,18 @@ def _sessions_on_disk() -> list[dict]:
             if path != _session_path(data["session_id"]):
                 raise ValueError("Evaluation session filename does not match its identity.")
         except (OSError, ValueError, RuntimeError) as exc:
+            # ValidationError text can include document-derived field values.
             log.warning("Skipping invalid evaluation session %s; file is unchanged (%s)",
                         path.name, type(exc).__name__)
             continue
+        # A package must not carry a session as current when its history
+        # marker is only pending. An unreadable marker is reported by the scan.
+        try:
+            pending = _pending_path(data["session_id"])
+            if pending.exists():
+                _apply_pending(data, _load_pending(pending))
+        except (OSError, ValueError):
+            pass
         sessions.append(data)
     return sessions
 
@@ -3476,7 +3708,6 @@ def sessions_for(collection: str) -> list[dict]:
             if session.get("collection") != collection:
                 continue
             try:
-                from models.schemas import SessionResponse
                 validate_session(session)
                 if sid != session.get("session_id"):
                     raise ValueError("Cached session key does not match identity")
@@ -3484,14 +3715,20 @@ def sessions_for(collection: str) -> list[dict]:
             except (OSError, ValueError, RuntimeError) as exc:
                 log.warning("Skipping invalid cached evaluation session %s (%s)",
                             sid, type(exc).__name__)
-                _record_issue(Path(str(sid) + ".json"), "SESSION_READ_FAILED")
+                _record_issue(_session_key(str(sid)), "SESSION_READ_FAILED")
                 continue
             found.append(session)
         return copy.deepcopy(found)
 
 
 def store_session(session: dict) -> None:
-    """Write through the durable store so the cache cannot undo an import."""
+    """Write through the durable store so the cache cannot undo an import.
+
+    Anything outside this module that writes a session file directly will be
+    silently undone: the cache still holds the previous version, and the next
+    cache-based write puts that back over the file. Import learned this the
+    hard way — a restored session reverted to its pre-import orphaned state.
+    """
     validate_session(session)
     _save_session_sync(session)
 
@@ -3570,7 +3807,16 @@ def _update_session_sync(session_id: str, change):
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
-    """Retain the historical guard in memory if a completed mutation cannot persist it."""
+    """Mark every session for a collection, on disk and in memory.
+
+    Sessions are never deleted and never remapped. A remap that guesses which
+    new chunk replaces an old one corrupts an evaluation baseline silently,
+    which is worse than an honest flag the user can act on.
+
+    If a completed mutation cannot persist a marker to the session file, the
+    historical guard is kept in memory and in a pending marker that survives
+    restart.
+    """
     global _store_revision
     sessions = sessions_for(collection)
     now = datetime.now(timezone.utc).isoformat()
@@ -3588,7 +3834,8 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
             # failed-write diagnostic. Publish the marker in the process cache
             # even when disk still holds the prior snapshot, so a completed
             # delete/rebuild cannot export this session as a current baseline.
-            # A later successful session write will persist the marker.
+            # A pending marker carries it across restart; a later successful
+            # session write persists it and removes the pending marker.
             with _state_lock:
                 current = _sessions.get(session["session_id"])
                 if current is not None:
@@ -3597,20 +3844,30 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
                     _sessions[session["session_id"]] = snapshot
                     _store_revision += 1
             log.exception("Could not durably mark session %s %s", session["session_id"], flag)
+            saved = _write_pending_marker(session["session_id"],
+                                          {flag: True, f"{flag}_reason": reason, f"{flag}_at": now})
+            with _state_lock:
+                key = _session_key(session["session_id"])
+                # An uncertain-durability report keeps its own wording.
+                if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
+                    _record_issue(key, "SESSION_WRITE_FAILED", _MARKER_MESSAGES[saved])
     return marked
 
 
 def mark_stale(collection: str, reason: str) -> int:
+    """Chunk identity changed, so the pairs no longer describe what is stored."""
     return _flag_sessions(collection, "stale", reason)
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
+    """The collection is gone. Retained rather than deleted — see RAG_EXPORT_SPECIFICATIONS.md §8 rule 4."""
     return _flag_sessions(collection, "orphaned", reason)
 
 
+# Published cache snapshots are immutable (see save_session), so readers take a
+# copy without waiting for the writer lock, which is held through fsync.
 def get_session(session_id: str) -> dict | None:
-    with _state_lock:
-        return copy.deepcopy(_sessions.get(session_id))
+    return copy.deepcopy(_sessions.get(session_id))
 
 
 def _parse_gs_json(text: str) -> dict:
@@ -4083,12 +4340,27 @@ def _resolve_includes(text: str, depth: int = 0) -> str:
 
 def _render(template: str, values: dict[str, str]) -> str:
     text = _resolve_includes((_TEMPLATE_DIR / template).read_text())
-    for key, value in values.items():
-        text = text.replace(f"@@{key}@@", str(value))
-    left = re.findall(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", text)
-    if left:
-        raise RuntimeError(f"{template}: unsubstituted placeholders {sorted(set(left))}")
-    return text
+    # Substitute only original template tokens. Inserted data can itself contain
+    # token-shaped text and must never be interpreted as another substitution.
+    def substitute(match):
+        key = match.group()[2:-2]
+        if key not in values:
+            raise RuntimeError(f"{template}: unsubstituted placeholder {match.group()}")
+        return str(values[key])
+    return re.sub(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", substitute, text)
+
+
+def _render_retrieve(collection: str, cfg: dict, metadata: dict) -> str:
+    """Only validated, encoded Python literals may cross into script source."""
+    cfg = retrieval_config.validate(cfg, collection)
+    return _render("retrieve.py.tmpl", {
+        "PACKAGE_METADATA": repr(metadata),
+        "COLLECTION_NAME": repr(collection),
+        "RETRIEVAL_MODE": repr(cfg["retrieval_mode"]),
+        "TOP_K": repr(cfg["top_k"]),
+        "ALPHA": repr(cfg["alpha"]),
+        "RESPONSE_FORMAT": repr(cfg["response_format"]),
+    })
 
 
 def render_help(embed_dimensions: int | str) -> str:
@@ -4199,6 +4471,7 @@ def build(
             b.add_json("ingest_config.json", ingest_cfg)
 
         retrieval_cfg, is_default = retrieval_config.resolve(collection)
+        retrieval_cfg = retrieval_config.validate(retrieval_cfg, collection)
         has_saved_retrieval = not is_default
         b.add_json("retrieval_config.json", retrieval_cfg)
 
@@ -4208,15 +4481,19 @@ def build(
 
         # 5. sources, when they exist
         index = sources.load_index(collection)
-        fidelity = "with-sources" if index["documents"] else "chunks-only"
-        source_document_count = len(index["documents"])
+        shipped = {}
+        for digest, entry in index["documents"].items():
+            blob = sources.blob_path(collection, digest)
+            if not blob.exists():
+                warnings.append(f"retained source {digest[:12]} is missing on disk")
+                continue
+            shipped[digest] = entry
+        fidelity = "with-sources" if shipped else "chunks-only"
+        source_document_count = len(shipped)
         if fidelity == "with-sources":
-            b.add_json("sources/index.json", index)
-            for digest in index["documents"]:
+            b.add_json("sources/index.json", {**index, "documents": shipped})
+            for digest in shipped:
                 blob = sources.blob_path(collection, digest)
-                if not blob.exists():
-                    warnings.append(f"retained source {digest[:12]} is missing on disk")
-                    continue
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
@@ -4311,17 +4588,12 @@ def build(
             contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
-            (stage / "retrieve.py").write_text(_render("retrieve.py.tmpl", {
-                "COLLECTION_NAME": collection,
-                "PACKAGE_FILENAME": filename,
-                "ID8": id8,
-                "CREATED_AT": created_at,
-                "EMBED_MODEL": settings.embed_model,
-                "EMBED_DIMENSIONS": dimensions if dimensions is not None else "unknown",
-                "RETRIEVAL_MODE": retrieval_cfg["retrieval_mode"],
-                "TOP_K": retrieval_cfg["top_k"],
-                "ALPHA": retrieval_cfg["alpha"],
-                "RESPONSE_FORMAT": retrieval_cfg["response_format"],
+            (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
+                "package_filename": filename,
+                "id8": id8,
+                "created_at": created_at,
+                "embed_model": settings.embed_model,
+                "embed_dimensions": dimensions,
             }))
             (stage / "retrieve.py").chmod(0o755)
 
@@ -4672,7 +4944,9 @@ def get_job(job_id: str) -> dict | None:
 # staging name for the startup sweep to recognise. A SIGKILL during the insert
 # would leave a half-filled collection that looks like a real one. A marker
 # written before the build, and removed after it, lets the next start tell the
-# two apart.
+# two apart. The marker's instance token is also written into the collection's
+# schema description, so a collection created later under the same name is
+# never mistaken for the interrupted import.
 
 def _markers_dir() -> Path:
     d = Path(settings.upload_dir) / "imports_in_progress"
@@ -4684,23 +4958,33 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
+def _instance_description(instance: str) -> str:
+    return f"rag-import:{instance}"
+
+
 def _read_marker(path: Path) -> tuple[dict, Path]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
         raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
     data = json.loads(path.read_text())
     collection, count = data["collection"], data["expected_chunks"]
     snapshot = data["expected_snapshot"]
-    if (type(data.get("version")) is not int or data["version"] != 3
+    # Version 3 predates the instance identity: it is read so that its cleanup
+    # can finish and its snapshot stays named, but it never authorizes deletion.
+    if (type(data.get("version")) is not int or data["version"] not in (3, 4)
             or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
             or path.name != f"{collection}.json" or type(count) is not int or count < 0
             or data["state"] not in ("building", "cleanup")
+            or (data["version"] == 4 and (type(data["instance"]) is not str
+                                          or not re.fullmatch(r"[0-9a-f]{32}", data["instance"])))
             or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
         raise ValueError("Invalid import ownership")
     return data, _markers_dir() / snapshot["file"]
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> None:
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> str:
+    """Publish the marker; returns the instance token the target must carry."""
+    instance = uuid.uuid4().hex
     snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
     try:
         with batch_write.ExpectedRecords() as expected:
@@ -4714,8 +4998,8 @@ def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -
         collection_recovery._sync_dir(_markers_dir())
         collection_recovery._sync_dir(Path(settings.upload_dir))
         collection_recovery.atomic_json(_marker_path(collection), {
-            "version": 3, "collection": collection, "expected_chunks": expected_chunks,
-            "job_id": job_id, "state": "building",
+            "version": 4, "collection": collection, "expected_chunks": expected_chunks,
+            "job_id": job_id, "state": "building", "instance": instance,
             "expected_snapshot": {"file": snapshot.name, "sha256": packager.sha256_file(snapshot)},
         })
     except Exception:
@@ -4724,6 +5008,7 @@ def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -
         except OSError:
             _log.exception("Could not remove unpublished expectation snapshot %s", snapshot)
         raise
+    return instance
 
 
 def _mark_finished(collection: str) -> None:
@@ -4769,13 +5054,21 @@ def sweep_interrupted_imports() -> list[str]:
     """Remove collections left half-built by a killed import.
 
     Compare the expected identities, properties and vectors, not just count.
-    Unreadable or legacy ownership cannot authorize destructive cleanup.
+    Only the collection instance the import created, identified by the token
+    in its schema description, can be deleted. Unreadable or legacy ownership
+    cannot authorize destructive cleanup.
     """
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
         try:
             data, snapshot = _read_marker(marker)
             collection = data["collection"]
+            if data["state"] == "building" and data["version"] == 3:
+                # No instance identity: it cannot tell this import's collection
+                # from a later one under the same name, so it never deletes.
+                _log.warning("Import marker %s has no instance identity; kept, and never "
+                             "used to delete %r", marker, collection)
+                continue
             if data["state"] == "building":
                 if snapshot.is_symlink() or not snapshot.is_file():
                     raise ValueError("Expected-record snapshot is not a regular file")
@@ -4785,18 +5078,57 @@ def sweep_interrupted_imports() -> list[str]:
                     expected.load_snapshot(snapshot, data["expected_chunks"])
                     if wc._collection_exists_sync(collection):
                         col = wc.get_client().collections.get(collection)
-                        try:
-                            expected.verify(col, exact=True)
-                        except batch_write.BatchVerificationError:
-                            wc.get_client().collections.delete(collection)
-                            removed.append(f"{collection} (persisted records did not match import)")
+                        if col.config.get().description != _instance_description(data["instance"]):
+                            # Created after the import stopped, for example while
+                            # an earlier start could not resolve this marker.
+                            _log.warning("Collection %r is not the one the interrupted import "
+                                         "created; kept, and its import marker retired", collection)
+                        else:
+                            try:
+                                expected.verify(col, exact=True)
+                            except batch_write.BatchVerificationError:
+                                wc.get_client().collections.delete(collection)
+                                removed.append(f"{collection} (persisted records did not match import)")
             # Cleanup is an explicit durable phase: failure here never converts
             # a verified target back into a candidate for backend deletion.
             _mark_finished(collection)
         except Exception:
             _log.exception("Could not resolve import ownership %s; preserved", marker)
             continue
+    _sweep_orphaned_snapshots()
     return removed
+
+
+def _sweep_orphaned_snapshots() -> None:
+    """Remove expectation snapshots that no marker names.
+
+    A kill between writing the snapshot and publishing its marker, or a new
+    import overwriting a marker, leaves one behind. A marker that cannot be
+    parsed might name any of them, so then nothing is removed.
+    """
+    directory = _markers_dir()
+    referenced: set[str] = set()
+    for marker in directory.glob("*.json"):
+        try:
+            if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
+                raise ValueError("not a bounded regular file")
+            data = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            _log.warning("Unreadable import marker %s; expectation snapshots preserved", marker)
+            return
+        snapshot = data.get("expected_snapshot") if isinstance(data, dict) else None
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("file"), str):
+            referenced.add(snapshot["file"])
+    for path in sorted(directory.glob("*.sqlite3")):
+        if (path.name in referenced or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", path.name)
+                or path.is_symlink() or not path.is_file()):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            _log.exception("Could not remove orphaned expectation snapshot %s", path)
+            continue
+        _log.warning("Removed orphaned import expectation snapshot %s", path.name)
 
 
 def canonical(name: str) -> str:
@@ -4999,7 +5331,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
 # ── Building ──────────────────────────────────────────────────────────────────
 
-def _create_from_package(name: str, pkg: Path) -> None:
+def _create_from_package(name: str, pkg: Path, instance: str | None = None) -> None:
     cfg_path = pkg / "collection.json"
     cfg = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
     wc._create_collection_sync(
@@ -5008,6 +5340,7 @@ def _create_from_package(name: str, pkg: Path) -> None:
         cfg.get("distance_metric", "cosine"),
         cfg.get("hnsw_config") or {},
         preserve_hnsw=True,
+        description=_instance_description(instance) if instance else None,
     )
 
 
@@ -5114,9 +5447,24 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     return sessions
 
 
+def _read_retrieval_config(pkg: Path, original: str) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot."""
+    path = pkg / "retrieval_config.json"
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Retrieval settings must be a regular file")
+        return retrieval_config.validate(json.loads(path.read_text()), original)
+    except (OSError, ValueError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retrieval settings.",
+                           {"file": "retrieval_config.json"}) from exc
+
+
 def _restore_sidecars(target: str, pkg: Path, original: str,
                       validated_sessions: list[dict],
-                      restored_sessions: list[dict] | None = None) -> list[str]:
+                      restored_sessions: list[dict] | None = None,
+                      validated_retrieval: dict | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -5136,10 +5484,8 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
         out.mkdir(parents=True, exist_ok=True)
         (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
 
-    retrieval_cfg = pkg / "retrieval_config.json"
-    if retrieval_cfg.is_file():
-        data = json.loads(retrieval_cfg.read_text())
-        data["collection"] = target
+    if validated_retrieval is not None:
+        data = {**validated_retrieval, "collection": target}
         try:
             retrieval_config.save(data)
         except Exception as exc:                      # noqa: BLE001
@@ -5158,6 +5504,9 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
             data.pop("orphaned", None)
             data.pop("orphaned_reason", None)
             data.pop("orphaned_at", None)
+            # A package can carry any value here, and a write failure on the
+            # source system says nothing about this one's storage.
+            data.pop("persistence_error", None)
             # Write through the service: a direct file write leaves the
             # in-memory cache holding the old version, which the next flagging
             # pass would write straight back over this one.
@@ -5177,9 +5526,9 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
 
 
 @collection_writes.serialized("target")
-def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
+def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | None = None) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
-    _create_from_package(target, pkg)
+    _create_from_package(target, pkg, instance)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
     except Exception as original:
@@ -5228,6 +5577,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                {"name": original})
 
         validated_sessions = _read_goldstandard_sessions(pkg, original)
+        validated_retrieval = _read_retrieval_config(pkg, original)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -5265,14 +5615,15 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                         "if an orphan marker could not be persisted")
 
             expected = manifest.get("collection", {}).get("chunk_count", -1)
-            _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
+            instance = _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
             marked = target
-            written = _build(target, pkg, manifest, progress)
+            written = _build(target, pkg, manifest, progress, instance)
             _mark_finished(target)
             marked = None
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
-                target, pkg, original, validated_sessions, job["restored_sessions"])
+                target, pkg, original, validated_sessions, job["restored_sessions"],
+                validated_retrieval)
 
             if staged and temp_collection:
                 try:
@@ -5294,7 +5645,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
             job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
-                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
+                                   "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -5303,7 +5654,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
             job["error_detail"] = {"recovered_as": temp_collection,
-                                   "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}
+                                   "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
@@ -5873,10 +6224,17 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             raise PackageError(
                 "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified data is retained as '{staging}'.",
                 {"recovered_as": staging,
-                 "sidecar_snapshots": str(collection_recovery._root() / ownership["operation_id"])}) from exc
+                 "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}) from exc
+        if not cutover_started and ownership["state"] == "recovery":
+            # Only before_replace runs between retain and cutover. The original
+            # was never deleted, so the copy is discarded below.
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Gold-standard sessions could not be "
+                "marked stale before replacement, so the original collection is unchanged.") from exc
         raise
     finally:
-        if completed or original_intact or ownership["state"] == "scratch":
+        # Before cutover the original is intact, so a retained copy is not needed.
+        if completed or original_intact or not cutover_started or ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, client)
             except Exception:
@@ -5895,7 +6253,9 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         job["chunks_written"] = n
 
     try:
-        has_sources = sources.has_sources(source_collection)
+        needs_sources = operation == "rechunk" or (
+            operation == "reembed" and params.get("chunking") is not None)
+        has_sources = sources.has_sources(source_collection) if needs_sources else False
         records = None
 
         if operation == "rechunk":
@@ -6638,8 +6998,11 @@ async def tune_options(collection: str):
     """What this collection can be tuned with, given its fidelity."""
     if not await wc.collection_exists(collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
-    has_sources = await asyncio.to_thread(sources.has_sources, collection)
-    stats = await asyncio.to_thread(sources.stats, collection)
+    try:
+        has_sources = await asyncio.to_thread(sources.has_sources, collection)
+        stats = await asyncio.to_thread(sources.stats, collection)
+    except ValueError:
+        return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",
@@ -6658,6 +7021,7 @@ async def tune_options(collection: str):
 
 ```python
 from __future__ import annotations
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -6775,7 +7139,6 @@ async def download(filename: str):
 
 @router.get("/diagnostics")
 async def diagnostics():
-    import asyncio
     return {"issues": await asyncio.to_thread(gs.session_diagnostics)}
 ```
 
@@ -7093,12 +7456,7 @@ This package is:
 
 ```python
 #!/usr/bin/env python3
-"""Query the "@@COLLECTION_NAME@@" collection through a rag-docker API.
-
-Generated with the RAG package @@PACKAGE_FILENAME@@
-  package id : @@ID8@@
-  created    : @@CREATED_AT@@
-  embedding  : @@EMBED_MODEL@@ (@@EMBED_DIMENSIONS@@ dimensions)
+"""Query the packaged collection through a rag-docker API.
 
 The defaults below are the settings this collection was tuned with. Every one
 can be overridden with a flag. Standard library only, on purpose: this has to
@@ -7115,12 +7473,13 @@ import urllib.error
 import urllib.request
 
 # ── Baked in at export from the collection's saved retrieval settings ─────────
-COLLECTION = "@@COLLECTION_NAME@@"
+PACKAGE_METADATA = @@PACKAGE_METADATA@@
+COLLECTION = @@COLLECTION_NAME@@
 DEFAULT_API_URL = "http://localhost:8080/api"
-DEFAULT_MODE = "@@RETRIEVAL_MODE@@"
+DEFAULT_MODE = @@RETRIEVAL_MODE@@
 DEFAULT_TOP_K = @@TOP_K@@
 DEFAULT_ALPHA = @@ALPHA@@
-DEFAULT_RESPONSE_FORMAT = "@@RESPONSE_FORMAT@@"
+DEFAULT_RESPONSE_FORMAT = @@RESPONSE_FORMAT@@
 
 MODES = ("hnsw", "flat", "hybrid", "semantic")
 # Generous by default: the answer is generated by an LLM on CPU, which can take
@@ -9857,17 +10216,109 @@ print('PASS disposable model package and target removed', flush=True)
 # Verification suite
 
 Integration tests that run the acceptance criteria in `SPECIFICATIONS.md` §10
-and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a live stack.
+and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a running stack: the disposable
+verify project, never the live stack (#152).
 
 ```bash
-docker compose up -d          # they need the stack running
-
-bash scripts/verify/all.sh                    # everything, ~20 min
-RAG_SKIP_SLOW=1 bash scripts/verify/all.sh    # skip LLM work, ~3 min
-bash scripts/verify/all.sh 02 04              # only the named suites
+bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
+bash scripts/verify/stack.sh run 02 04              # only the named suites
 ```
 
 Exits non-zero if any check fails.
+
+## Entry point and verify project
+
+`stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
+the stack built from a checkout. `stack.sh` never builds, starts or stops the
+live `rag-docker` stack, and only reads its model volume, to copy the models.
+That guards against accidents, not hostile code (see "What it doesn't protect
+against" below).
+
+| Command | What it does |
+|---|---|
+| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
+
+`--checkout` is the checkout to build and test; the default is the one holding
+`stack.sh`. The overlay `docker-compose.verify.yml` and `stack.sh` itself always
+come from the checkout holding `stack.sh`, so a reviewer can run a trusted copy
+against someone else's checkout.
+
+What makes it separate from the live stack:
+
+- **Its own project and port.** Compose project `rag-verify`, publishing only
+  the proxy, on `127.0.0.1:8081` (`RAG_VERIFY_PORT`; 8080 is refused). Its
+  network, containers and volumes (`rag-verify_weaviate_data`, ...) are its
+  own, and empty at every `up`.
+- **Its own images.** `rag-verify-api:latest` and `rag-verify-ui:latest`, and
+  `rag-verify-<service>:latest` for any other service that builds. The
+  configuration check refuses a build that would write any other tag, so the
+  build doesn't move the base file's `rag-docker-api` and `rag-docker-ui`
+  tags, or a third-party tag the live stack runs. `down` removes every image
+  the project built.
+- **Its own exports folder.** `${TMPDIR:-/tmp}/rag-verify-<uid>/exports`,
+  inside a folder of the user's own with mode 700 (a symlink there, or a
+  folder owned by someone else, is refused). It is passed to the suites as
+  `RAG_EXPORTS_DIR`, in place of the checkout's `./exports`.
+- **A copy of the models.** The Ollama models are copied once from the live
+  `rag-docker_ollama_models` into the volume `rag-verify-ollama-models` (about
+  2.5 GB). Every `up` checks the copy against the live store by sha256 and
+  repairs any difference. The live volume is mounted read-only, in a throwaway
+  container with no network, and only for that copy. The copy is kept by
+  `down`, so later runs don't copy again. With no live model volume, the copy
+  is skipped and the verify project's Ollama pulls the models into it, which
+  needs the internet.
+- **A configuration check.** Before anything is built, `up` reads the resolved
+  configuration (`docker compose config`) and checks it against an allow-list
+  of what the base file and the overlay need (#154). It refuses any other
+  top-level or service key (for example `volumes_from`, `network_mode`,
+  `privileged`, `cap_add`, `devices`, `pid`, `secrets`, `configs`); a build
+  with options other than a context and Dockerfile inside the checkout, or
+  whose image isn't `rag-verify-<service>`; a `rag-docker-*` image, under any
+  registry name; a network other than the project's own bridge network, or
+  joined with options; a volume that isn't the project's own or the model
+  copy; anything but the proxy published, on loopback at the verify port; a
+  mount other than a volume or a read-only bind from inside the checkout
+  (never its `exports` folder), apart from the api's own exports folder; and
+  the Docker socket. It can't see `env_file`, which compose merges into the
+  environment.
+- **Start-up.** `up` tears down anything left from an earlier run first, then
+  builds, then starts with `up --wait` (15 minutes), and tries once more if that
+  fails (Weaviate can be slow to report healthy, #130). If it still fails, it
+  prints the last log lines of each service that isn't up. `up` then leaves
+  the project running for inspection (`down` removes it); `run` removes it.
+
+**Memory.** The verify project runs next to the live stack on the same Docker
+VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
+answer LLM questions at once, each loads its own model (about 3 GB), so
+expect slower answers or a reload rather than a failure.
+
+**What it doesn't protect against.** The suites, and anything else a checkout
+runs on the host, have full access to Docker. The verify project keeps
+verification away from the live stack by accident, not from hostile code:
+reviewing what a branch runs is the security review's job.
+
+### The live stack is refused
+
+`all.sh` and every suite (`NN_*.sh`) refuse to run, exit 2, before any request
+or Docker command, when their target is the live stack: when the compose
+project they would act on is `rag-docker` (from `COMPOSE_PROJECT_NAME`, or
+the folder name when it's unset), or when `RAG_API` uses port 8080, which is
+also its default. `stack.sh` sets both for the verify project.
+
+`RAG_VERIFY_LIVE=1` overrides the refusal with a warning, for someone verifying
+their own deployment on purpose. The documented commands and the PR review
+never use it. Restarts never reach the live project, even with it: with
+`RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
+`04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing.
+
+`python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
+configuration check and both refusals, with Docker replaced by a stub, so it
+needs no stack.
 
 ## Focused import validation regressions
 
@@ -9878,13 +10329,19 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
 seams are mocked; this complements the live transfer suite and does not prove
-Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies:
+Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies, on
+the verify project: `bash scripts/verify/stack.sh up`, paste the `export` lines
+it prints, then
 
 ```bash
 docker compose run --rm --no-deps \
   -v "$PWD/scripts/tests:/tests:ro" -e RAG_TEST_API_DIR=/app \
   api python /tests/test_session_import.py
 ```
+
+and `bash scripts/verify/stack.sh down` when done. Without those exports,
+`docker compose run` from the main checkout starts a container in the live
+`rag-docker` project, with the live volumes mounted.
 
 Alternatively, with `uv` on the host:
 
@@ -9895,9 +10352,20 @@ uv run --no-project --python 3.11 \
   python scripts/tests/test_session_import.py
 ```
 
+`scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
+retrieval package rejection before model, backend, recovery, or sidecar mutation;
+historical defaults/coercion and `ef` round trips; and generated Python literal
+regressions. Run it with the same API dependencies as the session import test.
+`05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
+15 malformed settings imports across abort/rename/replace and verifies live
+collection counts and saved settings are unchanged. The normal rename import
+also checks all saved retrieval fields round-trip. Controlled tests complement,
+and do not replace, this live acceptance.
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
-embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository:
+embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
+(on the verify project, with the exports from `stack.sh up`, as above):
 
 ```bash
 docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
@@ -9933,24 +10401,39 @@ Run the controlled regressions with the API dependencies installed:
 python -m unittest discover -s scripts/tests -p 'test_batch*.py'
 ```
 
-For a **disposable stack**, the following fault acceptance uses real Weaviate,
-synthetic `VfyBatchRecovery*` collections and the real embedding model. It injects
-final-create failures into the test process, retains import/tuning recovery,
-restarts the API, then verifies exact UUIDs, properties, vectors and sources.
-It also checks real completed-batch rejection/partial acceptance, ingestion UUID
-rollback after a post-write read fault, resumption of metadata cleanup after backend
-deletion, owned scratch cleanup and retention of an unowned marker-like collection. It must not run against a user's data stack.
+`batch_recovery.py` is the fault acceptance. It uses real Weaviate, synthetic
+collections and the real embedding model. It injects final-create failures into
+the test process, retains import/tuning recovery, restarts the API, then verifies
+exact UUIDs, properties, vectors and sources. It also checks real completed-batch
+rejection/partial acceptance, ingestion UUID rollback after a post-write read fault,
+resumption of metadata cleanup after backend deletion, owned scratch cleanup and
+retention of an unowned marker-like collection. It must not run against a
+user's data stack: run it on the verify project.
+
+`05_transfer.sh` runs it when `RAG_ALLOW_RESTART=1`: prepare, `docker compose
+restart api`, check, then cleanup. It creates and deletes only the
+`${RAG_TEST_PREFIX}BatchRecovery*` collections, archive and package folder it
+records in its state file. The restart ends any job in progress on the stack.
+Cleanup always runs, even after a failed check; the phase logs stay in
+`/tmp/vfy_recovery_prepare.log`, `/tmp/vfy_recovery_check.log` and
+`/tmp/vfy_recovery_cleanup.log`. The script accepts only a prefix starting with
+`Vfy` (a guard on its destructive phases), so with any other `RAG_TEST_PREFIX`
+the suite skips these checks and says why.
+
+To run the phases by hand on a disposable stack:
 
 ```bash
+bash scripts/verify/stack.sh up      # then paste the export lines it prints
 docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
 docker compose restart api
 # Wait for /api/health to report healthy before the next phase.
 docker compose exec -T api python - check < scripts/verify/batch_recovery.py
 docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
+bash scripts/verify/stack.sh down
 ```
 
-If interrupted, keep the recorded fixtures and run `check` after restarting; run
-`cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
+In a manual run, if interrupted, keep the recorded fixtures and run `check` after
+restarting; run `cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
 live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 
 ## Layout
@@ -9960,7 +10443,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
-| `settings_validation.py` | standalone: `RAG_API=http://localhost:8080/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
+| `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
@@ -9969,7 +10452,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E28; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E29; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
@@ -9991,10 +10474,13 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; use `18080` with a deliberate loopback test override |
-| `RAG_API` | `http://localhost:8080/api` | where the API is |
+| `RAG_VERIFY_PORT` | `8081` | `stack.sh`: the verify project's host port; 8080 is refused |
+| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; `stack.sh` sets it to the verify port |
+| `RAG_API` | `http://localhost:8080/api` | where the API is; `stack.sh` sets it to the verify project. Port 8080, the default, is refused as the live stack unless `RAG_VERIFY_LIVE=1` |
+| `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
+| `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks) |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
@@ -10026,10 +10512,12 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On a disposable stack with its embedding model already pulled, run:
+On the verify project (`bash scripts/verify/stack.sh up`, then paste the
+`export` lines it prints), whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
+bash scripts/verify/stack.sh down
 ```
 
 This verifies the real model's referenced bytes, copies them into a temporary
@@ -10048,15 +10536,15 @@ python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
 ## Cleaning up
 
 Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
-the end. If a run is interrupted:
+the end. On the verify project nothing outlives the run: `stack.sh run` removes
+the whole project, volumes included, even when interrupted. If `stack.sh` itself
+was killed, remove what is left with:
 
 ```bash
-curl -s localhost:8080/api/collections | python3 -c \
-  "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
-  | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
+bash scripts/verify/stack.sh down
 ```
 
-`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes eighteen owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes twenty-one owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 
 The infrastructure suite requires Docker Engine 28.0.0+ and checks both resolved Compose and live Docker bindings for a single loopback proxy publication. When deploying an alternate host port for testing, set `RAG_EXPECTED_PROXY_PORT` to that port as well as `RAG_API`. Its inspection files are kept in a private temporary directory removed on exit. The local profile assumes standard bridge/NAT routing.
 
@@ -10078,9 +10566,12 @@ Tuning normalizes the backend first-character alias for active jobs and ownershi
 # Run every verification suite against a running stack.
 #
 #   bash scripts/verify/all.sh              # everything (~20 min, LLM-bound)
-#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~3 min)
+#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~8 min)
 #   RAG_ALLOW_RESTART=1 bash scripts/verify/all.sh  # also restart the stack
 #   bash scripts/verify/all.sh 02 04        # only the named suites
+#
+# Normally started by scripts/verify/stack.sh run, on the disposable verify
+# project. It refuses the live rag-docker stack (#152).
 #
 # Exits non-zero if any check fails, so it can gate a commit or a release.
 #
@@ -10091,8 +10582,10 @@ Tuning normalizes the backend first-character alias for active jobs and ownershi
 set -uo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
-# One run at a time: the fixtures rebuilt below are shared (#95).
-. ./lock.sh
+# One run at a time: the fixtures rebuilt below are shared (#95). lib.sh takes
+# the lock (lock.sh) and holds the live-stack guard (#152).
+. ./lib.sh
+live_guard
 
 API="${RAG_API:-http://localhost:8080/api}"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -10100,7 +10593,7 @@ FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
 if [ "$code" != "200" ]; then
   printf '\nNo healthy API at %s (HTTP %s).\n' "$API" "$code"
-  printf 'Start the stack first:  docker compose up -d\n\n'
+  printf 'Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
   exit 2
 fi
 
@@ -10110,7 +10603,8 @@ fi
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
     printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
-    printf 'Restart it and run again:  docker compose restart ollama\n\n'
+    printf 'Restart it and run again:  docker compose restart ollama\n'
+    printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
   fi
   printf '\n%s\n' "$sanity"
@@ -10159,6 +10653,515 @@ else
   printf '\n  At least one suite failed.\n\n'
 fi
 exit "$overall"
+```
+
+### scripts/verify/stack.sh
+
+```bash
+#!/usr/bin/env bash
+#
+# Run the verification suite on a disposable compose project, never on the
+# live stack (#152).
+#
+#   bash scripts/verify/stack.sh run [--checkout DIR] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
+#   bash scripts/verify/stack.sh down
+#
+# `run` brings the verify project up, runs that checkout's all.sh against it
+# (RAG_SKIP_SLOW and RAG_ALLOW_RESTART pass through) and always tears it down,
+# exiting with all.sh's status. `up` leaves the project running and prints the
+# environment that points docker compose and the suites at it; `down` removes
+# it. --checkout picks the checkout to build and test (default: this one).
+#
+# The verify project is compose project `rag-verify` on port RAG_VERIFY_PORT
+# (default 8081; 8080 is refused), with its own empty volumes, its own image
+# tags (rag-verify-api, rag-verify-ui) and its own exports folder. The live
+# `rag-docker` stack holds real data, and nothing here builds, starts, stops or
+# writes to it. Its only contact with it: the Ollama models are copied from
+# rag-docker_ollama_models, mounted read-only in a throwaway container, into
+# the volume rag-verify-ollama-models, which is kept between runs and checked
+# by sha256 on every `up`.
+#
+# The overlay docker-compose.verify.yml and this script come from the checkout
+# that holds this script, so an evaluation can run a trusted copy against a PR's
+# checkout. Before anything is built, the resolved configuration is checked
+# against an allow-list of what docker-compose.yml and the overlay need (#154),
+# and refused otherwise: any other top-level or service key (volumes_from,
+# network_mode, privileged, secrets, ...); a build with options other than a
+# context and Dockerfile inside the checkout, or one that would write a tag
+# other than rag-verify-<service>; a rag-docker-* image under any registry
+# name; a network or volume other than the project's own (and the model copy);
+# any published port but the proxy on loopback at the verify port; a mount
+# other than a volume or a read-only bind from inside the checkout (never its
+# exports folder), apart from the api's own exports folder; the Docker socket.
+# It can't see env_file, which compose merges into the environment.
+#
+# What this does not do: the suites, and anything else the checkout runs on the
+# host, still have full access to Docker. It keeps verification away from the
+# live stack by accident, not from hostile code; that is the security review's.
+set -uo pipefail
+
+PROJECT=rag-verify
+LIVE_MODELS=rag-docker_ollama_models
+MODELS=rag-verify-ollama-models
+HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+SCRATCH="${TMPDIR:-/tmp}"
+SCRATCH="${SCRATCH%/}"
+[ -n "$SCRATCH" ] || SCRATCH=/tmp
+# A folder of this user's own, mode 700, holds the exports folder, so another
+# local user can't pre-create it or plant a symlink there (#154).
+PRIVATE="$SCRATCH/rag-verify-$(id -u)"
+EXPORTS="$PRIVATE/exports"
+
+usage() {
+  sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
+  exit 2
+}
+
+fail() {
+  printf '\nstack.sh: %s\n\n' "$1" >&2
+  exit 2
+}
+
+# Prints why the private folder can't be used, or nothing.
+private_problem() {
+  if [ -L "$PRIVATE" ]; then
+    printf '%s is a symlink; refusing to use it.' "$PRIVATE"
+  elif [ -e "$PRIVATE" ] && [ ! -d "$PRIVATE" ]; then
+    printf '%s exists and is not a folder; refusing to use it.' "$PRIVATE"
+  elif [ -d "$PRIVATE" ] && [ ! -O "$PRIVATE" ]; then
+    printf '%s belongs to another user; refusing to use it.' "$PRIVATE"
+  fi
+}
+
+# ── arguments, checked before any Docker command ─────────────────────────────
+[ "$#" -ge 1 ] || usage
+CMD="$1"; shift
+case "$CMD" in up|down|run) ;; *) usage ;; esac
+CHECKOUT="$HARNESS"
+PULL=""
+ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --checkout)
+      [ "$CMD" != down ] && [ "$#" -ge 2 ] || usage
+      CHECKOUT="$2"; shift 2 ;;
+    --pull)
+      [ "$CMD" = up ] || usage
+      PULL=1; shift ;;
+    -*) usage ;;
+    *)
+      [ "$CMD" = run ] || usage
+      ARGS+=("$1"); shift ;;
+  esac
+done
+
+PORT="${RAG_VERIFY_PORT:-8081}"
+case "$PORT" in
+  ''|*[!0-9]*) fail "RAG_VERIFY_PORT must be a port number, not '$PORT'." ;;
+esac
+[ "${#PORT}" -le 5 ] || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
+PORT=$((10#$PORT))
+{ [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ]; } || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
+[ "$PORT" -ne 8080 ] || fail "RAG_VERIFY_PORT can't be 8080: that is the live rag-docker stack's port."
+
+if [ "$CMD" != down ]; then
+  { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
+    || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
+  CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# The private folder, checked before any Docker command; up and run create it.
+problem=$(private_problem)
+[ -z "$problem" ] || fail "$problem"
+if [ "$CMD" != down ]; then
+  if [ -d "$PRIVATE" ]; then
+    chmod 700 "$PRIVATE" || fail "could not set $PRIVATE to mode 700."
+  else
+    mkdir -m 700 "$PRIVATE" || fail "could not create $PRIVATE."
+  fi
+fi
+
+# ── one verify run per machine ───────────────────────────────────────────────
+# Held for the whole command; the all.sh started below inherits it.
+. "$HARNESS/scripts/verify/lock.sh"
+TEARDOWN=0
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [ "$TEARDOWN" = 1 ]; then
+    TEARDOWN=0
+    do_down || rc=2
+  fi
+  _rag_lock_release
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── the verify environment ───────────────────────────────────────────────────
+unset COMPOSE_PATH_SEPARATOR
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$HARNESS/docker-compose.verify.yml"
+export RAG_VERIFY_PORT="$PORT"
+export RAG_API="http://localhost:$PORT/api"
+export RAG_EXPECTED_PROXY_PORT="$PORT"
+export RAG_EXPORTS_DIR="$EXPORTS"
+
+# ── down: remove everything of the verify project, except the model copy ────
+# The images the verify project built, by name. Untagged entries are left
+# out: they can't be removed by name.
+labelled_images() {
+  docker image ls --filter "label=com.docker.compose.project=$PROJECT" \
+    --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>'
+}
+
+do_down() {
+  local filter="label=com.docker.compose.project=$PROJECT" ids images problem left
+  # Project name only, from a neutral folder: no compose file is needed.
+  (cd / && env -u COMPOSE_FILE docker compose -p "$PROJECT" down -v --remove-orphans) >/dev/null 2>&1
+  ids=$(docker ps -aq --filter "$filter")
+  [ -z "$ids" ] || docker rm -f $ids >/dev/null
+  ids=$(docker network ls -q --filter "$filter")
+  [ -z "$ids" ] || docker network rm $ids >/dev/null
+  ids=$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")
+  [ -z "$ids" ] || docker volume rm $ids >/dev/null
+  # Every image built for the project, whatever its service, but only by a
+  # rag-verify-* name. A labelled image under any other name is left alone
+  # and reported below.
+  images=$(labelled_images | grep '^rag-verify-')
+  [ -z "$images" ] || docker image rm $images >/dev/null
+  problem=$(private_problem)
+  if [ -n "$problem" ]; then
+    printf 'stack.sh: %s\n' "$problem" >&2
+    return 2
+  fi
+  if [ -L "$EXPORTS" ]; then
+    printf 'stack.sh: %s is a symlink; not removing it.\n' "$EXPORTS" >&2
+    return 2
+  fi
+  [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
+  left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
+  if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
+    left="$left $EXPORTS"
+  fi
+  if [ -n "$left" ]; then
+    printf 'stack.sh: the verify project was not fully removed: %s\n' "$(printf '%s' "$left" | tr '\n' ' ')" >&2
+    return 2
+  fi
+  printf 'verify project %s removed (the model copy %s is kept)\n' "$PROJECT" "$MODELS"
+}
+
+# ── the models: a copy of the live store, checked on every up ────────────────
+# The image that runs the copy is the ollama image pinned by the harness's own
+# docker-compose.yml, already on this machine, not one the checkout picks.
+seed_image() {
+  python3 - "$HARNESS/docker-compose.yml" <<'IMAGEPY'
+import sys
+inside = False
+for line in open(sys.argv[1]):
+    if line.rstrip('\n') == '  ollama:':
+        inside = True
+    elif inside and line.startswith('  ') and not line.startswith('   ') and line.strip():
+        break
+    elif inside and line.startswith('    image:'):
+        print(line.split(':', 1)[1].strip().strip('"\''))
+        sys.exit(0)
+sys.exit(1)
+IMAGEPY
+}
+
+# Runs in the throwaway container: /live is the live store (read-only), /copy
+# the verify copy. Every file is compared by sha256 and copied when missing or
+# different; files the live store doesn't have are removed.
+SYNC='set -euo pipefail
+copied=0; repaired=0; removed=0
+cd /live
+while IFS= read -r -d "" f; do
+  f="${f#./}"
+  want=$(sha256sum "/live/$f" | cut -d" " -f1)
+  case "$f" in
+    */blobs/sha256-*) [ "${f##*/sha256-}" = "$want" ] || echo "warning: live blob $f does not match its name" >&2 ;;
+  esac
+  if [ -f "/copy/$f" ] && [ ! -L "/copy/$f" ]; then
+    [ "$(sha256sum "/copy/$f" | cut -d" " -f1)" = "$want" ] && continue
+    repaired=$((repaired + 1))
+  else
+    copied=$((copied + 1))
+  fi
+  mkdir -p "/copy/$(dirname "$f")"
+  rm -rf "/copy/$f"
+  cp -p "/live/$f" "/copy/$f"
+done < <(find . -type f -print0)
+cd /copy
+while IFS= read -r -d "" f; do
+  f="${f#./}"
+  if [ ! -f "/live/$f" ] || [ -L "/live/$f" ]; then rm -f "/copy/$f"; removed=$((removed + 1)); fi
+done < <(find . \( -type f -o -type l \) -print0)
+find /copy -mindepth 1 -type d -empty -delete
+echo "models: copied=$copied repaired=$repaired removed=$removed"'
+
+do_seed() {
+  local img
+  if ! docker volume inspect "$MODELS" >/dev/null 2>&1; then
+    docker volume create --label rag-verify.models=1 "$MODELS" >/dev/null || fail "could not create the volume $MODELS."
+  fi
+  if ! docker volume inspect "$LIVE_MODELS" >/dev/null 2>&1; then
+    printf 'note: there is no %s volume to copy the models from, so the verify\n' "$LIVE_MODELS"
+    printf 'project'"'"'s ollama will pull them into %s (this needs the internet).\n' "$MODELS"
+    return 0
+  fi
+  img=$(seed_image) || fail "could not find the ollama image in $HARNESS/docker-compose.yml."
+  docker image inspect "$img" >/dev/null 2>&1 \
+    || fail "the image $img, used to copy the models, isn't on this machine; it isn't pulled for this."
+  printf 'checking the model copy %s against %s (read-only)...\n' "$MODELS" "$LIVE_MODELS"
+  docker run --rm --network none --entrypoint /bin/bash \
+    -v "$LIVE_MODELS:/live:ro" -v "$MODELS:/copy" "$img" -c "$SYNC" \
+    || fail "copying the models into $MODELS failed."
+}
+
+# ── the guard on the resolved configuration ──────────────────────────────────
+do_guard() {
+  local config rc
+  config=$(mktemp "$SCRATCH/rag-verify-config.XXXXXX") || fail "could not create a scratch file."
+  if ! docker compose -p "$PROJECT" config --format json > "$config"; then
+    rm -f "$config"
+    fail "docker compose config failed for $CHECKOUT."
+  fi
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" <<'GUARDPY'
+import json, os, sys
+
+checkout, exports, port, path = sys.argv[1:5]
+config = json.load(open(path))
+services = config.get('services') or {}
+volumes = config.get('volumes') or {}
+networks = config.get('networks') or {}
+real = os.path.realpath
+problems = []
+
+# An allow-list (#154): only the keys and values that docker-compose.yml and
+# the overlay resolve to. Anything else could reach the host or other
+# containers, so it is refused; a branch that needs more changes this list.
+TOP_KEYS = {'name', 'services', 'volumes', 'networks'}
+SERVICE_KEYS = {'build', 'command', 'depends_on', 'entrypoint', 'environment',
+                'healthcheck', 'image', 'networks', 'ports', 'volumes'}
+BUILD_KEYS = {'context', 'dockerfile'}
+NETWORK_KEYS = {'name', 'driver', 'ipam'}
+VOLUME_KEYS = {'name', 'external'}
+MOUNT_KEYS = {'type', 'source', 'target', 'read_only', 'bind', 'volume'}
+
+def inside(child, parent):
+    child, parent = real(child), real(parent)
+    return child == parent or child.startswith(parent.rstrip('/') + '/')
+
+def normalise(image):
+    # The same image under its registry-qualified names.
+    for prefix in ('docker.io/', 'index.docker.io/', 'registry-1.docker.io/'):
+        if image.startswith(prefix):
+            image = image[len(prefix):]
+            break
+    if image.startswith('library/'):
+        image = image[len('library/'):]
+    return image
+
+def extra(keys, allowed):
+    return ', '.join(sorted(set(keys) - allowed))
+
+# (g) top level: only these keys, and the verify project's name
+if extra(config, TOP_KEYS):
+    problems.append(f"(g) top-level keys not allowed: {extra(config, TOP_KEYS)}")
+if config.get('name') != 'rag-verify':
+    problems.append(f"(g) the project name is {config.get('name')!r}, not 'rag-verify'")
+
+# (h) service keys: only the base file's
+for svc, service in services.items():
+    if extra(service, SERVICE_KEYS):
+        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, SERVICE_KEYS)}")
+
+# (i) builds: only a context and a Dockerfile, both inside the checkout
+for svc, service in services.items():
+    if 'build' not in service:
+        continue
+    build = service['build']
+    if not isinstance(build, dict):
+        problems.append(f"(i) service {svc!r} has a build of an unexpected form: {build!r}")
+        continue
+    if extra(build, BUILD_KEYS):
+        problems.append(f"(i) service {svc!r} uses build keys not allowed: {extra(build, BUILD_KEYS)}")
+    context = build.get('context')
+    if not (isinstance(context, str) and os.path.isabs(context) and inside(context, checkout)):
+        problems.append(f"(i) service {svc!r} builds from {context!r}, not a folder inside the checkout")
+        continue
+    dockerfile = os.path.join(context, build.get('dockerfile') or 'Dockerfile')
+    if not inside(dockerfile, checkout):
+        problems.append(f"(i) service {svc!r} uses the Dockerfile {dockerfile!r}, outside the checkout")
+
+# (a) volumes: the project's own, or the external model copy, nothing else
+for key, volume in volumes.items():
+    volume = volume or {}
+    name = volume.get('name')
+    if key == 'ollama_models' or name == 'rag-verify-ollama-models':
+        ok = (name == 'rag-verify-ollama-models' and volume.get('external') is True
+              and not volume.get('driver_opts'))
+    else:
+        ok = (name == 'rag-verify_' + key and not volume.get('external')
+              and not volume.get('driver_opts'))
+    if not ok:
+        problems.append(f"(a) volume {key!r} resolves to {name!r}"
+                        f"{' (external)' if volume.get('external') else ''}"
+                        f"{' (driver_opts)' if volume.get('driver_opts') else ''}; "
+                        f"only rag-verify_{key} or the external rag-verify-ollama-models are allowed")
+    if extra(volume, VOLUME_KEYS):
+        problems.append(f"(a) volume {key!r} uses keys not allowed: {extra(volume, VOLUME_KEYS)}")
+for svc, service in services.items():
+    for mount in service.get('volumes') or []:
+        if mount.get('type') == 'volume' and mount.get('source') and mount['source'] not in volumes:
+            problems.append(f"(a) service {svc!r} mounts undeclared volume {mount['source']!r}")
+
+# (b) images: never the live stack's tags; a build writes only its own
+# rag-verify-<service> tag, so no tag the live stack runs can be rebuilt
+for svc, service in services.items():
+    image = normalise(service.get('image') or '')
+    if image.startswith('rag-docker-') or image.startswith('rag-docker:'):
+        problems.append(f"(b) service {svc!r} uses the live image {service.get('image')!r}")
+for svc, want in (('api', 'rag-verify-api:latest'), ('ui', 'rag-verify-ui:latest')):
+    if svc in services and services[svc].get('image') != want:
+        problems.append(f"(b) service {svc!r} must use {want}, not {services[svc].get('image')!r}")
+for svc, service in services.items():
+    if 'build' in service and svc not in ('api', 'ui') and 'image' in service \
+            and normalise(service.get('image') or '') not in (f'rag-verify-{svc}:latest', f'rag-verify-{svc}'):
+        problems.append(f"(b) service {svc!r} builds, so its image must be rag-verify-{svc}:latest "
+                        f"or unset, not {service.get('image')!r}")
+
+# (j) networks: the project's own bridge networks, joined with no options
+for key, network in networks.items():
+    network = network or {}
+    if extra(network, NETWORK_KEYS):
+        problems.append(f"(j) network {key!r} uses keys not allowed: {extra(network, NETWORK_KEYS)}")
+    if network.get('name') != 'rag-verify_' + key:
+        problems.append(f"(j) network {key!r} resolves to {network.get('name')!r}; only rag-verify_{key} is allowed")
+    if network.get('driver') not in (None, 'bridge'):
+        problems.append(f"(j) network {key!r} uses the driver {network.get('driver')!r}; only bridge is allowed")
+    if network.get('ipam'):
+        problems.append(f"(j) network {key!r} sets ipam options")
+for svc, service in services.items():
+    joined = service.get('networks') or {}
+    if isinstance(joined, list):
+        joined = {name: None for name in joined}
+    for name, options in joined.items():
+        if name not in networks:
+            problems.append(f"(j) service {svc!r} joins the undeclared network {name!r}")
+        if options:
+            problems.append(f"(j) service {svc!r} sets options on network {name!r}")
+
+# (c) exactly one published port: the proxy, on loopback, the verify port
+ports = [(svc, p) for svc, service in services.items() for p in service.get('ports') or []]
+if not (len(ports) == 1 and ports[0][0] == 'proxy'
+        and ports[0][1].get('host_ip') == '127.0.0.1'
+        and str(ports[0][1].get('published')) == port
+        and ports[0][1].get('target') == 80
+        and ports[0][1].get('protocol', 'tcp') == 'tcp'):
+    shown = ', '.join(f"{svc}:{p.get('host_ip', '')}:{p.get('published')}->{p.get('target')}/{p.get('protocol', 'tcp')}"
+                      for svc, p in ports) or 'none'
+    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->80/tcp, not {shown}")
+
+# (d) mounts: volumes and binds only, with no options; binds read-only, from
+# inside the checkout but not its exports folder; (e) never the socket
+sockets = {'/var/run/docker.sock', '/run/docker.sock'}
+checkout_exports = os.path.join(checkout, 'exports')
+for svc, service in services.items():
+    for mount in service.get('volumes') or []:
+        source, target = mount.get('source') or '', mount.get('target') or ''
+        if source in sockets or target in sockets or (source and real(source) in {real(s) for s in sockets}):
+            problems.append(f"(e) service {svc!r} mounts the Docker socket")
+            continue
+        if extra(mount, MOUNT_KEYS):
+            problems.append(f"(d) service {svc!r} mount {target!r} uses keys not allowed: {extra(mount, MOUNT_KEYS)}")
+        if mount.get('type') not in ('volume', 'bind'):
+            problems.append(f"(d) service {svc!r} mount {target!r} is of type {mount.get('type')!r}; only volume and bind are allowed")
+            continue
+        if mount.get('volume'):
+            problems.append(f"(d) service {svc!r} mount {target!r} sets volume options")
+        if set(mount.get('bind') or {}) - {'create_host_path'}:
+            problems.append(f"(d) service {svc!r} mount {target!r} sets bind options")
+        if mount.get('type') != 'bind' or (svc == 'api' and target == '/app/exports'):
+            continue  # the api's exports: rule (f)
+        if not (os.path.isabs(source) and inside(source, checkout)):
+            problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout")
+        elif inside(source, checkout_exports) or inside(checkout_exports, source):
+            problems.append(f"(d) service {svc!r} binds {source!r}, which is or holds the checkout's exports folder")
+        elif mount.get('read_only') is not True:
+            problems.append(f"(d) service {svc!r} binds {source!r} read-write; binds must be read-only")
+
+# (f) the API's exports are the verify project's own folder
+mounts = [m for m in (services.get('api', {}).get('volumes') or []) if m.get('target') == '/app/exports']
+if not (len(mounts) == 1 and mounts[0].get('type') == 'bind' and real(mounts[0].get('source') or '/') == real(exports)):
+    problems.append(f"(f) the api's /app/exports must be bound from {exports}, not "
+                    f"{[m.get('source') for m in mounts] or 'nothing'}")
+
+if problems:
+    print('The resolved compose configuration is refused:')
+    for problem in problems:
+        print('  ' + problem)
+    sys.exit(2)
+GUARDPY
+  rc=$?
+  rm -f "$config"
+  [ "$rc" -eq 0 ] || fail "the verify project's configuration is refused (see above); nothing was built or started."
+}
+
+# ── up ───────────────────────────────────────────────────────────────────────
+do_up() {
+  local i code=000 service state health
+  printf 'clearing any leftover verify project...\n'
+  do_down >/dev/null || fail "could not remove a leftover verify project."
+  mkdir -p "$EXPORTS" || fail "could not create $EXPORTS."
+  do_seed
+  do_guard
+  printf 'building the verify project from %s...\n' "$CHECKOUT"
+  docker compose -p "$PROJECT" build ${PULL:+--pull} || fail "the build failed."
+  if ! docker compose -p "$PROJECT" up -d --wait --wait-timeout 900; then
+    # Weaviate can be slow to report healthy (#130): one more try.
+    printf 'the first start failed; trying once more...\n'
+    if ! docker compose -p "$PROJECT" up -d --wait --wait-timeout 900; then
+      docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+        | while read -r service state health; do
+            case "$state/${health:-}" in
+              running/healthy|running/) ;;
+              *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+                 docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+            esac
+          done
+      [ "$CMD" != run ] || fail "the verify project did not come up; run removes it now."
+      fail "the verify project did not come up; it is left running for inspection (stack.sh down removes it)."
+    fi
+  fi
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
+  printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+    printf 'export %s=%q\n' "$var" "${!var}"
+  done
+  printf '\n'
+}
+
+case "$CMD" in
+  down)
+    do_down || exit 2 ;;
+  up)
+    do_up ;;
+  run)
+    TEARDOWN=1
+    do_up
+    rc=0
+    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+    exit "$rc" ;;
+esac
 ```
 
 ### scripts/verify/lib.sh
@@ -10233,7 +11236,7 @@ require_stack() {
   code=$(api_code "$API/health")
   if [ "$code" != "200" ]; then
     printf '\n  Cannot reach a healthy API at %s (HTTP %s).\n' "$API" "$code"
-    printf '  Start the stack first:  docker compose up -d\n\n'
+    printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
 }
@@ -10266,7 +11269,7 @@ import json,sys
 for c in json.load(sys.stdin)['collections']:
     if c['name'].startswith('$PREFIX'): print(c['name'])" 2>/dev/null)
   for n in $names; do drop_collection "$n"; done
-  rm -f "${REPO_ROOT:-.}"/exports/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
+  rm -f "${RAG_EXPORTS_DIR:-${REPO_ROOT:-.}/exports}"/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
 }
 
 summary() {
@@ -10278,6 +11281,77 @@ summary() {
   fi
   return 0
 }
+
+# ── the live stack is off limits (#152) ──────────────────────────────────────
+# Verification runs on the disposable `rag-verify` project that
+# scripts/verify/stack.sh brings up, never on the live `rag-docker` stack that
+# holds real data. A target is live when the compose project these scripts
+# would act on is rag-docker, or when RAG_API uses the live port 8080.
+
+# Prints why the current target is the live stack, or nothing.
+live_target_reason() {
+  local project="${COMPOSE_PROJECT_NAME:-}" root port
+  if [ -z "$project" ]; then
+    # What compose would use: COMPOSE_PROJECT_NAME from the checkout's .env
+    # (optionally after `export `; the last one wins; quotes removed), else
+    # a `name:` in the compose file, else the folder name (#154).
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    project=$(sed -n 's/^\(export[[:space:]]\{1,\}\)\{0,1\}COMPOSE_PROJECT_NAME=//p' "$root/.env" 2>/dev/null | tail -1 \
+      | sed -e 's/^"\(.*\)"$/\1/' -e t -e "s/^'\(.*\)'\$/\1/")
+    [ -n "$project" ] || project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
+    [ -n "$project" ] || project=$(basename "$root")
+  fi
+  # Lowercased, everything outside [a-z0-9_-] dropped, and leading `-` and
+  # `_` stripped, as compose normalises a name.
+  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[-_]*//')
+  port=$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+try:
+    port = url.port
+except ValueError:
+    port = None
+print(port if port is not None else (443 if url.scheme == "https" else 80))' "$API" 2>/dev/null)
+  if [ "$project" = "rag-docker" ]; then
+    printf 'the compose project is rag-docker, the live rag-docker stack'
+  elif [ "$port" = "8080" ]; then
+    printf 'RAG_API (%s) uses port 8080, the live rag-docker stack' "$API"
+  fi
+}
+
+# Refuses a live target unless RAG_VERIFY_LIVE=1, which only warns.
+live_guard() {
+  local reason
+  reason=$(live_target_reason)
+  [ -n "$reason" ] || return 0
+  if [ "${RAG_VERIFY_LIVE:-0}" = "1" ]; then
+    printf '\n  WARNING: RAG_VERIFY_LIVE=1, so this run targets the live rag-docker stack:\n  %s.\n\n' "$reason" >&2
+    return 0
+  fi
+  printf '\n  Refusing to verify against the live rag-docker stack: %s.\n' "$reason" >&2
+  printf '  Run it on the disposable verify project:  bash scripts/verify/stack.sh run\n' >&2
+  printf '  (RAG_VERIFY_LIVE=1 overrides this; see scripts/verify/README.md.)\n\n' >&2
+  exit 2
+}
+
+# Prints why a restart must not run here, or nothing. Restarts never reach the
+# live project, whatever RAG_VERIFY_LIVE says.
+restart_refusal_reason() {
+  local project
+  project=$(printf '%s' "${COMPOSE_PROJECT_NAME:-}" | tr '[:upper:]' '[:lower:]')
+  if [ -z "$project" ]; then
+    printf 'COMPOSE_PROJECT_NAME is not set, so a restart could reach the live rag-docker stack; run it through scripts/verify/stack.sh'
+  elif [ "$project" = "rag-docker" ]; then
+    printf 'restarts never run against the live rag-docker project (#152)'
+  fi
+}
+
+# Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
+# that borrow these helpers are not suites and are left alone.
+case "$(basename "$0")" in
+  [0-9][0-9]_*.sh) live_guard ;;
+esac
 ```
 
 ### scripts/verify/lock.sh
@@ -10985,7 +12059,11 @@ check_eq "a recreated collection does not inherit the retrieval config" \
   "$(api_get "/retrieval/config/$C" | jfield "['is_default']")" "True"
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Save a known config here, right before the restart: the section above ends
   # by recreating $C with no saved config, so relying on earlier state made
   # this check fail on every run (#73).
@@ -10994,9 +12072,9 @@ if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
     "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
-  # Name the project: from a checkout in a folder not called rag-docker,
-  # compose would otherwise act on a different project.
-  project="${COMPOSE_PROJECT_NAME:-rag-docker}"
+  # Name the project explicitly; restart_refusal_reason has already made sure
+  # it is set and is not the live rag-docker project.
+  project="$COMPOSE_PROJECT_NAME"
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
   elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
@@ -11809,7 +12887,11 @@ code=$(api_code "$API/goldstandard/download/definitely_not_here.json")
 check_eq "download of an unknown filename returns 404" "$code" "404"
 
 # ── sessions survive a restart ───────────────────────────────────────────────
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "sessions survive an API restart" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   (cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ../..)" && docker compose restart api >/dev/null 2>&1)
   for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
   api_get "/goldstandard/session/$SID" > /tmp/vfy_post.json
@@ -11845,7 +12927,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26, E27)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E29)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -11856,7 +12938,8 @@ check "imported evaluation identity acceptance suite" $?
 bash ./14_reindex.sh
 check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
-EXPORTS="$REPO_ROOT/exports"
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
 
 section "Export, import and tuning"
 
@@ -11864,6 +12947,8 @@ section "Export, import and tuning"
 check "evaluation import and generated-session regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_index_boundary.py)
 check "retained-source index boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
+check "retrieval import and generated-script trust-boundary regressions" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -11924,6 +13009,10 @@ import json,sys; d=json.load(sys.stdin)
 sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
 check "the corruption error names the offending file" $?
 rm -f "$EXPORTS/$CORRUPT"
+
+# Digest-valid malformed retrieval settings must fail before every conflict path.
+python3 ./retrieval_settings.py "$API" "$C" "$EXPORTS/$PKG"
+check "invalid retrieval imports preserve live collections and settings" $?
 
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
@@ -12050,6 +13139,199 @@ drop_collection "$gname"
 (cd "$REPO_ROOT" && docker compose exec -T api \
   rm -f "/app/uploads/goldstandard_sessions/$GS_SID.json") >/dev/null 2>&1 || true
 
+# ── retained-source identities never select outside files (E29, #138) ───────
+# A crafted, digest-valid package names an outside sentinel file in the API
+# container through sources/index.json. Import must refuse it before any live
+# mutation, and nothing exported afterwards may carry the sentinel's bytes.
+E29_TAG="$(python3 -c 'import uuid;print(uuid.uuid4().hex[:12])')"
+E29_SENT="/tmp/e29-sentinel-$E29_TAG"
+E29_TEXT="E29-OUTSIDE-SENTINEL-$E29_TAG"
+(cd "$REPO_ROOT" && docker compose exec -T api sh -c "printf '%s' '$E29_TEXT' > '$E29_SENT'")
+check "E29: the outside sentinel exists in the API container" $?
+make_src_pkg() {   # make_src_pkg <abs|trav|mismatch> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$E29_SENT" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, mode, suffix, sent = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+sha = lambda b: hashlib.sha256(b).hexdigest()
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    idx_path = root / "sources" / "index.json"
+    index = json.loads(idx_path.read_text())
+    digest, entry = next(iter(index["documents"].items()))   # the valid in-directory source
+    if mode == "abs":
+        key = sent
+    elif mode == "trav":
+        key = "../../.." + sent        # /app/sources/<collection>/../../.. is /
+    else:                              # a digest-shaped key whose blob doesn't match it
+        key = "0" * 64
+        blob = root / "sources" / key
+        blob.write_bytes(b"bytes that do not hash to the key")
+        manifest["files"]["sources/" + key] = "sha256:" + sha(blob.read_bytes())
+    index["documents"][key] = dict(entry, filenames=["leak.txt"])
+    idx_path.write_text(json.dumps(index))
+    assert "sources/index.json" in manifest["files"]
+    manifest["files"]["sources/index.json"] = "sha256:" + sha(idx_path.read_bytes())
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+}
+no_sentinel_in_exports() {   # exit 0 when no file or archive member in exports holds the sentinel
+  python3 - "$EXPORTS" "$E29_TEXT" <<'ENDPY'
+import pathlib, sys, tarfile
+root, needle = pathlib.Path(sys.argv[1]), sys.argv[2].encode()
+hits = []
+for p in root.rglob("*"):
+    if not p.is_file():
+        continue
+    if needle in p.read_bytes():
+        hits.append(str(p))
+    if p.name.endswith(".tar.gz"):
+        try:
+            with tarfile.open(p) as t:
+                for m in t.getmembers():
+                    f = t.extractfile(m) if m.isfile() else None
+                    if f is not None and needle in f.read():
+                        hits.append(f"{p.name}:{m.name}")
+        except tarfile.TarError:
+            pass
+print("\n".join(hits) or "no sentinel bytes in exports")
+sys.exit(1 if hits else 0)
+ENDPY
+}
+src_index_hash() {   # sha256 of the collection's retained index inside the API container
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" <<'ENDPY'
+import hashlib, sys
+from services import sources
+p = sources.collection_dir(sys.argv[1]) / "index.json"
+print(hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing")
+ENDPY
+  )
+}
+collection_names() { api_get "/collections" | python3 -c "
+import json,sys; print(' '.join(sorted(c['name'] for c in json.load(sys.stdin)['collections'])))"; }
+run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_e29job.json
+  api_post "/import" "{\"filename\":\"$1\",\"on_conflict\":\"$2\"}" > /tmp/vfy_imp.json
+  local j; j=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+  wait_for_job "/import/job/$j" 1800 >/dev/null
+  api_get "/import/job/$j" > /tmp/vfy_e29job.json
+}
+
+# Import → export, rename: the PR's controlled regression in one chain on the
+# live stack. If the import is (wrongly) accepted, export what it created and
+# look for the sentinel there.
+names_before=$(collection_names)
+ABSPKG=$(make_src_pkg abs srcabs)
+run_import "$ABSPKG" rename
+check_eq "E29: an absolute source-index key is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_e29job.json'))
+sys.exit(0 if 'sources/index.json' in json.dumps(d) else 1)"
+check "E29: the refusal names sources/index.json" $?
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_e29job.json'))
+sys.exit(1 if '$E29_SENT' in json.dumps(d) or '$E29_TEXT' in json.dumps(d) else 0)"
+check "E29: the refusal doesn't echo the outside path or its contents" $?
+read -r e29stat e29name <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+if [ "$e29stat" = "completed" ] && [ "$e29name" != "-" ]; then
+  api_post "/export" "{\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800 >/dev/null
+fi
+check_eq "E29: a refused rename import creates no collection" "$(collection_names)" "$names_before"
+leak=$(no_sentinel_in_exports); check "E29: import → export never archives the outside sentinel" $? "$leak"
+[ "$e29stat" = "completed" ] && [ "$e29name" != "-" ] && drop_collection "$e29name"
+
+# Replace: refused before any live mutation, for every unsafe identity.
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+idx_before=$(src_index_hash "$C")
+for mode in abs trav mismatch; do
+  [ "$mode" = abs ] && P="$ABSPKG" || P=$(make_src_pkg "$mode" "src$mode")
+  run_import "$P" replace
+  check_eq "E29: replace with a $mode source identity is refused as PACKAGE_CORRUPT" \
+    "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+  check_eq "E29: ... leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  check_eq "E29: ... and the live retrieval settings ($mode)" \
+    "$(api_get "/retrieval/config/$C" | jfield "['top_k']")" "7"
+  check_eq "E29: ... and the retained source index ($mode)" "$(src_index_hash "$C")" "$idx_before"
+  rm -f "$EXPORTS/$P"
+done
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+
+# The valid in-directory source still round-trips after the refusals.
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+e29job=$(jfield "['job_id']" < /tmp/vfy_e29exp.json)
+check_eq "E29: the collection still exports after refused imports" \
+  "$(wait_for_job "/export/job/$e29job" 1800)" "completed"
+E29PKG=$(api_get "/export/job/$e29job" | jfield "['filename']")
+python3 - "$EXPORTS/$E29PKG" <<'ENDPY'
+import hashlib, json, re, sys, tarfile
+with tarfile.open(sys.argv[1]) as t:
+    names = {m.name.split("/", 1)[1]: m for m in t.getmembers() if "/" in m.name}
+    index = json.load(t.extractfile(names["sources/index.json"]))
+    docs = index["documents"]
+    ok = bool(docs) and all(re.fullmatch(r"[0-9a-f]{64}", k) for k in docs)
+    for k in docs:
+        ok = ok and hashlib.sha256(t.extractfile(names[f"sources/{k}"]).read()).hexdigest() == k
+sys.exit(0 if ok else 1)
+ENDPY
+check "E29: its package carries the valid source under its digest, and nothing else" $?
+rm -f "$EXPORTS/$E29PKG"
+
+# Read boundaries: an unsafe index already on disk (as a pre-fix import would
+# have left it) must not let export or re-chunking read the sentinel.
+plant() {   # plant <abs|link|restore>
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$E29_SENT" "$1" <<'ENDPY'
+import hashlib, json, os, sys
+from services import sources
+d = sources.collection_dir(sys.argv[1]); sent, mode = sys.argv[2], sys.argv[3]
+idx, bak = d / "index.json", d / "index.json.e29bak"
+if mode == "restore":
+    keep = json.loads(bak.read_text())["documents"]
+    for p in d.iterdir():
+        if p.is_symlink():
+            p.unlink()
+    os.replace(bak, idx)
+    sys.exit(0)
+if not bak.exists():
+    bak.write_bytes(idx.read_bytes())
+index = json.loads(bak.read_text())
+entry = next(iter(index["documents"].values()))
+if mode == "abs":
+    key = sent
+else:
+    key = hashlib.sha256(open(sent, "rb").read()).hexdigest()
+    os.symlink(sent, d / key)
+index["documents"][key] = dict(entry, filenames=["leak.txt"])
+idx.write_text(json.dumps(index))
+ENDPY
+  )
+}
+for mode in abs link; do
+  plant "$mode"
+  check "E29: planted a $mode source entry on disk" $?
+  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  check_eq "E29: export refuses an on-disk $mode source entry" \
+    "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
+  leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
+  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  plant restore
+  check "E29: restored the collection's own source index ($mode)" $?
+done
+check_eq "E29: the restored index is the original" "$(src_index_hash "$C")" "$idx_before"
+(cd "$REPO_ROOT" && docker compose exec -T api rm -f "$E29_SENT") >/dev/null 2>&1 || true
+
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
@@ -12068,6 +13350,12 @@ check_eq "rename imports alongside the original" "$istat" "completed"
 [ "$irenamed" = "True" ] && [ "$iname" != "$C" ]
 check "the renamed collection has a new name" $? "imported as $iname"
 check_eq "every chunk is imported" "$iwritten" "$chunks_before"
+api_get "/retrieval/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
+check "renamed import preserves every saved retrieval setting" $?
 
 # A successful destructive replace must be exercised as well as abort/rename.
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
@@ -12271,8 +13559,17 @@ sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
-  RP="${PREFIX}BatchRecovery"
+RP="${PREFIX}BatchRecovery"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "batch recovery across an API restart" 1 "$restart_refusal"
+elif ! [[ "$RP" =~ ^Vfy[A-Za-z0-9_]+$ ]]; then
+  # batch_recovery.py refuses any other prefix, as a guard on its destructive phases.
+  skip "batch recovery across an API restart" "batch_recovery.py accepts only Vfy… prefixes; RAG_TEST_PREFIX='$PREFIX' gives '$RP'"
+else
   (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
   check "batch faults fail truthfully and retain verified recovery" $? \
@@ -12286,8 +13583,6 @@ if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
   check "recovery acceptance fixtures are removed" $?
-else
-  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 rm -f "$EXPORTS/$PKG"
@@ -13628,11 +14923,18 @@ from services import goldstandard as gs
 def fixture():
     return {'session_id':'gs_450abcde','collection':'OwnedPersistence','status':'completed','pairs_total':2,'pairs_completed':2,'pairs':[{'pair_id':'p_'+str(i),'question':'Original','answer':'Original','contexts':['Inert'],'ground_truth':'Original','source_file':'inert.txt','chunk_index':i,'status':'pending'} for i in range(2)]}
 
+def child_env():
+    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+
+def client():
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
+
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         patches=[(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{})]
         if hasattr(gs,'_diagnostics'):patches.append((gs,'_diagnostics',{}))
+        if hasattr(gs,'_scan_cache'):patches.append((gs,'_scan_cache',{}))
         for obj,key,value in patches:
             change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
         self.data=fixture();gs.store_session(self.data)
@@ -13938,6 +15240,163 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         self.assertEqual(build.call_count,2);self.assertEqual(job['status'],'completed')
         self.assertIn('inspect session recovery diagnostics',job['notes'][0]);self.assertNotIn('marked orphaned',job['notes'][0])
         self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    # #127 follow-ups.
+    def pending(self):
+        return Path(self.tmp.name)/'goldstandard_sessions'/'pending_markers'/(self.data['session_id']+'.json')
+
+    def fail_session_file_replace(self):
+        path=gs._session_path(self.data['session_id']);original=gs.os.replace
+        def replace(src,dst):
+            if Path(dst)==path:raise OSError('Owned session-file marker fault')
+            return original(src,dst)
+        return patch.object(gs.os,'replace',side_effect=replace)
+
+    def test_session_poll_does_not_block_event_loop_during_slow_commit(self):
+        async def run():
+            inside=threading.Event();real_fsync=os.fsync
+            def slow_fsync(fd):
+                inside.set();time.sleep(1.5);return real_fsync(fd)
+            with patch.object(gs.os,'fsync',side_effect=slow_fsync):
+                writer=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'status':'edited','answer':'Slow commit'}))
+                self.assertTrue(await asyncio.to_thread(inside.wait,5))
+                gaps=[]
+                async def ticker():
+                    last=time.monotonic()
+                    for _ in range(30):
+                        await asyncio.sleep(0.02);now=time.monotonic();gaps.append(now-last);last=now
+                tick=asyncio.create_task(ticker());await asyncio.sleep(0.05)
+                async with client() as c:response=await c.get('/goldstandard/session/'+self.data['session_id'])
+                await tick;await writer
+            self.assertEqual(response.status_code,200)
+            self.assertLess(max(gaps),0.5,'event loop stalled %.2fs while a poll waited for the writer lock'%max(gaps))
+        asyncio.run(run())
+
+    def test_failed_marker_survives_restart_and_refuses_current_export(self):
+        first="""import sys
+from unittest.mock import patch
+from config import settings
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
+    gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+"""
+        second="""import sys,asyncio,json,httpx
+from config import settings
+from main import app
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+async def run():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as c:
+        r=await c.post('/goldstandard/save',json={'session_id':'gs_450abcde','filename':'owned-restart.json'})
+        return r.status_code,r.json()
+print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_diagnostics()}))
+"""
+        one=subprocess.run([sys.executable,'-c',first,self.tmp.name],env=child_env(),capture_output=True,text=True,timeout=60)
+        self.assertEqual(one.returncode,0,one.stderr[-2000:])
+        two=subprocess.run([sys.executable,'-c',second,self.tmp.name],env=child_env(),capture_output=True,text=True,timeout=60)
+        self.assertEqual(two.returncode,0,two.stderr[-2000:])
+        observed=json.loads(two.stdout.strip().splitlines()[-1])
+        self.assertEqual(observed['export'][0],409,observed)
+        self.assertEqual(observed['export'][1]['error']['code'],'HISTORICAL_SESSION')
+        issues=[i for i in observed['diagnostics'] if i['filename']=='gs_450abcde.json']
+        self.assertEqual([i['code'] for i in issues],['SESSION_WRITE_FAILED'],observed['diagnostics'])
+        self.assertIn('pending marker',issues[0]['message'])
+
+    def test_failed_marker_is_applied_to_package_snapshots(self):
+        with self.fail_session_file_replace():
+            self.assertEqual(gs.mark_stale('OwnedPersistence','Owned rebuild'),0)
+        self.assertNotIn('stale',json.loads(gs._session_path(self.data['session_id']).read_text()))
+        exported=[s for s in gs._sessions_on_disk() if s['session_id']==self.data['session_id']]
+        self.assertTrue(exported[0].get('stale'));self.assertEqual(exported[0]['stale_reason'],'Owned rebuild')
+        self.assertNotIn('stale',json.loads(gs._session_path(self.data['session_id']).read_text()))
+
+    def test_next_successful_write_persists_marker_and_removes_pending_file(self):
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertTrue(self.pending().is_file())
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}))
+        self.assertTrue(json.loads(gs._session_path(self.data['session_id']).read_text())['orphaned'])
+        self.assertFalse(self.pending().exists());self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_both_failed_markers_are_kept_pending(self):
+        with self.fail_session_file_replace():
+            gs.mark_stale('OwnedPersistence','Owned rebuild');gs.mark_orphaned('OwnedPersistence','Owned deletion')
+        state=self.restart();self.assertTrue(state['stale']);self.assertTrue(state['orphaned'])
+        self.assertEqual((state['stale_reason'],state['orphaned_reason']),('Owned rebuild','Owned deletion'))
+
+    def test_unreadable_pending_marker_is_preserved_and_reported(self):
+        self.pending().parent.mkdir();self.pending().write_text('{')
+        state=self.restart();self.assertFalse(state.get('orphaned'))
+        self.assertEqual([(i['filename'],i['code']) for i in gs.session_diagnostics()],[('pending_markers/gs_450abcde.json','SESSION_READ_FAILED')])
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}));self.assertEqual(self.pending().read_text(),'{')
+
+    def test_pending_marker_write_failure_keeps_guard_until_restart(self):
+        with patch.object(gs.os,'replace',side_effect=OSError('Owned storage fault')):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        self.assertFalse(self.pending().exists())
+        with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.save_session(self.data['session_id'],'owned.json'))
+        self.assertEqual(error.exception.code,'HISTORICAL_SESSION')
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_WRITE_FAILED');self.assertIn('until restart',issue['message'])
+
+    def test_unknown_persistence_error_does_not_fail_writes_or_markers(self):
+        for value in ({'code':'BOGUS','message':'Owned'},'Owned text'):
+            with self.subTest(value=value):
+                data=fixture();data['persistence_error']=value;gs.store_session(data)
+                self.assertEqual(gs.session_diagnostics(),[])
+                self.assertEqual(asyncio.run(gs.update_pair(data['session_id'],'p_0',{'answer':'Edit'}))['answer'],'Edit')
+                self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned deletion'),1)
+
+    def test_import_restore_strips_persistence_error(self):
+        from services import importer
+        source=fixture();source.update(session_id='gs_450abcd9',errors=['Owned kept reason'],persistence_error={'code':'SESSION_WRITE_FAILED','message':'Owned source failure'})
+        pkg=Path(self.tmp.name)/'owned-package';pkg.mkdir();restored=[]
+        importer._restore_sidecars('OwnedPersistence',pkg,'OwnedPersistence',[source],restored)
+        stored=gs.get_session(restored[0]['session_id'])
+        self.assertNotIn('persistence_error',stored);self.assertEqual(stored['errors'],['Owned kept reason'])
+        self.assertNotIn('persistence_error',json.loads(gs._session_path(stored['session_id']).read_text()))
+        self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_nonregular_session_destination_is_typed_write_failure(self):
+        path=gs._session_path(self.data['session_id']);path.unlink();path.mkdir()
+        async def run():
+            async with client() as c:
+                return await c.patch('/goldstandard/session/'+self.data['session_id']+'/pair/p_0',json={'status':'edited','answer':'Refused'})
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code,503,response.text);self.assertEqual(response.json()['error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+
+    def test_cached_read_failure_uses_one_absolute_diagnostic_key(self):
+        sid='gs_450bad05';(gs._sessions_dir()/(sid+'.json')).write_text('{')
+        gs._sessions[sid]={'session_id':sid,'collection':'OwnedPersistence'}
+        self.assertEqual(len(gs.sessions_for('OwnedPersistence')),1)
+        self.assertTrue(all(Path(key).is_absolute() for key in gs._diagnostics),list(gs._diagnostics))
+        names=[i['filename'] for i in gs.session_diagnostics()]
+        self.assertEqual(names,[sid+'.json'])
+
+    def test_marker_failure_wording_differs_from_edit_failure(self):
+        with self.fail_session_file_replace():
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Rejected'}))
+            self.assertIn('previous snapshot remains authoritative',gs.session_diagnostics()[0]['message'])
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_WRITE_FAILED')
+        self.assertIn('pending marker',issue['message']);self.assertNotIn('previous snapshot remains authoritative',issue['message'])
+
+    def test_scan_cache_skips_unchanged_and_reflects_changes(self):
+        path=gs._session_path(self.data['session_id']);original=Path.read_text;reads=[]
+        def read(p,*args,**kwargs):
+            if p==path:reads.append(1)
+            return original(p,*args,**kwargs)
+        with patch.object(Path,'read_text',read):
+            gs.session_diagnostics();reads.clear()
+            gs.session_diagnostics();self.assertEqual(reads,[],'an unchanged session file was read again')
+            changed=fixture();changed['pairs'][0]['answer']='Changed';gs.store_session(changed)
+            gs._sessions={};gs.load_sessions_from_disk();self.assertEqual(len(reads),1)
+            self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Changed')
+        bad=gs._sessions_dir()/'gs_450bad00.json';bad.write_text('{')
+        self.assertEqual(len(gs.session_diagnostics()),1);bad.unlink();self.assertEqual(gs.session_diagnostics(),[])
 
 if __name__ == '__main__':
     unittest.main()
@@ -14298,6 +15757,43 @@ class IdentityTests(unittest.TestCase):
                 self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
                 self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/expected):'SESSION_WRITE_FAILED'})
                 self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
+
+    # Testing reviewer (#148): the ValueError branch, the HTTP envelope and grammar boundaries.
+    def test_reviewer_generation_redirected_storage_root_is_session_write_failed_503(self):
+        storage=Path(settings.upload_dir)/'goldstandard_sessions';moved=Path(self.tmp.name)/'owned-moved-sessions'
+        storage.rename(moved);storage.symlink_to(moved);before=sorted(p.name for p in moved.iterdir())
+        with patch.object(gs,'_diagnostics',{}),patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abc11'+'0'*24)):
+            with self.assertRaises(gs.GoldStandardError) as caught:gs._store_generated_session(fixture())
+            self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
+            self.assertIsInstance(caught.exception.__cause__,ValueError)
+            self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/'gs_460abc11.json'):'SESSION_WRITE_FAILED'})
+        self.assertEqual(sorted(p.name for p in moved.iterdir()),before);self.assertEqual(list(gs._sessions),[self.original['session_id']])
+
+    def test_reviewer_generate_route_returns_503_session_write_failed_envelope(self):
+        from routers import goldstandard as route
+        from models.schemas import GenerateRequest
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(route.wc,'collection_exists',new=AsyncMock(return_value=True)),patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+                response=await route.generate(GenerateRequest(collection='OwnedGeneration',sample_size=1,seed=None))
+                generate.assert_not_called()
+            return response
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code,503);self.assertEqual(json.loads(response.body)['error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(list(gs._sessions),[self.original['session_id']])
+
+    def test_reviewer_preflight_refuses_near_canonical_and_unbounded_source_ids(self):
+        before=self.path.read_bytes()
+        for source in ['gs_460ABCDE','GS_460abcde','gs_460abcd','gs_460abcde0','gs_460abcdg',' gs_460abcde','gs_460abcde\n','gs_'+'a'*10000,'',460]:
+            with self.subTest(source=repr(source)[:40]):
+                package=Path(tempfile.mkdtemp(dir=self.tmp.name));gold=package/'goldstandard';gold.mkdir()
+                data=fixture();data['session_id']=source;(gold/'owned.json').write_text(json.dumps(data))
+                with self.assertRaises(importer.PackageError) as caught:importer._read_goldstandard_sessions(package,'OwnedOriginal')
+                self.assertEqual((caught.exception.code,caught.exception.detail),('PACKAGE_CORRUPT',{'file':'goldstandard/owned.json'}))
+        package=Path(tempfile.mkdtemp(dir=self.tmp.name));gold=package/'goldstandard';gold.mkdir()
+        data=fixture();data['session_id']='gs_0123abcd';(gold/'owned.json').write_text(json.dumps(data))
+        self.assertEqual([s['session_id'] for s in importer._read_goldstandard_sessions(package,'OwnedOriginal')],['gs_0123abcd'])
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(list(self.path.parent.glob('*.json'))),1)
 
 if __name__=='__main__':unittest.main()
 ```
@@ -14884,7 +16380,7 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     paths=await asyncio.to_thread(lambda:list(tuning.collection_recovery._root().glob('*.json')));assert len(paths)==1
     owner=await asyncio.to_thread(lambda:json.loads(paths[0].read_text()))
     check(owner['state']=='recovery' and owner['target']==collection and owner['staging']==stage,'durable recovery ownership binds the original and retained copy')
-    snapshot=Path(result['error_detail']['sidecar_snapshots'])/'goldstandard'/(sid+'.json')
+    snapshot=Path(settings.upload_dir)/result['error_detail']['sidecar_snapshots']/'goldstandard'/(sid+'.json')
     check(await asyncio.to_thread(snapshot.read_bytes)==session_bytes,'pre-cutover evaluation snapshot is retained byte-identically')
     check(await asyncio.to_thread(lambda:gs.get_session(sid).get('stale')),'failed cutover marks its retained evaluation historical')
     await asyncio.to_thread(wc._sweep_staging_sync)
@@ -15227,7 +16723,7 @@ class ImportCutoverTests(unittest.TestCase):
             if name=='OwnedImport':backend.remove(name);raise RuntimeError('Owned final insertion failed')
         module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
         module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');retained=job['error_detail']['recovered_as']
-        self.assertIn(retained,backend);self.assertTrue(Path(job['error_detail']['sidecar_snapshots']).is_dir())
+        self.assertIn(retained,backend);self.assertFalse(Path(job['error_detail']['sidecar_snapshots']).is_absolute());self.assertTrue((root/job['error_detail']['sidecar_snapshots']).is_dir())
         self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
 
 
@@ -15291,7 +16787,8 @@ import ast,asyncio,json,os,subprocess,sys,tempfile,threading,unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
+api_dir=os.environ.get('RAG_TEST_API_DIR')
+sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
 # Loaded from the host script on stdin with its helper passed alongside it.
 source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE',str(Path(__file__).with_name('reindex.py'))))
 tree=ast.parse(source.read_text());assert isinstance(tree.body[-1],ast.Expr);tree.body.pop()
@@ -15351,19 +16848,21 @@ if __name__=='__main__':unittest.main()
 
 ```python
 """Untrusted retained-source identities never select filesystem paths."""
+import asyncio
 import hashlib
 import json
 import os
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
 
 from config import settings
-from services import importer, packager, sources
+from services import importer, ingest_pipeline, packager, sources
 from services.packager import PackageError
 
 
@@ -15458,6 +16957,366 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tar.gz")))
 
 
+    def test_validate_index_rejects_malformed_shapes(self):
+        digest = "a" * 64
+        good = {"filenames": ["document.txt"]}
+        for bad in ([], {"documents": []}, {"documents": {digest: "entry"}},
+                    {"documents": {digest: {"filenames": "document.txt"}}},
+                    {"documents": {digest: {"filenames": [1]}}},
+                    {"documents": {digest.upper(): good}},
+                    {"documents": {digest + "\n": good}}):
+            with self.subTest(index=bad):
+                with self.assertRaises(ValueError):
+                    sources.validate_index(bad)
+        self.assertEqual(sources.validate_index({"documents": {digest: good}})["documents"].keys(),
+                         {digest})
+
+    def test_import_rejects_missing_or_mismatched_sources(self):
+        bare = self.root / "bare"
+        bare.mkdir()
+        importer._validate_package_sources(bare, {"fidelity": "chunks-only"})
+        with self.assertRaises(PackageError) as raised:
+            importer._validate_package_sources(bare, {"fidelity": "with-sources"})
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+        digest = hashlib.sha256(b"retained source").hexdigest()
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        for blob in (None, b"different bytes"):
+            with self.subTest(blob=blob):
+                path = self.package / "sources" / digest
+                if blob is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(blob)
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+
+    def test_blob_path_refuses_linked_collection_directory(self):
+        content = self.outside.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / digest).write_bytes(content)
+        Path(settings.sources_dir).mkdir(parents=True)
+        sources.collection_dir("Linked").symlink_to(elsewhere, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            sources.blob_path("Linked", digest)
+
+    def test_export_omits_missing_blob_from_shipped_index(self):
+        content = b"available source"
+        available = hashlib.sha256(content).hexdigest()
+        missing = hashlib.sha256(b"missing source").hexdigest()
+        retained = sources.collection_dir("Exported")
+        retained.mkdir(parents=True)
+        (retained / available).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                available: {"filenames": ["available.txt"]},
+                missing: {"filenames": ["missing.txt"]},
+            }}))
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "read_chunks", return_value=iter(())), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
+             patch.object(packager.retrieval_config, "validate", return_value={}), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Exported")
+        self.assertEqual(result["source_document_count"], 1)
+        self.assertTrue(any("missing on disk" in warning for warning in result["warnings"]))
+        with tarfile.open(self.root / result["filename"]) as archive:
+            names = archive.getnames()
+            index_name = next(name for name in names if name.endswith("/sources/index.json"))
+            index = json.load(archive.extractfile(index_name))
+            self.assertEqual(set(index["documents"]), {available})
+            self.assertTrue(any(name.endswith(f"/sources/{available}") for name in names))
+            self.assertFalse(any(name.endswith(f"/sources/{missing}") for name in names))
+
+    def test_tune_options_reports_invalid_index_as_typed_error(self):
+        from routers import tuning as tuning_router
+        retained = sources.collection_dir("Invalid")
+        retained.mkdir(parents=True)
+        (retained / "index.json").write_text(json.dumps(self.index("../outside.txt")))
+        with patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock,
+                          return_value=True):
+            response = asyncio.run(tuning_router.tune_options("Invalid"))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "SOURCE_INDEX_INVALID")
+
+    def test_ingest_keeps_stored_chunks_when_source_index_is_invalid(self):
+        upload = self.root / "accepted.txt"
+        upload.write_text("accepted text")
+        job_id = "source-index-retention-error"
+        job = {"status": "queued", "files_total": 1, "files_completed": 0,
+               "files_failed": 0, "chunks_stored": 0, "errors": []}
+        with patch.dict(ingest_pipeline._jobs, {job_id: job}, clear=True), \
+             patch.object(ingest_pipeline, "_parse_file", return_value=("accepted text", [])), \
+             patch.object(ingest_pipeline.wc, "_insert_chunks_sync") as insert, \
+             patch.object(ingest_pipeline.sources, "store", side_effect=ValueError("Invalid retained source index")):
+            ingest_pipeline._process_job_sync(job_id, [upload], self.root,
+                                              "Invalid", "fixed", 150, 0, 0.85, 0)
+        insert.assert_called_once()
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
+                          job["chunks_stored"]), ("completed", 1, 0, 1))
+
+
 if __name__ == "__main__":
     unittest.main()
+```
+
+### scripts/tests/test_retrieval_import.py
+
+```python
+"""Controlled package preflight and generated-script trust-boundary regressions."""
+import ast
+import json
+import os
+import sys
+import tarfile
+import tempfile
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
+from config import settings
+from models.schemas import SaveRetrievalConfigBody
+from services import importer, packager, retrieval_config
+
+
+INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
+           {'retrieval_mode': 'hybrid"; injected = True #'},
+           {'response_format': 'engineer"; injected = True #'},
+           {'top_k': True}, {'top_k': 0}, {'top_k': 51}, {'top_k': 1.5},
+           {'alpha': False}, {'alpha': -0.1}, {'alpha': 1.1},
+           {'alpha': float('nan')}, {'alpha': float('inf')},
+           {'ef': True}, {'ef': 15}, {'ef': 513}]
+
+
+class RetrievalImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pkg = self.root / 'package'
+        self.pkg.mkdir()
+        self.uploads = self.root / 'uploads'
+        self.uploads.mkdir()
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.uploads), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.dict(importer._jobs, {}, clear=True))
+        self.stack.enter_context(patch.object(importer, '_log'))
+
+    def archive(self, data):
+        (self.pkg / 'retrieval_config.json').write_text(data)
+        (self.pkg / 'chunks.jsonl').write_text('')
+        manifest = {'package_format': 1, 'collection': {'name': 'Corpus', 'chunk_count': 0},
+                    'embedding': {'model': settings.embed_model},
+                    'files': {p.name: 'sha256:' + packager.sha256_file(p)
+                              for p in self.pkg.iterdir() if p.name != 'manifest.json'}}
+        (self.pkg / 'manifest.json').write_text(json.dumps(manifest))
+        with tarfile.open(self.exports / 'fixture.tar.gz', 'w:gz') as tar:
+            tar.add(self.pkg, arcname='package')
+
+    def test_digest_valid_bad_settings_refused_before_any_live_mutation(self):
+        original = retrieval_config.validate({'top_k': 9}, 'Corpus')
+        retrieval_config.save(original)
+        saved = retrieval_config._path('Corpus')
+        before = saved.read_bytes()
+        for data in [json.dumps(value) for value in INVALID] + ['{']:
+            self.archive(data)
+            for conflict in ('abort', 'rename', 'replace'):
+                with self.subTest(data=data, conflict=conflict), ExitStack() as mocks:
+                    operations = [mocks.enter_context(patch.object(module, name)) for module, name in [
+                        (importer, '_ensure_models'), (importer, '_build'),
+                        (importer.wc, '_collection_exists_sync'), (importer.wc, '_delete_collection_sync'),
+                        (importer.wc, 'get_client'), (importer, '_restore_sidecars'),
+                        (importer, '_mark_started'), (importer.collection_recovery, 'begin')]]
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', conflict)
+                    result = importer._jobs['test']
+                    self.assertEqual(result['status'], 'failed')
+                    self.assertEqual(result['error_code'], 'PACKAGE_CORRUPT')
+                    self.assertEqual(result['error_detail'], {'file': 'retrieval_config.json'})
+                    for operation in operations:
+                        operation.assert_not_called()
+                    self.assertEqual(saved.read_bytes(), before)
+                    self.assertFalse((self.root / 'sources').exists())
+                    self.assertFalse(list(self.uploads.glob('import-*')))
+
+    def test_valid_historical_defaults_coercion_and_ef_match_api_and_roundtrip(self):
+        for data in [{}, {'collection': 'OldName', 'top_k': '7', 'alpha': '0.5', 'ef': '64'},
+                     {'retrieval_mode': 'flat', 'top_k': 50, 'alpha': 0, 'ef': 512,
+                      'response_format': 'engineer', 'legacy_field': 'ignored'}]:
+            with self.subTest(data=data):
+                self.archive(json.dumps(data))
+                expected = SaveRetrievalConfigBody.model_validate({**data, 'collection': 'Corpus'}).model_dump()
+                with patch.object(importer, '_ensure_models', return_value=[]), \
+                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
+                     patch.object(importer, '_build', return_value=0):
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', 'abort')
+                self.assertEqual(importer._jobs['test']['status'], 'completed')
+                self.assertEqual(retrieval_config.load('Corpus'), expected)
+
+    def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
+        self.archive(json.dumps({'top_k': '8', 'ef': 64}))
+        validated = importer._read_retrieval_config(self.pkg, 'Corpus')
+        (self.pkg / 'retrieval_config.json').write_text('{')
+        importer._restore_sidecars('Renamed', self.pkg, 'Corpus', [], validated_retrieval=validated)
+        self.assertEqual(retrieval_config.load('Renamed'), {**validated, 'collection': 'Renamed'})
+        self.assertEqual(validated['collection'], 'Corpus')
+
+    def test_absent_settings_remain_optional_and_nonregular_settings_fail(self):
+        self.assertIsNone(importer._read_retrieval_config(self.pkg, 'Corpus'))
+        (self.pkg / 'retrieval_config.json').mkdir()
+        with self.assertRaises(packager.PackageError):
+            importer._read_retrieval_config(self.pkg, 'Corpus')
+
+    def test_saved_invalid_settings_cannot_generate_script(self):
+        for data in INVALID:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                packager._render_retrieve('Corpus', data, {})
+
+    def test_generated_script_defaults_are_literals_and_metadata_stays_data(self):
+        malicious = '\"\"\"\nraise RuntimeError("injected")\n#\\\n@@TOP_K@@'
+        cfg = {'retrieval_mode': 'hybrid', 'top_k': '8', 'alpha': '0.25',
+               'response_format': 'engineer', 'ef': 64, 'unknown': malicious}
+        source = packager._render_retrieve(malicious, cfg, {'embed_model': malicious})
+        tree = ast.parse(source)
+        literals = {node.targets[0].id: ast.literal_eval(node.value)
+                    for node in tree.body if isinstance(node, ast.Assign)}
+        self.assertEqual(literals['COLLECTION'], malicious)
+        self.assertEqual(literals['PACKAGE_METADATA'], {'embed_model': malicious})
+        self.assertEqual(literals['DEFAULT_TOP_K'], 8)
+        self.assertIs(type(literals['DEFAULT_TOP_K']), int)
+        self.assertEqual(literals['DEFAULT_ALPHA'], 0.25)
+        namespace = {'__name__': 'retrieval_import_test'}
+        exec(compile(tree, 'retrieve.py', 'exec'), namespace)
+        args = namespace['build_parser']().parse_args(['a question'])
+        self.assertEqual((args.mode, args.top_k, args.alpha, args.response_format),
+                         ('hybrid', 8, 0.25, 'engineer'))
+
+    def test_export_emits_normalized_settings_and_executable_defaults(self):
+        saved = {'collection': 'Corpus', 'top_k': '7', 'alpha': '0.5', 'ef': 64}
+        retrieval_config.save(saved)
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            source = archive.extractfile(members['retrieve.py']).read().decode()
+        self.assertEqual(cfg, SaveRetrievalConfigBody.model_validate(saved).model_dump())
+        namespace = {'__name__': 'retrieval_import_test'}
+        exec(compile(source, 'retrieve.py', 'exec'), namespace)
+        self.assertEqual(namespace['DEFAULT_TOP_K'], 7)
+        self.assertEqual(namespace['DEFAULT_ALPHA'], 0.5)
+        self.assertEqual(namespace['PACKAGE_METADATA']['package_filename'], result['filename'])
+
+    def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
+        for value in INVALID:
+            with self.subTest(value=value), ExitStack() as mocks:
+                mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={}))
+                mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+                mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
+                if value is None:  # None denotes no saved file, not an invalid saved config.
+                    continue
+                with self.assertRaises((ValueError, TypeError)):
+                    packager.build('Corpus')
+                self.assertEqual(list(self.exports.iterdir()), [])
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+### scripts/verify/retrieval_settings.py
+
+```python
+"""Live transfer regression: digest-valid invalid settings cannot replace a corpus."""
+import hashlib
+import json
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+
+def run(api, collection, package):
+    def request(path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(api.rstrip('/') + path, data=data,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+
+    def collections():
+        return sorted((c['name'], c['object_count'])
+                      for c in request('/collections')['collections'])
+
+    package = Path(package)
+    saved = request('/retrieval/config/' + collection)
+    baseline = collections()
+    marker = {**saved, 'top_k': 9 if saved['top_k'] != 9 else 10}
+    try:
+        request('/retrieval/config', marker)
+        expected = request('/retrieval/config/' + collection)
+        invalid = [[], {'top_k': '5; raise RuntimeError("injected")'},
+                   {'retrieval_mode': 'hybrid"; raise RuntimeError("injected") #'},
+                   {'alpha': 2}, {'ef': True}]
+        for value in invalid:
+            with tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                with tarfile.open(package) as archive:
+                    archive.extractall(work, filter='data')
+                root = next(p for p in work.iterdir() if p.is_dir())
+                side = root / 'retrieval_config.json'
+                side.write_text(json.dumps(value))
+                manifest_path = root / 'manifest.json'
+                manifest = json.loads(manifest_path.read_text())
+                manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
+                manifest_path.write_text(json.dumps(manifest))
+                with tempfile.NamedTemporaryFile(prefix='vfy-retrieval-', suffix='.tar.gz',
+                                                 dir=package.parent) as output:
+                    with tarfile.open(output.name, 'w:gz') as archive:
+                        archive.add(root, arcname=root.name)
+                    for conflict in ('abort', 'rename', 'replace'):
+                        job_id = request('/import', {'filename': Path(output.name).name,
+                                                     'on_conflict': conflict})['job_id']
+                        deadline = time.monotonic() + 120
+                        while True:
+                            job = request('/import/job/' + job_id)
+                            if job['status'] in ('failed', 'completed'):
+                                break
+                            if time.monotonic() >= deadline:
+                                raise AssertionError('Retrieval settings import timed out')
+                            time.sleep(0.2)
+                        assert job['status'] == 'failed', job
+                        assert job['error_code'] == 'PACKAGE_CORRUPT', job
+                        assert job['error_detail'] == {'file': 'retrieval_config.json'}, job
+                        assert request('/retrieval/config/' + collection) == expected
+                        assert collections() == baseline
+        print('15 digest-valid malformed retrieval imports rejected; live collections/settings preserved')
+    finally:
+        request('/retrieval/config', saved)
+
+
+if __name__ == '__main__':
+    run(*sys.argv[1:])
 ```

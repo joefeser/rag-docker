@@ -46,8 +46,17 @@ _tasks: set[asyncio.Task] = set()
 _state_lock = threading.RLock()
 _diagnostics: dict[str, dict] = {}
 _scan_lock = threading.Lock()
+# Parse/validation results by path, keyed on (inode, mtime_ns, size); scans only.
+_scan_cache: dict[str, tuple[tuple[int, int, int], dict | None]] = {}
 _store_revision = 0
 _SESSION_ID = re.compile(r"gs_[0-9a-f]{8}")
+_PENDING_DIR = "pending_markers"
+_MARKER_FLAGS = ("stale", "orphaned")
+_PERSISTENCE_CODES = ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN")
+_MARKER_MESSAGES = {
+    True: "History marker could not be saved in the session file. A pending marker keeps the session historical after restart, and current export is refused. Check local storage; the next successful write of this session saves the marker.",
+    False: "History marker could not be saved. The session is treated as historical and current export is refused only until restart. Check local storage, then edit this session to save the marker.",
+}
 
 
 def validate_session_id(session_id: str) -> None:
@@ -98,7 +107,62 @@ def _session_path(session_id: str) -> Path:
     return target
 
 
-def _record_issue(path: Path, code: str) -> None:
+def _session_key(session_id: str) -> Path:
+    # The scan's diagnostic key form, without the storage checks that may be
+    # what failed; one key per file keeps Health's entries distinct.
+    return Path(settings.upload_dir).resolve() / "goldstandard_sessions" / f"{session_id}.json"
+
+
+def _pending_root() -> Path:
+    p = _session_storage_root() / _PENDING_DIR
+    if p.is_symlink() or (p.exists() and not p.is_dir()):
+        raise ValueError("Pending marker storage is not a regular directory.")
+    return p
+
+
+def _pending_path(session_id: str) -> Path:
+    validate_session_id(session_id)
+    root = _pending_root()
+    candidate = root / f"{session_id}.json"
+    if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+        raise ValueError("Pending marker destination is not a regular file.")
+    if candidate.resolve().parent != root.resolve():
+        raise ValueError("Pending marker destination is outside marker storage.")
+    return candidate
+
+
+def _load_pending(path: Path) -> dict:
+    """A pending marker holds only history flags that a session file could not take."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Pending marker must be a regular file.")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or data.get("session_id") != path.stem:
+        raise ValueError("Pending marker does not match its session.")
+    validate_session_id(data["session_id"])
+    allowed = {"session_id"} | {f"{flag}{suffix}" for flag in _MARKER_FLAGS for suffix in ("", "_reason", "_at")}
+    if set(data) - allowed or not any(flag in data for flag in _MARKER_FLAGS):
+        raise ValueError("Pending marker has unexpected fields.")
+    for flag in _MARKER_FLAGS:
+        if flag in data and data[flag] is not True:
+            raise ValueError("Pending marker flag must be true.")
+        for suffix in ("_reason", "_at"):
+            if not isinstance(data.get(flag + suffix), (str, type(None))):
+                raise ValueError("Pending marker metadata must be text.")
+    return data
+
+
+def _apply_pending(session: dict, pending: dict) -> bool:
+    changed = False
+    for flag in _MARKER_FLAGS:
+        if pending.get(flag) is True and session.get(flag) is not True:
+            session[flag] = True
+            session[f"{flag}_reason"] = pending.get(f"{flag}_reason")
+            session[f"{flag}_at"] = pending.get(f"{flag}_at")
+            changed = True
+    return changed
+
+
+def _record_issue(path: Path, code: str, message: str | None = None) -> None:
     changed = _diagnostics.get(str(path), {}).get("code") != code
     messages = {
         "SESSION_STORAGE_UNAVAILABLE": "Session storage could not be inspected. Existing files are preserved; inspect local storage and restart after recovery.",
@@ -107,7 +171,8 @@ def _record_issue(path: Path, code: str) -> None:
         "SESSION_WRITE_FAILED": "Update failed before replacement; the previous snapshot remains authoritative. Check local storage before retrying.",
         "SESSION_DURABILITY_UNCERTAIN": "Replacement occurred but directory durability could not be confirmed. Refresh the session and inspect local storage before retrying.",
     }
-    _diagnostics[str(path)] = {"filename": path.name, "code": code, "message": messages[code]}
+    filename = f"{_PENDING_DIR}/{path.name}" if path.parent.name == _PENDING_DIR else path.name
+    _diagnostics[str(path)] = {"filename": filename, "code": code, "message": message or messages[code]}
     if changed:
         log.error("Session persistence issue %s for %s", code, path.name)
 
@@ -118,6 +183,29 @@ def _sync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _replace_durably(path: Path, payload: str) -> None:
+    """Write a unique fsynced temporary file and replace `path` with it.
+
+    Returning means the replacement happened; raising means it did not. The
+    caller syncs the directory and decides what a failure means.
+    """
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                prefix="." + path.stem + "-", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                log.exception("Could not remove owned session temporary file %s", temporary.name)
 
 
 def _save_session_sync(session: dict) -> None:
@@ -133,40 +221,73 @@ def _save_session_sync(session: dict) -> None:
         try:
             path = _session_path(snapshot["session_id"])
             _sessions_dir()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (str(snapshot["session_id"]) + ".json"), "SESSION_WRITE_FAILED")
             raise GoldStandardError("SESSION_WRITE_FAILED", "Session directory could not be prepared. The previous snapshot is unchanged.", 503) from exc
-        temporary = None
         replaced = False
         try:
             payload = json.dumps(snapshot, indent=2, allow_nan=False)
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                    prefix="." + path.stem + "-", suffix=".tmp", delete=False) as output:
-                temporary = Path(output.name)
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, path)
+            _replace_durably(path, payload)
             replaced = True
             _sessions[snapshot["session_id"]] = snapshot
             _store_revision += 1
             _sync_directory(path.parent)
-            if snapshot.get("persistence_error"):
-                _record_issue(path, snapshot["persistence_error"]["code"])
+            # Only generation's own codes are evidence; an imported or edited
+            # value is not, and must not turn a completed write into an error.
+            error = snapshot.get("persistence_error")
+            if isinstance(error, dict) and error.get("code") in _PERSISTENCE_CODES:
+                _record_issue(path, error["code"])
             else:
                 _diagnostics.pop(str(path), None)
+            try:
+                _discard_pending_marker(snapshot)
+            except Exception:                         # noqa: BLE001
+                log.exception("Could not remove pending history marker for %s", snapshot["session_id"])
         except (OSError, ValueError, TypeError) as exc:
             code = "SESSION_DURABILITY_UNCERTAIN" if replaced else "SESSION_WRITE_FAILED"
             _record_issue(path, code)
             message = ("Session replacement occurred but durability could not be confirmed. Refresh the session and inspect diagnostics before retrying."
                        if replaced else "Session update could not be persisted. The previous snapshot is unchanged.")
             raise GoldStandardError(code, message, 503) from exc
-        finally:
-            if temporary is not None:
+
+
+def _write_pending_marker(session_id: str, fields: dict) -> bool:
+    """Keep a history flag across restart when its session file cannot take it."""
+    with _state_lock:
+        try:
+            path = _pending_path(session_id)
+            merged = {"session_id": session_id}
+            if path.exists():
                 try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    log.exception("Could not remove owned session temporary file %s", temporary.name)
+                    merged.update(_load_pending(path))
+                except (OSError, ValueError):
+                    # Nothing readable to keep; the new marker replaces it.
+                    pass
+            merged.update(fields)
+            if not path.parent.exists():
+                path.parent.mkdir()
+                _sync_directory(path.parent.parent)
+            _replace_durably(path, json.dumps(merged, indent=2))
+            _sync_directory(path.parent)
+            return True
+        except (OSError, ValueError):
+            log.exception("Could not save pending history marker for %s", session_id)
+            return False
+
+
+def _discard_pending_marker(snapshot: dict) -> None:
+    """A successful write that carries every pending flag makes the marker obsolete."""
+    path = _pending_path(snapshot["session_id"])
+    if not path.exists():
+        return
+    try:
+        pending = _load_pending(path)
+    except (OSError, ValueError):
+        # An unreadable marker is preserved and the scan reports it.
+        return
+    if not _apply_pending(copy.deepcopy(snapshot), pending):
+        path.unlink()
+        _sync_directory(path.parent)
 
 
 def _scan_sessions() -> None:
@@ -191,39 +312,80 @@ def _scan_sessions() -> None:
             return
         for path in paths:
             if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", path.name):
-                issues[path] = "SESSION_INTERRUPTED_WRITE"
+                issues[path] = ("SESSION_INTERRUPTED_WRITE", None)
             elif path.name.endswith(".json"):
                 try:
                     if path.is_symlink() or not path.is_file():
                         raise ValueError("Evaluation session must be a regular file.")
-                    data = json.loads(path.read_text())
-                    validate_session(data)
+                    stat = path.stat()
+                    signature = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                    cached = _scan_cache.get(str(path))
+                    if cached is not None and cached[0] == signature:
+                        if cached[1] is None:
+                            raise ValueError("Evaluation session is unchanged and still invalid.")
+                        data = copy.deepcopy(cached[1])
+                    else:
+                        # Only parse and validation outcomes are remembered; a
+                        # failed read is retried on the next scan.
+                        _scan_cache.pop(str(path), None)
+                        text = path.read_text()
+                        _scan_cache[str(path)] = (signature, None)
+                        data = json.loads(text)
+                        validate_session(data)
+                        _scan_cache[str(path)] = (signature, copy.deepcopy(data))
                     if path != _session_path(data["session_id"]):
                         raise ValueError("Evaluation session filename does not match its identity.")
                     loaded[data["session_id"]] = data
                     retained_error = data.get("persistence_error")
-                    if isinstance(retained_error, dict) and retained_error.get("code") in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
-                        issues[path] = retained_error["code"]
+                    if isinstance(retained_error, dict) and retained_error.get("code") in _PERSISTENCE_CODES:
+                        issues[path] = (retained_error["code"], None)
                 except (OSError, ValueError, TypeError):
-                    issues[path] = "SESSION_READ_FAILED"
+                    issues[path] = ("SESSION_READ_FAILED", None)
+        listed = {str(path) for path in paths}
+        for key in list(_scan_cache):
+            if key not in listed:
+                _scan_cache.pop(key, None)
+        pending_root = root / _PENDING_DIR
+        pending_paths = []
+        try:
+            if pending_root.is_symlink() or (pending_root.exists() and not pending_root.is_dir()):
+                raise ValueError("Pending marker storage is not a regular directory.")
+            with os.scandir(pending_root) as entries:
+                pending_paths = [Path(entry.path) for entry in entries]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            issues[pending_root] = ("SESSION_READ_FAILED", None)
+        for path in pending_paths:
+            if not re.fullmatch(r"gs_[0-9a-f]{8}\.json", path.name):
+                continue
+            try:
+                pending = _load_pending(path)
+            except (OSError, ValueError):
+                issues[path] = ("SESSION_READ_FAILED", None)
+                continue
+            data = loaded.get(pending["session_id"])
+            # A marker whose session file is missing has nothing to apply to.
+            if data is not None and _apply_pending(data, pending):
+                issues[root / path.name] = ("SESSION_WRITE_FAILED", _MARKER_MESSAGES[True])
         with _state_lock:
             # A concurrent durable commit wins over an older inspection, including
             # its cache and write-failure diagnostics. The next refresh rescans.
             if revision != _store_revision:
                 return
             _diagnostics.pop(str(storage_label), None)
-            present = {str(path) for path in paths}
+            present = {str(path) for path in paths + pending_paths} | {str(pending_root)}
             for key, issue in list(_diagnostics.items()):
-                if issue["code"] in ("SESSION_READ_FAILED", "SESSION_INTERRUPTED_WRITE") and Path(key).parent == root and (key not in present or Path(key) not in issues):
+                if issue["code"] in ("SESSION_READ_FAILED", "SESSION_INTERRUPTED_WRITE") and Path(key).parent in (root, pending_root) and (key not in present or Path(key) not in issues):
                     _diagnostics.pop(key, None)
             for sid, data in loaded.items():
                 if sid not in _sessions:
                     _sessions[sid] = data
                     _store_revision += 1
-            for path, code in issues.items():
+            for path, (code, message) in issues.items():
                 # Preserve the independent failed-write policy at the same path.
                 if _diagnostics.get(str(path), {}).get("code") not in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
-                    _record_issue(path, code)
+                    _record_issue(path, code, message)
 
 
 def load_sessions_from_disk() -> None:
@@ -247,9 +409,18 @@ def _sessions_on_disk() -> list[dict]:
             if path != _session_path(data["session_id"]):
                 raise ValueError("Evaluation session filename does not match its identity.")
         except (OSError, ValueError, RuntimeError) as exc:
+            # ValidationError text can include document-derived field values.
             log.warning("Skipping invalid evaluation session %s; file is unchanged (%s)",
                         path.name, type(exc).__name__)
             continue
+        # A package must not carry a session as current when its history
+        # marker is only pending. An unreadable marker is reported by the scan.
+        try:
+            pending = _pending_path(data["session_id"])
+            if pending.exists():
+                _apply_pending(data, _load_pending(pending))
+        except (OSError, ValueError):
+            pass
         sessions.append(data)
     return sessions
 
@@ -268,7 +439,6 @@ def sessions_for(collection: str) -> list[dict]:
             if session.get("collection") != collection:
                 continue
             try:
-                from models.schemas import SessionResponse
                 validate_session(session)
                 if sid != session.get("session_id"):
                     raise ValueError("Cached session key does not match identity")
@@ -276,14 +446,20 @@ def sessions_for(collection: str) -> list[dict]:
             except (OSError, ValueError, RuntimeError) as exc:
                 log.warning("Skipping invalid cached evaluation session %s (%s)",
                             sid, type(exc).__name__)
-                _record_issue(Path(str(sid) + ".json"), "SESSION_READ_FAILED")
+                _record_issue(_session_key(str(sid)), "SESSION_READ_FAILED")
                 continue
             found.append(session)
         return copy.deepcopy(found)
 
 
 def store_session(session: dict) -> None:
-    """Write through the durable store so the cache cannot undo an import."""
+    """Write through the durable store so the cache cannot undo an import.
+
+    Anything outside this module that writes a session file directly will be
+    silently undone: the cache still holds the previous version, and the next
+    cache-based write puts that back over the file. Import learned this the
+    hard way — a restored session reverted to its pre-import orphaned state.
+    """
     validate_session(session)
     _save_session_sync(session)
 
@@ -362,7 +538,16 @@ def _update_session_sync(session_id: str, change):
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
-    """Retain the historical guard in memory if a completed mutation cannot persist it."""
+    """Mark every session for a collection, on disk and in memory.
+
+    Sessions are never deleted and never remapped. A remap that guesses which
+    new chunk replaces an old one corrupts an evaluation baseline silently,
+    which is worse than an honest flag the user can act on.
+
+    If a completed mutation cannot persist a marker to the session file, the
+    historical guard is kept in memory and in a pending marker that survives
+    restart.
+    """
     global _store_revision
     sessions = sessions_for(collection)
     now = datetime.now(timezone.utc).isoformat()
@@ -380,7 +565,8 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
             # failed-write diagnostic. Publish the marker in the process cache
             # even when disk still holds the prior snapshot, so a completed
             # delete/rebuild cannot export this session as a current baseline.
-            # A later successful session write will persist the marker.
+            # A pending marker carries it across restart; a later successful
+            # session write persists it and removes the pending marker.
             with _state_lock:
                 current = _sessions.get(session["session_id"])
                 if current is not None:
@@ -389,20 +575,30 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
                     _sessions[session["session_id"]] = snapshot
                     _store_revision += 1
             log.exception("Could not durably mark session %s %s", session["session_id"], flag)
+            saved = _write_pending_marker(session["session_id"],
+                                          {flag: True, f"{flag}_reason": reason, f"{flag}_at": now})
+            with _state_lock:
+                key = _session_key(session["session_id"])
+                # An uncertain-durability report keeps its own wording.
+                if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
+                    _record_issue(key, "SESSION_WRITE_FAILED", _MARKER_MESSAGES[saved])
     return marked
 
 
 def mark_stale(collection: str, reason: str) -> int:
+    """Chunk identity changed, so the pairs no longer describe what is stored."""
     return _flag_sessions(collection, "stale", reason)
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
+    """The collection is gone. Retained rather than deleted — see RAG_EXPORT_SPECIFICATIONS.md §8 rule 4."""
     return _flag_sessions(collection, "orphaned", reason)
 
 
+# Published cache snapshots are immutable (see save_session), so readers take a
+# copy without waiting for the writer lock, which is held through fsync.
 def get_session(session_id: str) -> dict | None:
-    with _state_lock:
-        return copy.deepcopy(_sessions.get(session_id))
+    return copy.deepcopy(_sessions.get(session_id))
 
 
 def _parse_gs_json(text: str) -> dict:
