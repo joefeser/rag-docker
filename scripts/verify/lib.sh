@@ -57,10 +57,25 @@ skip() {
 # `expr` is python indexing against the parsed document, e.g. ['status']
 jfield() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)" 2>/dev/null; }
 
-api_get()  { curl -s -m 120 "$API$1"; }
-api_code() { curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
-api_post() { curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
-api_post_code() { curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Every helper below that reaches the API first checks that this suite's verify
+# lock is still held by it or an ancestor (#184). A suite orphaned by a run that
+# died after it passed lock.sh stops at its next helper call, before any
+# request, instead of acting on a later run's verify project. The suite ends
+# even when the helper runs inside $(...) or a pipeline, and its EXIT trap
+# still runs. Not re-checked: direct curl and `docker compose exec` calls in the
+# suites, and the Python helpers, which end on their own timeouts (up to 900 s).
+_rag_require_lock_owner() {
+  _rag_lock_owner_ok && return 0
+  _rag_lock_leftover
+  # In a subshell, exit alone would end only the subshell.
+  [ "${BASHPID:-}" = "$$" ] || kill -TERM "$$" 2>/dev/null
+  exit 3
+}
+
+api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
+api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
+api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 
 require_stack() {
   local code
@@ -77,6 +92,7 @@ require_stack() {
 wait_for_job() {
   local path="$1" limit="${2:-600}" waited=0 status=""
   while [ "$waited" -lt "$limit" ]; do
+    _rag_require_lock_owner
     status=$(api_get "$path" | jfield "['status']")
     case "$status" in
       completed|failed|partial|cancelled) printf '%s' "$status"; return 0 ;;
@@ -90,7 +106,7 @@ make_collection() {
   api_post "/collections" "{\"name\":\"$1\",\"index_type\":\"${2:-hnsw}\",\"distance_metric\":\"${3:-cosine}\",\"hnsw_config\":{\"efConstruction\":128,\"maxConnections\":64,\"ef\":64}}" >/dev/null
 }
 
-drop_collection() { curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
+drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
 
 # Remove every collection and package this run created.
 cleanup_prefixed() {
