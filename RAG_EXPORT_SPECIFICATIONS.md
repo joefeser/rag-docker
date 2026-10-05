@@ -713,11 +713,11 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
 | `SOURCES_REQUIRED` | tuning needs `with-sources`; package is `chunks-only` |
-| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Reindex and re-embed from stored chunks remain available. |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |
+| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Reindex and re-embed from stored chunks remain available. |
 | `IMPORT_FAILED` | an unexpected error during import; the message carries the cause |
 
 ---
