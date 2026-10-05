@@ -19,6 +19,7 @@ from pathlib import Path
 
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, SaveRetrievalConfigBody
+from services import settings_store
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +40,9 @@ _DIR: Path | None = None
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        _DIR = Path(settings.upload_dir) / "retrieval_configs"
-        _DIR.mkdir(parents=True, exist_ok=True)
+        directory = Path(settings.upload_dir) / "retrieval_configs"
+        directory.mkdir(parents=True, exist_ok=True)
+        _DIR = directory
     return _DIR
 
 
@@ -105,9 +107,7 @@ def validate(config: dict, collection: str) -> dict:
 def save(config: dict) -> dict:
     collection = config["collection"]
     p = _path(collection)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2, sort_keys=True))
-    tmp.replace(p)
+    settings_store.publish(p, config)
     return config
 
 
