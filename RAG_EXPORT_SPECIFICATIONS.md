@@ -594,6 +594,8 @@ rather than silently ignoring one of them.
 
 ### 7.3 Gold-standard invalidation
 
+Invalidation covers both supported first-character collection aliases without changing stored session provenance.
+
 Any operation that changes chunk identity — re-chunking, or re-embedding that
 rebuilds the collection — MUST mark every gold-standard session for that
 collection `stale`, recording why and when. Sessions are not deleted and are not
