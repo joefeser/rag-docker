@@ -690,7 +690,8 @@ ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
 MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
-SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
+SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
+SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
 OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
 
 
@@ -790,6 +791,9 @@ class IngestConfigResponse(BaseModel):
 
 # ── Retrieval config ──────────────────────────────────────────────────────────
 
+# These bounds apply to saves. A saved or packaged ef that is an integer outside
+# SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
+# export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
     collection: str
     retrieval_mode: RetrievalMode = "hnsw"
@@ -1216,6 +1220,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1226,6 +1231,35 @@ log = logging.getLogger(__name__)
 
 INDEX_NAME = "index.json"
 INDEX_VERSION = 1
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def validate_index(index: dict) -> dict:
+    """Refuse source identities that could address anything but a stored blob."""
+    if not isinstance(index, dict) or not isinstance(index.get("documents"), dict):
+        raise ValueError("Invalid retained source index")
+    for digest, entry in index["documents"].items():
+        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+            raise ValueError("Invalid retained source digest")
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid retained source entry")
+        names = entry.get("filenames")
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise ValueError("Invalid retained source filenames")
+    return index
+
+
+def blob_path(collection: str, digest: str) -> Path:
+    """Return a retained blob path only when it cannot escape its collection."""
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise ValueError("Invalid retained source digest")
+    directory = collection_dir(collection)
+    if directory.is_symlink():
+        raise ValueError("Retained source directory is a link")
+    blob = directory / digest
+    if blob.is_symlink():
+        raise ValueError("Retained source blob is a link")
+    return blob
 
 
 def _root() -> Path:
@@ -1242,6 +1276,8 @@ def _index_path(collection: str) -> Path:
 
 def load_index(collection: str) -> dict:
     p = _index_path(collection)
+    if p.is_symlink():
+        raise ValueError("Retained source index is a link")
     if not p.exists():
         return {"version": INDEX_VERSION, "documents": {}}
     try:
@@ -1249,9 +1285,11 @@ def load_index(collection: str) -> dict:
     except (OSError, ValueError):
         log.warning("Unreadable source index for %r; treating as empty", collection)
         return {"version": INDEX_VERSION, "documents": {}}
+    if not isinstance(data, dict):
+        raise ValueError("Invalid retained source index")
     data.setdefault("version", INDEX_VERSION)
     data.setdefault("documents", {})
-    return data
+    return validate_index(data)
 
 
 def _save_index(collection: str, index: dict) -> None:
@@ -1428,7 +1466,8 @@ can record how it is meant to be queried.
 
 Kept in a service rather than in the router because the exporter needs
 programmatic access: an export package ships a retrieval script carrying these
-parameters.
+parameters. An integer ef outside the save bounds, stored before PR #108, is
+inactive; export and import clear it to null rather than refuse it.
 """
 from __future__ import annotations
 
@@ -1438,7 +1477,7 @@ import re
 from pathlib import Path
 
 from config import settings
-from models.schemas import SaveRetrievalConfigBody
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, SaveRetrievalConfigBody
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -1498,16 +1537,30 @@ def resolve(collection: str) -> tuple[dict, bool]:
     return merged, False
 
 
+def normalize(config: dict, collection: str) -> tuple[dict, int | None]:
+    """validate(), also clearing a legacy ef; returns (settings, cleared ef or None).
+
+    A legacy ef is an integer outside the save bounds, which the API accepted
+    before PR #108. ef is inactive, so it becomes null; any other invalid value,
+    including a boolean, fractional or string ef, is still refused.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Retrieval settings must be an object")
+    ef = config.get("ef")
+    cleared = None
+    if type(ef) is int and not SEARCH_EF_MIN <= ef <= SEARCH_EF_MAX:
+        cleared, config = ef, {**config, "ef": None}
+    return SaveRetrievalConfigBody.model_validate(
+        {**config, "collection": collection}).model_dump(), cleared
+
+
 def validate(config: dict, collection: str) -> dict:
     """Apply the API save contract, binding settings to the actual collection.
 
     Older packages may omit defaulted fields or carry an obsolete collection
     name. Extra fields are ignored just as they are for API saves.
     """
-    if not isinstance(config, dict):
-        raise ValueError("Retrieval settings must be an object")
-    return SaveRetrievalConfigBody.model_validate(
-        {**config, "collection": collection}).model_dump()
+    return normalize(config, collection)[0]
 
 
 def save(config: dict) -> dict:
@@ -2172,21 +2225,29 @@ async def collection_exists(name: str) -> bool:
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
+    canonical_name = coll.config.get().name
     count = coll.aggregate.over_all(total_count=True).total_count
-    client.collections.delete(name)
-    collection_recovery.retire_deleted(collection_writes.canonical(name), client)
+    client.collections.delete(canonical_name)
+    collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
-    sources.delete(name)
-    retrieval_config.delete(name)
-    ingest_config.delete(name)
+    # Older writers saved sidecars under the first-character backend alias.
+    # The caller can use either spelling, so clean both after backend deletion.
+    # Other case changes can name distinct collections and must be preserved.
+    alias = canonical_name[:1].lower() + canonical_name[1:]
+    spellings = list(dict.fromkeys((canonical_name, alias)))
+    for spelling in spellings:
+        sources.delete(spelling)
+        retrieval_config.delete(spelling)
+        ingest_config.delete(spelling)
     # Gold-standard sessions are kept and flagged, never deleted (spec §8 rule 4):
     # they are evaluation work the user may still want, and the pairs stay
     # readable even with the collection gone. Imported here rather than at module
     # level because goldstandard imports this module.
     from services import goldstandard
-    goldstandard.mark_orphaned(
-        name, f"collection '{name}' was deleted")
+    for spelling in spellings:
+        goldstandard.mark_orphaned(
+            spelling, f"collection '{canonical_name}' was deleted")
     return count or 0
 
 
@@ -2947,7 +3008,7 @@ def _process_job_sync(
                         path.read_bytes(),
                         mimetypes.guess_type(path.name)[0],
                     )
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.
@@ -3931,12 +3992,34 @@ def _failed_generation(current: dict, exc: Exception) -> None:
         current["persistence_error"] = {"code": exc.code, "message": exc.message}
 
 
+def _publish_generation_failure(session_id: str, exc: Exception, write_error: Exception) -> None:
+    """Publish a failed status the store could not save, as marker failures do."""
+    global _store_revision
+    with _state_lock:
+        current = _sessions.get(session_id)
+        if current is None:
+            return
+        snapshot = copy.deepcopy(current)
+        _failed_generation(snapshot, exc)
+        _failed_generation(snapshot, write_error)
+        _sessions[session_id] = snapshot
+        _store_revision += 1
+
+
 async def _record_generation_failure(session_id: str, exc: Exception) -> None:
     try:
         await asyncio.to_thread(_update_session_sync, session_id,
                                 lambda current: _failed_generation(current, exc))
-    except Exception:
+    except Exception as write_error:
         log.exception("Could not durably report failed generation for %s", session_id)
+        # Otherwise `generating` stays in the cache for as long as the fault
+        # lasts, and the UI polls it forever. The cache runs ahead of disk;
+        # the next successful write of this session saves the failed status.
+        # The lock can be held through fsync, so this stays off the event loop.
+        try:
+            await asyncio.to_thread(_publish_generation_failure, session_id, exc, write_error)
+        except Exception:
+            log.exception("Could not publish failed generation for %s", session_id)
 
 
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
@@ -4167,7 +4250,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from pydantic import ValidationError
+
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -4340,6 +4426,34 @@ def render_help(embed_dimensions: int | str) -> str:
     })
 
 
+def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[dict, bool]:
+    """The settings to package, and whether they are defaults.
+
+    Runs before any chunk is read, so bad settings fail the export early with
+    a next step instead of a raw validation message. A legacy ef is cleared
+    with a warning; the saved file itself is left alone.
+    """
+    try:
+        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, cleared = retrieval_config.normalize(cfg, collection)
+    except TypeError as exc:          # resolve(): the saved JSON is not an object
+        problems, cause = "the settings file is not a JSON object", exc
+    except ValidationError as exc:
+        problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
+                             for error in exc.errors())
+        cause = exc
+    else:
+        if cleared is not None:
+            warnings.append(f"saved retrieval setting ef={cleared} is outside "
+                            f"{SEARCH_EF_MIN}-{SEARCH_EF_MAX} and was exported as null; ef is "
+                            "no longer used. Save this collection's settings on the Retrieval "
+                            "page to clear it.")
+        return cfg, is_default
+    raise ValueError(f"Saved retrieval settings for '{collection}' are invalid: {problems}. "
+                     "Open the Retrieval page, save this collection's settings, then "
+                     "export again.") from cause
+
+
 def _ingest_config(collection: str) -> dict | None:
     """The collection's saved chunking settings, or None."""
     return ingest_config.load(collection)
@@ -4400,6 +4514,9 @@ def build(
     try:
         b = _Builder(stage)
 
+        # Settings first: a bad config fails before any chunk is streamed.
+        retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -4434,8 +4551,6 @@ def build(
         if ingest_cfg is not None:
             b.add_json("ingest_config.json", ingest_cfg)
 
-        retrieval_cfg, is_default = retrieval_config.resolve(collection)
-        retrieval_cfg = retrieval_config.validate(retrieval_cfg, collection)
         has_saved_retrieval = not is_default
         b.add_json("retrieval_config.json", retrieval_cfg)
 
@@ -4445,16 +4560,19 @@ def build(
 
         # 5. sources, when they exist
         index = sources.load_index(collection)
-        fidelity = "with-sources" if index["documents"] else "chunks-only"
-        source_document_count = len(index["documents"])
+        shipped = {}
+        for digest, entry in index["documents"].items():
+            blob = sources.blob_path(collection, digest)
+            if not blob.exists():
+                warnings.append(f"retained source {digest[:12]} is missing on disk")
+                continue
+            shipped[digest] = entry
+        fidelity = "with-sources" if shipped else "chunks-only"
+        source_document_count = len(shipped)
         if fidelity == "with-sources":
-            b.add_json("sources/index.json", index)
-            src_dir = sources.collection_dir(collection)
-            for digest in index["documents"]:
-                blob = src_dir / digest
-                if not blob.exists():
-                    warnings.append(f"retained source {digest[:12]} is missing on disk")
-                    continue
+            b.add_json("sources/index.json", {**index, "documents": shipped})
+            for digest in shipped:
+                blob = sources.blob_path(collection, digest)
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
@@ -4873,6 +4991,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import model_bundle
 from services import packager
@@ -5341,6 +5460,35 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     return written
 
 
+def _validate_package_sources(pkg: Path, manifest: dict) -> None:
+    """Check untrusted retained-source identities before any live mutation."""
+    source_dir = pkg / "sources"
+    if not source_dir.exists():
+        if manifest.get("fidelity") == "with-sources":
+            raise PackageError("PACKAGE_CORRUPT", "Retained sources are missing.",
+                               {"file": "sources/index.json"})
+        return
+    index_path = source_dir / sources.INDEX_NAME
+    try:
+        if source_dir.is_symlink() or not source_dir.is_dir():
+            raise ValueError("Retained source directory is not a regular directory")
+        if (not index_path.exists() and not index_path.is_symlink()
+                and manifest.get("fidelity") != "with-sources"):
+            return
+        if index_path.is_symlink() or not index_path.is_file():
+            raise ValueError("Retained source index is missing or is not a regular file")
+        index = sources.validate_index(json.loads(index_path.read_text()))
+        for digest in index["documents"]:
+            blob = source_dir / digest
+            if blob.is_symlink() or not blob.is_file():
+                raise ValueError("Retained source blob is missing or is not a regular file")
+            if packager.sha256_file(blob) != digest:
+                raise ValueError("Retained source blob does not match its identity")
+    except (OSError, ValueError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
+                           {"file": "sources/index.json"}) from exc
+
+
 def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     """Preflight every evaluation sidecar before touching live state.
 
@@ -5379,18 +5527,28 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     return sessions
 
 
-def _read_retrieval_config(pkg: Path, original: str) -> dict | None:
-    """Validate once before live mutation; restore this normalized snapshot."""
+def _read_retrieval_config(pkg: Path, original: str,
+                           notes: list[str] | None = None) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot.
+
+    A legacy ef (an integer outside the save bounds, from before PR #108) is
+    cleared to null, and `notes` records it for the completed job.
+    """
     path = pkg / "retrieval_config.json"
     if not path.exists():
         return None
     try:
         if path.is_symlink() or not path.is_file():
             raise ValueError("Retrieval settings must be a regular file")
-        return retrieval_config.validate(json.loads(path.read_text()), original)
+        validated, cleared = retrieval_config.normalize(json.loads(path.read_text()), original)
     except (OSError, ValueError) as exc:
         raise PackageError("PACKAGE_CORRUPT", "Invalid retrieval settings.",
                            {"file": "retrieval_config.json"}) from exc
+    if cleared is not None and notes is not None:
+        notes.append(f"the package's retrieval setting ef={cleared} is outside "
+                     f"{SEARCH_EF_MIN}-{SEARCH_EF_MAX} and was restored as null; "
+                     "ef is no longer used.")
+    return validated
 
 
 def _restore_sidecars(target: str, pkg: Path, original: str,
@@ -5493,6 +5651,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         archive = packager.exports_dir() / Path(filename).name
         pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
         packager.verify_digests(pkg, manifest)                      # check 3
+        _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]
@@ -5508,7 +5667,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                {"name": original})
 
         validated_sessions = _read_goldstandard_sessions(pkg, original)
-        validated_retrieval = _read_retrieval_config(pkg, original)
+        retrieval_notes: list[str] = []
+        validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -5554,7 +5714,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
                 target, pkg, original, validated_sessions, job["restored_sessions"],
-                validated_retrieval)
+                validated_retrieval) + retrieval_notes
 
             if staged and temp_collection:
                 try:
@@ -6026,13 +6186,12 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    src_dir = sources.collection_dir(collection)
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
         for digest, entry in sorted(documents.items()):
-            blob = src_dir / digest
+            blob = sources.blob_path(collection, digest)
             if not blob.is_file():
                 raise PackageError(
                     "SOURCES_REQUIRED",
@@ -6185,7 +6344,9 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         job["chunks_written"] = n
 
     try:
-        has_sources = sources.has_sources(source_collection)
+        needs_sources = operation == "rechunk" or (
+            operation == "reembed" and params.get("chunking") is not None)
+        has_sources = sources.has_sources(source_collection) if needs_sources else False
         records = None
 
         if operation == "rechunk":
@@ -6928,8 +7089,11 @@ async def tune_options(collection: str):
     """What this collection can be tuned with, given its fidelity."""
     if not await wc.collection_exists(collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
-    has_sources = await asyncio.to_thread(sources.has_sources, collection)
-    stats = await asyncio.to_thread(sources.stats, collection)
+    try:
+        has_sources = await asyncio.to_thread(sources.has_sources, collection)
+        stats = await asyncio.to_thread(sources.stats, collection)
+    except ValueError:
+        return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",
@@ -10286,7 +10450,7 @@ verification run; it does not establish full-stack acceptance by itself.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers both controlled regressions and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename.
+`05_transfer.sh` registers both controlled regressions and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -10414,8 +10578,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23, E26 and E27; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E29; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
+| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
@@ -10517,6 +10682,8 @@ Run `python3 scripts/tests/test_loopback_verification.py` from the repository ro
 The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
 
 Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
+
+Issue #140 deletion coverage exercises canonical and accepted lowercase-alias HTTP deletion, both source/config sidecar spellings, durable orphan flags for both session spellings, and unrelated collection preservation. Controlled writer cases also cover backend deletion failure and retained recovery behavior; the controlled verifier invokes the actual deletion handler without a live backend.
 
 ## Deferred query configuration browser checks
 
@@ -12400,13 +12567,14 @@ with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patc
                         cleanup_failures.append(f'{name}: {response.status_code} {response.text}')
             except Exception as error:
                 cleanup_failures.append(f'{name}: {error!r}')
+        if cleanup_failures:
+            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
         if recovery:
             with patch.object(settings,'upload_dir',persistent_upload):
                 for owner in owners:
                     recovery.discard(owner,wc.get_client())
         wc.close_client()
         if cleanup_failures:
-            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
             if sys.exc_info()[0] is None:  # Otherwise the original failure stays the raised error.
                 raise AssertionError('owned collection cleanup failed: '+'; '.join(cleanup_failures))
 assert all(not wc._collection_exists_sync(name) for name in collections)
@@ -12910,7 +13078,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26, E27)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E29)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -12928,6 +13096,8 @@ section "Export, import and tuning"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
 check "evaluation import and generated-session regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_index_boundary.py)
+check "retained-source index boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
 check "retrieval import and generated-script trust-boundary regressions" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
@@ -13119,6 +13289,199 @@ drop_collection "$gname"
 # The restored session file outlives its collection by design (spec §8 rule 4).
 (cd "$REPO_ROOT" && docker compose exec -T api \
   rm -f "/app/uploads/goldstandard_sessions/$GS_SID.json") >/dev/null 2>&1 || true
+
+# ── retained-source identities never select outside files (E29, #138) ───────
+# A crafted, digest-valid package names an outside sentinel file in the API
+# container through sources/index.json. Import must refuse it before any live
+# mutation, and nothing exported afterwards may carry the sentinel's bytes.
+E29_TAG="$(python3 -c 'import uuid;print(uuid.uuid4().hex[:12])')"
+E29_SENT="/tmp/e29-sentinel-$E29_TAG"
+E29_TEXT="E29-OUTSIDE-SENTINEL-$E29_TAG"
+(cd "$REPO_ROOT" && docker compose exec -T api sh -c "printf '%s' '$E29_TEXT' > '$E29_SENT'")
+check "E29: the outside sentinel exists in the API container" $?
+make_src_pkg() {   # make_src_pkg <abs|trav|mismatch> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$E29_SENT" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, mode, suffix, sent = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+sha = lambda b: hashlib.sha256(b).hexdigest()
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    idx_path = root / "sources" / "index.json"
+    index = json.loads(idx_path.read_text())
+    digest, entry = next(iter(index["documents"].items()))   # the valid in-directory source
+    if mode == "abs":
+        key = sent
+    elif mode == "trav":
+        key = "../../.." + sent        # /app/sources/<collection>/../../.. is /
+    else:                              # a digest-shaped key whose blob doesn't match it
+        key = "0" * 64
+        blob = root / "sources" / key
+        blob.write_bytes(b"bytes that do not hash to the key")
+        manifest["files"]["sources/" + key] = "sha256:" + sha(blob.read_bytes())
+    index["documents"][key] = dict(entry, filenames=["leak.txt"])
+    idx_path.write_text(json.dumps(index))
+    assert "sources/index.json" in manifest["files"]
+    manifest["files"]["sources/index.json"] = "sha256:" + sha(idx_path.read_bytes())
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(root, arcname=root.name)
+    print(out.name)
+ENDPY
+}
+no_sentinel_in_exports() {   # exit 0 when no file or archive member in exports holds the sentinel
+  python3 - "$EXPORTS" "$E29_TEXT" <<'ENDPY'
+import pathlib, sys, tarfile
+root, needle = pathlib.Path(sys.argv[1]), sys.argv[2].encode()
+hits = []
+for p in root.rglob("*"):
+    if not p.is_file():
+        continue
+    if needle in p.read_bytes():
+        hits.append(str(p))
+    if p.name.endswith(".tar.gz"):
+        try:
+            with tarfile.open(p) as t:
+                for m in t.getmembers():
+                    f = t.extractfile(m) if m.isfile() else None
+                    if f is not None and needle in f.read():
+                        hits.append(f"{p.name}:{m.name}")
+        except tarfile.TarError:
+            pass
+print("\n".join(hits) or "no sentinel bytes in exports")
+sys.exit(1 if hits else 0)
+ENDPY
+}
+src_index_hash() {   # sha256 of the collection's retained index inside the API container
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" <<'ENDPY'
+import hashlib, sys
+from services import sources
+p = sources.collection_dir(sys.argv[1]) / "index.json"
+print(hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing")
+ENDPY
+  )
+}
+collection_names() { api_get "/collections" | python3 -c "
+import json,sys; print(' '.join(sorted(c['name'] for c in json.load(sys.stdin)['collections'])))"; }
+run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_e29job.json
+  api_post "/import" "{\"filename\":\"$1\",\"on_conflict\":\"$2\"}" > /tmp/vfy_imp.json
+  local j; j=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+  wait_for_job "/import/job/$j" 1800 >/dev/null
+  api_get "/import/job/$j" > /tmp/vfy_e29job.json
+}
+
+# Import → export, rename: the PR's controlled regression in one chain on the
+# live stack. If the import is (wrongly) accepted, export what it created and
+# look for the sentinel there.
+names_before=$(collection_names)
+ABSPKG=$(make_src_pkg abs srcabs)
+run_import "$ABSPKG" rename
+check_eq "E29: an absolute source-index key is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_e29job.json'))
+sys.exit(0 if 'sources/index.json' in json.dumps(d) else 1)"
+check "E29: the refusal names sources/index.json" $?
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_e29job.json'))
+sys.exit(1 if '$E29_SENT' in json.dumps(d) or '$E29_TEXT' in json.dumps(d) else 0)"
+check "E29: the refusal doesn't echo the outside path or its contents" $?
+read -r e29stat e29name <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+if [ "$e29stat" = "completed" ] && [ "$e29name" != "-" ]; then
+  api_post "/export" "{\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800 >/dev/null
+fi
+check_eq "E29: a refused rename import creates no collection" "$(collection_names)" "$names_before"
+leak=$(no_sentinel_in_exports); check "E29: import → export never archives the outside sentinel" $? "$leak"
+[ "$e29stat" = "completed" ] && [ "$e29name" != "-" ] && drop_collection "$e29name"
+
+# Replace: refused before any live mutation, for every unsafe identity.
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+idx_before=$(src_index_hash "$C")
+for mode in abs trav mismatch; do
+  [ "$mode" = abs ] && P="$ABSPKG" || P=$(make_src_pkg "$mode" "src$mode")
+  run_import "$P" replace
+  check_eq "E29: replace with a $mode source identity is refused as PACKAGE_CORRUPT" \
+    "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+  check_eq "E29: ... leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  check_eq "E29: ... and the live retrieval settings ($mode)" \
+    "$(api_get "/retrieval/config/$C" | jfield "['top_k']")" "7"
+  check_eq "E29: ... and the retained source index ($mode)" "$(src_index_hash "$C")" "$idx_before"
+  rm -f "$EXPORTS/$P"
+done
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+
+# The valid in-directory source still round-trips after the refusals.
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+e29job=$(jfield "['job_id']" < /tmp/vfy_e29exp.json)
+check_eq "E29: the collection still exports after refused imports" \
+  "$(wait_for_job "/export/job/$e29job" 1800)" "completed"
+E29PKG=$(api_get "/export/job/$e29job" | jfield "['filename']")
+python3 - "$EXPORTS/$E29PKG" <<'ENDPY'
+import hashlib, json, re, sys, tarfile
+with tarfile.open(sys.argv[1]) as t:
+    names = {m.name.split("/", 1)[1]: m for m in t.getmembers() if "/" in m.name}
+    index = json.load(t.extractfile(names["sources/index.json"]))
+    docs = index["documents"]
+    ok = bool(docs) and all(re.fullmatch(r"[0-9a-f]{64}", k) for k in docs)
+    for k in docs:
+        ok = ok and hashlib.sha256(t.extractfile(names[f"sources/{k}"]).read()).hexdigest() == k
+sys.exit(0 if ok else 1)
+ENDPY
+check "E29: its package carries the valid source under its digest, and nothing else" $?
+rm -f "$EXPORTS/$E29PKG"
+
+# Read boundaries: an unsafe index already on disk (as a pre-fix import would
+# have left it) must not let export or re-chunking read the sentinel.
+plant() {   # plant <abs|link|restore>
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$E29_SENT" "$1" <<'ENDPY'
+import hashlib, json, os, sys
+from services import sources
+d = sources.collection_dir(sys.argv[1]); sent, mode = sys.argv[2], sys.argv[3]
+idx, bak = d / "index.json", d / "index.json.e29bak"
+if mode == "restore":
+    keep = json.loads(bak.read_text())["documents"]
+    for p in d.iterdir():
+        if p.is_symlink():
+            p.unlink()
+    os.replace(bak, idx)
+    sys.exit(0)
+if not bak.exists():
+    bak.write_bytes(idx.read_bytes())
+index = json.loads(bak.read_text())
+entry = next(iter(index["documents"].values()))
+if mode == "abs":
+    key = sent
+else:
+    key = hashlib.sha256(open(sent, "rb").read()).hexdigest()
+    os.symlink(sent, d / key)
+index["documents"][key] = dict(entry, filenames=["leak.txt"])
+idx.write_text(json.dumps(index))
+ENDPY
+  )
+}
+for mode in abs link; do
+  plant "$mode"
+  check "E29: planted a $mode source entry on disk" $?
+  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  check_eq "E29: export refuses an on-disk $mode source entry" \
+    "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
+  leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
+  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  plant restore
+  check "E29: restored the collection's own source index ($mode)" $?
+done
+check_eq "E29: the restored index is the original" "$(src_index_hash "$C")" "$idx_before"
+(cd "$REPO_ROOT" && docker compose exec -T api rm -f "$E29_SENT") >/dev/null 2>&1 || true
 
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
@@ -13391,6 +13754,7 @@ No production fault switches are added to the server.
 """
 import argparse
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -13408,6 +13772,28 @@ def require(condition, message):
     if not condition:
         raise AssertionError(message)
     print('PASS ' + message)
+
+
+def write_import_package(package, name, rows, dimensions):
+    """Write the replace-import fixture into an existing directory; return its manifest."""
+    (package / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    (package / 'collection.json').write_text('{}')
+    source_dir = package / 'sources'
+    source_dir.mkdir()
+    # Retained sources as an export ships them: digest-named blobs and their index.
+    blob = b'synthetic imported source'
+    digest = hashlib.sha256(blob).hexdigest()
+    (source_dir / digest).write_bytes(blob)
+    seen = '2026-09-27T00:00:00Z'
+    (source_dir / sources.INDEX_NAME).write_text(json.dumps({'version': sources.INDEX_VERSION, 'documents': {
+        digest: {'filenames': ['synthetic.txt'], 'size': len(blob), 'media_type': 'text/plain',
+                 'first_seen': seen, 'last_seen': seen}}}, indent=2, sort_keys=True))
+    manifest = {'package_format': 1, 'collection': {'name': name, 'chunk_count': len(rows)},
+                'embedding': {'model': settings.embed_model, 'dimensions': dimensions},
+                'fidelity': 'with-sources', 'files': {str(p.relative_to(package)): 'sha256:' + packager.sha256_file(p)
+                    for p in package.rglob('*') if p.is_file()}}
+    (package / 'manifest.json').write_text(json.dumps(manifest))
+    return manifest
 
 
 def prepare(prefix, state_path):
@@ -13490,16 +13876,7 @@ def prepare(prefix, state_path):
     import_name = collection('Import')
     package = Path(settings.upload_dir) / (prefix + '-package')
     package.mkdir()
-    (package / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
-    (package / 'collection.json').write_text('{}')
-    source_dir = package / 'sources'
-    source_dir.mkdir()
-    (source_dir / 'synthetic-source').write_bytes(b'synthetic imported source')
-    manifest = {'package_format': 1, 'collection': {'name': import_name, 'chunk_count': 2},
-                'embedding': {'model': settings.embed_model, 'dimensions': len(vector)},
-                'fidelity': 'with-sources', 'files': {str(p.relative_to(package)): 'sha256:' + packager.sha256_file(p)
-                    for p in package.rglob('*') if p.is_file()}}
-    (package / 'manifest.json').write_text(json.dumps(manifest))
+    write_import_package(package, import_name, rows, len(vector))
     archive = packager.exports_dir() / (prefix + '-fixture.tar.gz')
     state['archives'].append(str(archive))
     save()
@@ -14234,6 +14611,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     try {
       await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
       r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      r.check('initial metadata failure settles the pending read instead of leaving it stuck', !/Reading index details…/.test(await bodyText(s.page)) && /Index details are unavailable for this collection\./.test(await bodyText(s.page)));
       await clickByText(s.page, 'Refresh index details'); await sleep(500);
       const refreshed = await bodyText(s.page);
       r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
@@ -14893,7 +15271,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock,MagicMock,patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 import httpx
 from config import settings
 from main import app
@@ -14904,7 +15282,7 @@ def fixture():
     return {'session_id':'gs_450abcde','collection':'OwnedPersistence','status':'completed','pairs_total':2,'pairs_completed':2,'pairs':[{'pair_id':'p_'+str(i),'question':'Original','answer':'Original','contexts':['Inert'],'ground_truth':'Original','source_file':'inert.txt','chunk_index':i,'status':'pending'} for i in range(2)]}
 
 def child_env():
-    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
 
 def client():
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
@@ -15041,7 +15419,7 @@ def stopped(src,dst):
 gs.os.replace=stopped
 asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
 """
-        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
         child=subprocess.Popen([sys.executable,'-c',code,self.tmp.name,str(marker)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
             deadline=time.monotonic()+5
@@ -15176,6 +15554,90 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 finally:release.set()
                 await task
         asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
+
+    async def generate(self,pair):
+        # The real task, done-callback and reporter run; only the model and sampling are owned.
+        chunk={'content':'Inert','source_file':'inert.txt','chunk_index':0}
+        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
+            sid=(await gs.start_generation('OwnedPersistence',1,None))['session_id']
+            deadline=time.monotonic()+5
+            while gs._tasks:
+                if time.monotonic()>deadline:raise AssertionError('Owned generation did not finish')
+                await asyncio.sleep(0.01)
+        return sid
+
+    async def fetch(self,sid):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+            return await client.get('/goldstandard/session/'+sid)
+
+    def test_persistent_replace_failure_ends_generation_failed(self):
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def pair(chunk):fault.set();return fixture()['pairs'][0]
+        async def run():
+            with patch.object(gs.os,'replace',side_effect=replace):
+                sid=await self.generate(pair);return sid,await self.fetch(sid)
+        sid,response=asyncio.run(run());state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed')
+        self.assertTrue(any('SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
+        self.assertEqual(json.loads(gs._session_path(sid).read_text())['status'],'generating')
+
+    def test_directory_at_session_path_ends_generation_failed(self):
+        async def pair(chunk):
+            # The only generating session is the one this case started.
+            sid=next(key for key,value in gs._sessions.items() if value['status']=='generating')
+            path=gs._session_path(sid);path.unlink();path.mkdir()
+            return fixture()['pairs'][0]
+        async def run():
+            sid=await self.generate(pair);return sid,await self.fetch(sid)
+        sid,response=asyncio.run(run());state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed')
+        self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
+        # Untyped on develop; #127 types the same fault as SESSION_WRITE_FAILED.
+        self.assertTrue(any('not a regular file' in e or 'SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+
+    def test_cancelled_generation_with_failing_final_write_ends_failed(self):
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def run():
+            waiting=asyncio.Event()
+            async def pair(chunk):fault.set();waiting.set();await asyncio.Event().wait()
+            async def cancel():
+                await waiting.wait()
+                for task in list(gs._tasks):task.cancel()
+            with patch.object(gs.os,'replace',side_effect=replace):
+                canceller=asyncio.create_task(cancel())
+                sid=await self.generate(pair);await canceller;return sid
+        self.assertEqual(gs.get_session(asyncio.run(run()))['status'],'failed')
+
+    def test_cache_fallback_keeps_event_loop_responsive(self):
+        initial=fixture();initial.update(session_id='gs_450abcd1',status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+        written=threading.Event();held=threading.Event();release=threading.Event();seen=[]
+        def failing(sid,change):
+            written.set();raise gs.GoldStandardError('SESSION_WRITE_FAILED','Owned persistent write fault',503)
+        def hold():
+            with gs._state_lock:
+                held.set();seen.append(release.wait(5))
+        holder=threading.Thread(target=hold);holder.start();self.assertTrue(held.wait(5))
+        async def run():
+            with patch.object(gs,'_update_session_sync',side_effect=failing):
+                task=asyncio.create_task(gs._record_generation_failure(initial['session_id'],RuntimeError('Owned unexpected failure')))
+                try:
+                    self.assertTrue(await asyncio.to_thread(written.wait,5))
+                    # Long enough for the reporter to reach its fallback; on the loop it would block here.
+                    await asyncio.sleep(0.05)
+                finally:release.set()
+                await task
+        try:asyncio.run(run())
+        finally:release.set();holder.join(5)
+        self.assertEqual(seen,[True])
+        self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
 
     def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
         from services import tuning
@@ -15553,7 +16015,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
 from config import settings
 from services import goldstandard as gs,importer
 
@@ -15985,7 +16447,7 @@ import copy, math, os, sys, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
 from services import tuning
 validate_vectorizer = tuning.wc._validate_reindex_vectorizer_sync
 
@@ -16422,18 +16884,33 @@ async def additional_vectorizer_and_import_checks(api,client,name,temp,created,j
     check(staging in removed and not await asyncio.to_thread(client.collections.exists,staging),'startup removes the exact positively owned interrupted import scratch')
     check(await asyncio.to_thread(lambda:not records()),'startup completes and removes the owned import scratch journal')
 
-async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+async def collection_deletion_checks(api,client,name,temp,check):
     from services import sources,ingest_config,retrieval_config
-    caller=(name+'CallerDelete');caller=caller[:1].lower()+caller[1:];sid='gs_'+uuid.uuid4().hex[:8]
-    await asyncio.to_thread(wc._create_collection_sync,caller,'hnsw','cosine',{})
-    await asyncio.to_thread(client.collections.get(caller).data.insert,properties={'content':'Owned alias deletion'},vector=[.125]*768)
-    await asyncio.to_thread(sources.store,caller,'owned.txt',b'Owned caller original')
-    await asyncio.to_thread(ingest_config.save,{'collection':caller});await asyncio.to_thread(retrieval_config.save,{'collection':caller})
-    await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
-    check(await asyncio.to_thread(lambda:sources.collection_dir(caller).is_dir() and (Path(temp)/'ingest_configs'/(caller+'.json')).is_file()),'actual caller-spelled source/config sidecars exist before deletion')
-    response=await api.delete('/collections/'+caller)
-    check(response.status_code==200 and not await asyncio.to_thread(client.collections.exists,caller),'caller-spelled HTTP deletion removes the canonical backend collection')
-    check(await asyncio.to_thread(lambda:not sources.collection_dir(caller).exists() and not (Path(temp)/'ingest_configs'/(caller+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(caller+'.json')).exists() and gs.get_session(sid)['orphaned']),'caller source/config paths are cleaned and matching evaluation is orphaned')
+    # Exercise both aliases on the Linux volume, with separate physical paths.
+    for use_alias in (True,False):
+        canonical=name+('AliasDelete' if use_alias else 'CanonicalDelete')
+        alias=canonical[:1].lower()+canonical[1:]
+        caller=alias if use_alias else canonical
+        neighbor=canonical+'Neighbor'
+        for collection in (canonical,neighbor):
+            await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+            await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
+        identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in (canonical,alias,neighbor)}
+        for spelling,sid in identities.items():
+            await asyncio.to_thread(sources.store,spelling,'owned.txt',b'Owned deletion original')
+            await asyncio.to_thread(ingest_config.save,{'collection':spelling})
+            await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
+            await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        response=await api.delete('/collections/'+caller)
+        check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
+        for spelling in (canonical,alias):
+            check(await asyncio.to_thread(lambda:not sources.collection_dir(spelling).exists() and not (Path(temp)/'ingest_configs'/(spelling+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(spelling+'.json')).exists()),'deletion cleans exact source/ingest/retrieval spelling '+spelling)
+            check(await asyncio.to_thread(lambda:gs.get_session(identities[spelling])['orphaned'] and json.loads(gs._session_path(identities[spelling]).read_text())['orphaned']),'deletion persists orphan status for '+spelling)
+        check(await asyncio.to_thread(lambda:client.collections.exists(neighbor) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves unrelated collection sidecars and current session')
+
+
+async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+    await collection_deletion_checks(api,client,name,temp,check)
     before=await asyncio.to_thread(tuning._existing_records,name)
     child="from services import tuning,weaviate_client as w; import os; original=w._create_collection_sync; w._create_collection_sync=lambda *a,**k:(original(*a,**k),os._exit(17)); tuning._jobs['owned']={'status':'queued','chunks_written':0}; tuning._run('owned',"+repr(name)+",'reembed',{'index_type':'hnsw','distance_metric':'cosine'})"
     result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child],env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')},text=True,capture_output=True,timeout=30)
@@ -16461,7 +16938,7 @@ async def main():
         client=await asyncio.to_thread(wc.get_client)
         with patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
              patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1), \
-             patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
+             patch.object(gs,'_sessions',{}),patch.object(wc.ingest_config,'_DIR',None),patch.object(wc.retrieval_config,'_DIR',None),patch.object(wc,'_create_collection_sync',side_effect=record_create):
             def check(condition,label):
                 nonlocal checks
                 assert condition,label; checks+=1; print('PASS '+label,flush=True)
@@ -16594,7 +17071,7 @@ def serialized(argument):
 import os,sys,threading,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
 from services import collection_writes as writes
 
 class WriterTests(unittest.TestCase):
@@ -16719,15 +17196,15 @@ class DeletedRecoveryTests(unittest.TestCase):
         from unittest.mock import patch
         from types import SimpleNamespace
         from config import settings
-        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs
+        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs,ingest_config,retrieval_config
         self.recovery,self.wc=recovery,wc
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
-        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{})]:stack.enter_context(change)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
             def exists(inner,name):return writes.canonical(name) in self.backend
             def delete(inner,name):self.backend.remove(writes.canonical(name))
-            def get(inner,name):return SimpleNamespace(aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
+            def get(inner,name):return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=writes.canonical(name))),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
         self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
         self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
     def test_explicit_alias_delete_retires_only_matching_recovery_snapshots(self):
@@ -16745,6 +17222,63 @@ class DeletedRecoveryTests(unittest.TestCase):
         self.wc._delete_collection_sync(caller)
         self.assertFalse(sources.collection_dir(caller).exists());self.assertFalse((self.root/'ingest_configs'/(caller+'.json')).exists());self.assertFalse((self.root/'retrieval_configs'/(caller+'.json')).exists())
         self.assertTrue(gs.get_session(session['session_id'])['orphaned']);self.assertIn(self.owner['staging'],self.backend)
+    def test_alias_delete_cleans_both_spellings_and_preserves_distinct_collection(self):
+        import json
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        canonical,caller,neighbor='OwnedRecovery','ownedRecovery','Ownedrecovery'
+        self.backend.add(neighbor)
+        identities={canonical:'gs_14000001',caller:'gs_14000002',neighbor:'gs_14000003'}
+        for spelling,sid in identities.items():
+            sources.store(spelling,'inert.txt',b'Owned original')
+            ingest_config.save({'collection':spelling});retrieval_config.save({'collection':spelling})
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        # Exact calls prove both paths even on a case-insensitive host volume.
+        with patch.object(sources,'delete',wraps=sources.delete) as originals,patch.object(ingest_config,'delete',wraps=ingest_config.delete) as ingest,patch.object(retrieval_config,'delete',wraps=retrieval_config.delete) as retrieval:
+            self.assertEqual(self.wc._delete_collection_sync(caller),3)
+            for cleanup in (originals,ingest,retrieval):self.assertEqual(cleanup.call_args_list,[call(canonical),call(caller)])
+        self.assertNotIn(canonical,self.backend);self.assertIn(neighbor,self.backend)
+        for spelling in (canonical,caller):
+            self.assertFalse(sources.collection_dir(spelling).exists());self.assertIsNone(ingest_config.load(spelling));self.assertIsNone(retrieval_config.load(spelling))
+            session=gs.get_session(identities[spelling]);self.assertTrue(session['orphaned']);self.assertEqual(session['pairs'],[])
+            self.assertTrue(json.loads(gs._session_path(identities[spelling]).read_text())['orphaned'])
+        self.assertTrue(sources.collection_dir(neighbor).exists());self.assertIsNotNone(ingest_config.load(neighbor));self.assertIsNotNone(retrieval_config.load(neighbor));self.assertFalse(gs.get_session(identities[neighbor]).get('orphaned',False))
+        self.assertIn(self.owner['staging'],self.backend);self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_canonical_delete_cleans_once_and_orphans_canonical_session(self):
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        name='OwnedRecovery';sid='gs_14000004'
+        sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
+        gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(sources,'delete',wraps=sources.delete) as cleanup:
+            self.assertEqual(self.wc._delete_collection_sync(name),3);self.assertEqual(cleanup.call_args_list,[call(name),call('ownedRecovery')])
+        self.assertTrue(gs.get_session(sid)['orphaned']);self.assertFalse(sources.collection_dir(name).exists());self.assertIsNone(ingest_config.load(name));self.assertIsNone(retrieval_config.load(name))
+    def test_canonical_delete_cleans_historical_alias_sidecars_and_sessions(self):
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        canonical,alias,neighbor='OwnedRecovery','ownedRecovery','Ownedrecovery'
+        self.backend.add(neighbor);identities={alias:'gs_14000006',neighbor:'gs_14000007'}
+        for spelling,sid in identities.items():
+            sources.store(spelling,'owned.txt',b'Owned historical original')
+            ingest_config.save({'collection':spelling});retrieval_config.save({'collection':spelling})
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(sources,'delete',wraps=sources.delete) as originals:
+            self.assertEqual(self.wc._delete_collection_sync(canonical),3)
+            self.assertEqual(originals.call_args_list,[call(canonical),call(alias)])
+        self.assertFalse(sources.collection_dir(alias).exists())
+        self.assertIsNone(ingest_config.load(alias));self.assertIsNone(retrieval_config.load(alias))
+        self.assertTrue(gs.get_session(identities[alias]).get('orphaned',False))
+        self.assertTrue(sources.collection_dir(neighbor).exists());self.assertIsNotNone(ingest_config.load(neighbor))
+        self.assertFalse(gs.get_session(identities[neighbor]).get('orphaned',False))
+    def test_failed_backend_delete_preserves_sidecars_and_current_session(self):
+        from unittest.mock import patch
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        name='OwnedRecovery';sid='gs_14000005'
+        sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
+        gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(self.client.collections,'delete',side_effect=OSError('Owned delete failure')):
+            with self.assertRaisesRegex(OSError,'Owned delete failure'):self.wc._delete_collection_sync('ownedRecovery')
+        self.assertTrue(sources.collection_dir(name).exists());self.assertIsNotNone(ingest_config.load(name));self.assertIsNotNone(retrieval_config.load(name));self.assertFalse(gs.get_session(sid).get('orphaned',False));self.assertIn(name,self.backend)
     def test_deleting_original_preserves_distinct_retained_recovery(self):
         self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
         self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
@@ -16775,7 +17309,7 @@ from unittest.mock import patch
 api_dir=os.environ.get('RAG_TEST_API_DIR')
 sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
 # Loaded from the host script on stdin with its helper passed alongside it.
-source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE',str(Path(__file__).with_name('reindex.py'))))
+source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE') or str(Path(__file__).with_name('reindex.py')))
 tree=ast.parse(source.read_text());assert isinstance(tree.body[-1],ast.Expr);tree.body.pop()
 ns={'__file__':str(source),'__name__':'owned_verifier'};exec(compile(tree,str(source),'exec'),ns)
 
@@ -16793,7 +17327,7 @@ class LifecycleTests(unittest.TestCase):
             def insert(properties,uuid=None,vector=None):
                 if uuid is None:raise RuntimeError('connection refused 127.0.0.1:1')
                 created[name].append(dict(id=uuid,properties=properties,vector=vector))
-            return SimpleNamespace(data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
+            return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=name)),data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
         client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:ns["wc"].collection_writes.canonical(name) in created,delete=delete),close=lambda:closed.append(threading.get_ident()))
         protected={'protected':{'session_id':'gs_11111111'}}
         with patch.object(ns['tempfile'],'TemporaryDirectory',OwnedTemp),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create),patch.object(ns['tuning'],'_existing_records',side_effect=lambda name:list(created[ns["wc"].collection_writes.canonical(name)])),patch.object(ns['gs'],'_sessions',protected),patch.object(ns['gs'],'store_session',side_effect=OSError('Owned session failure')):
@@ -16801,6 +17335,24 @@ class LifecycleTests(unittest.TestCase):
             self.assertIs(ns['gs']._sessions,protected)
         self.assertFalse(created);self.assertEqual(len(closed),1);self.assertTrue(all(identity!=loop_thread for _,identity in calls));self.assertNotEqual(closed[0],loop_thread)
         self.assertTrue(all(not Path(directory).exists() for directory in temps))
+    def test_deletion_verifier_uses_actual_handler_with_owned_backend_and_sidecars(self):
+        from services import ingest_config,retrieval_config
+        backend={};checks=[];created=[]
+        canonical=ns['wc'].collection_writes.canonical
+        def create(name,*args,**kwargs):backend[canonical(name)]=0;created.append(canonical(name))
+        def collection(name):
+            name=canonical(name)
+            def insert(**kwargs):backend[name]+=1
+            return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=name)),data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kwargs:SimpleNamespace(total_count=backend[name])))
+        client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:canonical(name) in backend,delete=lambda name:backend.pop(canonical(name))))
+        def check(condition,label):self.assertTrue(condition,label);checks.append(label)
+        async def run(directory):
+            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),base_url='http://owned') as api:
+                await ns['collection_deletion_checks'](api,client,'OwnedVerifier',directory,check)
+        from routers import collections as collections_router
+        with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(collections_router,'_REGISTRY_FILE',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
+            asyncio.run(run(directory))
+        self.assertEqual(len(checks),12);self.assertEqual(set(backend),{'OwnedVerifierAliasDeleteNeighbor','OwnedVerifierCanonicalDeleteNeighbor'});self.assertEqual(len(created),4)
     def test_client_failure_still_cleans_temporary_directory(self):
         original_temp=tempfile.TemporaryDirectory;temps=[]
         def create(*args,**kwargs):result=original_temp(*args,**kwargs);temps.append(result.name);return result
@@ -16817,7 +17369,7 @@ class LifecycleTests(unittest.TestCase):
             root=Path(directory);fixture=root/'collections.json';fixture.write_text(json.dumps({'collections':[{'name':name} for name in [owned,probe,parent]]}))
             receipt=ns['preserve_receipt'](directory,[owned,probe],[('tuning','owned-job','running')]);data=json.loads(Path(receipt).read_text())
             self.assertEqual(data['created_collections'],[owned,probe]);self.assertEqual(data['pending_jobs'],[['tuning','owned-job','running']])
-            lib=Path(os.environ.get('RAG_VERIFIER_LIB',str(source.with_name('lib.sh'))))
+            lib=Path(os.environ.get('RAG_VERIFIER_LIB') or str(source.with_name('lib.sh')))
             code='source "$1"; PREFIX="$2"; REPO_ROOT="$3"; api_get(){ cat "$4"; }; drop_collection(){ printf "%s\\n" "$1"; }; cleanup_prefixed'
             # api_get's function arguments differ from the script's, so retain
             # the controlled input path in a distinct variable before defining it.
@@ -17078,6 +17630,227 @@ if __name__ == '__main__':
     unittest.main()
 ```
 
+### scripts/tests/test_source_index_boundary.py
+
+```python
+"""Untrusted retained-source identities never select filesystem paths."""
+import asyncio
+import hashlib
+import json
+import os
+import sys
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+
+from config import settings
+from services import importer, ingest_pipeline, packager, sources
+from services.packager import PackageError
+
+
+class SourceIndexBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source_patch = patch.object(settings, "sources_dir", str(self.root / "retained"))
+        self.source_patch.start()
+        self.addCleanup(self.source_patch.stop)
+        self.package = self.root / "package"
+        (self.package / "sources").mkdir(parents=True)
+        self.outside = self.root / "outside.txt"
+        self.outside.write_text("controlled outside sentinel")
+
+    def index(self, digest):
+        return {"version": 1, "documents": {
+            digest: {"filenames": ["document.txt"], "size": 10}}}
+
+    def test_valid_content_addressed_source_round_trips(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        retained = sources.collection_dir("Valid")
+        retained.mkdir(parents=True)
+        (retained / digest).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        self.assertEqual(sources.load_index("Valid")["documents"].keys(), {digest})
+        self.assertEqual(sources.blob_path("Valid", digest).read_bytes(), content)
+
+    def test_import_rejects_paths_before_restoring_sources(self):
+        for key in (str(self.outside), "../outside.txt", "a/b", "index.json"):
+            with self.subTest(key=key):
+                (self.package / "sources" / "index.json").write_text(json.dumps(self.index(key)))
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+                self.assertFalse(sources.collection_dir("Imported").exists())
+
+    def test_import_job_rejects_index_before_backend_or_model_work(self):
+        (self.package / "sources" / "index.json").write_text(
+            json.dumps(self.index(str(self.outside))))
+        check_embedding = Mock()
+        ensure_models = Mock()
+        backend = Mock()
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(importer.packager, "exports_dir", return_value=self.root), \
+             patch.object(importer.packager, "open_package", return_value=(
+                 self.package, {"fidelity": "with-sources"})), \
+             patch.object(importer.packager, "verify_digests"), \
+             patch.object(importer, "_check_embedding", check_embedding), \
+             patch.object(importer, "_ensure_models", ensure_models), \
+             patch.object(importer.wc, "get_client", backend):
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        check_embedding.assert_not_called()
+        ensure_models.assert_not_called()
+        backend.assert_not_called()
+
+    def test_export_rejects_outside_identity_and_link(self):
+        retained = sources.collection_dir("Imported")
+        retained.mkdir(parents=True)
+        (retained / "index.json").write_text(json.dumps(self.index(str(self.outside))))
+        with self.assertRaises(ValueError):
+            sources.load_index("Imported")
+        digest = hashlib.sha256(self.outside.read_bytes()).hexdigest()
+        (retained / digest).symlink_to(self.outside)
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        with self.assertRaises(ValueError):
+            sources.blob_path("Imported", digest)
+        (retained / "index.json").unlink()
+        (retained / "index.json").symlink_to(self.outside)
+        with self.assertRaises(ValueError):
+            sources.load_index("Imported")
+        (retained / "index.json").unlink()
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "read_chunks", return_value=iter(())), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            with self.assertRaises(ValueError):
+                packager.build("Imported")
+        self.assertFalse(list(self.root.glob("*.tar.gz")))
+
+
+    def test_validate_index_rejects_malformed_shapes(self):
+        digest = "a" * 64
+        good = {"filenames": ["document.txt"]}
+        for bad in ([], {"documents": []}, {"documents": {digest: "entry"}},
+                    {"documents": {digest: {"filenames": "document.txt"}}},
+                    {"documents": {digest: {"filenames": [1]}}},
+                    {"documents": {digest.upper(): good}},
+                    {"documents": {digest + "\n": good}}):
+            with self.subTest(index=bad):
+                with self.assertRaises(ValueError):
+                    sources.validate_index(bad)
+        self.assertEqual(sources.validate_index({"documents": {digest: good}})["documents"].keys(),
+                         {digest})
+
+    def test_import_rejects_missing_or_mismatched_sources(self):
+        bare = self.root / "bare"
+        bare.mkdir()
+        importer._validate_package_sources(bare, {"fidelity": "chunks-only"})
+        with self.assertRaises(PackageError) as raised:
+            importer._validate_package_sources(bare, {"fidelity": "with-sources"})
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+        digest = hashlib.sha256(b"retained source").hexdigest()
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        for blob in (None, b"different bytes"):
+            with self.subTest(blob=blob):
+                path = self.package / "sources" / digest
+                if blob is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(blob)
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+
+    def test_blob_path_refuses_linked_collection_directory(self):
+        content = self.outside.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / digest).write_bytes(content)
+        Path(settings.sources_dir).mkdir(parents=True)
+        sources.collection_dir("Linked").symlink_to(elsewhere, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            sources.blob_path("Linked", digest)
+
+    def test_export_omits_missing_blob_from_shipped_index(self):
+        content = b"available source"
+        available = hashlib.sha256(content).hexdigest()
+        missing = hashlib.sha256(b"missing source").hexdigest()
+        retained = sources.collection_dir("Exported")
+        retained.mkdir(parents=True)
+        (retained / available).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                available: {"filenames": ["available.txt"]},
+                missing: {"filenames": ["missing.txt"]},
+            }}))
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "read_chunks", return_value=iter(())), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
+             patch.object(packager.retrieval_config, "validate", return_value={}), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Exported")
+        self.assertEqual(result["source_document_count"], 1)
+        self.assertTrue(any("missing on disk" in warning for warning in result["warnings"]))
+        with tarfile.open(self.root / result["filename"]) as archive:
+            names = archive.getnames()
+            index_name = next(name for name in names if name.endswith("/sources/index.json"))
+            index = json.load(archive.extractfile(index_name))
+            self.assertEqual(set(index["documents"]), {available})
+            self.assertTrue(any(name.endswith(f"/sources/{available}") for name in names))
+            self.assertFalse(any(name.endswith(f"/sources/{missing}") for name in names))
+
+    def test_tune_options_reports_invalid_index_as_typed_error(self):
+        from routers import tuning as tuning_router
+        retained = sources.collection_dir("Invalid")
+        retained.mkdir(parents=True)
+        (retained / "index.json").write_text(json.dumps(self.index("../outside.txt")))
+        with patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock,
+                          return_value=True):
+            response = asyncio.run(tuning_router.tune_options("Invalid"))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "SOURCE_INDEX_INVALID")
+
+    def test_ingest_keeps_stored_chunks_when_source_index_is_invalid(self):
+        upload = self.root / "accepted.txt"
+        upload.write_text("accepted text")
+        job_id = "source-index-retention-error"
+        job = {"status": "queued", "files_total": 1, "files_completed": 0,
+               "files_failed": 0, "chunks_stored": 0, "errors": []}
+        with patch.dict(ingest_pipeline._jobs, {job_id: job}, clear=True), \
+             patch.object(ingest_pipeline, "_parse_file", return_value=("accepted text", [])), \
+             patch.object(ingest_pipeline.wc, "_insert_chunks_sync") as insert, \
+             patch.object(ingest_pipeline.sources, "store", side_effect=ValueError("Invalid retained source index")):
+            ingest_pipeline._process_job_sync(job_id, [upload], self.root,
+                                              "Invalid", "fixed", 150, 0, 0.85, 0)
+        insert.assert_called_once()
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
+                          job["chunks_stored"]), ("completed", 1, 0, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
 ### scripts/tests/test_retrieval_import.py
 
 ```python
@@ -17105,7 +17878,15 @@ INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
            {'top_k': True}, {'top_k': 0}, {'top_k': 51}, {'top_k': 1.5},
            {'alpha': False}, {'alpha': -0.1}, {'alpha': 1.1},
            {'alpha': float('nan')}, {'alpha': float('inf')},
-           {'ef': True}, {'ef': 15}, {'ef': 513}]
+           {'ef': True}, {'ef': '10000'}, {'ef': 64.5}]
+# Integer ef values outside 16-512 that the API stored before PR #108. ef is
+# inactive, so export and import clear them to null instead of refusing.
+LEGACY_EF = [-1, 0, 15, 513, 10000]
+EXPORT_WARNING = ('saved retrieval setting ef={} is outside 16-512 and was exported as null; '
+                  "ef is no longer used. Save this collection's settings on the Retrieval "
+                  'page to clear it.')
+IMPORT_NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was restored "
+               'as null; ef is no longer used.')
 
 
 class RetrievalImportTests(unittest.TestCase):
@@ -17180,6 +17961,36 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertEqual(importer._jobs['test']['status'], 'completed')
                 self.assertEqual(retrieval_config.load('Corpus'), expected)
 
+    def test_legacy_ef_is_normalised_and_reported(self):
+        for value in LEGACY_EF:
+            with self.subTest(ef=value):
+                cfg, cleared = retrieval_config.normalize({'ef': value, 'top_k': 7}, 'Corpus')
+                self.assertIsNone(cfg['ef'])
+                self.assertEqual(cfg['top_k'], 7)
+                self.assertEqual(cleared, value)
+        for value, kept in [(16, 16), (512, 512), (64, 64), (None, None), ('64', 64)]:
+            with self.subTest(ef=value):
+                cfg, cleared = retrieval_config.normalize({'ef': value}, 'Corpus')
+                self.assertEqual(cfg['ef'], kept)
+                self.assertIsNone(cleared)
+                self.assertEqual(retrieval_config.validate({'ef': value}, 'Corpus'), cfg)
+
+    def test_legacy_ef_import_completes_with_note(self):
+        for value in LEGACY_EF:
+            with self.subTest(ef=value):
+                self.archive(json.dumps({'ef': value, 'top_k': 7}))
+                with patch.object(importer, '_ensure_models', return_value=[]), \
+                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
+                     patch.object(importer, '_build', return_value=0):
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', 'abort')
+                job = importer._jobs['test']
+                self.assertEqual(job['status'], 'completed')
+                restored = retrieval_config.load('Corpus')
+                self.assertIsNone(restored['ef'])
+                self.assertEqual(restored['top_k'], 7)
+                self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+
     def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
         self.archive(json.dumps({'top_k': '8', 'ef': 64}))
         validated = importer._read_retrieval_config(self.pkg, 'Corpus')
@@ -17239,18 +18050,62 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(namespace['DEFAULT_ALPHA'], 0.5)
         self.assertEqual(namespace['PACKAGE_METADATA']['package_filename'], result['filename'])
 
+    def test_export_clears_legacy_ef_with_warning(self):
+        retrieval_config.save({'collection': 'Corpus', 'top_k': 7, 'ef': 10000})
+        saved = retrieval_config._path('Corpus')
+        before = saved.read_bytes()
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            manifest = json.load(archive.extractfile(members['manifest.json']))
+        self.assertIsNone(cfg['ef'])
+        self.assertEqual(cfg['top_k'], 7)
+        self.assertIn('retrieve.py', members)
+        warning = EXPORT_WARNING.format(10000)
+        self.assertEqual(result['warnings'].count(warning), 1)
+        self.assertEqual(manifest['warnings'].count(warning), 1)
+        self.assertEqual(saved.read_bytes(), before)
+
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:
+            if value is None:  # None denotes no saved file, not an invalid saved config.
+                continue
             with self.subTest(value=value), ExitStack() as mocks:
-                mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+                chunks = mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
                 mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={}))
                 mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
                 mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
-                if value is None:  # None denotes no saved file, not an invalid saved config.
-                    continue
-                with self.assertRaises((ValueError, TypeError)):
+                with self.assertRaises(ValueError) as caught:
                     packager.build('Corpus')
+                message = str(caught.exception)
+                self.assertIn("'Corpus'", message)
+                self.assertIn('Retrieval page', message)
+                if isinstance(value, dict):
+                    self.assertIn(next(iter(value)), message)
+                else:
+                    self.assertIn('not a JSON object', message)
+                chunks.assert_not_called()
                 self.assertEqual(list(self.exports.iterdir()), [])
+
+    def test_symlinked_settings_fail_with_package_corrupt(self):
+        target = self.root / 'outside.json'
+        target.write_text('{}')
+        (self.pkg / 'retrieval_config.json').symlink_to(target)
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_retrieval_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'retrieval_config.json'})
+
+    def test_render_refuses_a_template_token_without_a_value(self):
+        with self.assertRaises(RuntimeError):
+            packager._render('retrieve.py.tmpl', {'COLLECTION_NAME': repr('Corpus')})
 
 
 if __name__ == '__main__':

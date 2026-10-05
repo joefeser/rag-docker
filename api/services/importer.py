@@ -35,6 +35,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import model_bundle
 from services import packager
@@ -503,6 +504,35 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     return written
 
 
+def _validate_package_sources(pkg: Path, manifest: dict) -> None:
+    """Check untrusted retained-source identities before any live mutation."""
+    source_dir = pkg / "sources"
+    if not source_dir.exists():
+        if manifest.get("fidelity") == "with-sources":
+            raise PackageError("PACKAGE_CORRUPT", "Retained sources are missing.",
+                               {"file": "sources/index.json"})
+        return
+    index_path = source_dir / sources.INDEX_NAME
+    try:
+        if source_dir.is_symlink() or not source_dir.is_dir():
+            raise ValueError("Retained source directory is not a regular directory")
+        if (not index_path.exists() and not index_path.is_symlink()
+                and manifest.get("fidelity") != "with-sources"):
+            return
+        if index_path.is_symlink() or not index_path.is_file():
+            raise ValueError("Retained source index is missing or is not a regular file")
+        index = sources.validate_index(json.loads(index_path.read_text()))
+        for digest in index["documents"]:
+            blob = source_dir / digest
+            if blob.is_symlink() or not blob.is_file():
+                raise ValueError("Retained source blob is missing or is not a regular file")
+            if packager.sha256_file(blob) != digest:
+                raise ValueError("Retained source blob does not match its identity")
+    except (OSError, ValueError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
+                           {"file": "sources/index.json"}) from exc
+
+
 def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     """Preflight every evaluation sidecar before touching live state.
 
@@ -541,18 +571,28 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     return sessions
 
 
-def _read_retrieval_config(pkg: Path, original: str) -> dict | None:
-    """Validate once before live mutation; restore this normalized snapshot."""
+def _read_retrieval_config(pkg: Path, original: str,
+                           notes: list[str] | None = None) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot.
+
+    A legacy ef (an integer outside the save bounds, from before PR #108) is
+    cleared to null, and `notes` records it for the completed job.
+    """
     path = pkg / "retrieval_config.json"
     if not path.exists():
         return None
     try:
         if path.is_symlink() or not path.is_file():
             raise ValueError("Retrieval settings must be a regular file")
-        return retrieval_config.validate(json.loads(path.read_text()), original)
+        validated, cleared = retrieval_config.normalize(json.loads(path.read_text()), original)
     except (OSError, ValueError) as exc:
         raise PackageError("PACKAGE_CORRUPT", "Invalid retrieval settings.",
                            {"file": "retrieval_config.json"}) from exc
+    if cleared is not None and notes is not None:
+        notes.append(f"the package's retrieval setting ef={cleared} is outside "
+                     f"{SEARCH_EF_MIN}-{SEARCH_EF_MAX} and was restored as null; "
+                     "ef is no longer used.")
+    return validated
 
 
 def _restore_sidecars(target: str, pkg: Path, original: str,
@@ -655,6 +695,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         archive = packager.exports_dir() / Path(filename).name
         pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
         packager.verify_digests(pkg, manifest)                      # check 3
+        _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]
@@ -670,7 +711,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                {"name": original})
 
         validated_sessions = _read_goldstandard_sessions(pkg, original)
-        validated_retrieval = _read_retrieval_config(pkg, original)
+        retrieval_notes: list[str] = []
+        validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -716,7 +758,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
                 target, pkg, original, validated_sessions, job["restored_sessions"],
-                validated_retrieval)
+                validated_retrieval) + retrieval_notes
 
             if staged and temp_collection:
                 try:

@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from services import batch_write, collection_recovery as recovery, importer, tuning, weaviate_client as wc
 
@@ -68,7 +68,7 @@ class Collection:
         self.rows = {}
         self.fault = fault
         self.description = description
-        self.config = SimpleNamespace(get=lambda: SimpleNamespace(description=self.description, vectorizer=None))
+        self.config = SimpleNamespace(get=lambda: SimpleNamespace(name=self.name, description=self.description, vectorizer=None))
         self.batch = Batch(self)
         self.query = SimpleNamespace(fetch_objects=lambda filters, **kwargs: SimpleNamespace(
             objects=[obj for obj in self.iterator(include_vector=True) if str(obj.uuid) in filters.value]))
