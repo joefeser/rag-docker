@@ -291,7 +291,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
     async def generate(self,pair):
         # The real task, done-callback and reporter run; only the model and sampling are owned.
         chunk={'content':'Inert','source_file':'inert.txt','chunk_index':0}
-        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
+        with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
             sid=(await gs.start_generation('OwnedPersistence',1,None))['session_id']
             deadline=time.monotonic()+5
             while gs._tasks:
