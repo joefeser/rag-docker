@@ -870,6 +870,20 @@ class StackRunSuiteGroupTests(unittest.TestCase):
         self.assert_torn_down_after_up(box)
         self.assertFalse(Path(box.env['RAG_VERIFY_LOCK']).exists(), 'the verify lock is released')
 
+    def test_the_suite_reads_no_terminal(self):
+        # With job control on, a background job keeps the caller's stdin. From
+        # an interactive terminal the suite's first read (docker compose exec
+        # -T) is then stopped by SIGTTIN and the run hangs, so stack.sh gives
+        # the suite /dev/null. Data on stack.sh's stdin must not reach it.
+        box = Sandbox(self)
+        seen = box.root / 'stdin'
+        checkout = self.checkout(box, f'if read -r line; then echo "read:$line"; else echo eof; fi > "{seen}"\n')
+        env = {k: v for k, v in {**box.env, 'STUB_UP_OK': '1', 'STUB_CURL_CODE': '200'}.items() if v is not None}
+        result = subprocess.run(['bash', str(STACK), 'run', '--checkout', str(checkout)], cwd=ROOT, env=env,
+                                input='from-the-terminal\n', capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(seen.read_text().strip(), 'eof')
+
     def test_the_suite_is_stopped_before_the_teardown(self):
         box = Sandbox(self)
         started = box.root / 'started'

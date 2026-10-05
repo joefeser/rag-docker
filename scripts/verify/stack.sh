@@ -523,8 +523,11 @@ case "$CMD" in
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.
+    # Its stdin is /dev/null: a background job keeps the terminal otherwise,
+    # and run from one, its first read (docker compose exec -T) would be
+    # stopped by SIGTTIN and the run would hang.
     set -m
-    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} &
+    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} </dev/null &
     SUITE=$!
     set +m
     wait "$SUITE" || rc=$?
