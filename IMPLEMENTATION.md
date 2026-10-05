@@ -61,16 +61,24 @@ services:
       # Pinning the name keeps the identity stable across container recreation.
       CLUSTER_HOSTNAME: 'node1'
       RAFT_BOOTSTRAP_EXPECT: 1
+      # Without a Raft snapshot, every start replays each collection delete in
+      # Weaviate's Raft log and waits ~150ms on each one (issue #178: 922
+      # deletes, ~145s). A snapshot after 128 entries, checked every 30-60s,
+      # keeps the replayed tail short.
+      RAFT_SNAPSHOT_THRESHOLD: 128
+      RAFT_SNAPSHOT_INTERVAL: 30
     volumes:
       - weaviate_data:/var/lib/weaviate
     ports: []
     networks: [rag-internal]
     healthcheck:
       # The weaviate image has no curl; busybox wget is what it ships.
-      # A cold start replays Weaviate's schema history and loads its indexes
-      # before /ready answers. On a copy of real data that took up to 156s
-      # (#130); without start_period, compose marks Weaviate unhealthy after
-      # ~100s and fails the api, ui and proxy behind it.
+      # The first start on a volume whose Raft log has no snapshot yet (the
+      # first after upgrading to the snapshot settings above) still replays
+      # its whole history before /ready answers: up to 156s on a copy of real
+      # data, 163.5s live (issue #130). Later starts replay only the tail since
+      # the last snapshot. Without start_period, compose marks Weaviate
+      # unhealthy after ~100s and fails the api, ui and proxy behind it.
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/.well-known/ready"]
       interval: 10s
       timeout: 5s
@@ -12431,6 +12439,99 @@ sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) e
     "$(jfield "['is_default']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "False"
 else
   skip "restart, persistence and timing" "set RAG_ALLOW_RESTART=1 to include them"
+fi
+
+# ── restart from a Raft snapshot (issue #178; opt-in: it stops the stack) ────
+# The restart above comes too early for a snapshot: few schema changes, under
+# a minute of uptime. Here Weaviate takes one, a tail of changes follows it,
+# and a down/up must restore both: collections and objects from before the
+# snapshot, a create and a delete after it.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -z "$restart_refusal" ] && [ "$restart_limit_ok" = 0 ]; then
+  SNAP_KEEP="${C}SnapKeep"; SNAP_GONE="${C}SnapGone"; SNAP_TAIL="${C}SnapTail"
+  for n in "$SNAP_KEEP" "$SNAP_GONE" "$SNAP_TAIL"; do drop_collection "$n"; done
+  # put_objects <collection> <count>: objects with their own vectors, so no
+  # embedding call is involved.
+  put_objects() {
+    (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" "$2" <<'ENDPY'
+import sys
+from weaviate.classes.data import DataObject
+from services import weaviate_client as wc
+name, count = sys.argv[1], int(sys.argv[2])
+try:
+    result = wc.get_client().collections.get(name).data.insert_many([
+        DataObject(properties={"content": f"snapshot check {i}", "chunk_index": i},
+                   vector=[(i + 1) / (j + 1) for j in range(768)])
+        for i in range(count)])
+    sys.exit(1 if result.has_errors else 0)
+finally:
+    wc.close_client()
+ENDPY
+    ) >/dev/null 2>&1
+  }
+  snapshots() { (cd "$REPO_ROOT" && docker compose exec -T weaviate ls /var/lib/weaviate/raft/snapshots) 2>/dev/null | sort; }
+  make_collection "$SNAP_KEEP"; put_objects "$SNAP_KEEP" 5; keep_ok=$?
+  make_collection "$SNAP_GONE"; put_objects "$SNAP_GONE" 3; gone_ok=$?
+  [ "$keep_ok$gone_ok" = 00 ]
+  check "objects written before the snapshot" $?
+  before_snaps=$(snapshots)
+  # 70 create/delete pairs: 140 Raft entries, over the threshold of 128.
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "${C}Churn" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+client = wc.get_client()
+try:
+    for i in range(70):
+        client.collections.create(f"{sys.argv[1]}{i}")
+        client.collections.delete(f"{sys.argv[1]}{i}")
+finally:
+    wc.close_client()
+ENDPY
+  ) >/dev/null 2>&1
+  check "140 schema changes made" $?
+  # The interval is checked every 30-60s; allow 150s.
+  new_snap=""
+  for _ in $(seq 1 30); do
+    new_snap=$(comm -13 <(printf '%s\n' "$before_snaps") <(snapshots) | grep . | tail -1)
+    [ -n "$new_snap" ] && break
+    sleep 5
+  done
+  [ -n "$new_snap" ]
+  check "Weaviate snapshots its Raft log after 140 schema changes (within 150s)" $? "no new snapshot in /var/lib/weaviate/raft/snapshots"
+  snap_index=$(printf '%s' "$new_snap" | cut -d- -f2)
+  # The tail after the snapshot: one collection created, one deleted.
+  make_collection "$SNAP_TAIL"; put_objects "$SNAP_TAIL" 4
+  check "objects written after the snapshot" $?
+  drop_collection "$SNAP_GONE"
+  started=$(python3 -c "import time;print(time.time())")
+  project="$COMPOSE_PROJECT_NAME"
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  [ -n "$elapsed" ]
+  check "healthy again after a restart from the snapshot" $? "not healthy after $((restart_limit * 2))s"
+  # Weaviate logs the snapshot it started from on "raft node constructed".
+  restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
+import json, sys
+for line in sys.stdin:
+    _, _, body = line.partition('|')
+    try:
+        d = json.loads(body)
+    except ValueError:
+        continue
+    if d.get('msg') == 'raft node constructed':
+        print(d.get('last_snapshot_index', 0))")
+  [ -n "$snap_index" ] && [ "${restored:-0}" -ge "$snap_index" ] 2>/dev/null
+  check "the restart starts from the snapshot" $? "last_snapshot_index on start: ${restored:-none}, snapshot taken at: ${snap_index:-none}"
+  api_get "/collections" | python3 -c "
+import json, sys
+a = {c['name']: c['object_count'] for c in json.load(sys.stdin)['collections']}
+ok = (a.get('$SNAP_KEEP') == 5 and a.get('$SNAP_TAIL') == 4 and '$SNAP_GONE' not in a
+      and not any(n.startswith('${C}Churn') for n in a))
+print(a if not ok else '')
+sys.exit(0 if ok else 1)" > "$RAG_INFRA_TMP/vfy_snap.txt"
+  check "collections and objects before and after the snapshot survive the restart, deletes stay deleted" $? "$(cat "$RAG_INFRA_TMP/vfy_snap.txt")"
+  for n in "$SNAP_KEEP" "$SNAP_TAIL"; do drop_collection "$n"; done
+elif [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "restart from a Raft snapshot" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 # ── startup sweeps leave a clean instance alone ──────────────────────────────
