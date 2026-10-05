@@ -1537,7 +1537,7 @@ settings, regardless of when a prior collection's save completes.
 - Collection selector (populated from `GET /collections`).
 - Current configuration display (from `GET /ingest/config/{collection}` for the selected collection). Shows a "using defaults" notice when `is_default: true`.
 - Editable parameter form: chunking strategy selector, chunk size, overlap, similarity threshold, min chunk size. Controls follow the same visibility rules as the Import page (overlap hidden for `semantic`/`context_aware`; similarity threshold visible only for `semantic`).
-- "Save as Default" button → calls `POST /ingest/config` with the collection in the request body (upsert — creates on first save, overwrites on subsequent saves). Does not re-process existing documents. Shows a confirmation notice after successful save.
+- "Save as Default" button → calls `POST /ingest/config` with the collection in the request body (upsert — creates on first save, overwrites on subsequent saves). Does not re-process existing documents. Shows a confirmation notice after successful save. Loads and save results belong to their selection generation, including A→B→A. Changing collection clears old settings and notices; save stays unavailable until the selected configuration loads successfully, and duplicate saves are prevented.
 
 ### 7.6 Retrieval Config Page
 

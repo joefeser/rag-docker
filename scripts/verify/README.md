@@ -381,3 +381,12 @@ The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
 isolated fixture run does not replace the required full live-stack suite.
+
+## Deferred Chunking configuration checks
+
+`browser/chunking_config.js`, registered in `06_ui.sh` through `ui_criteria.js`,
+uses the rendered page with deferred API responses. Six cases cover late loads,
+failed loads, A→B→A selection, stale save completions, pending saves across
+selection changes, and duplicate-save prevention. Each affected save checks
+its actual collection and chunk-size payload. These fixtures make no backend
+writes and complement the live settings suite.
