@@ -64,8 +64,15 @@ with tempfile.TemporaryDirectory() as td:
     chunks = root / "chunks.jsonl"
     chunks.write_bytes(chunks.read_bytes()[: len(chunks.read_bytes()) // 2])
     out = src.parent / (src.name.replace(".tar.gz", "") + "-corrupt.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
 ENDPY
 CORRUPT=$(python3 - "$EXPORTS/$PKG" <<'ENDPY'
 import pathlib, sys
@@ -87,6 +94,10 @@ rm -f "$EXPORTS/$CORRUPT"
 # Digest-valid malformed retrieval settings must fail before every conflict path.
 python3 ./retrieval_settings.py "$API" "$C" "$EXPORTS/$PKG"
 check "invalid retrieval imports preserve live collections and settings" $?
+# Settings saved before PR #108 (#173): a legacy ef exports and imports as null
+# with a warning or note; other invalid saved settings fail the export early.
+python3 ./legacy_retrieval.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
+check "E28: legacy ef is cleared on export and import; invalid saved settings fail early" $?
 
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
@@ -114,8 +125,15 @@ with tempfile.TemporaryDirectory() as td:
         "sha256:" + hashlib.sha256(side.read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 }
@@ -169,8 +187,15 @@ with tempfile.TemporaryDirectory() as td:
             "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 )
@@ -251,8 +276,15 @@ with tempfile.TemporaryDirectory() as td:
     manifest["files"]["sources/index.json"] = "sha256:" + sha(idx_path.read_bytes())
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 }

@@ -10402,6 +10402,20 @@ What makes it separate from the live stack:
   fails (Weaviate can be slow to report healthy, #130). If it still fails, it
   prints the last log lines of each service that isn't up. `up` then leaves
   the project running for inspection (`down` removes it); `run` removes it.
+- **No suite outlives its run (#184).** `run` starts `all.sh` in a process
+  group of its own. Whenever `run` ends, whether normally, on a failing suite,
+  or on INT or TERM (which now act at once), it first stops that whole group
+  (TERM, then KILL after 5 seconds), so nothing the suites started is left
+  running, and only then tears the project down and releases the lock. A
+  `stack.sh` killed outright (SIGKILL) can't do that. Then the verify lock
+  stops the orphaned suite instead: `lock.sh` trusts an inherited
+  `RAG_VERIFY_LOCK_HELD` only while the lock's pid is that shell or one of its
+  ancestors, and `lib.sh`'s API helpers (`api_get`, `api_post`, `api_code`,
+  `api_post_code`, `drop_collection`, `make_collection` and every
+  `wait_for_job` poll) repeat that check before each request and end the
+  suite, exit 3, when it fails. Not re-checked: direct `curl` and
+  `docker compose exec` calls in the suites, and the Python helpers, which
+  end on their own timeouts (up to 900 s).
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -10485,7 +10499,13 @@ regressions. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
-also checks all saved retrieval fields round-trip. Controlled tests complement,
+also checks all saved retrieval fields round-trip. `legacy_retrieval.py` (E28,
+#184) writes a legacy `ef` and other invalid saved settings into the API
+container, then checks through the real API that a legacy `ef` exports and
+imports as `null` with a warning or note, and that other invalid saved settings
+fail the export early with an actionable error and publish nothing. Crafted
+packages are written under a `.part` name and renamed into place, because on
+Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
@@ -10572,7 +10592,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
-| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
+| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
@@ -10822,7 +10842,11 @@ exit "$overall"
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
 # (RAG_SKIP_SLOW and RAG_ALLOW_RESTART pass through) and always tears it down,
-# exiting with all.sh's status. `up` leaves the project running and prints the
+# exiting with all.sh's status. all.sh runs in a process group of its own, and
+# before the teardown that whole group is stopped (TERM, then KILL), so no suite
+# outlives the run that started it (#184). INT and TERM act at once. A
+# stack.sh killed outright (SIGKILL) can't do this; then lock.sh and lib.sh's
+# helpers stop the orphaned suite (see lock.sh). `up` leaves the project running and prints the
 # environment that points docker compose and the suites at it; `down` removes
 # it. --checkout picks the checkout to build and test (default: this one).
 #
@@ -10939,9 +10963,26 @@ fi
 # Held for the whole command; the all.sh started below inherits it.
 . "$HARNESS/scripts/verify/lock.sh"
 TEARDOWN=0
+SUITE=""
+# Stops all.sh's process group: everything the suites started, including what
+# they left running in the background after all.sh ended.
+stop_suite() {
+  local i
+  [ -n "$SUITE" ] || return 0
+  kill -TERM -- "-$SUITE" 2>/dev/null
+  for i in $(seq 1 50); do
+    # Zombies count as gone: only this shell can reap all.sh itself.
+    ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$SUITE" '$1 == g && $2 !~ /^Z/ {found=1} END {exit !found}' || break
+    sleep 0.1
+  done
+  kill -KILL -- "-$SUITE" 2>/dev/null
+  wait "$SUITE" 2>/dev/null
+  SUITE=""
+}
 on_exit() {
   local rc=$?
   trap - EXIT
+  stop_suite
   if [ "$TEARDOWN" = 1 ]; then
     TEARDOWN=0
     do_down || rc=2
@@ -11312,7 +11353,14 @@ case "$CMD" in
     TEARDOWN=1
     do_up
     rc=0
-    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+    # In the background with job control on, all.sh leads a process group of
+    # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
+    # command, returns as soon as INT or TERM arrives, so the traps act at once.
+    set -m
+    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} &
+    SUITE=$!
+    set +m
+    wait "$SUITE" || rc=$?
     exit "$rc" ;;
 esac
 ```
@@ -11379,10 +11427,25 @@ skip() {
 # `expr` is python indexing against the parsed document, e.g. ['status']
 jfield() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)" 2>/dev/null; }
 
-api_get()  { curl -s -m 120 "$API$1"; }
-api_code() { curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
-api_post() { curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
-api_post_code() { curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Every helper below that reaches the API first checks that this suite's verify
+# lock is still held by it or an ancestor (#184). A suite orphaned by a run that
+# died after it passed lock.sh stops at its next helper call, before any
+# request, instead of acting on a later run's verify project. The suite ends
+# even when the helper runs inside $(...) or a pipeline, and its EXIT trap
+# still runs. Not re-checked: direct curl and `docker compose exec` calls in the
+# suites, and the Python helpers, which end on their own timeouts (up to 900 s).
+_rag_require_lock_owner() {
+  _rag_lock_owner_ok && return 0
+  _rag_lock_leftover
+  # In a subshell, exit alone would end only the subshell.
+  [ "${BASHPID:-}" = "$$" ] || kill -TERM "$$" 2>/dev/null
+  exit 3
+}
+
+api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
+api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
+api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 
 require_stack() {
   local code
@@ -11399,6 +11462,7 @@ require_stack() {
 wait_for_job() {
   local path="$1" limit="${2:-600}" waited=0 status=""
   while [ "$waited" -lt "$limit" ]; do
+    _rag_require_lock_owner
     status=$(api_get "$path" | jfield "['status']")
     case "$status" in
       completed|failed|partial|cancelled) printf '%s' "$status"; return 0 ;;
@@ -11412,7 +11476,7 @@ make_collection() {
   api_post "/collections" "{\"name\":\"$1\",\"index_type\":\"${2:-hnsw}\",\"distance_metric\":\"${3:-cosine}\",\"hnsw_config\":{\"efConstruction\":128,\"maxConnections\":64,\"ef\":64}}" >/dev/null
 }
 
-drop_collection() { curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
+drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
 
 # Remove every collection and package this run created.
 cleanup_prefixed() {
@@ -11520,7 +11584,13 @@ esac
 # other run's recreated collection (#95).
 #
 # The first script to source this holds the lock for its whole process tree:
-# it exports RAG_VERIFY_LOCK_HELD, so the suites all.sh starts don't try again.
+# it exports RAG_VERIFY_LOCK_HELD and the lock's path, RAG_VERIFY_LOCK, so the
+# suites all.sh starts don't try again. An inherited RAG_VERIFY_LOCK_HELD is
+# trusted only while the lock's pid is this shell or one of its ancestors
+# (#184). A suite orphaned by a run that died still carries the variable; it
+# exits 3 here instead of acting on a later run's verify project, and never
+# takes the dead holder's lock over. lib.sh's API helpers repeat the check
+# before every request, for a suite that was already past this point.
 #
 # The lock is a directory holding a pid file. mkdir is atomic, so only one run
 # can create it. A lock whose holder has died is taken over, but only under a
@@ -11537,6 +11607,34 @@ _rag_lock_release() {
   [ "$(cat "$RAG_VERIFY_LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
   rm -f "$RAG_VERIFY_LOCK/pid"
   rmdir "$RAG_VERIFY_LOCK" 2>/dev/null || true
+}
+
+# Succeeds only when the lock's pid is this shell ($$) or an ancestor of it.
+# A missing, symlinked or pid-less lock, or a process table that can't be
+# read, counts as not ours. The pid == $$ case needs no ps, which the API
+# container lacks.
+_rag_lock_owner_ok() {
+  local lock="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}" owner pid steps=0
+  [ ! -L "$lock" ] || return 1
+  owner=$(cat "$lock/pid" 2>/dev/null) || return 1
+  case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  pid=$$
+  while [ "$steps" -lt 64 ]; do
+    [ "$pid" = "$owner" ] && return 0
+    [ "$pid" -gt 1 ] || return 1
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    steps=$((steps + 1))
+  done
+  return 1
+}
+
+_rag_lock_leftover() {
+  local lock="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}" owner
+  owner=$(cat "$lock/pid" 2>/dev/null | LC_ALL=C tr -cd '0-9' | cut -c1-20)
+  if [ -n "$owner" ]; then owner="its pid is $owner"; else owner="it has no pid"; fi
+  printf '\nThe verify lock %s is not held by this run or its parents (%s). This is a leftover\nof an earlier verify run, so it stops here.\n\n' \
+    "$lock" "$owner" >&2
 }
 
 _rag_lock_acquire() {
@@ -11605,10 +11703,12 @@ _rag_lock_acquire() {
   return 3
 }
 
-if [ -z "${RAG_VERIFY_LOCK_HELD:-}" ]; then
+if [ -n "${RAG_VERIFY_LOCK_HELD:-}" ]; then
+  _rag_lock_owner_ok || { _rag_lock_leftover; exit 3; }
+else
   RAG_VERIFY_LOCK="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}"
   _rag_lock_acquire "$RAG_VERIFY_LOCK" || exit 3
-  export RAG_VERIFY_LOCK_HELD=1
+  export RAG_VERIFY_LOCK RAG_VERIFY_LOCK_HELD=1
   # Released on exit, after any EXIT trap already set (bash traps replace
   # rather than chain, so keep the earlier one). A suite that sets its own
   # EXIT trap later should call _rag_lock_release in it; if it doesn't, the
@@ -13146,8 +13246,15 @@ with tempfile.TemporaryDirectory() as td:
     chunks = root / "chunks.jsonl"
     chunks.write_bytes(chunks.read_bytes()[: len(chunks.read_bytes()) // 2])
     out = src.parent / (src.name.replace(".tar.gz", "") + "-corrupt.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
 ENDPY
 CORRUPT=$(python3 - "$EXPORTS/$PKG" <<'ENDPY'
 import pathlib, sys
@@ -13169,6 +13276,10 @@ rm -f "$EXPORTS/$CORRUPT"
 # Digest-valid malformed retrieval settings must fail before every conflict path.
 python3 ./retrieval_settings.py "$API" "$C" "$EXPORTS/$PKG"
 check "invalid retrieval imports preserve live collections and settings" $?
+# Settings saved before PR #108 (#173): a legacy ef exports and imports as null
+# with a warning or note; other invalid saved settings fail the export early.
+python3 ./legacy_retrieval.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
+check "E28: legacy ef is cleared on export and import; invalid saved settings fail early" $?
 
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
@@ -13196,8 +13307,15 @@ with tempfile.TemporaryDirectory() as td:
         "sha256:" + hashlib.sha256(side.read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 }
@@ -13251,8 +13369,15 @@ with tempfile.TemporaryDirectory() as td:
             "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 )
@@ -13333,8 +13458,15 @@ with tempfile.TemporaryDirectory() as td:
     manifest["files"]["sources/index.json"] = "sha256:" + sha(idx_path.read_bytes())
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 }
@@ -17981,20 +18113,40 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertEqual(retrieval_config.validate({'ef': value}, 'Corpus'), cfg)
 
     def test_legacy_ef_import_completes_with_note(self):
-        for value in LEGACY_EF:
-            with self.subTest(ef=value):
-                self.archive(json.dumps({'ef': value, 'top_k': 7}))
-                with patch.object(importer, '_ensure_models', return_value=[]), \
-                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
-                     patch.object(importer, '_build', return_value=0):
+        # Every conflict mode (#184): abort into a new collection, rename beside
+        # an existing one, and replace an existing one through staging.
+        for conflict in ('abort', 'rename', 'replace'):
+            for value in LEGACY_EF:
+                with self.subTest(conflict=conflict, ef=value), ExitStack() as mocks:
+                    self.archive(json.dumps({'ef': value, 'top_k': 7}))
+                    mocks.enter_context(patch.object(importer, '_ensure_models', return_value=[]))
+                    mocks.enter_context(patch.object(importer, '_build', return_value=0))
+                    mocks.enter_context(patch.object(
+                        importer.wc, '_collection_exists_sync',
+                        side_effect=lambda name: conflict != 'abort' and name == 'Corpus'))
+                    if conflict == 'replace':
+                        mocks.enter_context(patch.object(importer.collection_recovery, 'begin',
+                                                         return_value={'staging': 'Corpus__importing_test',
+                                                                       'state': 'scratch'}))
+                        for name in ('retain', 'discard'):
+                            mocks.enter_context(patch.object(importer.collection_recovery, name))
+                        mocks.enter_context(patch.object(importer.wc, 'get_client'))
+                        mocks.enter_context(patch.object(importer.wc, '_delete_collection_sync'))
+                        mocks.enter_context(patch.object(importer.goldstandard, 'sessions_for', return_value=[]))
                     importer._jobs['test'] = {'status': 'queued'}
-                    importer._run('test', 'fixture.tar.gz', 'abort')
-                job = importer._jobs['test']
-                self.assertEqual(job['status'], 'completed')
-                restored = retrieval_config.load('Corpus')
-                self.assertIsNone(restored['ef'])
-                self.assertEqual(restored['top_k'], 7)
-                self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+                    importer._run('test', 'fixture.tar.gz', conflict)
+                    job = importer._jobs['test']
+                    self.assertEqual(job['status'], 'completed', job)
+                    target = job['collection']
+                    if conflict == 'rename':
+                        self.assertTrue(target.startswith('Corpus_imported_'), target)
+                    else:
+                        self.assertEqual(target, 'Corpus')
+                    restored = retrieval_config.load(target)
+                    self.assertIsNone(restored['ef'])
+                    self.assertEqual(restored['top_k'], 7)
+                    self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+                    retrieval_config._path(target).unlink()
 
     def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
         self.archive(json.dumps({'top_k': '8', 'ef': 64}))
@@ -18129,6 +18281,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import uuid
 
 
 def run(api, collection, package):
@@ -18165,12 +18318,17 @@ def run(api, collection, package):
                 manifest = json.loads(manifest_path.read_text())
                 manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
                 manifest_path.write_text(json.dumps(manifest))
-                with tempfile.NamedTemporaryFile(prefix='vfy-retrieval-', suffix='.tar.gz',
-                                                 dir=package.parent) as output:
-                    with tarfile.open(output.name, 'w:gz') as archive:
+                # Written under a .part name, then renamed into place: on Docker
+                # Desktop the API can read a freshly written bind-mounted file
+                # as empty (#184).
+                output = package.parent / f'vfy-retrieval-{uuid.uuid4().hex[:12]}.tar.gz'
+                part = output.with_name('.' + output.name + '.part')
+                try:
+                    with tarfile.open(part, 'w:gz') as archive:
                         archive.add(root, arcname=root.name)
+                    part.replace(output)
                     for conflict in ('abort', 'rename', 'replace'):
-                        job_id = request('/import', {'filename': Path(output.name).name,
+                        job_id = request('/import', {'filename': output.name,
                                                      'on_conflict': conflict})['job_id']
                         deadline = time.monotonic() + 120
                         while True:
@@ -18185,6 +18343,9 @@ def run(api, collection, package):
                         assert job['error_detail'] == {'file': 'retrieval_config.json'}, job
                         assert request('/retrieval/config/' + collection) == expected
                         assert collections() == baseline
+                finally:
+                    part.unlink(missing_ok=True)
+                    output.unlink(missing_ok=True)
         print('15 digest-valid malformed retrieval imports rejected; live collections/settings preserved')
     finally:
         request('/retrieval/config', saved)
@@ -18192,4 +18353,166 @@ def run(api, collection, package):
 
 if __name__ == '__main__':
     run(*sys.argv[1:])
+```
+
+### scripts/verify/legacy_retrieval.py
+
+```python
+"""Live E28 acceptance for retrieval settings saved under an older contract (#173).
+
+Writes the collection's saved settings file directly in the API container, as
+an API from before PR #108 could have, then checks through the real API:
+- a legacy integer ef exports as null with a warning, and the saved file is
+  left alone;
+- a package carrying a legacy ef imports with ef null and a note;
+- other invalid saved settings fail the export before any package is
+  published, with an error naming the fields and the Retrieval page.
+The collection's saved settings are restored on exit.
+"""
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+WARNING = ("saved retrieval setting ef={} is outside 16-512 and was exported as null; "
+           "ef is no longer used. Save this collection's settings on the Retrieval "
+           "page to clear it.")
+NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was restored "
+        "as null; ef is no longer used.")
+
+
+def run(api, collection, exports, repo_root):
+    exports = Path(exports)
+    failures = []
+
+    def request(path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(api.rstrip('/') + path, data=data,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+
+    def wait(path, timeout=900):
+        deadline = time.monotonic() + timeout
+        while True:
+            job = request(path)
+            if job['status'] in ('failed', 'completed'):
+                return job
+            if time.monotonic() >= deadline:
+                raise AssertionError(f'{path} timed out: {job}')
+            time.sleep(0.5)
+
+    def write_saved(value):
+        """Bypass the save contract, as an older API's saved file would."""
+        code = ('import json, sys\n'
+                'from services import retrieval_config\n'
+                'retrieval_config._path(sys.argv[1]).write_text(sys.argv[2])\n')
+        subprocess.run(['docker', 'compose', 'exec', '-T', 'api', 'python', '-c', code,
+                        collection, json.dumps(value)], cwd=repo_root, check=True)
+
+    def expect(name, ok, detail=''):
+        print(('PASS ' if ok else 'FAIL ') + name + ('' if ok else f'  -- {detail}'))
+        if not ok:
+            failures.append(name)
+
+    def listing():
+        return sorted(p.name for p in exports.iterdir())
+
+    saved = request('/retrieval/config/' + collection)
+    renamed = None
+    try:
+        # 1. Export of a legacy ef: null in the package, a warning, file left alone.
+        legacy = {k: saved[k] for k in ('retrieval_mode', 'alpha', 'response_format')}
+        write_saved({**legacy, 'top_k': 7, 'ef': 10000})
+        loaded = request('/retrieval/config/' + collection)
+        expect('legacy ef: the Retrieval page can still load the saved settings',
+               loaded['ef'] == 10000 and loaded['top_k'] == 7, loaded)
+        job = wait('/export/job/' + request('/export', {'collection': collection,
+                                                        'include_models': False})['job_id'])
+        expect('legacy ef: export completes', job['status'] == 'completed', job)
+        package = exports / job['filename']
+        with tarfile.open(package) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            manifest = json.load(archive.extractfile(members['manifest.json']))
+            script = archive.extractfile(members['retrieve.py']).read().decode()
+        warning = WARNING.format(10000)
+        expect('legacy ef: the package carries ef null and the other settings',
+               cfg['ef'] is None and cfg['top_k'] == 7, cfg)
+        expect('legacy ef: the export job warns once', job['warnings'].count(warning) == 1,
+               job['warnings'])
+        expect('legacy ef: the manifest records the warning',
+               manifest['warnings'].count(warning) == 1, manifest['warnings'])
+        expect('legacy ef: retrieve.py carries the saved top_k', 'DEFAULT_TOP_K = 7' in script,
+               [l for l in script.splitlines() if 'TOP_K =' in l])
+        after = request('/retrieval/config/' + collection)
+        expect('legacy ef: export leaves the saved settings alone', after['ef'] == 10000, after)
+
+        # 2. Import of a package with a legacy ef: restored as null, with a note.
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with tarfile.open(package) as archive:
+                archive.extractall(work, filter='data')
+            root = next(p for p in work.iterdir() if p.is_dir())
+            side = root / 'retrieval_config.json'
+            side.write_text(json.dumps({**json.loads(side.read_text()), 'ef': 513}))
+            manifest_path = root / 'manifest.json'
+            manifest = json.loads(manifest_path.read_text())
+            manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
+            manifest_path.write_text(json.dumps(manifest))
+            crafted = exports / (package.name.replace('.tar.gz', '') + '-legacyef.tar.gz')
+            # Write under another name, then rename: on Docker Desktop, the API
+            # container can read a freshly written bind-mounted file as empty.
+            partial = crafted.with_name('.' + crafted.name + '.part')
+            with tarfile.open(partial, 'w:gz') as archive:
+                archive.add(root, arcname=root.name)
+            partial.replace(crafted)
+        try:
+            job = wait('/import/job/' + request('/import', {'filename': crafted.name,
+                                                            'on_conflict': 'rename'})['job_id'])
+        finally:
+            crafted.unlink(missing_ok=True)
+            package.unlink(missing_ok=True)
+        expect('legacy ef: a package with ef=513 imports', job['status'] == 'completed', job)
+        if job['status'] == 'completed':
+            renamed = job['collection']
+            expect('legacy ef: the import notes the cleared ef once',
+                   job['notes'].count(NOTE.format(513)) == 1, job['notes'])
+            restored = request('/retrieval/config/' + renamed)
+            expect('legacy ef: the imported collection has ef null and the package top_k',
+                   restored['ef'] is None and restored['top_k'] == 7
+                   and restored['is_default'] is False, restored)
+
+        # 3. Other invalid saved settings fail early, actionably, publishing nothing.
+        for value, needles in [({**legacy, 'top_k': 0, 'alpha': 2}, ['top_k', 'alpha']),
+                               ({**legacy, 'ef': True}, ['ef']),
+                               ([], ['not a JSON object'])]:
+            write_saved(value)
+            before = listing()
+            job = wait('/export/job/' + request('/export', {'collection': collection,
+                                                            'include_models': False})['job_id'])
+            error = job.get('error') or ''
+            expect(f'invalid saved settings {value!r}: export fails', job['status'] == 'failed', job)
+            expect(f'invalid saved settings {value!r}: the error is actionable',
+                   all(n in error for n in needles) and 'Retrieval page' in error
+                   and f"'{collection}'" in error, error)
+            expect(f'invalid saved settings {value!r}: no package or staging is left',
+                   listing() == before, sorted(set(listing()) ^ set(before)))
+    finally:
+        if renamed:
+            urllib.request.urlopen(urllib.request.Request(
+                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE'),
+                timeout=120).read()
+        request('/retrieval/config', saved)
+    print(f'{len(failures)} legacy/invalid retrieval settings check(s) failed')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(run(*sys.argv[1:]))
 ```

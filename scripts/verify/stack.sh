@@ -9,7 +9,11 @@
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
 # (RAG_SKIP_SLOW and RAG_ALLOW_RESTART pass through) and always tears it down,
-# exiting with all.sh's status. `up` leaves the project running and prints the
+# exiting with all.sh's status. all.sh runs in a process group of its own, and
+# before the teardown that whole group is stopped (TERM, then KILL), so no suite
+# outlives the run that started it (#184). INT and TERM act at once. A
+# stack.sh killed outright (SIGKILL) can't do this; then lock.sh and lib.sh's
+# helpers stop the orphaned suite (see lock.sh). `up` leaves the project running and prints the
 # environment that points docker compose and the suites at it; `down` removes
 # it. --checkout picks the checkout to build and test (default: this one).
 #
@@ -126,9 +130,26 @@ fi
 # Held for the whole command; the all.sh started below inherits it.
 . "$HARNESS/scripts/verify/lock.sh"
 TEARDOWN=0
+SUITE=""
+# Stops all.sh's process group: everything the suites started, including what
+# they left running in the background after all.sh ended.
+stop_suite() {
+  local i
+  [ -n "$SUITE" ] || return 0
+  kill -TERM -- "-$SUITE" 2>/dev/null
+  for i in $(seq 1 50); do
+    # Zombies count as gone: only this shell can reap all.sh itself.
+    ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$SUITE" '$1 == g && $2 !~ /^Z/ {found=1} END {exit !found}' || break
+    sleep 0.1
+  done
+  kill -KILL -- "-$SUITE" 2>/dev/null
+  wait "$SUITE" 2>/dev/null
+  SUITE=""
+}
 on_exit() {
   local rc=$?
   trap - EXIT
+  stop_suite
   if [ "$TEARDOWN" = 1 ]; then
     TEARDOWN=0
     do_down || rc=2
@@ -499,6 +520,13 @@ case "$CMD" in
     TEARDOWN=1
     do_up
     rc=0
-    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+    # In the background with job control on, all.sh leads a process group of
+    # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
+    # command, returns as soon as INT or TERM arrives, so the traps act at once.
+    set -m
+    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} &
+    SUITE=$!
+    set +m
+    wait "$SUITE" || rc=$?
     exit "$rc" ;;
 esac

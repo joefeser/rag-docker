@@ -718,6 +718,109 @@ class StackRunTeardownTests(unittest.TestCase):
         self.assertFalse(Path(box.env['RAG_VERIFY_LOCK']).exists(), 'the verify lock is released')
 
 
+def alive(pid):
+    """True while pid runs (a zombie, already dead, counts as gone)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
+class StackRunSuiteGroupTests(unittest.TestCase):
+    """#184: `run` stops the suite's whole process group before it tears the
+    project down, so no suite outlives the run that started it."""
+
+    checkout = StackRunTeardownTests.checkout
+    assert_torn_down_after_up = StackRunTeardownTests.assert_torn_down_after_up
+
+    def wait_for(self, path):
+        import time
+        for _ in range(200):
+            if path.exists() and path.read_text().strip():
+                return int(path.read_text().split()[0])
+            time.sleep(0.05)
+        self.fail(f'{path} never appeared')
+
+    def assert_gone(self, *pids):
+        import time
+        for _ in range(100):
+            if not any(alive(p) for p in pids):
+                return
+            time.sleep(0.05)
+        self.fail(f'still running: {[p for p in pids if alive(p)]}')
+
+    def start(self, box, checkout):
+        env = {**box.env, 'STUB_UP_OK': '1', 'STUB_CURL_CODE': '200'}
+        proc = subprocess.Popen(['bash', str(STACK), 'run', '--checkout', str(checkout)], cwd=ROOT, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and (os.killpg(proc.pid, signal.SIGKILL), proc.wait()))
+        return proc
+
+    def test_a_background_child_left_by_the_suite_is_stopped(self):
+        box = Sandbox(self)
+        child = box.root / 'child.pid'
+        checkout = self.checkout(box, f'sleep 300 &\necho $! > "{child}"\nexit 0\n')
+        result = box.run(['bash', str(STACK), 'run', '--checkout', str(checkout)],
+                         STUB_UP_OK='1', STUB_CURL_CODE='200')
+        pid = int(child.read_text())
+        self.addCleanup(lambda: alive(pid) and os.kill(pid, signal.SIGKILL))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_gone(pid)
+        self.assert_torn_down_after_up(box)
+
+    def test_term_to_stack_alone_stops_the_suite_at_once(self):
+        box = Sandbox(self)
+        pids = box.root / 'pids'
+        checkout = self.checkout(box, f'sleep 300 &\necho "$$ $!" > "{pids}"\nsleep 30\nexit 0\n')
+        proc = self.start(box, checkout)
+        self.wait_for(pids)
+        suite, child = map(int, pids.read_text().split())
+        self.addCleanup(lambda: [alive(p) and os.kill(p, signal.SIGKILL) for p in (suite, child)])
+        os.kill(proc.pid, signal.SIGTERM)      # stack.sh only, not its group
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 143, out + err)
+        self.assert_gone(suite, child)
+        self.assertIn('verify project rag-verify removed', out)
+        self.assert_torn_down_after_up(box)
+        self.assertFalse(Path(box.env['RAG_VERIFY_LOCK']).exists(), 'the verify lock is released')
+
+    def test_the_suite_is_stopped_before_the_teardown(self):
+        box = Sandbox(self)
+        started = box.root / 'started'
+        checkout = self.checkout(box, textwrap.dedent(f'''\
+            trap 'echo '"'"'["suite", "terminated"]'"'"' >> "$STUB_LOG"; exit 143' TERM
+            echo $$ > "{started}"
+            sleep 30 & wait
+            '''))
+        proc = self.start(box, checkout)
+        self.wait_for(started)
+        os.kill(proc.pid, signal.SIGTERM)
+        out, err = proc.communicate(timeout=15)
+        calls = box.calls()
+        self.assertIn(['suite', 'terminated'], calls, out + err)
+        down = ['docker', 'compose', '-p', 'rag-verify', 'down', '-v', '--remove-orphans']
+        last_down = max(i for i, c in enumerate(calls) if c == down)
+        self.assertLess(calls.index(['suite', 'terminated']), last_down)
+
+
+class CraftedPackageWriteTests(unittest.TestCase):
+    """#184: a package the host writes for the API to import is written under
+    a .part name in the same folder and renamed into place, because on Docker
+    Desktop the container can read a freshly closed bind-mounted file as empty."""
+
+    def test_every_crafted_package_is_renamed_into_place(self):
+        for name, count in (('05_transfer.sh', 4), ('retrieval_settings.py', 1)):
+            with self.subTest(file=name):
+                source = (VERIFY / name).read_text()
+                opened = re.findall(r"tarfile\.open\(([^,()]+), ['\"]w:gz['\"]\)", source)
+                self.assertEqual(len(opened), count, opened)
+                self.assertEqual(set(opened), {'part'}, 'written straight to the final name')
+                self.assertEqual(source.count('part.replace('), count)
+
+
 @unittest.skipUnless(shutil.which('sha256sum'), 'needs sha256sum (it runs in the ollama image)')
 class ModelSyncTests(unittest.TestCase):
     """Written by the #153 testing reviewer: the SYNC script that keeps
