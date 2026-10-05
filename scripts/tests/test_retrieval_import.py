@@ -173,11 +173,37 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual((args.mode, args.top_k, args.alpha, args.response_format),
                          ('hybrid', 8, 0.25, 'engineer'))
 
+    def test_export_checks_stored_model_before_streaming_or_bundling(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        for model, kind, named in (('old-model', 'text2vec-ollama', None), (None, 'none', None), ('new-model', 'text2vec-ollama', {'named': {}})):
+            with self.subTest(model=model, kind=kind, named=named):
+                cfg = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer=kind, model={'model': model}), vector_config=named)
+                backend = MagicMock()
+                backend.collections.get.return_value.config.get.return_value = cfg
+                with patch.object(settings, 'embed_model', 'new-model'), patch.object(packager.wc, 'get_client', return_value=backend), patch.object(packager, 'read_chunks') as chunks, patch.object(packager.model_bundle, 'export_model') as bundle:
+                    before = sorted(self.exports.iterdir())
+                    with self.assertRaises(packager.PackageError) as caught:
+                        packager.build('Corpus', include_models=True)
+                    self.assertEqual(caught.exception.code, 'EMBEDDING_MISMATCH')
+                    self.assertIn('Re-embed', caught.exception.message)
+                    chunks.assert_not_called()
+                    bundle.assert_not_called()
+                    self.assertEqual(sorted(self.exports.iterdir()), before)
+
+    def test_collection_schema_records_actual_model_not_process_default(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        backend = MagicMock()
+        backend.collections.get.return_value.config.get.return_value = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama', model={'model': 'stored-model'}), vector_config=None)
+        with patch.object(settings, 'embed_model', 'different-model'), patch.object(packager.wc, 'get_client', return_value=backend):
+            self.assertEqual(packager.wc._collection_config_sync('Corpus')['embedding_model'], 'stored-model')
+
     def test_export_emits_normalized_settings_and_executable_defaults(self):
         saved = {'collection': 'Corpus', 'top_k': '7', 'alpha': '0.5', 'ef': 64}
         retrieval_config.save(saved)
         with patch.object(packager, 'read_chunks', return_value=[]), \
-             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
              patch.object(packager, '_ingest_config', return_value=None), \
              patch.object(packager, '_goldstandard_sessions', return_value=[]), \
              patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
@@ -199,7 +225,7 @@ class RetrievalImportTests(unittest.TestCase):
         saved = retrieval_config._path('Corpus')
         before = saved.read_bytes()
         with patch.object(packager, 'read_chunks', return_value=[]), \
-             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
              patch.object(packager, '_ingest_config', return_value=None), \
              patch.object(packager, '_goldstandard_sessions', return_value=[]), \
              patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
@@ -223,7 +249,7 @@ class RetrievalImportTests(unittest.TestCase):
                 continue
             with self.subTest(value=value), ExitStack() as mocks:
                 chunks = mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
-                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={}))
+                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}))
                 mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
                 mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
                 with self.assertRaises(ValueError) as caught:

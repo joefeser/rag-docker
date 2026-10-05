@@ -286,6 +286,19 @@ def build(
         # Settings first: a bad config fails before any chunk is streamed.
         retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
 
+        collection_cfg = wc._collection_config_sync(collection)
+        stored_model = collection_cfg.get("embedding_model")
+        if not isinstance(stored_model, str) or not stored_model or stored_model != settings.embed_model:
+            raise PackageError(
+                "EMBEDDING_MISMATCH",
+                f"Collection '{collection}' has embedding model {stored_model!r}, "
+                f"but this instance is configured for {settings.embed_model!r}. "
+                "Export cannot attribute its stored vectors to the configured model. "
+                "Re-embed the collection with the configured model before exporting; "
+                "unknown or named-vector configurations are not supported.",
+                {"collection": collection, "stored_model": stored_model,
+                 "configured_model": settings.embed_model})
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -313,7 +326,7 @@ def build(
             progress(chunk_count)
 
         # 2. collection.json
-        b.add_json("collection.json", wc._collection_config_sync(collection))
+        b.add_json("collection.json", collection_cfg)
 
         # 3. configs
         ingest_cfg = _ingest_config(collection)

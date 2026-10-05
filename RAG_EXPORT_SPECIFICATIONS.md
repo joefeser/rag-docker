@@ -741,6 +741,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E10 | `retrieve.py` exits 3 with one sentence when the stack is down |
 | E11 | Import into a clean instance reproduces chunk count and answers equivalently |
 | E12 | Import refuses `EMBEDDING_MISMATCH` when the target uses a different embedding model |
+| E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 | E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
