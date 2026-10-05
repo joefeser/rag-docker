@@ -794,6 +794,93 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(list(self.cols.items), ['Corpus'])
         self.assertEqual(list(recovery._root().iterdir()), [])
 
+    # ── reviewer-added (#126 item 1, 7) ──
+
+    def test_every_import_mode_binds_its_target_to_the_marker_instance(self):
+        seen = {}
+        actual_finish = importer._mark_finished
+        def finish(collection):
+            data, _ = importer._read_marker(importer._marker_path(collection))
+            others = {name: col.description for name, col in self.cols.items.items() if name != collection}
+            seen[collection] = (data['version'], data['instance'],
+                                self.cols.get(collection).description, others)
+            actual_finish(collection)
+        for mode in ('abort', 'rename', 'replace'):
+            with self.subTest(mode=mode):
+                seen.clear()
+                self.cols.items.clear()
+                if mode != 'abort':
+                    self.cols.create('Corpus')
+                pkg, manifest = self.package()
+                importer._jobs['job'] = dict(chunks_written=0)
+                with patch.object(importer.packager, 'open_package', return_value=(pkg, manifest)), \
+                        patch.object(importer.packager, 'verify_digests'), \
+                        patch.object(importer, '_check_embedding'), \
+                        patch.object(importer, '_ensure_models', return_value=[]), \
+                        patch.object(importer, '_mark_finished', side_effect=finish):
+                    importer._run('job', 'fixture.tar.gz', mode)
+                job = importer._jobs['job']
+                self.assertEqual(job['status'], 'completed', job)
+                self.assertEqual(list(seen), [job['collection']])
+                version, instance, description, others = seen[job['collection']]
+                self.assertEqual(version, 4)
+                self.assertRegex(instance, r'^[0-9a-f]{32}$')
+                self.assertEqual(description, importer._instance_description(instance))
+                # Staging copies (replace) and pre-existing collections carry no token.
+                self.assertTrue(all(value is None for value in others.values()), others)
+
+    def test_v4_marker_with_invalid_instance_never_deletes(self):
+        for bad in ('A' * 32, 'a' * 31, 7, None, '<missing>'):
+            with self.subTest(instance=bad):
+                self.cols.items['Corpus'] = Collection('Corpus')
+                batch_write.insert(self.cols.get('Corpus'), self.original)
+                importer._mark_started('Corpus', 2, 'job', self.original)
+                marker = importer._marker_path('Corpus')
+                data = json.loads(marker.read_text())
+                if bad == '<missing>':
+                    data.pop('instance')
+                else:
+                    data['instance'] = bad
+                marker.write_text(json.dumps(data))
+                if isinstance(bad, str):
+                    self.cols.get('Corpus').description = importer._instance_description(bad)
+                self.cols.get('Corpus').rows.clear()   # would be deleted if the marker were trusted
+                self.assertEqual(importer.sweep_interrupted_imports(), [])
+                self.assertTrue(self.cols.exists('Corpus'))
+                self.assertNotIn('Corpus', self.cols.deleted)
+                self.assertTrue(marker.exists())
+                self.assertTrue((importer._markers_dir() / data['expected_snapshot']['file']).exists())
+                marker.unlink()
+
+    def test_other_import_token_keeps_collection_and_retires_marker(self):
+        importer._mark_started('Corpus', 2, 'job', self.original)
+        marker = importer._marker_path('Corpus')
+        _, snapshot = importer._read_marker(marker)
+        self.cols.get('Corpus').description = importer._instance_description(uuid.uuid4().hex)
+        self.cols.get('Corpus').rows.clear()
+        self.assertEqual(importer.sweep_interrupted_imports(), [])
+        self.assertTrue(self.cols.exists('Corpus'))
+        self.assertNotIn('Corpus', self.cols.deleted)
+        self.assertFalse(marker.exists())
+        self.assertFalse(snapshot.exists())
+
+    def test_orphan_sweep_keeps_snapshots_named_by_invalid_markers_and_symlinks(self):
+        importer._mark_started('Corpus', 2, 'job', self.original)
+        marker = importer._marker_path('Corpus')
+        data = json.loads(marker.read_text())
+        data['version'] = 2          # parseable, but not valid ownership: preserved by the sweep
+        marker.write_text(json.dumps(data))
+        named = importer._markers_dir() / data['expected_snapshot']['file']
+        target = self.root / 'outside.sqlite3'
+        target.write_bytes(b'outside the markers directory')
+        link = importer._markers_dir() / (uuid.uuid4().hex + '.sqlite3')
+        link.symlink_to(target)
+        self.assertEqual(importer.sweep_interrupted_imports(), [])
+        self.assertTrue(marker.exists())
+        self.assertTrue(named.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(target.exists())
+
     def test_import_final_flush_never_reports_attempts_as_written(self):
         pkg = self.root / 'package'
         pkg.mkdir()
