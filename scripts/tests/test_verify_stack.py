@@ -436,6 +436,18 @@ class WeaviateHealthcheckTests(unittest.TestCase):
         })
 
 
+class WeaviateRaftSnapshotTests(unittest.TestCase):
+    """issue #178: Weaviate snapshots its Raft log often, so a start replays only a short tail."""
+
+    def test_snapshot_settings(self):
+        import yaml
+        compose = yaml.safe_load((ROOT / 'docker-compose.yml').read_text())
+        env = compose['services']['weaviate']['environment']
+        self.assertEqual(env.get('RAFT_SNAPSHOT_THRESHOLD'), 128)
+        self.assertEqual(env.get('RAFT_SNAPSHOT_INTERVAL'), 30)
+        self.assertNotIn('RAFT_TRAILING_LOGS', env)
+
+
 class RestartTimingTests(unittest.TestCase):
     """#130: a configurable restart limit, with the measured time on a pass and a fail."""
 
