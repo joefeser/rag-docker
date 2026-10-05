@@ -168,14 +168,24 @@ async def additional_vectorizer_and_import_checks(api,client,name,temp,created,j
 
 async def collection_deletion_checks(api,client,name,temp,check):
     from services import sources,ingest_config,retrieval_config
+    from routers import collections as collection_routes
+    from weaviate.exceptions import UnexpectedStatusCodeError
     # Exercise both aliases on the Linux volume, with separate physical paths.
     for use_alias in (True,False):
         canonical=name+('AliasDelete' if use_alias else 'CanonicalDelete')
         alias=canonical[:1].lower()+canonical[1:]
         caller=alias if use_alias else canonical
-        neighbor=canonical+'Neighbor'
+        neighbor=canonical[:-1]+canonical[-1].upper()
+        neighbor_supported=True
         for collection in (canonical,neighbor):
-            await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+            try:
+                await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+            except UnexpectedStatusCodeError as exc:
+                if collection != neighbor or exc.status_code != 422 or 'similar class' not in str(exc):
+                    raise
+                neighbor_supported=False
+                check(True,'backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume')
+                continue
             await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
         identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in (canonical,alias,neighbor)}
         for spelling,sid in identities.items():
@@ -183,12 +193,16 @@ async def collection_deletion_checks(api,client,name,temp,check):
             await asyncio.to_thread(ingest_config.save,{'collection':spelling})
             await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
             await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        await asyncio.to_thread(collection_routes._save_registry, {canonical:'owned', alias:'owned', neighbor:'neighbor'})
         response=await api.delete('/collections/'+caller)
+        registry=await asyncio.to_thread(collection_routes._load_registry)
+        check(registry=={neighbor:'neighbor'},'registry removes both aliases and preserves case-distinct neighbor')
         check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
         for spelling in (canonical,alias):
             check(await asyncio.to_thread(lambda:not sources.collection_dir(spelling).exists() and not (Path(temp)/'ingest_configs'/(spelling+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(spelling+'.json')).exists()),'deletion cleans exact source/ingest/retrieval spelling '+spelling)
             check(await asyncio.to_thread(lambda:gs.get_session(identities[spelling])['orphaned'] and json.loads(gs._session_path(identities[spelling]).read_text())['orphaned']),'deletion persists orphan status for '+spelling)
-        check(await asyncio.to_thread(lambda:client.collections.exists(neighbor) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves unrelated collection sidecars and current session')
+            check(gs.get_session(identities[spelling])['orphaned_reason']==f"collection '{canonical}' was deleted",'orphan reason names canonical collection for '+spelling)
+        check(await asyncio.to_thread(lambda:(not neighbor_supported or client.collections.exists(neighbor)) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves case-distinct sidecars and current session')
 
 
 async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
@@ -204,6 +218,7 @@ async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,c
     check(stage in removed and not await asyncio.to_thread(client.collections.exists,stage) and await asyncio.to_thread(tuning._existing_records,name)==before and not await asyncio.to_thread(owners),'startup removes exact legacy tuning scratch while preserving original records')
 
 async def main():
+    from routers import collections as collection_routes
     token=uuid.uuid4().hex[:8]; name=owned_name(os.environ.get('RAG_TEST_PREFIX','Vfy49'),token)
     probe=name+'Probe'; sid='gs_'+token; job=None; jobs=[]; checks=0
     await bounded_poll_cases()
@@ -218,7 +233,8 @@ async def main():
     temp=temporary.name
     try:
         client=await asyncio.to_thread(wc.get_client)
-        with patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
+        with patch.object(collection_routes,'_REGISTRY_FILE',Path(temp)/'collection_registry.json'), \
+             patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
              patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1), \
              patch.object(gs,'_sessions',{}),patch.object(wc.ingest_config,'_DIR',None),patch.object(wc.retrieval_config,'_DIR',None),patch.object(wc,'_create_collection_sync',side_effect=record_create):
             def check(condition,label):
