@@ -260,6 +260,13 @@ def _collection_config_sync(name: str) -> dict:
     coll = get_client().collections.get(name)
     cfg = coll.config.get()
     vi = cfg.vector_index_config
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model_config = getattr(vectorizer, "model", None)
+    embedding_model = (model_config.get("model")
+                       if getattr(kind, "value", kind) == "text2vec-ollama"
+                       and isinstance(model_config, dict)
+                       and not getattr(cfg, "vector_config", None) else None)
 
     index_type = "flat" if "flat" in type(vi).__name__.lower() else "hnsw"
     distance = {
@@ -278,6 +285,7 @@ def _collection_config_sync(name: str) -> dict:
 
     return {
         "name": name,
+        "embedding_model": embedding_model,
         "index_type": index_type,
         "distance_metric": distance,
         "hnsw_config": hnsw,

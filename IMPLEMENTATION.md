@@ -2348,6 +2348,13 @@ def _collection_config_sync(name: str) -> dict:
     coll = get_client().collections.get(name)
     cfg = coll.config.get()
     vi = cfg.vector_index_config
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model_config = getattr(vectorizer, "model", None)
+    embedding_model = (model_config.get("model")
+                       if getattr(kind, "value", kind) == "text2vec-ollama"
+                       and isinstance(model_config, dict)
+                       and not getattr(cfg, "vector_config", None) else None)
 
     index_type = "flat" if "flat" in type(vi).__name__.lower() else "hnsw"
     distance = {
@@ -2366,6 +2373,7 @@ def _collection_config_sync(name: str) -> dict:
 
     return {
         "name": name,
+        "embedding_model": embedding_model,
         "index_type": index_type,
         "distance_metric": distance,
         "hnsw_config": hnsw,
@@ -4530,6 +4538,19 @@ def build(
         # Settings first: a bad config fails before any chunk is streamed.
         retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
 
+        collection_cfg = wc._collection_config_sync(collection)
+        stored_model = collection_cfg.get("embedding_model")
+        if not isinstance(stored_model, str) or not stored_model or stored_model != settings.embed_model:
+            raise PackageError(
+                "EMBEDDING_MISMATCH",
+                f"Collection '{collection}' has embedding model {stored_model!r}, "
+                f"but this instance is configured for {settings.embed_model!r}. "
+                "Export cannot attribute its stored vectors to the configured model. "
+                "Re-embed the collection with the configured model before exporting; "
+                "unknown or named-vector configurations are not supported.",
+                {"collection": collection, "stored_model": stored_model,
+                 "configured_model": settings.embed_model})
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -4557,7 +4578,7 @@ def build(
             progress(chunk_count)
 
         # 2. collection.json
-        b.add_json("collection.json", wc._collection_config_sync(collection))
+        b.add_json("collection.json", collection_cfg)
 
         # 3. configs
         ingest_cfg = _ingest_config(collection)
@@ -18049,7 +18070,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         (retained / "index.json").write_text(json.dumps(self.index(digest)))
         with patch.object(packager, "exports_dir", return_value=self.root), \
              patch.object(packager, "read_chunks", return_value=iter(())), \
-             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
              patch.object(packager, "_ingest_config", return_value=None), \
              patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
              patch.object(packager, "_goldstandard_sessions", return_value=[]):
@@ -18117,7 +18138,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
             }}))
         with patch.object(packager, "exports_dir", return_value=self.root), \
              patch.object(packager, "read_chunks", return_value=iter(())), \
-             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
              patch.object(packager.wc, "_meta_sync", return_value={}), \
              patch.object(packager, "_ingest_config", return_value=None), \
              patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
@@ -18364,11 +18385,37 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual((args.mode, args.top_k, args.alpha, args.response_format),
                          ('hybrid', 8, 0.25, 'engineer'))
 
+    def test_export_checks_stored_model_before_streaming_or_bundling(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        for model, kind, named in (('old-model', 'text2vec-ollama', None), (None, 'none', None), ('new-model', 'text2vec-ollama', {'named': {}})):
+            with self.subTest(model=model, kind=kind, named=named):
+                cfg = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer=kind, model={'model': model}), vector_config=named)
+                backend = MagicMock()
+                backend.collections.get.return_value.config.get.return_value = cfg
+                with patch.object(settings, 'embed_model', 'new-model'), patch.object(packager.wc, 'get_client', return_value=backend), patch.object(packager, 'read_chunks') as chunks, patch.object(packager.model_bundle, 'export_model') as bundle:
+                    before = sorted(self.exports.iterdir())
+                    with self.assertRaises(packager.PackageError) as caught:
+                        packager.build('Corpus', include_models=True)
+                    self.assertEqual(caught.exception.code, 'EMBEDDING_MISMATCH')
+                    self.assertIn('Re-embed', caught.exception.message)
+                    chunks.assert_not_called()
+                    bundle.assert_not_called()
+                    self.assertEqual(sorted(self.exports.iterdir()), before)
+
+    def test_collection_schema_records_actual_model_not_process_default(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        backend = MagicMock()
+        backend.collections.get.return_value.config.get.return_value = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama', model={'model': 'stored-model'}), vector_config=None)
+        with patch.object(settings, 'embed_model', 'different-model'), patch.object(packager.wc, 'get_client', return_value=backend):
+            self.assertEqual(packager.wc._collection_config_sync('Corpus')['embedding_model'], 'stored-model')
+
     def test_export_emits_normalized_settings_and_executable_defaults(self):
         saved = {'collection': 'Corpus', 'top_k': '7', 'alpha': '0.5', 'ef': 64}
         retrieval_config.save(saved)
         with patch.object(packager, 'read_chunks', return_value=[]), \
-             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
              patch.object(packager, '_ingest_config', return_value=None), \
              patch.object(packager, '_goldstandard_sessions', return_value=[]), \
              patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
@@ -18390,7 +18437,7 @@ class RetrievalImportTests(unittest.TestCase):
         saved = retrieval_config._path('Corpus')
         before = saved.read_bytes()
         with patch.object(packager, 'read_chunks', return_value=[]), \
-             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
              patch.object(packager, '_ingest_config', return_value=None), \
              patch.object(packager, '_goldstandard_sessions', return_value=[]), \
              patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
@@ -18414,7 +18461,7 @@ class RetrievalImportTests(unittest.TestCase):
                 continue
             with self.subTest(value=value), ExitStack() as mocks:
                 chunks = mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
-                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={}))
+                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}))
                 mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
                 mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
                 with self.assertRaises(ValueError) as caught:
