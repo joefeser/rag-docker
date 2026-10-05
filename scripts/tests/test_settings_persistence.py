@@ -30,6 +30,33 @@ class SettingsPersistenceTests(unittest.TestCase):
         return [{**service.DEFAULTS, 'collection': 'ConcurrentSettings', field: value}
                 for value in ((1000, 1100, 1200) if service is ingest_config else (5, 7, 9))]
 
+    def test_import_publication_preserves_config_on_failure_and_uses_shared_lock(self):
+        from services import importer
+        with self.fixture(ingest_config) as root:
+            old, incoming, _ = self.values(ingest_config)
+            ingest_config.save(old)
+            pkg = root / 'package'
+            pkg.mkdir()
+            (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            path = ingest_config._path(old['collection'])
+            before = path.read_bytes()
+            entered = []
+            class ObservedLock:
+                def __enter__(self):
+                    entered.append(True)
+                def __exit__(self, *args):
+                    pass
+            with patch.object(settings_store, '_write_lock', ObservedLock()), \
+                 patch.object(Path, 'replace', side_effect=OSError('owned publication failure')):
+                with self.assertRaises(OSError):
+                    importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            self.assertEqual(entered, [True])
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(path.parent.glob('*.tmp')), [])
+            importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            self.assertEqual(ingest_config.load(old['collection']), incoming)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_contending_saves_publish_their_own_complete_values(self):
         for service in SERVICES:
             with self.subTest(service=service.__name__), self.fixture(service):
@@ -176,22 +203,6 @@ class SettingsPersistenceTests(unittest.TestCase):
                     service.save({**old, 'unserializable': object()})
                 self.assertEqual(service.load(old['collection']), old)
                 self.assertEqual(list(service._dir().glob('*.tmp')), [])
-
-
-class ImplementationTests(unittest.TestCase):
-    def test_embedded_sources_match_runtime(self):
-        root = Path(__file__).resolve().parents[2]
-        text = (root / 'IMPLEMENTATION.md').read_text()
-        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
-                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
-                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py'):
-            with self.subTest(file=name):
-                fence = '````' if name.endswith('.md') else '```'
-                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
-                header = f'### {name}\n\n{fence}{language}\n'
-                start = text.index(header) + len(header)
-                end = text.index('\n' + fence + '\n', start)
-                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
 
 
 if __name__ == '__main__':

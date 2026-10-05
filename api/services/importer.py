@@ -35,6 +35,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
+from services import settings_store
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import model_bundle
@@ -616,7 +617,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
         data["collection"] = target
         out = Path(settings.upload_dir) / "ingest_configs"
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
+        settings_store.publish(out / f"{_safe_file(target)}.json", data)
 
     if validated_retrieval is not None:
         data = {**validated_retrieval, "collection": target}

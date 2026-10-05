@@ -490,7 +490,7 @@ the destination directory and atomically replaces the saved configuration. A 201
 acknowledges that request's complete value was published; a later successful save
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
-Failed saves clean up their own temporary file when filesystem permissions allow.
+Failed saves clean up their own temporary file when filesystem permissions allow. Package import publishes ingest settings through this same lock and atomic writer. Published files use mode 0600 (API owner read/write), including replacements of older files.
 
 ---
 
@@ -1854,7 +1854,7 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
       *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
 - [x] Concurrent ingest/retrieval settings saves publish their own complete values; failed publication preserves the previous valid configuration (#141).
-      *`test_settings_persistence.py` controls worker contention and first-save directory creation with events, observes each publication and unique temporary path, and injects serialization, creation, partial-write, close and replacement failures for both services. Suite 07 registers these controlled tests alongside live HTTP validation and round trips; full-stack verification is recorded separately.*
+      *`test_settings_persistence.py` controls worker contention and first-save directory creation with events, observes each publication and unique temporary path, and injects serialization, creation, partial-write, close and replacement failures for both services. Suite 07 registers these controlled tests (including failed import publication), host-side `ImplementationTests`, and 15 rounds of 12 concurrent live saves per ingest/retrieval route; each round checks that the persisted config is one complete acknowledged response. Full-stack verification is recorded separately.*
 - [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).
       *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
 

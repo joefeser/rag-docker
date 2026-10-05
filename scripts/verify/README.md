@@ -381,3 +381,7 @@ The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
 isolated fixture run does not replace the required full live-stack suite.
+
+Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
+(no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
+retrieval route. The persistence cases cover failed import-config publication.
