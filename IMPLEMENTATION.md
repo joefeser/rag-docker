@@ -67,10 +67,15 @@ services:
     networks: [rag-internal]
     healthcheck:
       # The weaviate image has no curl; busybox wget is what it ships.
+      # A cold start replays Weaviate's schema history and loads its indexes
+      # before /ready answers. On a copy of real data that took up to 156s
+      # (#130); without start_period, compose marks Weaviate unhealthy after
+      # ~100s and fails the api, ui and proxy behind it.
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/.well-known/ready"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 180s
 
   ollama:
     image: ollama/ollama:0.3.14
@@ -6186,6 +6191,26 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
+    # A chunks-only import or a failed retention can leave a mixed corpus.
+    # Any retained file is insufficient: replacing from that subset loses the
+    # other chunks and successful cutover discards their recovery copy.
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    uncovered = set()
+    for obj in wc.get_client().collections.get(collection).iterator():
+        filename = (obj.properties or {}).get("source_file")
+        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
+            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
+    if uncovered:
+        raise PackageError(
+            "SOURCES_REQUIRED",
+            "Cannot change chunk boundaries: some stored chunks have missing or "
+            "ambiguous retained originals. Re-embed without chunking parameters "
+            "or re-index to preserve the existing chunks.",
+            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
@@ -10630,6 +10655,7 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
 | `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
@@ -11564,6 +11590,49 @@ restart_refusal_reason() {
   fi
 }
 
+# Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
+# docker-compose.yml plus 60s for `down` and the api's own start.
+RESTART_LIMIT_DEFAULT_S=240
+
+# Prints the restart limit in seconds, or, with status 1, why the value of
+# RAG_RESTART_LIMIT_S is refused. Empty means unset.
+restart_limit() {
+  local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
+  case "$value" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+  esac
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  return 1
+}
+
+# wait_healthy_timed <started-epoch> <cap-seconds>: polls /health every 2s.
+# Prints the whole seconds since <started> once it returns 200, or nothing
+# once <cap> seconds have passed.
+wait_healthy_timed() {
+  local started="$1" cap="$2" code now
+  while :; do
+    code=$(api_code "$API/health")
+    now=$(python3 -c "import time;print(int(time.time()-$started))")
+    if [ "$code" = "200" ]; then printf '%s' "$now"; return 0; fi
+    [ "$now" -lt "$cap" ] || return 0
+    sleep 2
+  done
+}
+
+# restart_timing_check <limit> <elapsed, or empty if never healthy>: the
+# restart timing result, with the measured time on a pass and on a fail.
+restart_timing_check() {
+  local limit="$1" elapsed="$2"
+  if [ -n "$elapsed" ] && [ "$elapsed" -le "$limit" ]; then
+    check "restart reaches healthy within ${limit}s (took ${elapsed}s)" 0
+  elif [ -n "$elapsed" ]; then
+    check "restart reaches healthy within ${limit}s" 1 "took ${elapsed}s"
+  else
+    check "restart reaches healthy within ${limit}s" 1 "not healthy after $((limit * 2))s"
+  fi
+}
+
 # Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
 # that borrow these helpers are not suites and are left alone.
 case "$(basename "$0")" in
@@ -12313,9 +12382,15 @@ check_eq "a recreated collection does not inherit the retrieval config" \
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
   check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ "$restart_limit_ok" != 0 ]; then
+  check "restart, persistence and timing" 1 "$restart_limit"
 elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Save a known config here, right before the restart: the section above ends
   # by recreating $C with no saved config, so relying on earlier state made
@@ -12329,10 +12404,9 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # it is set and is not the live rag-docker project.
   project="$COMPOSE_PROJECT_NAME"
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
-  for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
-  elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
-  [ "$elapsed" -le 120 ]
-  check "restart reaches healthy within 120s" $? "took ${elapsed}s"
+  # Wait up to twice the limit, so a slow restart is still timed (#130).
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  restart_timing_check "$restart_limit" "$elapsed"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os

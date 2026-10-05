@@ -406,6 +406,89 @@ class RestartGuardTests(unittest.TestCase):
                 self.assertLess(ask, min(acts))
         self.assertNotIn('COMPOSE_PROJECT_NAME:-rag-docker', (VERIFY / '01_infrastructure.sh').read_text())
 
+    def test_infrastructure_checks_the_limit_before_restarting(self):
+        # #130: an invalid RAG_RESTART_LIMIT_S fails the check and restarts nothing.
+        text = (VERIFY / '01_infrastructure.sh').read_text()
+        block = text[text.index('if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]'):]
+        down = re.search(r'docker compose[^\n]*down', block)
+        self.assertIsNotNone(down, 'restart command not found')
+        self.assertIn('restart_limit', block[:down.start()])
+
+
+# Weaviate's measured cold start on a copy of real data, rounded up to 30s (#130).
+WEAVIATE_START_PERIOD_S = 180
+# The restart check's default limit: the start period plus 60s (#130).
+RESTART_LIMIT_DEFAULT_S = WEAVIATE_START_PERIOD_S + 60
+
+
+class WeaviateHealthcheckTests(unittest.TestCase):
+    """#130: compose waits out Weaviate's cold start instead of failing its dependants."""
+
+    def test_start_period_covers_the_measured_cold_start(self):
+        import yaml
+        compose = yaml.safe_load((ROOT / 'docker-compose.yml').read_text())
+        self.assertEqual(compose['services']['weaviate']['healthcheck'], {
+            'test': ['CMD', 'wget', '-q', '--spider', 'http://localhost:8080/v1/.well-known/ready'],
+            'interval': '10s',
+            'timeout': '5s',
+            'retries': 10,
+            'start_period': f'{WEAVIATE_START_PERIOD_S}s',
+        })
+
+
+class RestartTimingTests(unittest.TestCase):
+    """#130: a configurable restart limit, with the measured time on a pass and a fail."""
+
+    def bash(self, script, **env):
+        box = Sandbox(self)
+        result = box.run(['bash', '-c', f'. "{VERIFY}/lib.sh"; {script}'], **env)
+        return result
+
+    def test_default_limit(self):
+        for value in (None, ''):
+            with self.subTest(value=value):
+                result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, str(RESTART_LIMIT_DEFAULT_S))
+
+    def test_valid_override(self):
+        for value, limit in (('45', '45'), ('007', '7')):
+            with self.subTest(value=value):
+                result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, limit)
+
+    def test_invalid_values_are_refused(self):
+        for value in ('0', '000', '-5', '1.5', 'abc', '10s', ' 30'):
+            with self.subTest(value=value):
+                result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('RAG_RESTART_LIMIT_S', result.stdout)
+                self.assertIn(f"'{value}'", result.stdout)
+
+    def test_wait_reports_seconds_once_healthy(self):
+        result = self.bash('wait_healthy_timed "$(date +%s)" 30', STUB_CURL_CODE='200',
+                           RAG_API='http://localhost:9/api')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r'^[0-9]+$')
+        self.assertLessEqual(int(result.stdout), 1)
+
+    def test_wait_prints_nothing_at_the_cap(self):
+        result = self.bash('wait_healthy_timed "$(date +%s)" 2', STUB_CURL_CODE='000',
+                           RAG_API='http://localhost:9/api')
+        self.assertEqual(result.stdout, '')
+
+    def test_results_report_the_time(self):
+        cases = (('300 143', 'PASS', 'restart reaches healthy within 300s (took 143s)'),
+                 ('300 300', 'PASS', 'restart reaches healthy within 300s (took 300s)'),
+                 ('300 412', 'FAIL', 'took 412s'),
+                 ("300 ''", 'FAIL', 'not healthy after 600s'))
+        for args, verdict, text in cases:
+            with self.subTest(args=args):
+                result = self.bash(f'restart_timing_check {args}')
+                self.assertIn(verdict, result.stdout)
+                self.assertIn(text, result.stdout)
+
 
 class StackArgumentTests(unittest.TestCase):
     """S7 and S8: bad arguments are refused before any Docker command."""

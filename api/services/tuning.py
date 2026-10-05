@@ -128,6 +128,26 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
+    # A chunks-only import or a failed retention can leave a mixed corpus.
+    # Any retained file is insufficient: replacing from that subset loses the
+    # other chunks and successful cutover discards their recovery copy.
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    uncovered = set()
+    for obj in wc.get_client().collections.get(collection).iterator():
+        filename = (obj.properties or {}).get("source_file")
+        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
+            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
+    if uncovered:
+        raise PackageError(
+            "SOURCES_REQUIRED",
+            "Cannot change chunk boundaries: some stored chunks have missing or "
+            "ambiguous retained originals. Re-embed without chunking parameters "
+            "or re-index to preserve the existing chunks.",
+            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))

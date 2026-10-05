@@ -894,5 +894,51 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(progress, [])
 
 
+class SourceCoverageTests(unittest.TestCase):
+    def test_rechunk_requires_unambiguous_originals_for_all_stored_files(self):
+        from services import sources
+        for operation in ("rechunk", "reembed"):
+            for missing in ("legacy.txt", None, "retained.txt"):
+                with self.subTest(operation=operation, missing=missing), tempfile.TemporaryDirectory() as tmp:
+                    cols = Collections()
+                    cols.create("Corpus")
+                    original = records(2)
+                    original[0]["properties"]["source_file"] = missing
+                    original[1]["properties"]["source_file"] = "retained.txt"
+                    cols.get("Corpus").rows = {r["id"]: copy.deepcopy(r) for r in original}
+                    with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)):
+                        sources.store("Corpus", "retained.txt", b"retained original")
+                        if missing == "retained.txt":
+                            sources.store("Corpus", "retained.txt", b"ambiguous second original")
+                        job = {}
+                        with patch.dict(tuning._jobs, {"coverage": job}), patch.object(tuning, "_parse_file") as parse:
+                            tuning._run("coverage", "Corpus", operation, {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
+                        self.assertEqual(job["status"], "failed")
+                        self.assertEqual(job["error_code"], "SOURCES_REQUIRED")
+                        parse.assert_not_called()
+                        self.assertEqual(cols.get("Corpus").rows, {r["id"]: r for r in original})
+                        self.assertEqual(cols.deleted, [])
+                        self.assertEqual(set(cols.items), {"Corpus"})
+                        self.assertEqual(list(recovery._root().glob("*.json")), [])
+
+    def test_fully_retained_collection_completes_real_cutover(self):
+        from services import sources
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = Collections()
+            cols.create("Corpus")
+            original = records(1)[0]
+            original["properties"]["source_file"] = "retained.txt"
+            cols.get("Corpus").rows[original["id"]] = original
+            with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(wc, "_create_collection_sync", side_effect=lambda name, *a, **kw: cols.create(name)), patch.object(wc, "_collection_config_sync", return_value={"index_type": "hnsw", "distance_metric": "cosine", "hnsw_config": {}}), patch.object(tuning, "_parse_file", side_effect=lambda p: (p.read_text(), [])), patch.object(tuning, "do_chunk", side_effect=lambda **kw: [kw["text"]]):
+                sources.store("Corpus", "retained.txt", b"retained original")
+                job = {}
+                with patch.dict(tuning._jobs, {"coverage": job}):
+                    tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
+                self.assertEqual(job["status"], "completed", job)
+                self.assertEqual([r["properties"]["content"] for r in cols.get("Corpus").rows.values()], ["retained original"])
+                self.assertEqual(set(cols.items), {"Corpus"})
+                self.assertEqual(list(recovery._root().glob("*.json")), [])
+
+
 if __name__ == '__main__':
     unittest.main()
