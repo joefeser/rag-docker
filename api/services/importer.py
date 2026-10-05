@@ -603,12 +603,15 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     notes: list[str] = []
 
     src = pkg / "sources"
-    if src.is_dir():
+    if (src / sources.INDEX_NAME).is_file():
+        # Preflight validated these identities and bytes. Never retain unrelated
+        # package files: their names could shadow a future content-addressed blob.
+        index = sources.validate_index(json.loads((src / sources.INDEX_NAME).read_text()))
         dest = sources.collection_dir(target)
         dest.mkdir(parents=True, exist_ok=True)
-        for item in src.iterdir():
-            if item.is_file():
-                shutil.copyfile(item, dest / item.name)
+        for digest in index["documents"]:
+            shutil.copyfile(src / digest, dest / digest)
+        shutil.copyfile(src / sources.INDEX_NAME, dest / sources.INDEX_NAME)
 
     ingest_cfg = pkg / "ingest_config.json"
     if ingest_cfg.is_file():

@@ -99,6 +99,14 @@ minimum, 32 GB recommended) assumes the current behaviour and MUST be restated a
 
 ---
 
+
+Retained-source import restores only blobs named by the validated index. Unindexed
+files are ignored, including sources in chunks-only packages with no index. Older
+packages whose indexes name missing blobs remain rejected as `PACKAGE_CORRUPT`;
+re-export from the repaired source rather than silently reducing claimed fidelity.
+The source identity hash is checked independently of manifest digests: a manifest
+can authenticate bytes under a filename that is not their content digest.
+
 ## 3. Prerequisite B — Retrieval Settings Persistence
 
 Also required before export, because a package ships a script that claims to
@@ -705,6 +713,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
 | `SOURCES_REQUIRED` | tuning needs `with-sources`; package is `chunks-only` |
+| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Reindex and re-embed from stored chunks remain available. |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
@@ -757,7 +766,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals |
-| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import ignores unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, while record-only tuning still works; missing-blob exports pass import preflight |
 
 ---
 

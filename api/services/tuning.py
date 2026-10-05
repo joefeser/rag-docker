@@ -317,9 +317,6 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
                         {"collection": collection})
                 properties = _chunks_from_sources(source_collection, **params["chunking"])
                 reason = "the collection was re-chunked and re-embedded"
-            elif has_sources:
-                properties = _existing_chunks(collection)
-                reason = "the collection was re-embedded, so its vectors changed"
             else:
                 properties = _existing_chunks(collection)
                 reason = ("the collection was re-embedded from stored chunk text, "
