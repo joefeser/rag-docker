@@ -10447,6 +10447,10 @@ directories and does not connect to Weaviate or Ollama.
 verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
 verification run; it does not establish full-stack acceptance by itself.
 
+Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
+(no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
+retrieval route. The persistence cases cover failed import-config publication.
+
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
@@ -10710,10 +10714,6 @@ The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
 isolated fixture run does not replace the required full live-stack suite.
-
-Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
-(no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
-retrieval route. The persistence cases cover failed import-config publication.
 ````
 
 ### scripts/verify/all.sh
@@ -17465,6 +17465,34 @@ def publish(path: Path, config: dict) -> None:
                     log.warning("Could not remove settings temporary file %s", temporary)
 ```
 
+### scripts/tests/test_settings_implementation.py
+
+```python
+"""Host-side source-copy checks; no API runtime dependencies."""
+from pathlib import Path
+import unittest
+
+class ImplementationTests(unittest.TestCase):
+    def test_embedded_sources_match_runtime(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / 'IMPLEMENTATION.md').read_text()
+        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
+                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
+                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py',
+                     'scripts/verify/settings_validation.py', 'api/services/importer.py'):
+            with self.subTest(file=name):
+                fence = '````' if name.endswith('.md') else '```'
+                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
+                header = f'### {name}\n\n{fence}{language}\n'
+                start = text.index(header) + len(header)
+                end = text.index('\n' + fence + '\n', start)
+                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
 ### scripts/tests/test_settings_persistence.py
 
 ```python
@@ -18238,30 +18266,3 @@ if __name__ == '__main__':
     run(*sys.argv[1:])
 ```
 
-### scripts/tests/test_settings_implementation.py
-
-```python
-"""Host-side source-copy checks; no API runtime dependencies."""
-from pathlib import Path
-import unittest
-
-class ImplementationTests(unittest.TestCase):
-    def test_embedded_sources_match_runtime(self):
-        root = Path(__file__).resolve().parents[2]
-        text = (root / 'IMPLEMENTATION.md').read_text()
-        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
-                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
-                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py',
-                     'scripts/verify/settings_validation.py', 'api/services/importer.py'):
-            with self.subTest(file=name):
-                fence = '````' if name.endswith('.md') else '```'
-                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
-                header = f'### {name}\n\n{fence}{language}\n'
-                start = text.index(header) + len(header)
-                end = text.index('\n' + fence + '\n', start)
-                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
-
-
-if __name__ == '__main__':
-    unittest.main()
-```
