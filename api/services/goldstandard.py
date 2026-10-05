@@ -392,6 +392,27 @@ def load_sessions_from_disk() -> None:
     _scan_sessions()
 
 
+def reconcile_interrupted_generations() -> None:
+    """Startup only: no generation worker survives a process restart."""
+    if _tasks:
+        raise RuntimeError("Generation recovery must run before workers start")
+    interruption = RuntimeError("Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.")
+    with _state_lock:
+        interrupted = [sid for sid, value in _sessions.items() if value.get("status") == "generating"]
+    for session_id in interrupted:
+        def settle(current):
+            if current.get("status") == "generating":
+                _failed_generation(current, interruption)
+        try:
+            _update_session_sync(session_id, settle)
+        except Exception as write_error:
+            # Keep the stored snapshot for a later retry, but never advertise a
+            # live worker that does not exist. Existing diagnostics expose the
+            # persistence failure and a subsequent restart retries settlement.
+            log.exception("Could not persist interrupted generation %s", session_id)
+            _publish_generation_failure(session_id, interruption, write_error)
+
+
 def _sessions_on_disk() -> list[dict]:
     """Return detached, validated files for export without changing the cache."""
     try:

@@ -13,6 +13,7 @@ async def lifespan(app: FastAPI):
     from services import goldstandard, metrics
     from services import weaviate_client as wc
     goldstandard.load_sessions_from_disk()
+    goldstandard.reconcile_interrupted_generations()
     metrics.load_from_disk()
     # Sweep only durably owned scratch. Verified recovery collections and
     # unowned marker-like names must survive startup.
