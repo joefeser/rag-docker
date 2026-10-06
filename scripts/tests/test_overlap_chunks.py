@@ -1,5 +1,6 @@
 """Overlap window invariants on inert synthetic text and the ingest worker."""
 import os
+import hashlib
 import runpy
 import sys
 import tempfile
@@ -73,7 +74,7 @@ class OverlapTests(unittest.TestCase):
         # This exercises that path instead of just trusting the inspection.
         with tempfile.TemporaryDirectory() as directory:
             src_dir = Path(directory)
-            digest = 'deadbeef' * 8
+            digest = hashlib.sha256(b'irrelevant retained bytes').hexdigest()
             (src_dir / digest).write_bytes(b'irrelevant retained bytes')
             job_id = 'tune-budget-test'
             tuning._jobs[job_id] = {'job_id': job_id}
