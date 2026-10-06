@@ -16102,8 +16102,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         sid,response=asyncio.run(run());state=gs.get_session(sid)
         self.assertEqual(state['status'],'failed')
         self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
-        # Untyped on develop; #127 types the same fault as SESSION_WRITE_FAILED.
-        self.assertTrue(any('not a regular file' in e or 'SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+        self.assertTrue(any('SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
 
     def test_cancelled_generation_with_failing_final_write_ends_failed(self):
         fault=threading.Event();original=gs.os.replace
@@ -16143,6 +16142,38 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         finally:release.set();holder.join(5)
         self.assertEqual(seen,[True])
         self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
+
+    def test_uncertain_failure_report_keeps_both_reasons(self):
+        original=gs.GoldStandardError('SESSION_WRITE_FAILED','Original generation write failed',500)
+        report=gs.GoldStandardError('SESSION_DURABILITY_UNCERTAIN','Reporter replace completed but sync failed',500)
+        gs._publish_generation_failure(self.data['session_id'],original,report)
+        current=gs.get_session(self.data['session_id'])
+        self.assertEqual(current['persistence_error']['code'],'SESSION_DURABILITY_UNCERTAIN')
+        self.assertTrue(any('SESSION_WRITE_FAILED' in message for message in current['errors']))
+        self.assertTrue(any('SESSION_DURABILITY_UNCERTAIN' in message for message in current['errors']))
+
+    def test_cached_generation_failure_is_saved_by_next_successful_write(self):
+        # Reviewer (#136 spec sentence): the cache runs ahead of disk until a later successful write saves it.
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def pair(chunk):fault.set();return fixture()['pairs'][0]
+        async def run():
+            with patch.object(gs.os,'replace',side_effect=replace):return await self.generate(pair)
+        sid=asyncio.run(run())
+        self.assertEqual(json.loads(gs._session_path(sid).read_text())['status'],'generating')
+        self.assertEqual(gs.mark_stale('OwnedPersistence','Owned later write'),2)
+        gs._sessions={};gs.load_sessions_from_disk();state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed',state)
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED')
+        self.assertTrue(state['stale'])
+
+    def test_cache_fallback_does_not_recreate_a_removed_session(self):
+        # Reviewer: a session gone from the cache must not be resurrected by the fallback.
+        before=gs._store_revision
+        gs._publish_generation_failure('gs_450abcd2',RuntimeError('Owned failure'),OSError('Owned write fault'))
+        self.assertIsNone(gs.get_session('gs_450abcd2'));self.assertEqual(gs._store_revision,before)
 
     def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
         from services import tuning
