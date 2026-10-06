@@ -396,4 +396,139 @@ shown21=$(printf '%s' "$out21" | sed -n 's/.*holds "\(.*\)", not a pid.*/\1/p')
 [ "$shown21" = "$(printf 'z%.0s' $(seq 1 40))" ]
 check "T21: a 40-character holder is shown whole" "$?" "shown: $shown21"
 
+# --- T22-T24: an inherited RAG_VERIFY_LOCK_HELD is trusted only when the
+# lock's pid is this shell or an ancestor (#184). A suite orphaned by a run
+# that died still carries the variable; it must stop, not act on a later
+# run's verify project, and must not take the dead holder's lock over.
+leftover() {   # leftover <name> <lock>: source lock.sh as an orphan would
+  local out rc
+  out=$(RAG_VERIFY_LOCK_HELD=1 RAG_VERIFY_LOCK="$2" bash -c '. "'"$VERIFY"'/lock.sh"; echo ran' 2>&1)
+  rc=$?
+  check_eq "$1: an inherited lock not held by an ancestor exits 3" "$rc" "3"
+  case "$out" in *ran*) ran=1 ;; *) ran=0 ;; esac
+  check "$1: the script's own commands never run" "$ran" "output: $out"
+  LEFTOVER_OUT=$out
+}
+L22="$TESTLOCK_HOME/t22.lock"; mkdir "$L22"
+bash -c 'exit 0' &
+dead22=$!
+wait "$dead22" 2>/dev/null
+echo "$dead22" > "$L22/pid"
+leftover "T22 (dead holder)" "$L22"
+case "$LEFTOVER_OUT" in *"$dead22"*) named=0 ;; *) named=1 ;; esac
+check "T22: the refusal names the recorded pid" "$named" "output: $LEFTOVER_OUT"
+check_eq "T22: the dead holder's lock is not taken over" "$(cat "$L22/pid" 2>/dev/null)" "$dead22"
+
+L23="$TESTLOCK_HOME/t23.lock"; mkdir "$L23"
+sleep 30 &
+live23=$!
+echo "$live23" > "$L23/pid"
+leftover "T23 (live non-ancestor holder)" "$L23"
+case "$LEFTOVER_OUT" in *"$live23"*) named=0 ;; *) named=1 ;; esac
+check "T23: the refusal names the recorded pid" "$named" "output: $LEFTOVER_OUT"
+kill "$live23" 2>/dev/null; wait "$live23" 2>/dev/null
+
+leftover "T24 (no lock at all)" "$TESTLOCK_HOME/t24-absent.lock"
+
+# --- T25: a grandchild of the holder still runs (the ancestor walk goes past
+# the parent: stack.sh -> all.sh -> suite). --------------------------------
+cat > "$TESTLOCK_HOME/inner.sh" <<EOF
+. "$VERIFY/lock.sh"
+echo inner-ran
+EOF
+cat > "$TESTLOCK_HOME/middle.sh" <<EOF
+bash "$TESTLOCK_HOME/inner.sh"
+EOF
+out25=$(RAG_VERIFY_LOCK="$TESTLOCK_HOME/t25.lock" bash -c '. "'"$VERIFY"'/lock.sh"; bash "'"$TESTLOCK_HOME"'/middle.sh"' 2>&1)
+rc25=$?
+check_eq "T25: a grandchild under the held lock exits 0" "$rc25" "0"
+case "$out25" in *inner-ran*) ran=0 ;; *) ran=1 ;; esac
+check "T25: the grandchild's own commands ran" "$ran" "output: $out25"
+
+# --- T26: a child finds a non-default lock path its holder set as a plain
+# shell variable: lock.sh exports the path along with RAG_VERIFY_LOCK_HELD. --
+out26=$(env -u RAG_VERIFY_LOCK bash -c 'RAG_VERIFY_LOCK="'"$TESTLOCK_HOME"'/t26.lock"; . "'"$VERIFY"'/lock.sh"; bash "'"$TESTLOCK_HOME"'/inner.sh"' 2>&1)
+rc26=$?
+check_eq "T26: a child with RAG_VERIFY_LOCK unset still finds its holder's lock" "$rc26" "0"
+case "$out26" in *inner-ran*) ran=0 ;; *) ran=1 ;; esac
+check "T26: the child's own commands ran" "$ran" "output: $out26"
+
+# --- T27-T29: lib.sh's API helpers re-check the lock owner (#184). A suite
+# already past lock.sh when its holder died stops at its next helper call,
+# even inside $(...), and makes no request. curl is a stub that logs.
+STUBBIN="$TESTLOCK_HOME/bin"; mkdir -p "$STUBBIN"
+cat > "$STUBBIN/curl" <<'EOF'
+#!/bin/sh
+echo "curl $*" >> "$CURL_LOG"
+printf '{"status":"running"}'
+EOF
+chmod +x "$STUBBIN/curl"
+cat > "$TESTLOCK_HOME/suite.sh" <<EOF
+. "$VERIFY/lib.sh"
+trap 'echo "exit-trap \$?" >> "\$MARK"' EXIT
+touch "\$READY"
+while [ ! -f "\$GO" ]; do sleep 0.05; done
+case "\$MODE" in
+  get)  x=\$(api_get /health) ;;
+  wait) wait_for_job /job/x 20 >/dev/null ;;
+esac
+echo after >> "\$MARK"
+EOF
+# helper_case <name> <mode> <holder: exit|kill|alive>; sets H_* results
+helper_case() {
+  local dir="$TESTLOCK_HOME/$1" child="" i hp
+  mkdir -p "$dir"
+  export CURL_LOG="$dir/curl.log" MARK="$dir/mark" READY="$dir/ready" GO="$dir/go" MODE="$2"
+  : > "$CURL_LOG"
+  PATH="$STUBBIN:$PATH" RAG_VERIFY_LOCK="$dir/lock" RAG_API=http://localhost:1/api bash -c '
+    . "'"$VERIFY"'/lock.sh"
+    bash -c "bash \"'"$TESTLOCK_HOME"'/suite.sh\"; echo \"status \$?\" >> \"\$MARK\"" &
+    echo $! > "'"$dir"'/child.pid"
+    while [ ! -f "$READY" ]; do sleep 0.05; done
+    if [ "'"$3"'" = alive ]; then touch "$GO"; wait; else sleep 30; fi' &
+  hp=$!
+  for i in $(seq 1 100); do [ -f "$READY" ] && break; sleep 0.05; done
+  child=$(cat "$dir/child.pid" 2>/dev/null)
+  case "$3" in
+    exit) kill -TERM "$hp" 2>/dev/null; wait "$hp" 2>/dev/null ;;   # the holder's trap releases the lock
+    kill) kill -KILL "$hp" 2>/dev/null; wait "$hp" 2>/dev/null ;;   # the lock is left behind, stale
+  esac
+  : > "$CURL_LOG"
+  H_START=$(date +%s)
+  [ "$3" = alive ] || touch "$GO"
+  for i in $(seq 1 400); do kill -0 "$child" 2>/dev/null || break; sleep 0.05; done
+  H_SECS=$(( $(date +%s) - H_START ))
+  [ "$3" = alive ] && wait "$hp" 2>/dev/null
+  H_CURLS=$(wc -l < "$CURL_LOG" | tr -d ' ')
+  H_MARK=$(cat "$MARK" 2>/dev/null)
+  kill -KILL "$child" 2>/dev/null
+  H_STATUS=$(printf '%s\n' "$H_MARK" | sed -n 's/^status //p')
+}
+# The suite ran its EXIT trap and its process ended non-zero.
+ended_nonzero() {
+  case "$H_MARK" in *exit-trap*) ;; *) return 1 ;; esac
+  [ -n "$H_STATUS" ] && [ "$H_STATUS" != 0 ]
+}
+helper_case t27 get exit
+check_eq "T27: api_get in \$(...) after the holder exited makes no request" "$H_CURLS" "0"
+case "$H_MARK" in *after*) a=1 ;; *) a=0 ;; esac
+check "T27: nothing after the helper runs" "$a" "mark: $H_MARK"
+ended_nonzero
+check "T27: the suite ends non-zero and its EXIT trap runs" "$?" "mark: $H_MARK"
+
+helper_case t28 wait kill
+[ "$H_CURLS" -le 1 ]
+check "T28: wait_for_job after the holder was killed polls at most once more" "$?" "curl calls: $H_CURLS"
+case "$H_MARK" in *after*) a=1 ;; *) a=0 ;; esac
+check "T28: nothing after wait_for_job runs" "$a" "mark: $H_MARK"
+ended_nonzero
+check "T28: the suite ends non-zero and its EXIT trap runs" "$?" "mark: $H_MARK"
+[ "$H_SECS" -lt 10 ]
+check "T28: it stops at the next poll, not at the 20 s timeout" "$?" "took ${H_SECS}s"
+
+helper_case t29 get alive
+check_eq "T29: under a live holder api_get makes its request" "$H_CURLS" "1"
+case "$H_MARK" in *after*"exit-trap 0"*"status 0"*) a=0 ;; *) a=1 ;; esac
+check "T29: the suite carries on and exits 0" "$a" "mark: $H_MARK"
+
 summary

@@ -14,6 +14,7 @@ from models.schemas import (
     CreateCollectionRequest,
 )
 from services import weaviate_client as wc
+from services.collection_writes import canonical
 from utils import api_error
 
 router = APIRouter(prefix="/collections")
@@ -98,7 +99,9 @@ async def delete_collection(name: str):
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
-        registry.pop(name, None)
+        canonical_name = canonical(name)
+        for spelling in {canonical_name, canonical_name[:1].lower() + canonical_name[1:]}:
+            registry.pop(spelling, None)
         await asyncio.to_thread(_save_registry, registry)
 
     return {"name": name, "objects_deleted": count}

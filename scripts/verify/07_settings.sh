@@ -8,6 +8,8 @@ require_stack
 section "Concurrent settings publication and failed-write preservation"
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - SettingsPersistenceTests < scripts/tests/test_settings_persistence.py)
 check "controlled retrieval/ingest concurrency and publication failures" $?
+(cd ../.. && python3 scripts/tests/test_settings_implementation.py)
+check "settings embedded implementation copies match runtime" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?

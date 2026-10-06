@@ -120,20 +120,40 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertEqual(retrieval_config.validate({'ef': value}, 'Corpus'), cfg)
 
     def test_legacy_ef_import_completes_with_note(self):
-        for value in LEGACY_EF:
-            with self.subTest(ef=value):
-                self.archive(json.dumps({'ef': value, 'top_k': 7}))
-                with patch.object(importer, '_ensure_models', return_value=[]), \
-                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
-                     patch.object(importer, '_build', return_value=0):
+        # Every conflict mode (#184): abort into a new collection, rename beside
+        # an existing one, and replace an existing one through staging.
+        for conflict in ('abort', 'rename', 'replace'):
+            for value in LEGACY_EF:
+                with self.subTest(conflict=conflict, ef=value), ExitStack() as mocks:
+                    self.archive(json.dumps({'ef': value, 'top_k': 7}))
+                    mocks.enter_context(patch.object(importer, '_ensure_models', return_value=[]))
+                    mocks.enter_context(patch.object(importer, '_build', return_value=0))
+                    mocks.enter_context(patch.object(
+                        importer.wc, '_collection_exists_sync',
+                        side_effect=lambda name: conflict != 'abort' and name == 'Corpus'))
+                    if conflict == 'replace':
+                        mocks.enter_context(patch.object(importer.collection_recovery, 'begin',
+                                                         return_value={'staging': 'Corpus__importing_test',
+                                                                       'state': 'scratch'}))
+                        for name in ('retain', 'discard'):
+                            mocks.enter_context(patch.object(importer.collection_recovery, name))
+                        mocks.enter_context(patch.object(importer.wc, 'get_client'))
+                        mocks.enter_context(patch.object(importer.wc, '_delete_collection_sync'))
+                        mocks.enter_context(patch.object(importer.goldstandard, 'sessions_for', return_value=[]))
                     importer._jobs['test'] = {'status': 'queued'}
-                    importer._run('test', 'fixture.tar.gz', 'abort')
-                job = importer._jobs['test']
-                self.assertEqual(job['status'], 'completed')
-                restored = retrieval_config.load('Corpus')
-                self.assertIsNone(restored['ef'])
-                self.assertEqual(restored['top_k'], 7)
-                self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+                    importer._run('test', 'fixture.tar.gz', conflict)
+                    job = importer._jobs['test']
+                    self.assertEqual(job['status'], 'completed', job)
+                    target = job['collection']
+                    if conflict == 'rename':
+                        self.assertTrue(target.startswith('Corpus_imported_'), target)
+                    else:
+                        self.assertEqual(target, 'Corpus')
+                    restored = retrieval_config.load(target)
+                    self.assertIsNone(restored['ef'])
+                    self.assertEqual(restored['top_k'], 7)
+                    self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+                    retrieval_config._path(target).unlink()
 
     def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
         self.archive(json.dumps({'top_k': '8', 'ef': 64}))
@@ -173,11 +193,37 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual((args.mode, args.top_k, args.alpha, args.response_format),
                          ('hybrid', 8, 0.25, 'engineer'))
 
+    def test_export_checks_stored_model_before_streaming_or_bundling(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        for model, kind, named in (('old-model', 'text2vec-ollama', None), (None, 'none', None), ('new-model', 'text2vec-ollama', {'named': {}})):
+            with self.subTest(model=model, kind=kind, named=named):
+                cfg = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer=kind, model={'model': model}), vector_config=named)
+                backend = MagicMock()
+                backend.collections.get.return_value.config.get.return_value = cfg
+                with patch.object(settings, 'embed_model', 'new-model'), patch.object(packager.wc, 'get_client', return_value=backend), patch.object(packager, 'read_chunks') as chunks, patch.object(packager.model_bundle, 'export_model') as bundle:
+                    before = sorted(self.exports.iterdir())
+                    with self.assertRaises(packager.PackageError) as caught:
+                        packager.build('Corpus', include_models=True)
+                    self.assertEqual(caught.exception.code, 'EMBEDDING_MISMATCH')
+                    self.assertIn('Re-embed', caught.exception.message)
+                    chunks.assert_not_called()
+                    bundle.assert_not_called()
+                    self.assertEqual(sorted(self.exports.iterdir()), before)
+
+    def test_collection_schema_records_actual_model_not_process_default(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        backend = MagicMock()
+        backend.collections.get.return_value.config.get.return_value = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama', model={'model': 'stored-model'}), vector_config=None)
+        with patch.object(settings, 'embed_model', 'different-model'), patch.object(packager.wc, 'get_client', return_value=backend):
+            self.assertEqual(packager.wc._collection_config_sync('Corpus')['embedding_model'], 'stored-model')
+
     def test_export_emits_normalized_settings_and_executable_defaults(self):
         saved = {'collection': 'Corpus', 'top_k': '7', 'alpha': '0.5', 'ef': 64}
         retrieval_config.save(saved)
         with patch.object(packager, 'read_chunks', return_value=[]), \
-             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
              patch.object(packager, '_ingest_config', return_value=None), \
              patch.object(packager, '_goldstandard_sessions', return_value=[]), \
              patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
@@ -199,7 +245,7 @@ class RetrievalImportTests(unittest.TestCase):
         saved = retrieval_config._path('Corpus')
         before = saved.read_bytes()
         with patch.object(packager, 'read_chunks', return_value=[]), \
-             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
              patch.object(packager, '_ingest_config', return_value=None), \
              patch.object(packager, '_goldstandard_sessions', return_value=[]), \
              patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
@@ -223,7 +269,7 @@ class RetrievalImportTests(unittest.TestCase):
                 continue
             with self.subTest(value=value), ExitStack() as mocks:
                 chunks = mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
-                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={}))
+                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}))
                 mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
                 mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
                 with self.assertRaises(ValueError) as caught:

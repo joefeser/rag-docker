@@ -74,6 +74,20 @@ What makes it separate from the live stack:
   fails (Weaviate can be slow to report healthy, #130). If it still fails, it
   prints the last log lines of each service that isn't up. `up` then leaves
   the project running for inspection (`down` removes it); `run` removes it.
+- **No suite outlives its run (#184).** `run` starts `all.sh` in a process
+  group of its own. Whenever `run` ends, whether normally, on a failing suite,
+  or on INT or TERM (which now act at once), it first stops that whole group
+  (TERM, then KILL after 5 seconds), so nothing the suites started is left
+  running, and only then tears the project down and releases the lock. A
+  `stack.sh` killed outright (SIGKILL) can't do that. Then the verify lock
+  stops the orphaned suite instead: `lock.sh` trusts an inherited
+  `RAG_VERIFY_LOCK_HELD` only while the lock's pid is that shell or one of its
+  ancestors, and `lib.sh`'s API helpers (`api_get`, `api_post`, `api_code`,
+  `api_post_code`, `drop_collection`, `make_collection` and every
+  `wait_for_job` poll) repeat that check before each request and end the
+  suite, exit 3, when it fails. Not re-checked: direct `curl` and
+  `docker compose exec` calls in the suites, and the Python helpers, which
+  end on their own timeouts (up to 900 s).
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -118,6 +132,10 @@ directories and does not connect to Weaviate or Ollama.
 verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
 verification run; it does not establish full-stack acceptance by itself.
 
+Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
+(no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
+retrieval route. The persistence cases cover failed import-config publication.
+
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
@@ -157,7 +175,13 @@ regressions. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
-also checks all saved retrieval fields round-trip. Controlled tests complement,
+also checks all saved retrieval fields round-trip. `legacy_retrieval.py` (E28,
+#184) writes a legacy `ef` and other invalid saved settings into the API
+container, then checks through the real API that a legacy `ef` exports and
+imports as `null` with a warning or note, and that other invalid saved settings
+fail the export early with an actionable error and publish nothing. Crafted
+packages are written under a `.part` name and renamed into place, because on
+Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
@@ -244,7 +268,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
-| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
+| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
@@ -282,6 +306,7 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
 | `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
@@ -380,4 +405,4 @@ node scripts/verify/browser/query_config.js
 The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
-isolated fixture run does not replace the required full live-stack suite.
+isolated fixture run does not replace the full verification suite (`stack.sh run`).
