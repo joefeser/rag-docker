@@ -418,4 +418,4 @@ selection changes, and duplicate-save prevention. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
-Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in the API container with its pinned dependencies.
+Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
