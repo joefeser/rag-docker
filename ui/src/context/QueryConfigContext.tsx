@@ -27,6 +27,7 @@ interface QueryConfigValue {
   isDefault: boolean
   loading: boolean
   error: string
+  /** False means superseded: the caller must show no success or error notice. */
   saveConfig: (config: QueryConfig) => Promise<boolean>
 }
 
@@ -55,6 +56,7 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const selectedCollection = useRef('')
   const saveId = useRef(0)
   const selectionId = useRef(0)
+  const publishedSaveId = useRef<number | null>(null)
   const latestFailed = useRef(false)
   const lastSuccess = useRef<{ id: number; value: RetrievalConfig } | null>(null)
 
@@ -64,6 +66,7 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
     selectionId.current++
     latestFailed.current = false
     lastSuccess.current = null
+    publishedSaveId.current = null
     // Invalidate immediately, before the next effect runs. A -> B -> A is
     // also a new generation even though the collection name matches again.
     requestId.current++
@@ -108,7 +111,10 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
       const saveTicket = ++saveId.current
       latestFailed.current = false
       const isCurrent = () => selection === selectionId.current && collection === selectedCollection.current
-      const publish = (saved: RetrievalConfig) => {
+      const publish = (success: { id: number; value: RetrievalConfig }) => {
+        if (publishedSaveId.current === success.id) return
+        publishedSaveId.current = success.id
+        const saved = success.value
         // Cancel pending loads without invalidating other saves in this selection.
         requestId.current++
         setConfigState(fromResponse(saved))
@@ -125,13 +131,13 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
         // If the newest request failed, retain the newest acknowledged success,
         // even when that older request's response arrives after the failure.
         if (saveTicket === saveId.current || latestFailed.current) {
-          publish(lastSuccess.current.value)
+          publish(lastSuccess.current)
         }
         return saveTicket === saveId.current
       } catch (e: unknown) {
         if (!isCurrent() || saveTicket !== saveId.current) return false
         latestFailed.current = true
-        if (lastSuccess.current) publish(lastSuccess.current.value)
+        if (lastSuccess.current) publish(lastSuccess.current)
         throw e
       }
     },

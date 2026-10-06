@@ -76,6 +76,17 @@ An invalid on-disk index makes tuning options return a typed 409
 need to read retained sources. A failed retention write after chunk storage does
 not misreport the ingested file as failed.
 
+Retained-source import restores only blobs named by the validated index. Unindexed
+files are ignored, including sources in chunks-only packages with no index. Older
+packages whose indexes name missing blobs remain rejected as `PACKAGE_CORRUPT`;
+re-export from the repaired source rather than silently reducing claimed fidelity.
+After manifest digest verification, each indexed blob’s manifest digest must equal
+`sha256:<filename>`. This preserves content-addressed identity without hashing a
+listed blob twice. Indexed blobs not listed in the manifest are hashed separately;
+a listed digest that differs from the filename is rejected.
+The same indexed-only copy rule applies to replace-mode recovery collections;
+unindexed package files cannot survive a failed final cutover.
+
 Retention MUST NOT change chunking, embedding, or any existing response shape.
 
 ### 2.3 Deletion
@@ -99,15 +110,6 @@ minimum, 32 GB recommended) assumes the current behaviour and MUST be restated a
 
 ---
 
-
-Retained-source import restores only blobs named by the validated index. Unindexed
-files are ignored, including sources in chunks-only packages with no index. Older
-packages whose indexes name missing blobs remain rejected as `PACKAGE_CORRUPT`;
-re-export from the repaired source rather than silently reducing claimed fidelity.
-After manifest digest verification, each indexed blob’s manifest digest must equal
-`sha256:<filename>`. This preserves content-addressed identity without hashing a
-listed blob twice. Legacy blobs not listed in the manifest are hashed separately;
-a listed digest that differs from the filename is rejected.
 
 ## 3. Prerequisite B — Retrieval Settings Persistence
 
@@ -176,7 +178,7 @@ filename.
 ragpkg-.../
 ├── README.md               generated; §9
 ├── manifest.json           §4.4
-├── collection.json         schema, index type, distance metric, HNSW params
+├── collection.json         schema, stored embedding_model, index type, distance metric, HNSW params
 ├── chunks.jsonl            one object per line; §4.5
 ├── ingest_config.json      present if the collection has one
 ├── retrieval_config.json   §3.1
@@ -339,6 +341,13 @@ completion, the written filename.
 - The package is written to `/app/exports` (host `./exports`), never streamed.
 - Chunks are read with `include_vector=True`, paged, so memory does not scale
   with collection size.
+- Export MUST refuse `EMBEDDING_MISMATCH` before reading chunks or publishing a
+  package when the collection’s stored embedding model differs from this instance
+  or its vectorizer configuration is unsupported. Re-embed into a supported
+  collection with this instance’s model before exporting. `collection.json` and
+  the manifest bind vectors to that stored model.
+- Failed export jobs expose typed package refusal fields `error_code` and
+  `error_detail`, alongside the human-readable `error`.
 - Export MUST NOT block ingest or query.
 - Writing is atomic: build under a temporary name in the same directory and
   rename on success, so a partial file is never mistaken for a package.
@@ -604,13 +613,12 @@ rather than silently ignoring one of them.
 
 ### 7.3 Gold-standard invalidation
 
-Invalidation covers both supported first-character collection aliases without changing stored session provenance.
-
 Any operation that changes chunk identity — re-chunking, or re-embedding that
 rebuilds the collection — MUST mark every gold-standard session for that
 collection `stale`, recording why and when. Sessions are not deleted and are not
 remapped: a wrong remap corrupts an evaluation baseline silently, which is worse
-than an honest stale flag.
+than an honest stale flag. Invalidation MUST cover both supported first-character
+collection aliases without changing stored session provenance.
 
 For identity-changing rebuilds, persist the flag after preparation succeeds but before deleting the live collection. A failure after cutover begins also marks history stale, including a failed reindex whose original collection may be missing or partial. A successful identity-preserving reindex keeps its existing validity semantics. This request-time validity barrier is separate from session persistence concurrency and durable collection recovery.
 
@@ -754,12 +762,11 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E10 | `retrieve.py` exits 3 with one sentence when the stack is down |
 | E11 | Import into a clean instance reproduces chunk count and answers equivalently |
 | E12 | Import refuses `EMBEDDING_MISMATCH` when the target uses a different embedding model |
-| E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 | E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
-| E16 | Re-chunking marks the collection's gold-standard sessions `stale` |
-| E17 | Re-chunking a `chunks-only` or partially retained collection fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
+| E16 | Re-chunking and failed destructive cutover mark sessions under both supported first-character collection aliases `stale`; the reported count includes both spellings, and stored provenance is unchanged |
+| E17 | Re-chunking a `chunks-only`, partially retained or ambiguously retained collection (a second name for the same retained content, or a name with more than one chunk set) fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
 | E18 | `replace` reports the number of orphaned sessions |
 | E19 | Package `README.md` states the collection name, fidelity and encryption warning |
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
@@ -771,7 +778,8 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
-| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import ignores unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, while record-only tuning still works; missing-blob exports pass import preflight |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, while record-only tuning still works; missing-blob exports pass import preflight |
+| E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 
 ---
 

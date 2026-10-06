@@ -40,6 +40,10 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
 
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
+    except packager.PackageError as exc:
+        _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
+        job.update(status="failed", error=f"PackageError: {exc.message}",
+                   error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
         _log.exception("Export of %r failed", collection)
         job["status"] = "failed"
@@ -89,6 +93,8 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         "retrieve_script": None,
         "warnings": [],
         "error": None,
+        "error_code": None,
+        "error_detail": None,
     }
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
