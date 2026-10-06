@@ -135,6 +135,40 @@ class ValidityServiceTests(unittest.TestCase):
             self.assertEqual(bool(current.get('stale')),failure!='stage')
             if failure!='stage':self.assertTrue(current['stale_at'])
 
+    def test_failed_cutover_marks_both_backend_aliases(self):
+        # #191: tuning.py's after-cutover failure paths call mark_stale with the
+        # caller's spelling and no before_replace; both aliases must be marked.
+        from services import tuning
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        for caller in ('ValidityFixture','validityFixture'):
+            with self.subTest(caller=caller):
+                for sid,name in (('gs_11111111','ValidityFixture'),('gs_22222222','validityFixture'),('gs_33333333','Validityfixture')):
+                    data=session();data.update(session_id=sid,collection=name);gs.store_session(data)
+                client=MagicMock();stage=MagicMock()
+                stage.aggregate.over_all.return_value=SimpleNamespace(total_count=1)
+                client.collections.get.return_value=stage
+                ownership={'staging':'ValidityFixture__test','state':'scratch','operation_id':'test'}
+                def create(name,*args,**kwargs):
+                    if name=='ValidityFixture':raise RuntimeError('create fault')
+                with patch.object(tuning.wc,'get_client',return_value=client), \
+                     patch.object(tuning.wc,'_collection_config_sync',return_value={'index_type':'hnsw','distance_metric':'cosine','hnsw_config':{}}), \
+                     patch.object(tuning.wc,'_create_collection_sync',side_effect=create), \
+                     patch.object(tuning.wc,'_insert_chunks_sync'), \
+                     patch.object(tuning.collection_recovery,'begin',return_value=ownership), \
+                     patch.object(tuning.collection_recovery,'retain',side_effect=lambda owner,**kw:owner.update(state='recovery')), \
+                     patch.object(tuning.collection_recovery,'sidecar_reference',return_value=None), \
+                     patch.object(tuning.collection_recovery,'discard'):
+                    with self.assertRaises(Exception):
+                        tuning._rebuild(caller,[{'content':'Inert'}],None,None,None,source_collection=caller)
+                gs._sessions={};gs.load_sessions_from_disk()
+                for sid,name in (('gs_11111111','ValidityFixture'),('gs_22222222','validityFixture')):
+                    current=gs.get_session(sid)
+                    self.assertEqual(current['collection'],name)
+                    self.assertTrue(current.get('stale'),(caller,name))
+                    self.assertIn('cutover',current['stale_reason'])
+                self.assertFalse(gs.get_session('gs_33333333').get('stale',False))
+
     def test_successful_identity_preserving_reindex_keeps_validity_semantics(self):
         from services import tuning
         job={'status':'queued'}

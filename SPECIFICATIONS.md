@@ -22,7 +22,9 @@ This document translates the decisions in ANALYSIS.md into precise, implementabl
 ```yaml
 services:
   weaviate:
-    image: semitechnologies/weaviate:1.39.4
+    # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
+    # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
+    image: semitechnologies/weaviate:1.39.6
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
@@ -30,35 +32,52 @@ services:
       ENABLE_MODULES: 'text2vec-ollama'
       TEXT2VEC_OLLAMA_APIENDPOINT: http://ollama:11434
       TEXT2VEC_OLLAMA_MODEL: nomic-embed-text
-      # Raft state is keyed by node identity; without a fixed hostname the
-      # recorded identity stops matching after `compose down` and startup dies
-      # with "could not open cloud meta store: bootstrap: context deadline
-      # exceeded".
+      # Weaviate 1.25 persists Raft cluster state keyed by node identity. Without
+      # a fixed CLUSTER_HOSTNAME it derives that identity from the container, so
+      # the IP recorded in weaviate_data no longer matches after `compose down`
+      # and startup dies with:
+      #   "could not open cloud meta store: bootstrap: context deadline exceeded"
+      # Pinning the name keeps the identity stable across container recreation.
       CLUSTER_HOSTNAME: 'node1'
       RAFT_BOOTSTRAP_EXPECT: 1
+      # Without a Raft snapshot, every start replays each collection delete in
+      # Weaviate's Raft log and waits ~150ms on each one (issue #178: 922
+      # deletes, ~145s). A snapshot after 128 entries, checked every 30-60s,
+      # keeps the replayed tail short.
+      RAFT_SNAPSHOT_THRESHOLD: 128
+      RAFT_SNAPSHOT_INTERVAL: 30
     volumes:
       - weaviate_data:/var/lib/weaviate
     ports: []
     networks: [rag-internal]
     healthcheck:
-      # The weaviate image ships busybox wget, NOT curl.
+      # The weaviate image has no curl; busybox wget is what it ships.
+      # The first start on a volume whose Raft log has no snapshot yet (the
+      # first after upgrading to the snapshot settings above) still replays
+      # its whole history before /ready answers: up to 156s on a copy of real
+      # data, 163.5s live (issue #130). Later starts replay only the tail since
+      # the last snapshot. Without start_period, compose marks Weaviate
+      # unhealthy after ~100s and fails the api, ui and proxy behind it.
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/.well-known/ready"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 180s
 
   ollama:
     image: ollama/ollama:0.3.14
-    # Run via bash so the script does not need its executable bit, which is
-    # not reliably preserved when the project is distributed as a zip.
+    # Invoked via bash rather than as ["/entrypoint.sh"] so the script does not
+    # need its executable bit. That bit is not reliably preserved when the
+    # project is distributed as a zip (Finder compress, cloud storage, or a
+    # Windows machine in the transfer path can all drop it), which would
+    # otherwise fail with "permission denied" on a fresh install.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     volumes:
       - ollama_models:/root/.ollama
       - ./ollama/entrypoint.sh:/entrypoint.sh:ro
     networks: [rag-internal]
     healthcheck:
-      # The ollama image ships ONLY the ollama binary -- no curl, wget or nc --
-      # so the CLI is the only usable probe.
+      # The ollama image has no curl/wget; the CLI is the only probe available.
       test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
       interval: 20s
       timeout: 15s
@@ -74,9 +93,9 @@ services:
   api:
     build: ./api
     # Explicit tag so the image name does not depend on the directory name.
-    # Without it compose derives "<project>-api" from the folder, and an offline
-    # install extracted to a differently named folder would not find the loaded
-    # image and would try to rebuild (which needs the internet).
+    # Without it compose derives "<project>-api" from the folder, and an
+    # offline install extracted to a differently named folder would not find
+    # the loaded image and would try to rebuild (which needs the internet).
     image: rag-docker-api:latest
     environment:
       WEAVIATE_HOST: weaviate
@@ -89,8 +108,8 @@ services:
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
       OLLAMA_MODELS_DIR: /ollama
-      # Reported by /health and compared against the memory Docker actually
-      # provides. Raise it if you allocate more to Docker Desktop; no rebuild.
+      # Shown by /health and compared against the memory Docker actually
+      # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
     volumes:
       - ingest_uploads:/app/uploads
@@ -100,7 +119,10 @@ services:
       # reach the file from the host without going through Docker.
       - ./exports:/app/exports
       # Ollama's model store, shared read-write so a package can carry models
-      # into an air-gapped machine.
+      # into an air-gapped machine. Installing a model means writing its exact
+      # manifest and blobs; there is no registry to pull from offline, and
+      # rebuilding a model through the HTTP API would not reproduce its
+      # template, params and license faithfully.
       - ollama_models:/ollama
     networks: [rag-internal]
     depends_on:
@@ -120,18 +142,24 @@ services:
       api: { condition: service_healthy }
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.29-alpine
     ports:
-      # Local unauthenticated workbench: host loopback only.
+      # This unauthenticated workbench is local to the host by default.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
     networks: [rag-internal]
     depends_on: [ui, api]
 
-# The MCP server is PARKED: its service block has been removed from
-# docker-compose.yml and its image is not bundled. Source is preserved in ./mcp
-# and the block to restore is in MCP_IMPLEMENTATION.md §7.
+# ── MCP server: PARKED ────────────────────────────────────────────────────────
+# The MCP server is built and tested but intentionally NOT wired into the stack.
+# Its source lives in ./mcp and its design in MCP_ANALYSIS.md,
+# MCP_SPECIFICATIONS.md and MCP_IMPLEMENTATION.md. Nothing here depends on it,
+# and the offline bundle does not ship its image.
+#
+# To bring it back: restore the service block recorded in MCP_IMPLEMENTATION.md
+# §7, add rag-docker-mcp:latest to the IMAGES array in package-offline.sh, and
+# rebuild. No code changes are needed -- it passed all 16 acceptance criteria.
 
 volumes:
   weaviate_data:
@@ -184,7 +212,7 @@ healthcheck:
 
 ### 2.4 Startup Sequence
 
-1. Weaviate starts → healthcheck passes (ready endpoint returns 200)
+1. Weaviate starts with a 180-second healthcheck start period for cold Raft replay → healthcheck passes (ready endpoint returns 200)
 2. Ollama starts → pulls models (phi3.5, nomic-embed-text) → healthcheck passes
 3. API starts → verifies both downstream connections → healthcheck passes
 4. UI starts (static build, no runtime deps)
@@ -490,7 +518,10 @@ the destination directory and atomically replaces the saved configuration. A 201
 acknowledges that request's complete value was published; a later successful save
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
-Failed saves clean up their own temporary file when filesystem permissions allow. Package import publishes ingest settings through this same lock and atomic writer. Published files use mode 0600 (API owner read/write), including replacements of older files.
+Failed saves clean up their own temporary file when filesystem permissions
+allow. Package import publishes ingest settings through this same lock and
+atomic writer. Published files use mode 0600 (API owner read/write), including
+replacements of older files.
 
 ---
 
@@ -650,7 +681,13 @@ Samples chunks from a collection and generates Q&A pairs.
 
 `sample_size`: integer from 1 through 100 (default 20). `seed`: optional integer; null selects with a fresh random nonce. Booleans, non-integral and non-finite values are rejected with 422 before collection lookup, session persistence or generation. Existing integral numeric coercion is retained.
 
-Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
+Generation waits at most one second to acquire the collection mutation guard
+before sampling and publishing its session. A busy collection returns
+`409 COLLECTION_BUSY` without creating a session or model task. If a completed
+deletion removed the collection before sampling, it returns
+`404 COLLECTION_NOT_FOUND`. Retry a busy request after the writer finishes.
+
+Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most 100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
 
 The iterator caches 100 objects and selection retains at most `sample_size` candidate payloads; the complete corpus is scanned once. Full scans can take longer than fetching an initial prefix. Payload size is inherited from stored chunks; this is a candidate-count bound, not a byte-size limit.
 
@@ -1132,7 +1169,10 @@ ingest default.
 - **409 `TUNE_IN_PROGRESS`** if the collection is already being tuned.
 - **`SOURCES_REQUIRED`** (through the job) when the operation needs originals the
   collection does not have. Re-embedding a `chunks-only` collection *with*
-  chunking fields is refused rather than half-honoured.
+  chunking fields is refused rather than half-honoured. Re-chunking is also
+  refused when a stored source file has no single retained original (a name
+  uploaded more than once, or a second name for the same content) or a
+  retained original is missing from disk.
 
 Each rebuild is staged into a temporary collection and verified before the
 original is deleted, so a failure before replacement leaves the original
@@ -1151,7 +1191,10 @@ sessions `stale`. `/tune/reindex` does not, because chunk identity is unchanged.
 GET /tune/{collection}
 ```
 
-What this collection can be tuned with, given its fidelity.
+What this collection can be tuned with, given its fidelity. `can_rechunk` is
+`false` when re-chunking would be refused: the collection is `chunks-only`, a
+stored source file has no single retained original, or a retained original is
+missing from disk.
 
 **Response 200:**
 ```json
@@ -1491,8 +1534,12 @@ them. Changing the selection (including leaving and returning to the same
 collection) invalidates pending responses for the prior selection. A stale
 save may finish persisting its original collection, but must not change the
 active settings, loading/error state, or invalidate the new collection's load.
-Within the current generation, only the latest initiated save may publish; a
-successful current save supersedes a pending older load for that collection.
+Within the current generation, the latest initiated save may publish. If it
+fails, the newest acknowledged success may publish, even if its response arrives
+after that failure. Each acknowledged save publishes at most once, so a later
+older completion cannot erase new edits by republishing the same result. Published
+saves supersede pending older loads. Superseded responses show neither Saved! nor
+an error, and an earlier notice timer cannot clear a newer Saved! notice.
 After the selected collection's load resolves, the next Q&A request uses its
 settings, regardless of when a prior collection's save completes.
 
@@ -1887,7 +1934,7 @@ now lives once, in `api/services/ingest_config.py`.
       A 513 MB sparse file gets 413.*
 
 - [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
-      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
+      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes 19 checks in 1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
 ### 10.2 Query
 
@@ -1911,6 +1958,9 @@ now lives once, in `api/services/ingest_config.py`.
       *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
 
 ### 10.3 Gold Standard
+
+- [x] Pending stale/orphan markers survive restart and are resolved by the next successful session write. Session and marker files use mode 0600; imported sessions clear persistence_error.
+  *Evidence: session_persistence_cases.py covers owner-only files, marker replay, symlink refusal and durability wording; session-import cases check cleared local persistence errors.*
 
 - [x] Retained stale/orphaned session warnings reach the live API and browser, with reasons/timestamps and legacy defaults. Historical export requires explicit choice, keeps RAGAS compatibility and preserves the original session.
       *Six controlled service/runtime groups plus one twelve-source documentation group cover validity/export and rebuild failure boundaries. Registered real backend/in-process HTTP checks cover actual stale/orphan markers, strict choices, missing sessions, empty history, compatible exports and a failed destructive cutover; browser fixtures cover empty history, failed lookup and duplicate export requests. An actual browser against the built UI and isolated real API shows legacy defaults, warning reasons/timestamps, reset consent after actual deletion, empty historical warnings and explicit four-field RAGAS download. Suite10 is called by05/all.sh; full suite is recorded separately.*
@@ -1949,6 +1999,8 @@ now lives once, in `api/services/ingest_config.py`.
       *Registered `13_identity.sh` exercises controlled collision, concurrent creation, guarded reads, and actual package/HTTP/backend/fresh-process acceptance. The exact current-head counts and full-suite result are recorded in PR #69.*
 - [x] Generation start returns 503 `SESSION_WRITE_FAILED`, writes nothing and records a diagnostic for the candidate session file when identity selection cannot inspect session storage (including a redirected storage directory) or runs out of attempts. Import refuses a source session ID that is not `gs_[0-9a-f]{8}` with `PACKAGE_CORRUPT` naming the sidecar, before restoring anything.
       *Registered `13_identity.sh` runs 21 owned cases in `session_identity_cases.py`. Generation start: `test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503`, `test_generation_allocation_failure_records_diagnostic_for_candidate` (inspection failure and exhaustion), `test_reviewer_generation_redirected_storage_root_is_session_write_failed_503` and `test_reviewer_generate_route_returns_503_session_write_failed_envelope`. Source IDs: `test_noncanonical_source_identity_is_refused_before_restoration` and `test_reviewer_preflight_refuses_near_canonical_and_unbounded_source_ids` (near misses, a 10,003-character ID, an empty string and an integer are refused; `gs_0123abcd` is accepted). The live check in `session_identity.py` imports a digest-valid package with a noncanonical source ID and expects `PACKAGE_CORRUPT` naming the sidecar, nothing restored and the original unchanged. The redirected-storage and route cases fail on the code before #148.*
+- [x] Generation guard contention is bounded to one second and returns `409 COLLECTION_BUSY` without sampling or publication; a completed deletion returns `404 COLLECTION_NOT_FOUND`.
+      *Suite 04 sampling tests cover a timed-out alias writer, waiter cleanup, a real guarded delete, and a writer released before the deadline.*
 - [x] Concurrent edits survive generation, independent-field updates and restart; write faults are not acknowledged, and changed regeneration targets are rejected. Initial chunk sampling and durable session publication share the collection mutation guard so replacement/deletion cannot miss the new snapshot; subsequent model work runs outside that guard.
       *Suite 04 calls `09_sampling.sh`, which runs `test_chunk_sampling.py`: controlled writer contention proves sampling/publication ordering; a paused generation proves both name spellings are unlocked; sampling and publication failures release the guard and start no task.*
       *Registered `12_persistence.sh` runs owned concurrency, interruption and failure-path cases plus real backend/HTTP/fresh-process checks. Exact counts and initial full-suite failures are retained in the PR; this is single-process acceptance.*
@@ -1982,9 +2034,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 `''`; the type name is now always included.
 
 - [x] Seeded selection reaches the complete UUID population, preserves rank order across backend iteration orders, and retrieves payloads only for selected IDs.
-      *19 controlled runtime groups plus one nine-source documentation group cover geometry-independent selection, API validation, missing winners and parked MCP function limits. Suite09, called by04, exercises160 owned synthetic SDK objects across pages; supplied vectors avoid model calls. Its registered live HTTP cases reject invalid generation settings before a missing collection can be queried. This is selection evidence, not deterministic LLM output.*
+      *19 controlled runtime groups plus one nine-source documentation group cover geometry-independent selection, API validation, missing winners and parked MCP function limits. Suite 09, called by 04, exercises 160 owned synthetic SDK objects across pages; supplied vectors avoid model calls. Its registered live HTTP cases reject invalid generation settings before a missing collection can be queried. This is selection evidence, not deterministic LLM output.*
 
 ### 10.4 Web UI
+
+- [x] Chunking loads and save results stay with their selection generation, including A→B→A; save is unavailable until the selected config loads. Stale responses preserve current edits and errors, collection changes clear the saved notice, and failed collection lists or mismatched configurations are reported.
+  *Evidence: `scripts/verify/browser/chunking_config.js` deferred load/save, stale failure, edited draft, collection-list failure, mismatched configuration and saved-notice cases in suite 06.*
 
 - [x] Role selection persists across page navigation within same browser session.
 - [x] End User role shows only the Q&A page in navigation.
@@ -2003,9 +2058,13 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
 
-- [x] Retrieval save confirmations and errors stay with their selection generation. Deferred browser cases verify stale success/failure after switching collections and preserve the newest acknowledged success when a newer save fails, in both response orders.
+- [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
+  *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
 
 ### 10.5 Infrastructure
+
+- [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
+  *Evidence: compose start_period and `RestartTimingTests` verify capped waiting, elapsed time from the supplied start, and positive six-digit limit validation.*
 
 - [x] `docker compose up` brings all five services healthy within 5 minutes on first run (including model pull).
       *Model volume deleted and re-pulled from scratch: **233s (3.9 min)**. Both
@@ -2125,3 +2184,10 @@ A rebuild from these documents is correct when:
 
 - [x] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
       *Registered `14_reindex.sh`: 24 runtime cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling cases and 44 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*
+
+Overlap retains internal whitespace-only windows to preserve exact character coverage and overlap; wholly blank input yields no chunks. Hard character boundaries and fixed per-file limits remain the existing contract, rather than changing retrieval behavior in this follow-up.
+
+- [x] Interrupted tuning final writes carry an operation instance token. Startup checks only the matching target against its retained recovery records, marks mismatches or missing targets stale, and preserves both collections and snapshots for inspection. A different target instance, unreadable backend, or missing recovery never authorizes deletion. Completed matching targets are left untouched.
+      *Controlled restart cases in `test_batch_recovery.py`; startup deliberately does not delete targets using mutable recovery data.*
+
+- [x] After an interrupted tuning cutover is checked, startup durably records the outcome (`complete`, `stale`, or `other-instance`) and clears `cutover_pending`, preserving the recovery collection and journal. Later startups do not compare or re-flag that operation. An undecidable check or failed outcome write remains pending for retry.

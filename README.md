@@ -416,7 +416,10 @@ curl -X POST http://localhost:8080/api/tune/reindex \
 
 `GET /api/tune/<collection>` says which of these the collection can do — a
 `chunks-only` collection cannot be re-chunked, because the originals are not
-there to re-split.
+there to re-split. Nor can a collection where a stored file has no single
+retained original (a file uploaded more than once under the same name, or the
+same content uploaded under a second name), or where a retained original is
+missing from disk.
 
 Each rebuild is staged and swapped in only once it succeeds, so a failure leaves
 the collection as it was.
@@ -724,3 +727,5 @@ curl -s http://localhost:8080/api/collections      # -> "MyDocs"
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
   -F 'collection=mydocs' -F 'files=@/dev/null;type=text/plain'   # -> 404
 ```
+
+Overlap uses exact character windows, including internal whitespace-only windows, so boundaries can split words. Per-file limits are 10,000 chunks and 10 million parsed characters; overlap also caps duplicated output at 10 million characters. At default 1000/200 sizing, more than 8,000,200 characters exceeds the window limit. Split large documents or select suitable chunk settings. These limits bound ingestion work independently of the upload byte limit.
