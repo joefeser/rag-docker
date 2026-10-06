@@ -95,6 +95,23 @@ def _save_index(collection: str, index: dict) -> None:
     tmp.replace(p)
 
 
+def restore_package(package: Path, collection: str) -> None:
+    """Copy only preflighted indexed originals, including into recovery copies.
+
+    Import preflight has checked the private extraction's index and blob bytes.
+    Unindexed files must never become retained originals under a future digest.
+    """
+    src = package / "sources"
+    if not (src / INDEX_NAME).is_file():
+        return
+    index = validate_index(json.loads((src / INDEX_NAME).read_text()))
+    dest = collection_dir(collection)
+    dest.mkdir(parents=True, exist_ok=True)
+    for digest in index["documents"]:
+        shutil.copyfile(src / digest, dest / digest)
+    shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
+
+
 def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
     """Retain one accepted upload. Returns its sha256."""
     digest = hashlib.sha256(data).hexdigest()

@@ -412,10 +412,16 @@ isolated fixture run does not replace the full verification suite (`stack.sh run
 ## Deferred Chunking configuration checks
 
 `browser/chunking_config.js`, registered in `06_ui.sh` through `ui_criteria.js`,
-uses the rendered page with deferred API responses. Six cases cover late loads,
+uses the rendered page with deferred API responses. Ten cases cover late loads,
 failed loads, A→B→A selection, stale save completions, pending saves across
-selection changes, and duplicate-save prevention. Each affected save checks
+selection changes, duplicate-save prevention, late responses against current
+edits and errors, the saved notice on a collection change, a configuration
+returned for another collection, and a failed collections list. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
+Retrieval deferred cases also cover superseded success/error notices, notice timer
+ownership, both orders of an acknowledged success and newer failure, and a
+three-save race that must not republish the same result over new edits.

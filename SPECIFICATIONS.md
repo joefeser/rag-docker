@@ -1132,7 +1132,10 @@ ingest default.
 - **409 `TUNE_IN_PROGRESS`** if the collection is already being tuned.
 - **`SOURCES_REQUIRED`** (through the job) when the operation needs originals the
   collection does not have. Re-embedding a `chunks-only` collection *with*
-  chunking fields is refused rather than half-honoured.
+  chunking fields is refused rather than half-honoured. Re-chunking is also
+  refused when a stored source file has no single retained original (a name
+  uploaded more than once, or a second name for the same content) or a
+  retained original is missing from disk.
 
 Each rebuild is staged into a temporary collection and verified before the
 original is deleted, so a failure before replacement leaves the original
@@ -1151,7 +1154,10 @@ sessions `stale`. `/tune/reindex` does not, because chunk identity is unchanged.
 GET /tune/{collection}
 ```
 
-What this collection can be tuned with, given its fidelity.
+What this collection can be tuned with, given its fidelity. `can_rechunk` is
+`false` when re-chunking would be refused: the collection is `chunks-only`, a
+stored source file has no single retained original, or a retained original is
+missing from disk.
 
 **Response 200:**
 ```json
@@ -1491,8 +1497,12 @@ them. Changing the selection (including leaving and returning to the same
 collection) invalidates pending responses for the prior selection. A stale
 save may finish persisting its original collection, but must not change the
 active settings, loading/error state, or invalidate the new collection's load.
-Within the current generation, only the latest initiated save may publish; a
-successful current save supersedes a pending older load for that collection.
+Within the current generation, the latest initiated save may publish. If it
+fails, the newest acknowledged success may publish, even if its response arrives
+after that failure. Each acknowledged save publishes at most once, so a later
+older completion cannot erase new edits by republishing the same result. Published
+saves supersede pending older loads. Superseded responses show neither Saved! nor
+an error, and an earlier notice timer cannot clear a newer Saved! notice.
 After the selected collection's load resolves, the next Q&A request uses its
 settings, regardless of when a prior collection's save completes.
 
@@ -1986,6 +1996,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 ### 10.4 Web UI
 
+- [x] Chunking loads and save results stay with their selection generation, including A→B→A; save is unavailable until the selected config loads. Stale responses preserve current edits and errors, collection changes clear the saved notice, and failed collection lists or mismatched configurations are reported.
+  *Evidence: `scripts/verify/browser/chunking_config.js` deferred load/save, stale failure, edited draft, collection-list failure, mismatched configuration and saved-notice cases in suite 06.*
+
 - [x] Role selection persists across page navigation within same browser session.
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`.*
@@ -2003,7 +2016,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
 
-- [x] Retrieval save confirmations and errors stay with their selection generation. Deferred browser cases verify stale success/failure after switching collections and preserve the newest acknowledged success when a newer save fails, in both response orders.
+- [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
+  *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
 
 ### 10.5 Infrastructure
 

@@ -4,18 +4,19 @@ const { makeReporter, clickByText, setValue } = require('./lib');
 const A = { collection: 'FixtureA', chunking_strategy: 'fixed', chunk_size: 100, chunk_overlap: 0, min_chunk_size: 0, similarity_threshold: null, is_default: false };
 const B = { ...A, collection: 'FixtureB', chunk_size: 2000 };
 const path = name => '/api/ingest/config/' + name;
-async function fixture(browser, base) {
+async function fixture(browser, base, { collectionsFail = false } = {}) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
-  await page.evaluateOnNewDocument((a, b) => {
+  await page.evaluateOnNewDocument((a, b, failCollections) => {
     sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     window.chunkingFixture = { requests: [] };
     window.fetch = (input, init = {}) => {
       const path = new URL(input, location.href).pathname;
       if (!path.startsWith('/api/')) return realFetch(input, init);
+      if (path === '/api/collections' && failCollections) return Promise.resolve(new Response(JSON.stringify({ error: { message: 'Collections list failed' } }), { status: 500 }));
       if (path === '/api/collections') return Promise.resolve(new Response(JSON.stringify({ collections: [a, b].map(c => ({ name: c.collection, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) }), { status: 200 }));
       if (path.startsWith('/api/ingest/config')) {
         const entry = { path, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null, done: false };
@@ -24,9 +25,9 @@ async function fixture(browser, base) {
       }
       return Promise.reject(new Error('Unexpected fixture request ' + path));
     };
-  }, A, B);
+  }, A, B, collectionsFail);
   await page.goto(base + '/chunking', { waitUntil: 'domcontentloaded' });
-  await pending(page, path(A.collection));
+  if (!collectionsFail) await pending(page, path(A.collection));
   return { ctx, page, errors };
 }
 async function pending(page, url, method = 'GET', count = 1) {
@@ -40,7 +41,11 @@ async function release(page, url, value, { method = 'GET', status = 200, last = 
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   }, url, method, value, status, last);
 }
-async function select(page, name) { await page.select('select', name); await pending(page, path(name)); }
+async function select(page, name) {
+  const count = await page.evaluate(p => window.chunkingFixture.requests.filter(r => r.path === p && r.method === 'GET' && !r.done).length, path(name));
+  await page.select('select', name);
+  await pending(page, path(name), 'GET', count + 1);
+}
 async function assertConfig(page, config) {
   assert.deepEqual(await page.evaluate(() => ({ collection: document.querySelector('select').value, size: Number(document.querySelector('input[type=range]')?.value) })), { collection: config.collection, size: config.chunk_size });
 }
@@ -111,10 +116,50 @@ async function runChunkingConfigTests(browser, base, reporter) {
       await assertConfig(page, { ...A, chunk_size: 500 });
       assert.equal(await page.evaluate(() => document.body.innerText.includes('Owned save failed')), true);
     }],
+    // Reviewer-added cases (#197 R3: old responses cannot replace current edits, errors or success state).
+    ['a late load cannot replace edits made on the selected collection', async page => {
+      await select(page, B.collection);
+      await release(page, path(B.collection), B);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '3000');
+      await release(page, path(A.collection), A);
+      await assertConfig(page, { ...B, chunk_size: 3000 });
+      await startSave(page);
+      const body = await page.evaluate(() => window.chunkingFixture.requests.find(r => r.method === 'POST').body);
+      assert.deepEqual([body.collection, body.chunk_size], [B.collection, 3000]);
+    }],
+    ['late load and save failures cannot set an error on the newly selected collection', async page => {
+      await select(page, B.collection);
+      await release(page, path(B.collection), B);
+      await release(page, path(A.collection), { error: { message: 'Stale A load failed' } }, { status: 500 });
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Stale A load failed')), false, 'stale load error shown under B');
+      await assertConfig(page, B);
+      await select(page, A.collection);
+      await release(page, path(A.collection), A);
+      await startSave(page);
+      await select(page, B.collection);
+      await release(page, path(B.collection), B);
+      await release(page, '/api/ingest/config', { error: { message: 'Stale A save failed' } }, { method: 'POST', status: 500 });
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Stale A save failed')), false, 'stale save error shown under B');
+      await assertConfig(page, B);
+    }],
+    ['changing collection clears the saved notice, and a config for another collection is refused', async page => {
+      await release(page, path(A.collection), A);
+      await startSave(page);
+      await release(page, '/api/ingest/config', A, { method: 'POST', status: 201 });
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), true, 'current save shows Saved!');
+      await select(page, B.collection);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false, 'Saved! kept after switching to B');
+      await release(page, path(B.collection), A);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('belongs to another collection')), true, 'mismatched config not refused');
+      assert.equal(await page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent === 'Save as Default')), false, 'save offered for a mismatched config');
+    }],
+    ['a failed collections list is reported', async page => {
+      await page.waitForFunction(() => document.body.innerText.includes('Collections list failed'), { timeout: 5000 });
+    }, { collectionsFail: true }],
   ];
-  for (const [name, test] of cases) {
+  for (const [name, test, opts] of cases) {
     let s;
-    try { s = await fixture(browser, base); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    try { s = await fixture(browser, base, opts); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
     catch (e) { reporter.check(name, false, e.stack || e.message); }
     finally { if (s) await s.ctx.close(); }
   }
