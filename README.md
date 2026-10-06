@@ -416,7 +416,10 @@ curl -X POST http://localhost:8080/api/tune/reindex \
 
 `GET /api/tune/<collection>` says which of these the collection can do — a
 `chunks-only` collection cannot be re-chunked, because the originals are not
-there to re-split.
+there to re-split. Nor can a collection where a stored file has no single
+retained original (a file uploaded more than once under the same name, or the
+same content uploaded under a second name), or where a retained original is
+missing from disk.
 
 Each rebuild is staged and swapped in only once it succeeds, so a failure leaves
 the collection as it was.

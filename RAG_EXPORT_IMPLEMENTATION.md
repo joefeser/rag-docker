@@ -703,7 +703,7 @@ guarantee held — but an abandoned staging collection is not merely untidy: it 
 returned by `GET /collections` and appears in the UI's collection pickers as
 though it were real.
 
-Two fixes, both at startup, where nothing can be mid-operation:
+Historical fixes (superseded by the ownership rules in the note below):
 
 1. `weaviate_client.sweep_staging()` removes any collection carrying the
    `__importing_` or `__tuning_` marker.
