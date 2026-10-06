@@ -518,7 +518,10 @@ the destination directory and atomically replaces the saved configuration. A 201
 acknowledges that request's complete value was published; a later successful save
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
-Failed saves clean up their own temporary file when filesystem permissions allow. Package import publishes ingest settings through this same lock and atomic writer. Published files use mode 0600 (API owner read/write), including replacements of older files.
+Failed saves clean up their own temporary file when filesystem permissions
+allow. Package import publishes ingest settings through this same lock and
+atomic writer. Published files use mode 0600 (API owner read/write), including
+replacements of older files.
 
 ---
 
@@ -684,7 +687,7 @@ before sampling and publishing its session. A busy collection returns
 deletion removed the collection before sampling, it returns
 `404 COLLECTION_NOT_FOUND`. Retry a busy request after the writer finishes.
 
-Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
+Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most 100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
 
 The iterator caches 100 objects and selection retains at most `sample_size` candidate payloads; the complete corpus is scanned once. Full scans can take longer than fetching an initial prefix. Payload size is inherited from stored chunks; this is a candidate-count bound, not a byte-size limit.
 
@@ -1931,7 +1934,7 @@ now lives once, in `api/services/ingest_config.py`.
       A 513 MB sparse file gets 413.*
 
 - [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
-      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
+      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes 19 checks in 1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
 ### 10.2 Query
 
@@ -1955,6 +1958,9 @@ now lives once, in `api/services/ingest_config.py`.
       *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
 
 ### 10.3 Gold Standard
+
+- [x] Pending stale/orphan markers survive restart and are resolved by the next successful session write. Session and marker files use mode 0600; imported sessions clear persistence_error.
+  *Evidence: session_persistence_cases.py covers owner-only files, marker replay, symlink refusal and durability wording; session-import cases check cleared local persistence errors.*
 
 - [x] Retained stale/orphaned session warnings reach the live API and browser, with reasons/timestamps and legacy defaults. Historical export requires explicit choice, keeps RAGAS compatibility and preserves the original session.
       *Six controlled service/runtime groups plus one twelve-source documentation group cover validity/export and rebuild failure boundaries. Registered real backend/in-process HTTP checks cover actual stale/orphan markers, strict choices, missing sessions, empty history, compatible exports and a failed destructive cutover; browser fixtures cover empty history, failed lookup and duplicate export requests. An actual browser against the built UI and isolated real API shows legacy defaults, warning reasons/timestamps, reset consent after actual deletion, empty historical warnings and explicit four-field RAGAS download. Suite10 is called by05/all.sh; full suite is recorded separately.*
@@ -2028,7 +2034,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 `''`; the type name is now always included.
 
 - [x] Seeded selection reaches the complete UUID population, preserves rank order across backend iteration orders, and retrieves payloads only for selected IDs.
-      *19 controlled runtime groups plus one nine-source documentation group cover geometry-independent selection, API validation, missing winners and parked MCP function limits. Suite09, called by04, exercises160 owned synthetic SDK objects across pages; supplied vectors avoid model calls. Its registered live HTTP cases reject invalid generation settings before a missing collection can be queried. This is selection evidence, not deterministic LLM output.*
+      *19 controlled runtime groups plus one nine-source documentation group cover geometry-independent selection, API validation, missing winners and parked MCP function limits. Suite 09, called by 04, exercises 160 owned synthetic SDK objects across pages; supplied vectors avoid model calls. Its registered live HTTP cases reject invalid generation settings before a missing collection can be queried. This is selection evidence, not deterministic LLM output.*
 
 ### 10.4 Web UI
 
@@ -2180,6 +2186,8 @@ A rebuild from these documents is correct when:
       *Registered `14_reindex.sh`: 24 runtime cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling cases and 44 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*
 
 Generated model questions, answers and ground truths must be nonempty strings. Invalid field types consume the same bounded reprompt budget as malformed JSON; exhausted attempts fail the pair rather than publishing Python representations. An omitted ground truth defaults to the validated answer, and null source filenames normalize to an empty string.
+
+Overlap retains internal whitespace-only windows to preserve exact character coverage and overlap; wholly blank input yields no chunks. Hard character boundaries and fixed per-file limits remain the existing contract, rather than changing retrieval behavior in this follow-up.
 
 - [x] Interrupted tuning final writes carry an operation instance token. Startup checks only the matching target against its retained recovery records, marks mismatches or missing targets stale, and preserves both collections and snapshots for inspection. A different target instance, unreadable backend, or missing recovery never authorizes deletion. Completed matching targets are left untouched.
       *Controlled restart cases in `test_batch_recovery.py`; startup deliberately does not delete targets using mutable recovery data.*
