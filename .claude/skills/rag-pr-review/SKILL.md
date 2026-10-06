@@ -41,6 +41,7 @@ Record `headRefOid` as the **reviewed SHA**, and `origin/develop` as the **devel
 
 - Linked issues are `closingIssuesReferences` plus any `Part of #n` / `Refs #n` in the body.
 - **No linked issue:** stop for this PR. Tell the user which open issues look closest and why, and ask which one is the source of truth. Do not guess, and do not review against the PR's own description. Post nothing, and set no statuses.
+- **Triage gate (before any claim):** at this PR's turn, fetch the current labels of every linked issue with `gh issue view N --json number,labels`. Include `closingIssuesReferences` and `Part of #n` / `Refs #n`; do not rely on an earlier queue snapshot. If any linked issue has `Triage`, skip this PR without claiming it, dispatching reviews, or setting statuses. Record `skipped: linked issue #N carries Triage` in the local queue history and report it to the user. A failed issue/label lookup leaves eligibility unknown: stop before claiming and report the lookup failure. Resume only after labels can be read and no linked issue carries `Triage`.
 - **More than one linked issue:** review against all of them, and name each in the dispatch.
 - **`Part of #n`:** note what the PR says it leaves for later. Specialists mark those requirements `deferred (Part of)` (see `reference.md`).
 
