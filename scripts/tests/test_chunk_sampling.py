@@ -1,5 +1,6 @@
 """Synthetic sampling invariants and validation before persistence/model work."""
 import asyncio
+import json
 import ast
 import runpy
 import os
@@ -206,6 +207,100 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.gather(*list(gs._tasks))
                     current = gs.get_session(result['session_id'])
                     self.assertTrue(current['stale' if marker == gs.mark_stale else 'orphaned'])
+
+    async def test_sampling_waits_for_an_in_progress_alias_mutation(self):
+        # Reviewer test (#194): a generation started while a writer holds the
+        # collection under its accepted alias must not sample until the writer ends.
+        import threading
+        from services.collection_writes import guard
+        chunk = {'content': 'new corpus', 'source_file': 'new.txt', 'chunk_index': 0}
+        holding, release = threading.Event(), threading.Event()
+        def writer():
+            with guard('inert'):
+                holding.set()
+                if not release.wait(5): raise TimeoutError('test writer release')
+        sampler = MagicMock(return_value=[chunk])
+        with patch.object(gs.wc, '_sample_chunks_sync', new=sampler), \
+             patch.object(gs, '_store_generated_session', side_effect=lambda s: {**s, 'session_id': 'gs_460abcd1'}), \
+             patch.object(gs, '_run_generation', new=AsyncMock()):
+            mutation = asyncio.create_task(asyncio.to_thread(writer))
+            try:
+                self.assertTrue(await asyncio.to_thread(holding.wait, 5))
+                generation = asyncio.create_task(gs.start_generation('Inert', 1, 7))
+                await asyncio.sleep(.2)
+                sampler.assert_not_called()
+                self.assertFalse(generation.done(), 'generation published while a writer held the alias')
+            finally:
+                release.set()
+            await mutation
+            result = await asyncio.wait_for(generation, 5)
+            sampler.assert_called_once_with('Inert', limit=1, seed=7)
+            await asyncio.gather(*list(gs._tasks))
+            self.assertEqual(result['session_id'], 'gs_460abcd1')
+
+    async def test_busy_generation_returns_409_without_publishing_and_cleans_waiter(self):
+        import threading
+        from services import collection_writes as writes
+        from routers import goldstandard as route
+        from models.schemas import GenerateRequest
+        held, release = threading.Event(), threading.Event()
+        def writer():
+            with writes.guard('inert'):
+                held.set()
+                if not release.wait(5): raise TimeoutError('writer release')
+        task = asyncio.create_task(asyncio.to_thread(writer))
+        try:
+            self.assertTrue(await asyncio.to_thread(held.wait, 5))
+            with patch.object(gs, '_GENERATION_GUARD_TIMEOUT_SECONDS', .02), \
+                 patch.object(wc, 'collection_exists', new=AsyncMock(return_value=True)), \
+                 patch.object(wc, '_sample_chunks_sync') as sample_mock, \
+                 patch.object(gs, '_store_generated_session') as publish:
+                response = await asyncio.wait_for(route.generate(GenerateRequest(collection='Inert', sample_size=1)), 2)
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(json.loads(response.body)['error']['code'], 'COLLECTION_BUSY')
+                sample_mock.assert_not_called()
+                publish.assert_not_called()
+                self.assertEqual(writes._registry['Inert'][1], 1)
+        finally:
+            release.set()
+            await task
+        self.assertNotIn('Inert', writes._registry)
+
+    async def test_real_delete_before_sampling_returns_typed_404(self):
+        import threading
+        from routers import goldstandard as route
+        from models.schemas import GenerateRequest
+        deleting, release = threading.Event(), threading.Event()
+        client = MagicMock()
+        client.collections.get.return_value.config.get.return_value.name = 'Inert'
+        client.collections.exists.return_value = True
+        def remove(name):
+            deleting.set()
+            if not release.wait(5): raise TimeoutError('delete release')
+            client.collections.exists.return_value = False
+        client.collections.delete.side_effect = remove
+        with patch.object(wc, 'get_client', return_value=client), \
+             patch.object(wc, 'collection_exists', new=AsyncMock(return_value=True)), \
+             patch.object(wc.collection_recovery, 'retire_deleted'), \
+             patch.object(wc.sources, 'delete'), \
+             patch.object(wc.retrieval_config, 'delete'), \
+             patch.object(wc.ingest_config, 'delete'), \
+             patch.object(gs, 'mark_orphaned'), \
+             patch.object(gs, '_store_generated_session') as publish:
+            deletion = asyncio.create_task(wc.delete_collection('inert'))
+            try:
+                self.assertTrue(await asyncio.to_thread(deleting.wait, 5))
+                generation = asyncio.create_task(route.generate(GenerateRequest(collection='Inert', sample_size=1)))
+                await asyncio.sleep(.05)
+                self.assertFalse(generation.done())
+            finally:
+                release.set()
+                await deletion
+            response = await asyncio.wait_for(generation, 2)
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(json.loads(response.body)['error']['code'], 'COLLECTION_NOT_FOUND')
+            publish.assert_not_called()
+            client.collections.get.return_value.iterator.assert_not_called()
 
     @staticmethod
     def _guard_free(name, timeout=2):
