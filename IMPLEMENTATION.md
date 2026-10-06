@@ -1315,6 +1315,23 @@ def _save_index(collection: str, index: dict) -> None:
     tmp.replace(p)
 
 
+def restore_package(package: Path, collection: str) -> None:
+    """Copy only preflighted indexed originals, including into recovery copies.
+
+    Import preflight has checked the private extraction's index and blob bytes.
+    Unindexed files must never become retained originals under a future digest.
+    """
+    src = package / "sources"
+    if not (src / INDEX_NAME).is_file():
+        return
+    index = validate_index(json.loads((src / INDEX_NAME).read_text()))
+    dest = collection_dir(collection)
+    dest.mkdir(parents=True, exist_ok=True)
+    for digest in index["documents"]:
+        shutil.copyfile(src / digest, dest / digest)
+    shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
+
+
 def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
     """Retain one accepted upload. Returns its sha256."""
     digest = hashlib.sha256(data).hexdigest()
@@ -1951,8 +1968,10 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     metadata.mkdir()
     target, staging = source_collection or record["target"], record["staging"]
     upload = Path(settings.upload_dir)
-    _copy(package / "sources" if package else sources.collection_dir(target),
-          sources.collection_dir(staging))
+    if package is not None:
+        sources.restore_package(package, staging)
+    else:
+        _copy(sources.collection_dir(target), sources.collection_dir(staging))
     for kind in ("ingest", "retrieval"):
         origin = package / f"{kind}_config.json" if package else upload / f"{kind}_configs" / f"{target}.json"
         _copy(origin, metadata / f"{kind}_config.json")
@@ -2546,11 +2565,17 @@ async def hybrid_query(
     return await asyncio.to_thread(_hybrid_query_sync, collection_name, query, alpha, top_k)
 
 
+class CollectionNotFoundError(LookupError):
+    """The collection disappeared before guarded sampling."""
+
+
 def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
     from models.schemas import GenerateRequest
     from services.chunk_sampling import select_chunk_ids
     request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
+    if not client.collections.exists(collection_name):
+        raise CollectionNotFoundError(collection_name)
     coll = client.collections.get(collection_name)
     objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
     identities = select_chunk_ids(objects, request.sample_size, request.seed)
@@ -2566,10 +2591,6 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
              "source_file": by_id[identity].get("source_file", ""),
              "chunk_index": by_id[identity].get("chunk_index", 0)}
             for identity in identities if identity in by_id]
-
-
-async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
-    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit, seed)
 ```
 
 ### api/services/ollama_client.py
@@ -4089,28 +4110,38 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
+_GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
+
+
 def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
     """Publish the sampled corpus identity before a writer can invalidate it."""
-    from services.collection_writes import guard
-    with guard(collection):
-        all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
-        actual_size = len(all_chunks)
+    from services.collection_writes import CollectionBusyError, guard
+    try:
+        with guard(collection, timeout=_GENERATION_GUARD_TIMEOUT_SECONDS):
+            all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
+            actual_size = len(all_chunks)
 
-        session = {
-            "session_id": "",
-            "collection": collection,
-            "status": "generating",
-            "pairs_total": actual_size,
-            # `attempted` drives progress and always reaches `total`; `completed`
-            # counts pairs that actually exist. Reporting one number for both made
-            # a session with a failed pair read "3/3" while holding 2.
-            "pairs_attempted": 0,
-            "pairs_completed": 0,
-            "pairs_failed": 0,
-            "pairs": [],
-        }
-        session = _store_generated_session(session)
-        return session, all_chunks
+            session = {
+                "session_id": "",
+                "collection": collection,
+                "status": "generating",
+                "pairs_total": actual_size,
+                # `attempted` drives progress and always reaches `total`; `completed`
+                # counts pairs that actually exist. Reporting one number for both made
+                # a session with a failed pair read "3/3" while holding 2.
+                "pairs_attempted": 0,
+                "pairs_completed": 0,
+                "pairs_failed": 0,
+                "pairs": [],
+            }
+            session = _store_generated_session(session)
+            return session, all_chunks
+    except CollectionBusyError as exc:
+        raise GoldStandardError("COLLECTION_BUSY",
+            f"Collection '{collection}' is busy. Retry after its current operation finishes.", 409) from exc
+    except wc.CollectionNotFoundError as exc:
+        raise GoldStandardError("COLLECTION_NOT_FOUND",
+            f"Collection '{collection}' not found.", 404) from exc
 
 
 async def start_generation(
@@ -5533,7 +5564,7 @@ def _validate_package_sources(pkg: Path, manifest: dict) -> None:
                 raise ValueError("Retained source blob is missing or is not a regular file")
             # Check 3 already hashed listed files in this private extraction.
             # Match that verified digest to the content-addressed filename;
-            # legacy unlisted blobs still need their own identity hash.
+            # manifest omissions still need their own identity hash.
             files = manifest.get("files", {})
             rel = f"sources/{digest}"
             actual = files[rel] if rel in files else "sha256:" + packager.sha256_file(blob)
@@ -5613,16 +5644,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
-    src = pkg / "sources"
-    if (src / sources.INDEX_NAME).is_file():
-        # Preflight validated these identities and bytes. Never retain unrelated
-        # package files: their names could shadow a future content-addressed blob.
-        index = sources.validate_index(json.loads((src / sources.INDEX_NAME).read_text()))
-        dest = sources.collection_dir(target)
-        dest.mkdir(parents=True, exist_ok=True)
-        for digest in index["documents"]:
-            shutil.copyfile(src / digest, dest / digest)
-        shutil.copyfile(src / sources.INDEX_NAME, dest / sources.INDEX_NAME)
+    sources.restore_package(pkg, target)
 
     ingest_cfg = pkg / "ingest_config.json"
     if ingest_cfg.is_file():
@@ -6226,6 +6248,57 @@ def _verify_records(collection: str, records: list[dict]) -> None:
         raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
 
 
+_MISSING_CHUNK_INDEX = object()
+
+
+def _emitted_name(digest: str, entry: dict) -> str:
+    """The source_file a rebuild writes for this retained digest's chunks."""
+    return Path((entry.get("filenames") or [digest])[0]).name
+
+
+def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
+    """Stored source files a rebuild from the retained originals would not reproduce."""
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    seen: dict[str, set] = {}
+    uncovered = set()
+    for obj in wc.get_client().collections.get(collection).iterator():
+        props = obj.properties or {}
+        filename = props.get("source_file")
+        if not isinstance(filename, str) or not filename:
+            uncovered.add("<unknown>")
+            continue
+        digests = by_filename.get(filename, [])
+        if len(digests) != 1 or _emitted_name(digests[0], documents[digests[0]]) != filename:
+            uncovered.add(filename)
+            continue
+        index = props.get("chunk_index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            index = _MISSING_CHUNK_INDEX
+        indices = seen.setdefault(filename, set())
+        if index in indices:
+            uncovered.add(filename)
+        indices.add(index)
+    return sorted(uncovered)
+
+
+def can_rechunk(collection: str) -> bool:
+    """Whether re-chunking would pass the checks made before parsing.
+
+    Used by the tuning options, so they offer re-chunking only when the job
+    would accept it. An invalid index or blob path raises ValueError.
+    """
+    documents = sources.load_index(collection)["documents"]
+    if not documents:
+        return False
+    for digest in documents:
+        if not sources.blob_path(collection, digest).is_file():
+            return False
+    return not _uncovered_source_files(collection, documents)
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -6246,25 +6319,22 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # A chunks-only import or a failed retention can leave a mixed corpus.
-    # Any retained file is insufficient: replacing from that subset loses the
-    # other chunks and successful cutover discards their recovery copy.
-    by_filename: dict[str, list[str]] = {}
-    for digest, entry in documents.items():
-        for filename in entry["filenames"]:
-            by_filename.setdefault(filename, []).append(digest)
-    uncovered = set()
-    for obj in wc.get_client().collections.get(collection).iterator():
-        filename = (obj.properties or {}).get("source_file")
-        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
-            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
+    # Re-chunking rebuilds one chunk set per retained digest, under its first
+    # name. A stored name is covered only when exactly one digest lists it, it
+    # is that digest's first name, and its chunks form one set (no repeated
+    # chunk_index). A second name for the same content, a re-upload (whether
+    # its retention succeeded or failed) and a name with no retained original
+    # are refused before staging: replacing from the retained subset would
+    # lose chunks, and a successful cutover discards their recovery copy.
+    # Issue #22 lifts this by rebuilding one chunk set per (digest, name).
+    uncovered = _uncovered_source_files(collection, documents)
     if uncovered:
         raise PackageError(
             "SOURCES_REQUIRED",
             "Cannot change chunk boundaries: some stored chunks have missing or "
             "ambiguous retained originals. Re-embed without chunking parameters "
             "or re-index to preserve the existing chunks.",
-            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+            {"collection": collection, "uncovered_source_files": uncovered})
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -6280,8 +6350,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     {"collection": collection, "digest": digest})
             # Parsers dispatch on the file extension, so the original filename
             # has to be restored before parsing.
-            filename = (entry.get("filenames") or [digest])[0]
-            staged = work / Path(filename).name
+            staged = work / _emitted_name(digest, entry)
             shutil.copyfile(blob, staged)
 
             text, elements = _parse_file(staged)
@@ -7172,19 +7241,28 @@ async def tune_options(collection: str):
     try:
         has_sources = await asyncio.to_thread(sources.has_sources, collection)
         stats = await asyncio.to_thread(sources.stats, collection)
+        can_rechunk = has_sources and await asyncio.to_thread(tuning.can_rechunk, collection)
     except ValueError:
         return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
+    if not has_sources:
+        note = ("No original documents were retained, so this collection cannot be "
+                "re-chunked. Re-embedding works from the stored chunk text, which "
+                "leaves chunk boundaries unchanged.")
+    elif can_rechunk:
+        note = "Every tuning operation is available."
+    else:
+        note = ("Some stored source files have no single retained original, or a "
+                "retained original is missing, so this collection cannot be "
+                "re-chunked. Re-embedding works from the stored chunk text, which "
+                "leaves chunk boundaries unchanged, and re-indexing is available.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",
         source_document_count=stats["document_count"],
-        can_rechunk=has_sources,
+        can_rechunk=can_rechunk,
         can_reembed=True,
         can_reindex=True,
-        note=("Every tuning operation is available." if has_sources else
-              "No original documents were retained, so this collection cannot be "
-              "re-chunked. Re-embedding works from the stored chunk text, which "
-              "leaves chunk boundaries unchanged."),
+        note=note,
     )
 ```
 
@@ -8340,6 +8418,7 @@ interface QueryConfigValue {
   isDefault: boolean
   loading: boolean
   error: string
+  /** False means superseded: the caller must show no success or error notice. */
   saveConfig: (config: QueryConfig) => Promise<boolean>
 }
 
@@ -8368,6 +8447,7 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const selectedCollection = useRef('')
   const saveId = useRef(0)
   const selectionId = useRef(0)
+  const publishedSaveId = useRef<number | null>(null)
   const latestFailed = useRef(false)
   const lastSuccess = useRef<{ id: number; value: RetrievalConfig } | null>(null)
 
@@ -8377,6 +8457,7 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
     selectionId.current++
     latestFailed.current = false
     lastSuccess.current = null
+    publishedSaveId.current = null
     // Invalidate immediately, before the next effect runs. A -> B -> A is
     // also a new generation even though the collection name matches again.
     requestId.current++
@@ -8421,7 +8502,10 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
       const saveTicket = ++saveId.current
       latestFailed.current = false
       const isCurrent = () => selection === selectionId.current && collection === selectedCollection.current
-      const publish = (saved: RetrievalConfig) => {
+      const publish = (success: { id: number; value: RetrievalConfig }) => {
+        if (publishedSaveId.current === success.id) return
+        publishedSaveId.current = success.id
+        const saved = success.value
         // Cancel pending loads without invalidating other saves in this selection.
         requestId.current++
         setConfigState(fromResponse(saved))
@@ -8438,13 +8522,13 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
         // If the newest request failed, retain the newest acknowledged success,
         // even when that older request's response arrives after the failure.
         if (saveTicket === saveId.current || latestFailed.current) {
-          publish(lastSuccess.current.value)
+          publish(lastSuccess.current)
         }
         return saveTicket === saveId.current
       } catch (e: unknown) {
         if (!isCurrent() || saveTicket !== saveId.current) return false
         latestFailed.current = true
-        if (lastSuccess.current) publish(lastSuccess.current.value)
+        if (lastSuccess.current) publish(lastSuccess.current)
         throw e
       }
     },
@@ -10893,11 +10977,17 @@ isolated fixture run does not replace the full verification suite (`stack.sh run
 ## Deferred Chunking configuration checks
 
 `browser/chunking_config.js`, registered in `06_ui.sh` through `ui_criteria.js`,
-uses the rendered page with deferred API responses. Six cases cover late loads,
+uses the rendered page with deferred API responses. Ten cases cover late loads,
 failed loads, A→B→A selection, stale save completions, pending saves across
-selection changes, and duplicate-save prevention. Each affected save checks
+selection changes, duplicate-save prevention, late responses against current
+edits and errors, the saved notice on a collection change, a configuration
+returned for another collection, and a failed collections list. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
+
+Retrieval deferred cases also cover superseded success/error notices, notice timer
+ownership, both orders of an acknowledged success and newer failure, and a
+three-save race that must not republish the same result over new edits.
 ````
 
 ### scripts/verify/all.sh
@@ -11746,9 +11836,9 @@ restart_limit() {
   local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
   case "$value" in
     ''|*[!0-9]*) ;;
-    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+    *) if [ "${#value}" -le 6 ] && [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
   esac
-  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds (at most 6 digits), not '%s'" "$value"
   return 1
 }
 
@@ -13949,6 +14039,72 @@ done
 check_eq "E29: the restored index is the original" "$(src_index_hash "$C")" "$idx_before"
 (cd "$REPO_ROOT" && docker compose exec -T api rm -f "$E29_SENT") >/dev/null 2>&1 || true
 
+# ── unindexed package blobs are never retained (E29, #179) ───────────────────
+# A digest-valid package carries an extra sources/ file named after the SHA-256
+# of a document not yet ingested, holding other bytes. Import must not retain
+# it, so a later ingest of that document keeps the document's own bytes.
+E29_FUTURE="$FIX/e29-future-$E29_TAG.txt"
+printf 'E29 future document %s: the bytes a later ingest must retain.\n' "$E29_TAG" > "$E29_FUTURE"
+E29_FDIG=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$E29_FUTURE")
+UNIDX=$(python3 - "$EXPORTS/$PKG" "$E29_FDIG" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, fdig = pathlib.Path(sys.argv[1]), sys.argv[2]
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    index = json.loads((root / "sources" / "index.json").read_text())
+    assert index["documents"] and fdig not in index["documents"]
+    planted = root / "sources" / fdig
+    planted.write_bytes(b"E29 planted unindexed bytes")
+    manifest["files"]["sources/" + fdig] = "sha256:" + hashlib.sha256(planted.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-unindexed.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+)
+run_import "$UNIDX" rename
+read -r ustat uname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+check_eq "E29: a digest-valid package with an unindexed source blob imports (rename)" "$ustat" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$uname" "$E29_FDIG" <<'ENDPY'
+import json, sys
+from services import sources
+d, fdig = sources.collection_dir(sys.argv[1]), sys.argv[2]
+names = {p.name for p in d.iterdir()} if d.is_dir() else set()
+docs = set(json.loads((d / "index.json").read_text())["documents"]) if (d / "index.json").is_file() else set()
+print("    retained:", sorted(names))
+sys.exit(0 if docs and names == docs | {"index.json"} and fdig not in names else 1)
+ENDPY
+)
+check "E29: import retains only the indexed blobs and index.json, not the unindexed one" $?
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$uname" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$E29_FUTURE" > /tmp/vfy_e29ing.json
+check_eq "E29: ingesting the document the planted name targets completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_e29ing.json)" 900)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$uname" "$E29_FDIG" <<'ENDPY'
+import hashlib, sys
+from services import sources
+name, fdig = sys.argv[1], sys.argv[2]
+p = sources.blob_path(name, fdig)
+got = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing"
+print("    retained blob hashes to", got)
+sys.exit(0 if got == fdig and fdig in sources.load_index(name)["documents"] else 1)
+ENDPY
+)
+check "E29: ... and its retained blob holds the document's own bytes" $?
+[ "$uname" != "-" ] && [ "$uname" != "$C" ] && drop_collection "$uname"
+rm -f "$EXPORTS/$UNIDX" "$E29_FUTURE"
+
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
@@ -14723,7 +14879,7 @@ module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, cli
 // Deferred responses exercise the real provider, Retrieval page, and Q&A page.
 // All API calls are intercepted before application startup; no backend is used.
 const assert = require('node:assert/strict');
-const { makeReporter, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, setValue, clickByText } = require('./lib');
 
 const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
 const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
@@ -14914,6 +15070,65 @@ async function runQueryConfigTests(browser, base, reporter) {
       await assertQuery(page, saved);
     }]);
   }
+  // Testing reviewer cases (#205): superseded saves in one selection, and the confirmation timer.
+  const shows = (page, text) => page.evaluate(t => document.body.innerText.includes(t), text);
+  cases.push(['superseded save shows no confirmation; only the latest save shows Saved!', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 2);
+    const current = { ...A, top_k: 17 };
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), false, 'the superseded save showed "Saved!"');
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the latest save showed no "Saved!"');
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  cases.push(['superseded save failure is not shown; the latest success confirms', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 2);
+    const current = { ...A, top_k: 17 };
+    await release(page, '/api/retrieval/config', { error: { message: 'Superseded save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await shows(page, 'Superseded save failed'), false, "the superseded save's failure was shown");
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Superseded save failed'), false, "the superseded save's failure was shown");
+    assert.equal(await shows(page, 'Saved!'), true, 'the latest save showed no "Saved!"');
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  cases.push(["an earlier save's confirmation timer does not clear a later save's Saved!", async page => {
+    await save(page);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the first save showed no "Saved!"');
+    const first = Date.now();
+    await sleep(2000);
+    const current = { ...A, top_k: 17 };
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the second save showed no "Saved!"');
+    await sleep(Math.max(0, first + 3600 - Date.now()));
+    assert.equal(await shows(page, 'Saved!'), true, "the first save's timer cleared the second save's \"Saved!\"");
+    await page.waitForFunction(() => !document.body.innerText.includes('Saved!'), { timeout: 5000 });
+  }]);
+  cases.push(['a late older success cannot republish an acknowledged save over new edits', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '13');
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 3);
+    await release(page, '/api/retrieval/config', { error: { message: 'Newest failed' } }, { method: 'POST', status: 500, last: true });
+    await release(page, '/api/retrieval/config', { ...A, top_k: 13 }, { method: 'POST', last: true });
+    await assertSettings(page, { ...A, top_k: 13 });
+    await setValue(page, '() => document.querySelector("input[type=range]")', '19');
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    await assertSettings(page, { ...A, top_k: 19 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+  }]);
   for (const [name, test] of cases) {
     let s;
     try {
@@ -17585,16 +17800,25 @@ def canonical(collection):
     return collection[:1].upper() + collection[1:]
 
 
+class CollectionBusyError(TimeoutError):
+    """A bounded caller could not acquire the collection mutation guard."""
+
+
 @contextmanager
-def guard(collection):
+def guard(collection, timeout=None):
     collection = canonical(collection)
     with _registry_lock:
         entry = _registry.setdefault(collection, [threading.RLock(), 0])
         entry[1] += 1
+    acquired = False
     try:
-        with entry[0]:
-            yield
+        acquired = entry[0].acquire() if timeout is None else entry[0].acquire(timeout=timeout)
+        if not acquired:
+            raise CollectionBusyError(collection)
+        yield
     finally:
+        if acquired:
+            entry[0].release()
         with _registry_lock:
             entry[1] -= 1
             if not entry[1]:
@@ -18961,18 +19185,19 @@ const { makeReporter, clickByText, setValue } = require('./lib');
 const A = { collection: 'FixtureA', chunking_strategy: 'fixed', chunk_size: 100, chunk_overlap: 0, min_chunk_size: 0, similarity_threshold: null, is_default: false };
 const B = { ...A, collection: 'FixtureB', chunk_size: 2000 };
 const path = name => '/api/ingest/config/' + name;
-async function fixture(browser, base) {
+async function fixture(browser, base, { collectionsFail = false } = {}) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
-  await page.evaluateOnNewDocument((a, b) => {
+  await page.evaluateOnNewDocument((a, b, failCollections) => {
     sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     window.chunkingFixture = { requests: [] };
     window.fetch = (input, init = {}) => {
       const path = new URL(input, location.href).pathname;
       if (!path.startsWith('/api/')) return realFetch(input, init);
+      if (path === '/api/collections' && failCollections) return Promise.resolve(new Response(JSON.stringify({ error: { message: 'Collections list failed' } }), { status: 500 }));
       if (path === '/api/collections') return Promise.resolve(new Response(JSON.stringify({ collections: [a, b].map(c => ({ name: c.collection, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) }), { status: 200 }));
       if (path.startsWith('/api/ingest/config')) {
         const entry = { path, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null, done: false };
@@ -18981,9 +19206,9 @@ async function fixture(browser, base) {
       }
       return Promise.reject(new Error('Unexpected fixture request ' + path));
     };
-  }, A, B);
+  }, A, B, collectionsFail);
   await page.goto(base + '/chunking', { waitUntil: 'domcontentloaded' });
-  await pending(page, path(A.collection));
+  if (!collectionsFail) await pending(page, path(A.collection));
   return { ctx, page, errors };
 }
 async function pending(page, url, method = 'GET', count = 1) {
@@ -18997,7 +19222,11 @@ async function release(page, url, value, { method = 'GET', status = 200, last = 
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   }, url, method, value, status, last);
 }
-async function select(page, name) { await page.select('select', name); await pending(page, path(name)); }
+async function select(page, name) {
+  const count = await page.evaluate(p => window.chunkingFixture.requests.filter(r => r.path === p && r.method === 'GET' && !r.done).length, path(name));
+  await page.select('select', name);
+  await pending(page, path(name), 'GET', count + 1);
+}
 async function assertConfig(page, config) {
   assert.deepEqual(await page.evaluate(() => ({ collection: document.querySelector('select').value, size: Number(document.querySelector('input[type=range]')?.value) })), { collection: config.collection, size: config.chunk_size });
 }
@@ -19068,10 +19297,50 @@ async function runChunkingConfigTests(browser, base, reporter) {
       await assertConfig(page, { ...A, chunk_size: 500 });
       assert.equal(await page.evaluate(() => document.body.innerText.includes('Owned save failed')), true);
     }],
+    // Reviewer-added cases (#197 R3: old responses cannot replace current edits, errors or success state).
+    ['a late load cannot replace edits made on the selected collection', async page => {
+      await select(page, B.collection);
+      await release(page, path(B.collection), B);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '3000');
+      await release(page, path(A.collection), A);
+      await assertConfig(page, { ...B, chunk_size: 3000 });
+      await startSave(page);
+      const body = await page.evaluate(() => window.chunkingFixture.requests.find(r => r.method === 'POST').body);
+      assert.deepEqual([body.collection, body.chunk_size], [B.collection, 3000]);
+    }],
+    ['late load and save failures cannot set an error on the newly selected collection', async page => {
+      await select(page, B.collection);
+      await release(page, path(B.collection), B);
+      await release(page, path(A.collection), { error: { message: 'Stale A load failed' } }, { status: 500 });
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Stale A load failed')), false, 'stale load error shown under B');
+      await assertConfig(page, B);
+      await select(page, A.collection);
+      await release(page, path(A.collection), A);
+      await startSave(page);
+      await select(page, B.collection);
+      await release(page, path(B.collection), B);
+      await release(page, '/api/ingest/config', { error: { message: 'Stale A save failed' } }, { method: 'POST', status: 500 });
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Stale A save failed')), false, 'stale save error shown under B');
+      await assertConfig(page, B);
+    }],
+    ['changing collection clears the saved notice, and a config for another collection is refused', async page => {
+      await release(page, path(A.collection), A);
+      await startSave(page);
+      await release(page, '/api/ingest/config', A, { method: 'POST', status: 201 });
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), true, 'current save shows Saved!');
+      await select(page, B.collection);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false, 'Saved! kept after switching to B');
+      await release(page, path(B.collection), A);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('belongs to another collection')), true, 'mismatched config not refused');
+      assert.equal(await page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent === 'Save as Default')), false, 'save offered for a mismatched config');
+    }],
+    ['a failed collections list is reported', async page => {
+      await page.waitForFunction(() => document.body.innerText.includes('Collections list failed'), { timeout: 5000 });
+    }, { collectionsFail: true }],
   ];
-  for (const [name, test] of cases) {
+  for (const [name, test, opts] of cases) {
     let s;
-    try { s = await fixture(browser, base); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    try { s = await fixture(browser, base, opts); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
     catch (e) { reporter.check(name, false, e.stack || e.message); }
     finally { if (s) await s.ctx.close(); }
   }

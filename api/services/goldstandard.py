@@ -774,28 +774,38 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
+_GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
+
+
 def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
     """Publish the sampled corpus identity before a writer can invalidate it."""
-    from services.collection_writes import guard
-    with guard(collection):
-        all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
-        actual_size = len(all_chunks)
+    from services.collection_writes import CollectionBusyError, guard
+    try:
+        with guard(collection, timeout=_GENERATION_GUARD_TIMEOUT_SECONDS):
+            all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
+            actual_size = len(all_chunks)
 
-        session = {
-            "session_id": "",
-            "collection": collection,
-            "status": "generating",
-            "pairs_total": actual_size,
-            # `attempted` drives progress and always reaches `total`; `completed`
-            # counts pairs that actually exist. Reporting one number for both made
-            # a session with a failed pair read "3/3" while holding 2.
-            "pairs_attempted": 0,
-            "pairs_completed": 0,
-            "pairs_failed": 0,
-            "pairs": [],
-        }
-        session = _store_generated_session(session)
-        return session, all_chunks
+            session = {
+                "session_id": "",
+                "collection": collection,
+                "status": "generating",
+                "pairs_total": actual_size,
+                # `attempted` drives progress and always reaches `total`; `completed`
+                # counts pairs that actually exist. Reporting one number for both made
+                # a session with a failed pair read "3/3" while holding 2.
+                "pairs_attempted": 0,
+                "pairs_completed": 0,
+                "pairs_failed": 0,
+                "pairs": [],
+            }
+            session = _store_generated_session(session)
+            return session, all_chunks
+    except CollectionBusyError as exc:
+        raise GoldStandardError("COLLECTION_BUSY",
+            f"Collection '{collection}' is busy. Retry after its current operation finishes.", 409) from exc
+    except wc.CollectionNotFoundError as exc:
+        raise GoldStandardError("COLLECTION_NOT_FOUND",
+            f"Collection '{collection}' not found.", 404) from exc
 
 
 async def start_generation(
