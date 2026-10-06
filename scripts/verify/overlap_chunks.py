@@ -15,7 +15,7 @@ from weaviate.classes.config import Configure, VectorDistances
 from config import settings
 from services import chunker, ingest_pipeline, weaviate_client as wc
 
-collection = 'VfyOverlap' + uuid.uuid4().hex[:12]
+collection = os.environ.get('RAG_TEST_PREFIX', 'Vfy') + 'Overlap' + uuid.uuid4().hex[:12]
 assert not wc._collection_exists_sync(collection)
 created = False
 try:
@@ -63,8 +63,10 @@ try:
                     print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
                 finally:
                     ingest_pipeline._jobs.pop(job_id,None)
-        stage=root/'budget';stage.mkdir()
-        source=stage/'over-budget.txt';source.write_text('x'*100000)
+        stage = root / 'budget'
+        stage.mkdir()
+        source = stage / 'over-budget.txt'
+        source.write_text('x' * 100000)
         job_id='overlap-budget-'+uuid.uuid4().hex[:8]
         job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
         ingest_pipeline._jobs[job_id]=job
@@ -75,7 +77,8 @@ try:
             stored=list(wc.get_client().collections.get(collection).iterator())
             assert not any(o.properties['source_file']==source.name for o in stored)
             print('PASS excessive overlap output fails before object storage',flush=True)
-        finally: ingest_pipeline._jobs.pop(job_id,None)
+        finally:
+            ingest_pipeline._jobs.pop(job_id, None)
     print('PASS owned temporary source paths removed', flush=True)
 finally:
     if created:

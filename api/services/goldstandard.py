@@ -17,6 +17,7 @@ from config import settings
 from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
+from services.collection_writes import canonical
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -589,7 +590,6 @@ def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: 
 
 def mark_stale(collection: str, reason: str, *, require_durable: bool = False) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
-    from services.collection_writes import canonical
     name = canonical(collection)
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.

@@ -2178,7 +2178,7 @@ from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
-from services import batch_write, collection_recovery
+from services import batch_write
 
 log = logging.getLogger(__name__)
 
@@ -3410,6 +3410,7 @@ from config import settings
 from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
+from services.collection_writes import canonical
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -3982,7 +3983,6 @@ def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: 
 
 def mark_stale(collection: str, reason: str, *, require_durable: bool = False) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
-    from services.collection_writes import canonical
     name = canonical(collection)
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
@@ -11685,10 +11685,17 @@ case "$CMD" in
     # Its stdin is /dev/null: a background job keeps the terminal otherwise,
     # and run from one, its first read (docker compose exec -T) would be
     # stopped by SIGTTIN and the run would hang.
+    # Record signals until the new process group has a registered owner.
+    SPAWN_SIGNAL=0
+    trap 'SPAWN_SIGNAL=130' INT
+    trap 'SPAWN_SIGNAL=143' TERM
     set -m
-    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} </dev/null &
+    (trap '' TTOU; exec bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"}) </dev/null &
     SUITE=$!
     set +m
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ "$SPAWN_SIGNAL" -eq 0 ] || exit "$SPAWN_SIGNAL"
     wait "$SUITE" || rc=$?
     exit "$rc" ;;
 esac
@@ -11990,6 +11997,8 @@ _rag_lock_owner_ok() {
   [ ! -L "$lock" ] || return 1
   owner=$(cat "$lock/pid" 2>/dev/null) || return 1
   case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  # PID 1 is every orphan’s ancestor; it cannot authorize this run.
+  [ "${#owner}" -le 10 ] && [ "$owner" -gt 1 ] || return 1
   pid=$$
   while [ "$steps" -lt 64 ]; do
     [ "$pid" = "$owner" ] && return 0
@@ -12106,7 +12115,7 @@ set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
 require_stack
 section "Bounded overlap text storage"
-(cd ../.. && docker compose exec -T -e RAG_OVERLAP_REAL_EMBEDDING="${RAG_OVERLAP_REAL_EMBEDDING:-0}" api python - < scripts/verify/overlap_chunks.py)
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" -e RAG_OVERLAP_REAL_EMBEDDING="${RAG_OVERLAP_REAL_EMBEDDING:-0}" api python - < scripts/verify/overlap_chunks.py)
 check "overlap coverage, bounds, budget rejection and owned-fixture cleanup" $?
 summary
 ```
@@ -12131,7 +12140,7 @@ from weaviate.classes.config import Configure, VectorDistances
 from config import settings
 from services import chunker, ingest_pipeline, weaviate_client as wc
 
-collection = 'VfyOverlap' + uuid.uuid4().hex[:12]
+collection = os.environ.get('RAG_TEST_PREFIX', 'Vfy') + 'Overlap' + uuid.uuid4().hex[:12]
 assert not wc._collection_exists_sync(collection)
 created = False
 try:
@@ -12179,8 +12188,10 @@ try:
                     print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
                 finally:
                     ingest_pipeline._jobs.pop(job_id,None)
-        stage=root/'budget';stage.mkdir()
-        source=stage/'over-budget.txt';source.write_text('x'*100000)
+        stage = root / 'budget'
+        stage.mkdir()
+        source = stage / 'over-budget.txt'
+        source.write_text('x' * 100000)
         job_id='overlap-budget-'+uuid.uuid4().hex[:8]
         job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
         ingest_pipeline._jobs[job_id]=job
@@ -12191,7 +12202,8 @@ try:
             stored=list(wc.get_client().collections.get(collection).iterator())
             assert not any(o.properties['source_file']==source.name for o in stored)
             print('PASS excessive overlap output fails before object storage',flush=True)
-        finally: ingest_pipeline._jobs.pop(job_id,None)
+        finally:
+            ingest_pipeline._jobs.pop(job_id, None)
     print('PASS owned temporary source paths removed', flush=True)
 finally:
     if created:
@@ -12870,11 +12882,18 @@ ingest() {
   local collection="$1" strategy="$2" size="$3" minsize="$4"; shift 4
   local args=() f
   for f in "$@"; do args+=(-F "files=@$f"); done
-  curl -s -m 600 -X POST "$API/ingest/upload" \
+  local http_status curl_status
+  http_status=$(curl -s -m 600 -o /tmp/vfy_job.json -w '%{http_code}' -X POST "$API/ingest/upload" \
     -F "collection=$collection" -F "strategy=$strategy" -F "chunk_size=$size" \
-    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}" > /tmp/vfy_job.json
+    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}")
+  curl_status=$?
   local job; job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['job_id'])" 2>/dev/null)
-  [ -n "$job" ] || { printf '{}' > /tmp/vfy_job.json; return 1; }
+  if [ "$curl_status" -ne 0 ] || [[ "$http_status" != 2?? ]] || [ -z "$job" ]; then
+    printf 'Upload failed: curl exit=%s HTTP=%s; response body follows:\n' "$curl_status" "$http_status" >&2
+    cat /tmp/vfy_job.json >&2
+    printf '\n' >&2
+    return 1
+  fi
   wait_for_job "/ingest/job/$job" 900 >/dev/null
   api_get "/ingest/job/$job" > /tmp/vfy_job.json
 }
@@ -13388,7 +13407,7 @@ for body in \
   '{"collection":"MissingSamplingFixture","sample_size":Infinity}'
 do
   code=$(api_post_code /goldstandard/generate "$body")
-  check_eq "invalid sampling request rejected with422: $body" "$code" "422"
+  check_eq "invalid sampling request rejected with 422: $body" "$code" "422"
 done
 summary
 ```
@@ -13689,6 +13708,9 @@ wait_for_job "/ingest/job/$job" 900 >/dev/null
 chunks_before=$(api_get "/collections" | python3 -c "
 import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
 
+# Saved ingest settings (the upload's own values) so the package carries
+# ingest_config.json and import restores it through settings_store (#189).
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
 # Retrieval settings must exist for the package to carry retrieve.py.
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
 
@@ -14261,6 +14283,12 @@ config=json.load(sys.stdin)
 expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
 sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
 check "renamed import preserves every saved retrieval setting" $?
+api_get "/ingest/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"collection":sys.argv[1],"chunking_strategy":"fixed","chunk_size":150,"min_chunk_size":40}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)' "$iname"
+check "renamed import restores the package's saved ingest settings (#189)" $?
 
 # A successful destructive replace must be exercised as well as abort/rename.
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
@@ -14960,21 +14988,79 @@ with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.ob
         assert refused.status_code==409 and refused.json()['error']['code']=='HISTORICAL_SESSION',refused.text
         print('PASS actual failed reindex cutover marks retained history and blocks default export',flush=True)
         creation_attempted=False
+        # #191: the real tuning job path marks sessions retained under either
+        # first-character backend alias, with supplied vectors and no model call.
+        # A collection of its own, so only this block's sessions share its spellings.
+        aliased=collection+'Alias'
+        alias=aliased[:1].lower()+aliased[1:]
+        distinct=aliased[:1]+aliased[1:2].swapcase()+aliased[2:]
+        alias_ids=[];alias_names={}
+        def store_alias_sessions():
+            ids={name:'gs_'+uuid.uuid4().hex[:8] for name in (aliased,alias,distinct)}
+            for name,sid in ids.items():
+                gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':copy.deepcopy(pairs)})
+                assert not client.get('/goldstandard/session/'+sid).json()['stale']
+            alias_ids.extend(ids.values());alias_names.update({sid:name for name,sid in ids.items()})
+            return ids
+        def tune(caller,operation,params):
+            job_id='alias'+uuid.uuid4().hex[:8]
+            tuning._jobs[job_id]={'job_id':job_id,'status':'queued','notes':[]}
+            try:
+                with patch.object(wc,'_insert_chunks_sync',side_effect=insert_supplied):
+                    tuning._run(job_id,caller,operation,params,source_collection=caller)
+                return tuning._jobs[job_id]
+            finally:
+                tuning._jobs.pop(job_id,None)
+        response=client.post('/collections',json={'name':aliased})
+        assert response.status_code==201,response.text
+        alias_created=True
+        insert_supplied(aliased,[{'content':'Owned inert chunk','source_file':'inert.txt','chunk_index':0}])
+        ids=store_alias_sessions()
+        job=tune(alias,'reindex',{'index_type':None,'distance_metric':None})
+        assert job['status']=='completed',job
+        for sid in ids.values():
+            assert not client.get('/goldstandard/session/'+sid).json()['stale']
+        print('PASS identity-preserving reindex through an alias leaves every session current',flush=True)
+        for caller in (alias,aliased):
+            ids=store_alias_sessions()
+            job=tune(caller,'reembed',{'chunking':None})
+            assert job['status']=='completed',job
+            expected=sum(name in (aliased,alias) for name in alias_names.values())  # either spelling, every retained one
+            assert any(f'{expected} gold-standard session(s) marked stale' in note for note in job['notes']),(caller,expected,job['notes'])
+            gs._sessions={};gs.load_sessions_from_disk()   # flags must come from disk
+            for name in (aliased,alias):
+                current=client.get('/goldstandard/session/'+ids[name]).json()
+                assert current['stale'] and current['stale_at'] and 're-embedded' in current['stale_reason'],(caller,name,current)
+                assert current['collection']==name,(caller,name,current['collection'])
+                refused=client.post('/goldstandard/save',json={'session_id':ids[name]})
+                assert refused.status_code==409 and refused.json()['error']['code']=='HISTORICAL_SESSION',refused.text
+                allowed=client.post('/goldstandard/save',json={'session_id':ids[name],'allow_historical':True})
+                assert allowed.status_code==200 and allowed.json()['historical'],allowed.text
+            unrelated=client.get('/goldstandard/session/'+ids[distinct]).json()
+            assert not unrelated['stale'] and unrelated['collection']==distinct,unrelated
+        print('PASS real re-embed through either spelling marks both alias sessions on disk, keeps provenance and a case-distinct name',flush=True)
+        response=client.delete('/collections/'+aliased+'?confirm=true')
+        assert response.status_code==200,response.text
+        alias_created=False
 
     finally:
+        if globals().get('alias_created') and wc._collection_exists_sync(aliased):
+            response=client.delete('/collections/'+aliased+'?confirm=true')
+            assert response.status_code==200,response.text
         if creation_attempted and wc._collection_exists_sync(collection):
             response=client.delete('/collections/'+collection+'?confirm=true')
             assert response.status_code==200,response.text
         # Recovery-enabled source combinations may retain a verified stage.
         # Only this helper's unique collection prefix authorizes its cleanup.
         for name in wc.get_client().collections.list_all(simple=True):
-            if name.startswith(collection+'__'):
+            if name.startswith(collection+'__') or name.startswith(collection+'Alias__'):
                 wc.get_client().collections.delete(name)
         gs._sessions.pop(session_id,None)
         if 'empty_id' in locals():gs._sessions.pop(empty_id,None)
         if 'fault_id' in locals():gs._sessions.pop(fault_id,None)
+        for alias_id in locals().get('alias_ids',[]):gs._sessions.pop(alias_id,None)
         wc.close_client()
-assert not wc._collection_exists_sync(collection)
+assert not wc._collection_exists_sync(collection) and not wc._collection_exists_sync(collection+'Alias')
 wc.close_client()
 print('PASS owned collection/session/files removed',flush=True)
 ```
@@ -16782,6 +16868,46 @@ print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_dia
             self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Changed')
         bad=gs._sessions_dir()/'gs_450bad00.json';bad.write_text('{')
         self.assertEqual(len(gs.session_diagnostics()),1);bad.unlink();self.assertEqual(gs.session_diagnostics(),[])
+
+    # Reviewer additions for #127.
+    def test_session_and_pending_marker_files_are_owner_only(self):
+        self.assertEqual(gs._session_path(self.data['session_id']).stat().st_mode&0o777,0o600)
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertEqual(self.pending().stat().st_mode&0o777,0o600)
+
+    def test_pending_marker_after_restart_is_saved_by_next_write(self):
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        state=self.restart();self.assertTrue(state['orphaned']);self.assertTrue(self.pending().is_file())
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}))
+        stored=json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertTrue(stored['orphaned']);self.assertEqual(stored['orphaned_reason'],'Owned completed deletion')
+        self.assertFalse(self.pending().exists());self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_symlinked_pending_storage_is_refused_and_guard_holds(self):
+        outside=Path(self.tmp.name)/'outside';outside.mkdir()
+        self.pending().parent.symlink_to(outside,target_is_directory=True)
+        with self.fail_session_file_replace():
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        self.assertEqual(list(outside.iterdir()),[])
+        with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.save_session(self.data['session_id'],'owned.json'))
+        self.assertEqual(error.exception.code,'HISTORICAL_SESSION')
+        issues={i['filename']:i for i in gs.session_diagnostics()}
+        self.assertIn('until restart',issues['gs_450abcde.json']['message'])
+        self.assertEqual(issues['pending_markers']['code'],'SESSION_READ_FAILED')
+
+    def test_pending_marker_without_session_file_is_ignored(self):
+        self.pending().parent.mkdir()
+        (self.pending().parent/'gs_450dead0.json').write_text(json.dumps({'session_id':'gs_450dead0','orphaned':True,'orphaned_reason':'Owned','orphaned_at':None}))
+        self.restart();self.assertIsNone(gs.get_session('gs_450dead0'));self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_durability_uncertain_marker_keeps_its_own_wording(self):
+        with patch.object(gs,'_sync_directory',side_effect=OSError('Owned directory sync fault')):
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertTrue(json.loads(gs._session_path(self.data['session_id']).read_text())['orphaned'])
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_DURABILITY_UNCERTAIN')
+        self.assertNotIn('pending marker',issue['message'])
 
 if __name__ == '__main__':
     unittest.main()

@@ -21,6 +21,6 @@ for body in \
   '{"collection":"MissingSamplingFixture","sample_size":Infinity}'
 do
   code=$(api_post_code /goldstandard/generate "$body")
-  check_eq "invalid sampling request rejected with422: $body" "$code" "422"
+  check_eq "invalid sampling request rejected with 422: $body" "$code" "422"
 done
 summary

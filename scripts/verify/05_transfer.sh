@@ -34,6 +34,9 @@ wait_for_job "/ingest/job/$job" 900 >/dev/null
 chunks_before=$(api_get "/collections" | python3 -c "
 import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
 
+# Saved ingest settings (the upload's own values) so the package carries
+# ingest_config.json and import restores it through settings_store (#189).
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
 # Retrieval settings must exist for the package to carry retrieve.py.
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
 
@@ -606,6 +609,12 @@ config=json.load(sys.stdin)
 expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
 sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
 check "renamed import preserves every saved retrieval setting" $?
+api_get "/ingest/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"collection":sys.argv[1],"chunking_strategy":"fixed","chunk_size":150,"min_chunk_size":40}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)' "$iname"
+check "renamed import restores the package's saved ingest settings (#189)" $?
 
 # A successful destructive replace must be exercised as well as abort/rename.
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
