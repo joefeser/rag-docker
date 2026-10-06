@@ -395,6 +395,49 @@ class RecoveryTests(unittest.TestCase):
             importer._run('job', 'fixture.tar.gz', 'replace')
         return importer._jobs['job']
 
+    def test_interrupted_tuning_partial_target_is_checked_at_startup(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        record = self.recovery_record()
+        self.assertTrue(record['cutover_pending'])
+        self.cols.interrupt = False
+        self.cols.create('Corpus', description=recovery.cutover_description(record))
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+        self.assertTrue(self.cols.exists('Corpus'))
+        self.assertTrue(self.cols.exists(record['staging']))
+        stale.assert_called_once()
+
+    def test_interrupted_tuning_never_deletes_another_target_instance(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        record = self.recovery_record()
+        self.cols.interrupt = False
+        self.cols.create('Corpus', description='new user collection')
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+        self.assertTrue(self.cols.exists('Corpus'))
+        stale.assert_not_called()
+
+    def test_interrupted_tuning_keeps_complete_target_and_unreadable_state(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        record = self.recovery_record()
+        self.cols.interrupt = False
+        self.cols.create('Corpus', description=recovery.cutover_description(record))
+        self.cols.get('Corpus').rows = copy.deepcopy(self.cols.get(record['staging']).rows)
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            self.assertTrue(self.cols.exists('Corpus'))
+            stale.assert_not_called()
+            self.cols.get('Corpus').fault = 'read'
+            recovery.sweep(self.client)
+            self.assertTrue(self.cols.exists('Corpus'))
+            stale.assert_not_called()
+
     def test_import_replace_note_counts_canonical_and_alias_sessions(self):
         seen = []
         def sessions(name):

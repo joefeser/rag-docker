@@ -237,9 +237,11 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             collection_recovery.retain(ownership)
         if before_replace:
             before_replace()
+        collection_recovery.begin_cutover(ownership)
         cutover_started = True
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True,
+                                   description=collection_recovery.cutover_description(ownership))
         if records is not None:
             _write_records(collection, records)
             written = len(records)
