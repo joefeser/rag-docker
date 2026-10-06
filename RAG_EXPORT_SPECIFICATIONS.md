@@ -604,13 +604,12 @@ rather than silently ignoring one of them.
 
 ### 7.3 Gold-standard invalidation
 
-Invalidation covers both supported first-character collection aliases without changing stored session provenance.
-
 Any operation that changes chunk identity — re-chunking, or re-embedding that
 rebuilds the collection — MUST mark every gold-standard session for that
 collection `stale`, recording why and when. Sessions are not deleted and are not
 remapped: a wrong remap corrupts an evaluation baseline silently, which is worse
-than an honest stale flag.
+than an honest stale flag. Invalidation MUST cover both supported first-character
+collection aliases without changing stored session provenance.
 
 For identity-changing rebuilds, persist the flag after preparation succeeds but before deleting the live collection. A failure after cutover begins also marks history stale, including a failed reindex whose original collection may be missing or partial. A successful identity-preserving reindex keeps its existing validity semantics. This request-time validity barrier is separate from session persistence concurrency and durable collection recovery.
 
@@ -758,7 +757,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
-| E16 | Re-chunking marks the collection's gold-standard sessions `stale` |
+| E16 | Re-chunking and failed destructive cutover mark sessions under both supported first-character collection aliases `stale`; the reported count includes both spellings, and stored provenance is unchanged |
 | E17 | Re-chunking a `chunks-only` or partially retained collection fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
 | E18 | `replace` reports the number of orphaned sessions |
 | E19 | Package `README.md` states the collection name, fidelity and encryption warning |
