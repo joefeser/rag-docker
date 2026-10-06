@@ -3986,7 +3986,13 @@ async def _generate_pair(chunk: dict) -> dict:
         system = GS_SYSTEM if attempt == 0 else GS_SYSTEM + GS_RETRY_SUFFIX
         raw = await _chat_once(system, user_msg)
         try:
-            data = _parse_gs_json(raw)
+            candidate = _parse_gs_json(raw)
+            for field in ("question", "answer", "ground_truth"):
+                value = candidate.get(field, candidate.get("answer") if field == "ground_truth" else None)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"Model {field} must be a nonempty string")
+                candidate[field] = value
+            data = candidate
             break
         except Exception as exc:                      # noqa: BLE001
             last_error = exc
@@ -3997,11 +4003,11 @@ async def _generate_pair(chunk: dict) -> dict:
 
     return {
         "pair_id": f"p_{uuid.uuid4().hex[:8]}",
-        "question": str(data.get("question", "")),
-        "answer": str(data.get("answer", "")),
+        "question": data["question"],
+        "answer": data["answer"],
         "contexts": [chunk["content"]],
-        "ground_truth": str(data.get("ground_truth", data.get("answer", ""))),
-        "source_file": chunk.get("source_file", ""),
+        "ground_truth": data["ground_truth"],
+        "source_file": str(chunk.get("source_file") or ""),
         "chunk_index": int(chunk.get("chunk_index", 0)),
         "status": "pending",
     }
