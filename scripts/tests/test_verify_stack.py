@@ -733,6 +733,19 @@ class StackLockTests(unittest.TestCase):
     """#154 (S18, S30): the build check holds the verify lock in its own
     shell; stack.sh inherits it, doesn't release it, and a second run waits."""
 
+    def test_init_or_zero_cannot_authorize_an_inherited_lock(self):
+        for owner in ('0', '1'):
+            with self.subTest(owner=owner):
+                box = Sandbox(self)
+                lock = Path(box.env['RAG_VERIFY_LOCK'])
+                lock.mkdir()
+                (lock / 'pid').write_text(owner)
+                result = box.run(['bash', '-c', f'. "{VERIFY}/lock.sh"; echo forbidden'],
+                                 RAG_VERIFY_LOCK_HELD='1')
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertNotIn('forbidden', result.stdout)
+                self.assertEqual((lock / 'pid').read_text(), owner)
+
     def test_held_lock_is_inherited_not_released(self):
         box = Sandbox(self)
         lock = box.env['RAG_VERIFY_LOCK']
@@ -858,10 +871,13 @@ class StackRunSuiteGroupTests(unittest.TestCase):
         box = Sandbox(self)
         child = box.root / 'child.pid'
         checkout = self.checkout(box, f'sleep 300 &\necho $! > "{child}"\nexit 0\n')
+        # Registered before the run: when the group isn't stopped, box.run
+        # times out on the child's inherited pipe and the child would be left.
+        self.addCleanup(lambda: child.exists() and alive(int(child.read_text()))
+                        and os.kill(int(child.read_text()), signal.SIGKILL))
         result = box.run(['bash', str(STACK), 'run', '--checkout', str(checkout)],
                          STUB_UP_OK='1', STUB_CURL_CODE='200')
         pid = int(child.read_text())
-        self.addCleanup(lambda: alive(pid) and os.kill(pid, signal.SIGKILL))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_gone(pid)
         self.assert_torn_down_after_up(box)
@@ -881,6 +897,32 @@ class StackRunSuiteGroupTests(unittest.TestCase):
         self.assertIn('verify project rag-verify removed', out)
         self.assert_torn_down_after_up(box)
         self.assertFalse(Path(box.env['RAG_VERIFY_LOCK']).exists(), 'the verify lock is released')
+
+    def test_term_between_fork_and_pid_registration_stops_the_suite(self):
+        box = Sandbox(self)
+        child = box.root / 'child.pid'
+        checkout = self.checkout(box, f'echo $$ > "{child}"\nsleep 300\n')
+        instrumented = box.root / 'stack.sh'
+        source = STACK.read_text()
+        source = re.sub(r'^HARNESS=.*$', f'HARNESS="{ROOT}"', source, count=1, flags=re.M)
+        source = source.replace('    SUITE=$!', '    kill -TERM $$\n    SUITE=$!')
+        instrumented.write_text(source)
+        self.addCleanup(lambda: child.exists() and alive(int(child.read_text()))
+                        and os.kill(int(child.read_text()), signal.SIGKILL))
+        result = box.run(['bash', str(instrumented), 'run', '--checkout', str(checkout)],
+                         STUB_UP_OK='1', STUB_CURL_CODE='200')
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        if child.exists(): self.assert_gone(int(child.read_text()))
+        self.assert_torn_down_after_up(box)
+
+    def test_background_output_signal_cannot_stop_suite(self):
+        box = Sandbox(self)
+        checkout = self.checkout(box, 'kill -TTOU $$\necho output-survived\n')
+        proc = self.start(box, checkout)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertIn('output-survived', out)
+        self.assert_torn_down_after_up(box)
 
     def test_the_suite_reads_no_terminal(self):
         # With job control on, a background job keeps the caller's stdin. From
@@ -921,13 +963,14 @@ class CraftedPackageWriteTests(unittest.TestCase):
     Desktop the container can read a freshly closed bind-mounted file as empty."""
 
     def test_every_crafted_package_is_renamed_into_place(self):
-        for name, count in (('05_transfer.sh', 4), ('retrieval_settings.py', 1)):
+        for name, var, count in (('05_transfer.sh', 'part', 4), ('retrieval_settings.py', 'part', 1),
+                                 ('legacy_retrieval.py', 'partial', 1)):
             with self.subTest(file=name):
                 source = (VERIFY / name).read_text()
                 opened = re.findall(r"tarfile\.open\(([^,()]+), ['\"]w:gz['\"]\)", source)
                 self.assertEqual(len(opened), count, opened)
-                self.assertEqual(set(opened), {'part'}, 'written straight to the final name')
-                self.assertEqual(source.count('part.replace('), count)
+                self.assertEqual(set(opened), {var}, 'written straight to the final name')
+                self.assertEqual(source.count(var + '.replace('), count)
 
 
 @unittest.skipUnless(shutil.which('sha256sum'), 'needs sha256sum (it runs in the ollama image)')

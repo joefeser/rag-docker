@@ -11528,10 +11528,17 @@ case "$CMD" in
     # Its stdin is /dev/null: a background job keeps the terminal otherwise,
     # and run from one, its first read (docker compose exec -T) would be
     # stopped by SIGTTIN and the run would hang.
+    # Record signals until the new process group has a registered owner.
+    SPAWN_SIGNAL=0
+    trap 'SPAWN_SIGNAL=130' INT
+    trap 'SPAWN_SIGNAL=143' TERM
     set -m
-    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} </dev/null &
+    (trap '' TTOU; exec bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"}) </dev/null &
     SUITE=$!
     set +m
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ "$SPAWN_SIGNAL" -eq 0 ] || exit "$SPAWN_SIGNAL"
     wait "$SUITE" || rc=$?
     exit "$rc" ;;
 esac
@@ -11833,6 +11840,8 @@ _rag_lock_owner_ok() {
   [ ! -L "$lock" ] || return 1
   owner=$(cat "$lock/pid" 2>/dev/null) || return 1
   case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  # PID 1 is every orphan’s ancestor; it cannot authorize this run.
+  [ "${#owner}" -le 10 ] && [ "$owner" -gt 1 ] || return 1
   pid=$$
   while [ "$steps" -lt 64 ]; do
     [ "$pid" = "$owner" ] && return 0
