@@ -1986,6 +1986,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 ### 10.4 Web UI
 
+- [x] Chunking loads and save results stay with their selection generation, including A→B→A; save is unavailable until the selected config loads. Stale responses preserve current edits and errors, collection changes clear the saved notice, and failed collection lists or mismatched configurations are reported.
+  *Evidence: `scripts/verify/browser/chunking_config.js` deferred load/save, stale failure, edited draft, collection-list failure, mismatched configuration and saved-notice cases in suite 06.*
+
 - [x] Role selection persists across page navigation within same browser session.
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`.*
