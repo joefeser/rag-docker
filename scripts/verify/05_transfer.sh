@@ -23,8 +23,6 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
-(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_provenance.py)
-check "source provenance refusal and bounded diagnostics" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -672,7 +670,6 @@ mixed_ingest policies.txt
 (cd "$REPO_ROOT" && docker compose exec -T api sh -c "rm -rf /app/sources/$MIXED") >/dev/null 2>&1
 mixed_ingest policies.md
 mixed_before=$(mixed_count); names_before=$(mixed_names); files_before=$(mixed_files)
-check_eq "partial sources disable re-chunk in tuning options" "$(api_get "/tune/$MIXED" | jfield "['can_rechunk']")" "False"
 check_eq "the mixed collection holds chunks from both files" "$files_before" "['policies.md', 'policies.txt']"
 for op in rechunk reembed; do
   api_post "/tune/$op" "{\"collection\":\"$MIXED\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json

@@ -103,13 +103,13 @@ with tempfile.TemporaryDirectory() as td:
         rec = json.loads(line)
         if set(rec) != {"id","vector","properties","source_sha256"}:
             probs.append(f"line {i+1}: keys {sorted(rec)}")
-        elif set(rec["properties"]) not in (EIGHT, EIGHT | {"source_digest"}):
+        elif set(rec["properties"]) != EIGHT:
             probs.append(f"line {i+1}: properties {sorted(rec['properties'])}")
         elif len(rec["vector"]) != manifest["embedding"]["dimensions"]:
             probs.append(f"line {i+1}: vector len {len(rec['vector'])}")
         elif not all(isinstance(v,(int,float)) for v in rec["vector"]):
             probs.append(f"line {i+1}: vector not all numbers")
-    check("§4.5 every chunk has the 4 fields, required properties, optional source provenance and a full vector",
+    check("§4.5 every chunk has the 4 fields, 8 properties and a full vector",
           not probs, "; ".join(probs[:3]))
 
     if fid == "with-sources":

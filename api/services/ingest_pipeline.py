@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import hashlib
 import logging
 import mimetypes
 import os
@@ -93,13 +92,11 @@ def _process_job_sync(
                     elements=elements if strategy == "context_aware" else None,
                 )
 
-                source_digest = hashlib.sha256(path.read_bytes()).hexdigest()
                 now = datetime.now(timezone.utc).isoformat()
                 weaviate_chunks = [
                     {
                         "content": c,
                         "source_file": path.name,
-                        "source_digest": source_digest,
                         "source_type": source_type,
                         "chunk_index": i,
                         "chunk_strategy": strategy,

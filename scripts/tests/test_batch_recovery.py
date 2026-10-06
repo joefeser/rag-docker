@@ -68,7 +68,7 @@ class Collection:
         self.rows = {}
         self.fault = fault
         self.description = description
-        self.config = SimpleNamespace(get=lambda: SimpleNamespace(name=self.name, description=self.description, vectorizer=None, properties=wc.COLLECTION_PROPERTIES))
+        self.config = SimpleNamespace(get=lambda: SimpleNamespace(name=self.name, description=self.description, vectorizer=None))
         self.batch = Batch(self)
         self.query = SimpleNamespace(fetch_objects=lambda filters, **kwargs: SimpleNamespace(
             objects=[obj for obj in self.iterator(include_vector=True) if str(obj.uuid) in filters.value]))
@@ -933,28 +933,25 @@ class SourceCoverageTests(unittest.TestCase):
                         self.assertEqual(set(cols.items), {"Corpus"})
                         self.assertEqual(list(recovery._root().glob("*.json")), [])
 
-    def test_source_digest_refuses_both_review_drop_cases_and_legacy(self):
+    def test_uncovered_source_details_are_bounded(self):
         from services import sources
-        for mode in ('second-name', 'failed-retention', 'legacy'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
-                cols = Collections()
-                cols.create('Corpus')
-                with patch.object(settings, 'sources_dir', tmp), patch.object(wc, 'get_client', return_value=SimpleNamespace(collections=cols)):
-                    digest = sources.store('Corpus', 'a.txt', b'original')
-                    if mode == 'second-name':
-                        sources.store('Corpus', 'b.txt', b'original')
-                    row = records(1)[0]
-                    row['properties'].update(source_file='b.txt' if mode == 'second-name' else 'a.txt')
-                    if mode != 'legacy':
-                        row['properties']['source_digest'] = digest if mode == 'second-name' else 'f' * 64
-                    cols.get('Corpus').rows[row['id']] = row
-                    before = copy.deepcopy(cols.get('Corpus').rows)
-                    with self.assertRaises(tuning.PackageError) as error:
-                        tuning.require_source_coverage('Corpus')
-                    self.assertEqual(error.exception.code, 'SOURCES_REQUIRED')
-                    self.assertIn(row['properties']['source_file'], error.exception.detail['uncovered_source_files'])
-                    self.assertEqual(cols.get('Corpus').rows, before)
-                    self.assertEqual(cols.deleted, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = Collections()
+            cols.create('Corpus')
+            for i in range(101):
+                row = records(1)[0]
+                row['properties']['source_file'] = f'{i:04d}' + 'x' * 500
+                cols.get('Corpus').rows[row['id']] = row
+            with patch.object(settings, 'sources_dir', tmp), patch.object(wc, 'get_client', return_value=SimpleNamespace(collections=cols)):
+                sources.store('Corpus', 'retained.txt', b'original')
+                with self.assertRaises(tuning.PackageError) as error:
+                    tuning._chunks_from_sources('Corpus', 'fixed', 1000, 0, .85, 100)
+                names = error.exception.detail['uncovered_source_files']
+                self.assertEqual(len(names), 100)
+                self.assertTrue(all(len(name) <= 256 for name in names))
+                self.assertTrue(error.exception.detail['uncovered_source_files_truncated'])
+                self.assertEqual(len(cols.get('Corpus').rows), 101)
+                self.assertEqual(cols.deleted, [])
 
     def test_fully_retained_collection_completes_real_cutover(self):
         from services import sources
@@ -965,8 +962,7 @@ class SourceCoverageTests(unittest.TestCase):
             original["properties"]["source_file"] = "retained.txt"
             cols.get("Corpus").rows[original["id"]] = original
             with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(wc, "_create_collection_sync", side_effect=lambda name, *a, **kw: cols.create(name)), patch.object(wc, "_collection_config_sync", return_value={"index_type": "hnsw", "distance_metric": "cosine", "hnsw_config": {}}), patch.object(tuning, "_parse_file", side_effect=lambda p: (p.read_text(), [])), patch.object(tuning, "do_chunk", side_effect=lambda **kw: [kw["text"]]):
-                digest = sources.store("Corpus", "retained.txt", b"retained original")
-                original["properties"]["source_digest"] = digest
+                sources.store("Corpus", "retained.txt", b"retained original")
                 job = {}
                 with patch.dict(tuning._jobs, {"coverage": job}):
                     tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
