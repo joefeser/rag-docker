@@ -8340,6 +8340,7 @@ interface QueryConfigValue {
   isDefault: boolean
   loading: boolean
   error: string
+  /** False means superseded: the caller must show no success or error notice. */
   saveConfig: (config: QueryConfig) => Promise<boolean>
 }
 
@@ -8368,6 +8369,7 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const selectedCollection = useRef('')
   const saveId = useRef(0)
   const selectionId = useRef(0)
+  const publishedSaveId = useRef<number | null>(null)
   const latestFailed = useRef(false)
   const lastSuccess = useRef<{ id: number; value: RetrievalConfig } | null>(null)
 
@@ -8377,6 +8379,7 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
     selectionId.current++
     latestFailed.current = false
     lastSuccess.current = null
+    publishedSaveId.current = null
     // Invalidate immediately, before the next effect runs. A -> B -> A is
     // also a new generation even though the collection name matches again.
     requestId.current++
@@ -8421,7 +8424,10 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
       const saveTicket = ++saveId.current
       latestFailed.current = false
       const isCurrent = () => selection === selectionId.current && collection === selectedCollection.current
-      const publish = (saved: RetrievalConfig) => {
+      const publish = (success: { id: number; value: RetrievalConfig }) => {
+        if (publishedSaveId.current === success.id) return
+        publishedSaveId.current = success.id
+        const saved = success.value
         // Cancel pending loads without invalidating other saves in this selection.
         requestId.current++
         setConfigState(fromResponse(saved))
@@ -8438,13 +8444,13 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
         // If the newest request failed, retain the newest acknowledged success,
         // even when that older request's response arrives after the failure.
         if (saveTicket === saveId.current || latestFailed.current) {
-          publish(lastSuccess.current.value)
+          publish(lastSuccess.current)
         }
         return saveTicket === saveId.current
       } catch (e: unknown) {
         if (!isCurrent() || saveTicket !== saveId.current) return false
         latestFailed.current = true
-        if (lastSuccess.current) publish(lastSuccess.current.value)
+        if (lastSuccess.current) publish(lastSuccess.current)
         throw e
       }
     },
@@ -10898,6 +10904,10 @@ failed loads, A→B→A selection, stale save completions, pending saves across
 selection changes, and duplicate-save prevention. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
+
+Retrieval deferred cases also cover superseded success/error notices, notice timer
+ownership, both orders of an acknowledged success and newer failure, and a
+three-save race that must not republish the same result over new edits.
 ````
 
 ### scripts/verify/all.sh
@@ -14723,7 +14733,7 @@ module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, cli
 // Deferred responses exercise the real provider, Retrieval page, and Q&A page.
 // All API calls are intercepted before application startup; no backend is used.
 const assert = require('node:assert/strict');
-const { makeReporter, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, setValue, clickByText } = require('./lib');
 
 const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
 const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
@@ -14914,6 +14924,65 @@ async function runQueryConfigTests(browser, base, reporter) {
       await assertQuery(page, saved);
     }]);
   }
+  // Testing reviewer cases (#205): superseded saves in one selection, and the confirmation timer.
+  const shows = (page, text) => page.evaluate(t => document.body.innerText.includes(t), text);
+  cases.push(['superseded save shows no confirmation; only the latest save shows Saved!', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 2);
+    const current = { ...A, top_k: 17 };
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), false, 'the superseded save showed "Saved!"');
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the latest save showed no "Saved!"');
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  cases.push(['superseded save failure is not shown; the latest success confirms', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 2);
+    const current = { ...A, top_k: 17 };
+    await release(page, '/api/retrieval/config', { error: { message: 'Superseded save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await shows(page, 'Superseded save failed'), false, "the superseded save's failure was shown");
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Superseded save failed'), false, "the superseded save's failure was shown");
+    assert.equal(await shows(page, 'Saved!'), true, 'the latest save showed no "Saved!"');
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  cases.push(["an earlier save's confirmation timer does not clear a later save's Saved!", async page => {
+    await save(page);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the first save showed no "Saved!"');
+    const first = Date.now();
+    await sleep(2000);
+    const current = { ...A, top_k: 17 };
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the second save showed no "Saved!"');
+    await sleep(Math.max(0, first + 3600 - Date.now()));
+    assert.equal(await shows(page, 'Saved!'), true, "the first save's timer cleared the second save's \"Saved!\"");
+    await page.waitForFunction(() => !document.body.innerText.includes('Saved!'), { timeout: 5000 });
+  }]);
+  cases.push(['a late older success cannot republish an acknowledged save over new edits', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '13');
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 3);
+    await release(page, '/api/retrieval/config', { error: { message: 'Newest failed' } }, { method: 'POST', status: 500, last: true });
+    await release(page, '/api/retrieval/config', { ...A, top_k: 13 }, { method: 'POST', last: true });
+    await assertSettings(page, { ...A, top_k: 13 });
+    await setValue(page, '() => document.querySelector("input[type=range]")', '19');
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    await assertSettings(page, { ...A, top_k: 19 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+  }]);
   for (const [name, test] of cases) {
     let s;
     try {
