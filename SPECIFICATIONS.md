@@ -1497,8 +1497,12 @@ them. Changing the selection (including leaving and returning to the same
 collection) invalidates pending responses for the prior selection. A stale
 save may finish persisting its original collection, but must not change the
 active settings, loading/error state, or invalidate the new collection's load.
-Within the current generation, only the latest initiated save may publish; a
-successful current save supersedes a pending older load for that collection.
+Within the current generation, the latest initiated save may publish. If it
+fails, the newest acknowledged success may publish, even if its response arrives
+after that failure. Each acknowledged save publishes at most once, so a later
+older completion cannot erase new edits by republishing the same result. Published
+saves supersede pending older loads. Superseded responses show neither Saved! nor
+an error, and an earlier notice timer cannot clear a newer Saved! notice.
 After the selected collection's load resolves, the next Q&A request uses its
 settings, regardless of when a prior collection's save completes.
 
@@ -2009,7 +2013,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
 
-- [x] Retrieval save confirmations and errors stay with their selection generation. Deferred browser cases verify stale success/failure after switching collections and preserve the newest acknowledged success when a newer save fails, in both response orders.
+- [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
+  *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
 
 ### 10.5 Infrastructure
 

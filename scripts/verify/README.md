@@ -417,3 +417,7 @@ failed loads, A→B→A selection, stale save completions, pending saves across
 selection changes, and duplicate-save prevention. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
+
+Retrieval deferred cases also cover superseded success/error notices, notice timer
+ownership, both orders of an acknowledged success and newer failure, and a
+three-save race that must not republish the same result over new edits.
