@@ -11836,9 +11836,9 @@ restart_limit() {
   local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
   case "$value" in
     ''|*[!0-9]*) ;;
-    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+    *) if [ "${#value}" -le 6 ] && [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
   esac
-  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds (at most 6 digits), not '%s'" "$value"
   return 1
 }
 
