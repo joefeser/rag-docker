@@ -154,6 +154,44 @@ async function runQueryConfigTests(browser, base, reporter) {
     await assertSettings(page, A);
     await assertQuery(page, A);
   }]);
+  // Reviewer cases: what a stale save leaves on the newly selected collection's page.
+  cases.push(['stale A save still persists to A, and B shows no save confirmation', async page => {
+    await save(page);
+    const posted = await page.evaluate(() => window.queryConfigFixture.requests.find(r => r.method === 'POST').body.collection);
+    assert.equal(posted, A.collection, 'the save request must name the collection it was started for');
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false, 'B shows "Saved!" from A\'s stale save');
+    await assertSettings(page, B);
+  }]);
+  cases.push(['stale A save failure is not shown as an error on B', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await release(page, '/api/retrieval/config', { error: { message: 'Fixture stale save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture stale save failed')), false, "B's page shows A's stale save failure");
+    await assertSettings(page, B);
+    await assertQuery(page, B);
+  }]);
+  for (const failureFirst of [true, false]) {
+    cases.push([`older acknowledged save survives newer failure (${failureFirst ? 'failure' : 'success'} first)`, async page => {
+      const saved = { ...A, top_k: 13 };
+      await setValue(page, '() => document.querySelector("input[type=range]")', '13');
+      await save(page);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+      await save(page);
+      await pending(page, '/api/retrieval/config', 'POST', 2);
+      const fail = () => release(page, '/api/retrieval/config', { error: { message: 'Latest save failed' } }, { method: 'POST', status: 500, last: true });
+      if (failureFirst) await fail();
+      await release(page, '/api/retrieval/config', saved, { method: 'POST' });
+      if (!failureFirst) await fail();
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Latest save failed')), true);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+      await assertSettings(page, saved);
+      await assertQuery(page, saved);
+    }]);
+  }
   for (const [name, test] of cases) {
     let s;
     try {

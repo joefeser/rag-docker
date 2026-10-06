@@ -395,6 +395,17 @@ class RecoveryTests(unittest.TestCase):
             importer._run('job', 'fixture.tar.gz', 'replace')
         return importer._jobs['job']
 
+    def test_import_replace_note_counts_canonical_and_alias_sessions(self):
+        seen = []
+        def sessions(name):
+            seen.append(name)
+            return [{'session_id': 'gs_18000001'}] if name == 'Corpus' else [{'session_id': 'gs_18000002'}]
+        with patch.object(importer.goldstandard, 'sessions_for', side_effect=sessions):
+            job = self.import_replace()
+        self.assertEqual(job['status'], 'completed')
+        self.assertEqual(set(seen), {'Corpus', 'corpus'})
+        self.assertTrue(any('2 gold-standard session(s)' in note for note in job['notes']), job)
+
     def test_replace_final_create_and_batch_failure_survive_restart(self):
         for fault in ('create', 'reject', 'partial', 'properties', 'vector'):
             with self.subTest(fault=fault):

@@ -341,7 +341,7 @@ Deletes a collection and all its objects. Requires `confirm=true` query paramete
 { "name": "Documents", "status": "deleted", "objects_removed": 1842 }
 ```
 
-Before deletion, resolves the backend's canonical collection name. After successful backend deletion, removes retained source documents and ingest/retrieval configurations for both the canonical name and its lowercase-first-character alias, regardless of the spelling used in the request. Only that first-character alias matches; distinct collection names are not case-folded or swept. Matching sessions for both spellings are preserved and durably marked orphaned. Also removes the caller's entry from `collection_registry.json`. Deleting an original collection preserves distinct retained recovery copies; explicitly deleting a retained recovery collection retires only its matching ownership journal and snapshots.
+Before deletion, resolves the backend's canonical collection name. After successful backend deletion, removes retained source documents and ingest/retrieval configurations for both the canonical name and its lowercase-first-character alias, regardless of the spelling used in the request. Only that first-character alias matches; distinct collection names are not case-folded or swept. Matching sessions for both spellings are preserved and durably marked orphaned. Also removes both spellings from `collection_registry.json`. Import-replace reports the number of retained sessions across both spellings. Deleting an original collection preserves distinct retained recovery copies; explicitly deleting a retained recovery collection retires only its matching ownership journal and snapshots.
 
 **Response 404** if the collection does not exist:
 ```json
@@ -490,7 +490,7 @@ the destination directory and atomically replaces the saved configuration. A 201
 acknowledges that request's complete value was published; a later successful save
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
-Failed saves clean up their own temporary file when filesystem permissions allow.
+Failed saves clean up their own temporary file when filesystem permissions allow. Package import publishes ingest settings through this same lock and atomic writer. Published files use mode 0600 (API owner read/write), including replacements of older files.
 
 ---
 
@@ -1849,12 +1849,12 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
-- [x] Deleting a collection by either its canonical name or first-character alias removes both spellings' retained sources and configurations, durably orphans both spellings' sessions, and preserves case-distinct neighbours and retained recovery copies.
-      *`test_collection_writes.py` covers both deletion spellings and a case-distinct neighbour; `reindex.py` runs both deletion paths through the HTTP handler against owned backend and sidecar fixtures, with `reindex_verifier_cases.py` checking registration.*
+- [x] Deleting a collection by either its canonical name or first-character alias removes both spellings' retained sources, configurations and registry entries, durably orphans both spellings' sessions, and preserves case-distinct neighbours and retained recovery copies. Import-replace notes count sessions under both spellings.
+      *`test_collection_writes.py` covers both deletion spellings and a case-distinct neighbour; `reindex.py` runs both deletion paths through the HTTP handler against owned backend and sidecar fixtures, with `reindex_verifier_cases.py` checking registration. The live backend rejects case-only neighbouring collections; Linux-volume checks still verify case-distinct sidecar/session preservation, while controlled tests cover both backend collections.*
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
       *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
 - [x] Concurrent ingest/retrieval settings saves publish their own complete values; failed publication preserves the previous valid configuration (#141).
-      *`test_settings_persistence.py` controls worker contention and first-save directory creation with events, observes each publication and unique temporary path, and injects serialization, creation, partial-write, close and replacement failures for both services. Suite 07 registers these controlled tests alongside live HTTP validation and round trips; full-stack verification is recorded separately.*
+      *`test_settings_persistence.py` controls worker contention and first-save directory creation with events, observes each publication and unique temporary path, and injects serialization, creation, partial-write, close and replacement failures for both services. Suite 07 registers these controlled tests (including failed import publication), host-side `ImplementationTests`, and 15 rounds of 12 concurrent live saves per ingest/retrieval route; each round checks that the persisted config is one complete acknowledged response. Full-stack verification is recorded separately.*
 - [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).
       *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
 
@@ -2002,6 +2002,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
+
+- [x] Retrieval save confirmations and errors stay with their selection generation. Deferred browser cases verify stale success/failure after switching collections and preserve the newest acknowledged success when a newer save fails, in both response orders.
 
 ### 10.5 Infrastructure
 

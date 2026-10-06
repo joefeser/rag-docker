@@ -5039,6 +5039,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
+from services import settings_store
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import model_bundle
@@ -5620,7 +5621,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
         data["collection"] = target
         out = Path(settings.upload_dir) / "ingest_configs"
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
+        settings_store.publish(out / f"{_safe_file(target)}.json", data)
 
     if validated_retrieval is not None:
         data = {**validated_retrieval, "collection": target}
@@ -5742,7 +5743,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                 collection_recovery.retain(ownership, package=pkg)
                 staged = True
                 # Counted before the delete, because the delete is what orphans them.
-                orphaned = len(goldstandard.sessions_for(target))
+                orphaned = len({session["session_id"]
+                                for spelling in {target, target[:1].lower() + target[1:]}
+                                for session in goldstandard.sessions_for(spelling)})
                 wc._delete_collection_sync(target)   # also drops its sources + config
                 if orphaned:
                     # Spec §8 rule 4: silently destroying evaluation work is worse
@@ -6711,6 +6714,7 @@ from models.schemas import (
     CreateCollectionRequest,
 )
 from services import weaviate_client as wc
+from services.collection_writes import canonical
 from utils import api_error
 
 router = APIRouter(prefix="/collections")
@@ -6795,7 +6799,9 @@ async def delete_collection(name: str):
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
-        registry.pop(name, None)
+        canonical_name = canonical(name)
+        for spelling in {canonical_name, canonical_name[:1].lower() + canonical_name[1:]}:
+            registry.pop(spelling, None)
         await asyncio.to_thread(_save_registry, registry)
 
     return {"name": name, "objects_deleted": count}
@@ -8328,7 +8334,7 @@ interface QueryConfigValue {
   isDefault: boolean
   loading: boolean
   error: string
-  saveConfig: (config: QueryConfig) => Promise<void>
+  saveConfig: (config: QueryConfig) => Promise<boolean>
 }
 
 const QueryConfigContext = createContext<QueryConfigValue | null>(null)
@@ -8355,10 +8361,16 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const requestId = useRef(0)
   const selectedCollection = useRef('')
   const saveId = useRef(0)
+  const selectionId = useRef(0)
+  const latestFailed = useRef(false)
+  const lastSuccess = useRef<{ id: number; value: RetrievalConfig } | null>(null)
 
   const setCollection = useCallback((name: string) => {
     if (name === selectedCollection.current) return
     selectedCollection.current = name
+    selectionId.current++
+    latestFailed.current = false
+    lastSuccess.current = null
     // Invalidate immediately, before the next effect runs. A -> B -> A is
     // also a new generation even though the collection name matches again.
     requestId.current++
@@ -8399,24 +8411,36 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const saveConfig = useCallback(
     async (next: QueryConfig) => {
       if (!collection) throw new Error('Select a collection before saving retrieval settings.')
-      const ticket = requestId.current
+      const selection = selectionId.current
       const saveTicket = ++saveId.current
-      const saved = await api.saveRetrievalConfig({ collection, ...next })
-      // A save belongs to the selection generation that started it. An old
-      // save must not publish into another collection or cancel its load.
-      // Of concurrent saves, only the latest started may publish.
-      if (
-        collection !== selectedCollection.current ||
-        ticket !== requestId.current ||
-        saveTicket !== saveId.current
-      ) return
-      // A completed save supersedes any load still in flight for this
-      // collection, which would otherwise land afterwards with stale values.
-      requestId.current++
-      setConfigState(fromResponse(saved))
-      setIsDefault(saved.is_default)
-      setError('')
-      setLoading(false)
+      latestFailed.current = false
+      const isCurrent = () => selection === selectionId.current && collection === selectedCollection.current
+      const publish = (saved: RetrievalConfig) => {
+        // Cancel pending loads without invalidating other saves in this selection.
+        requestId.current++
+        setConfigState(fromResponse(saved))
+        setIsDefault(saved.is_default)
+        setError('')
+        setLoading(false)
+      }
+      try {
+        const saved = await api.saveRetrievalConfig({ collection, ...next })
+        if (!isCurrent()) return false
+        if (!lastSuccess.current || saveTicket > lastSuccess.current.id) {
+          lastSuccess.current = { id: saveTicket, value: saved }
+        }
+        // If the newest request failed, retain the newest acknowledged success,
+        // even when that older request's response arrives after the failure.
+        if (saveTicket === saveId.current || latestFailed.current) {
+          publish(lastSuccess.current.value)
+        }
+        return saveTicket === saveId.current
+      } catch (e: unknown) {
+        if (!isCurrent() || saveTicket !== saveId.current) return false
+        latestFailed.current = true
+        if (lastSuccess.current) publish(lastSuccess.current.value)
+        throw e
+      }
     },
     [collection],
   )
@@ -9331,6 +9355,7 @@ export default function RetrievalPage() {
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
   const indexRequest = useRef(0)
+  const saveRequest = useRef(0)
 
   useEffect(() => {
     const ticket = ++indexRequest.current
@@ -9357,11 +9382,15 @@ export default function RetrievalPage() {
   }, [config])
 
   useEffect(() => {
+    saveRequest.current++
     setApplied(false)
     setSaveError('')
+    return () => { saveRequest.current++ }
   }, [collection])
 
   async function apply() {
+    const ticket = ++saveRequest.current
+    setApplied(false)
     const next: QueryConfig = {
       retrieval_mode: mode,
       top_k: topK,
@@ -9373,10 +9402,12 @@ export default function RetrievalPage() {
     }
     setSaveError('')
     try {
-      await saveConfig(next)
+      const saved = await saveConfig(next)
+      if (!saved || ticket !== saveRequest.current) return
       setApplied(true)
-      setTimeout(() => setApplied(false), 3000)
+      setTimeout(() => { if (ticket === saveRequest.current) setApplied(false) }, 3000)
     } catch (e: unknown) {
+      if (ticket !== saveRequest.current) return
       setSaveError(e instanceof Error ? e.message : String(e))
     }
   }
@@ -10530,6 +10561,10 @@ verification run; it does not establish full-stack acceptance by itself.
 
 Suite 04 also registers `test_chunk_sampling.py` through `09_sampling.sh`, including guard release before model generation and after sampling/publication failures.
 
+Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
+(no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
+retrieval route. The persistence cases cover failed import-config publication.
+
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
@@ -10799,7 +10834,7 @@ node scripts/verify/browser/query_config.js
 The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
-isolated fixture run does not replace the required full live-stack suite.
+isolated fixture run does not replace the full verification suite (`stack.sh run`).
 ````
 
 ### scripts/verify/all.sh
@@ -14765,6 +14800,44 @@ async function runQueryConfigTests(browser, base, reporter) {
     await assertSettings(page, A);
     await assertQuery(page, A);
   }]);
+  // Reviewer cases: what a stale save leaves on the newly selected collection's page.
+  cases.push(['stale A save still persists to A, and B shows no save confirmation', async page => {
+    await save(page);
+    const posted = await page.evaluate(() => window.queryConfigFixture.requests.find(r => r.method === 'POST').body.collection);
+    assert.equal(posted, A.collection, 'the save request must name the collection it was started for');
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false, 'B shows "Saved!" from A\'s stale save');
+    await assertSettings(page, B);
+  }]);
+  cases.push(['stale A save failure is not shown as an error on B', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await release(page, '/api/retrieval/config', { error: { message: 'Fixture stale save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture stale save failed')), false, "B's page shows A's stale save failure");
+    await assertSettings(page, B);
+    await assertQuery(page, B);
+  }]);
+  for (const failureFirst of [true, false]) {
+    cases.push([`older acknowledged save survives newer failure (${failureFirst ? 'failure' : 'success'} first)`, async page => {
+      const saved = { ...A, top_k: 13 };
+      await setValue(page, '() => document.querySelector("input[type=range]")', '13');
+      await save(page);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+      await save(page);
+      await pending(page, '/api/retrieval/config', 'POST', 2);
+      const fail = () => release(page, '/api/retrieval/config', { error: { message: 'Latest save failed' } }, { method: 'POST', status: 500, last: true });
+      if (failureFirst) await fail();
+      await release(page, '/api/retrieval/config', saved, { method: 'POST' });
+      if (!failureFirst) await fail();
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Latest save failed')), true);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+      await assertSettings(page, saved);
+      await assertQuery(page, saved);
+    }]);
+  }
   for (const [name, test] of cases) {
     let s;
     try {
@@ -16213,6 +16286,8 @@ require_stack
 section "Concurrent settings publication and failed-write preservation"
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - SettingsPersistenceTests < scripts/tests/test_settings_persistence.py)
 check "controlled retrieval/ingest concurrency and publication failures" $?
+(cd ../.. && python3 scripts/tests/test_settings_implementation.py)
+check "settings embedded implementation copies match runtime" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?
@@ -16245,7 +16320,11 @@ def request(path, body=None, method=None, raw=None, content_type='application/js
         with urllib.request.urlopen(req, timeout=60) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as response:
-        return response.code, json.load(response)
+        body = response.read()
+        try:
+            return response.code, json.loads(body)
+        except ValueError:  # a server error page that isn't JSON
+            return response.code, body.decode(errors='replace')[:200]
 
 
 def expect(path, body, code):
@@ -16332,6 +16411,28 @@ try:
     assert status == 200
     assert next(c for c in current['collections'] if c['name'] == collection)['object_count'] == 0
     print('PASS invalid multipart settings leave the collection empty', flush=True)
+
+    # #141: concurrent saves through the live routes. Every save must be
+    # acknowledged, and the persisted value must be one acknowledged response,
+    # complete and unmixed (no request publishes another request's temp file).
+    from concurrent.futures import ThreadPoolExecutor
+    rounds, width = 15, 12
+    for route, make in (('/ingest/config', lambda r, i: {'collection': collection, 'chunking_strategy': 'fixed',
+                                                         'chunk_size': 100 + 20 * r + i, 'min_chunk_size': i}),
+                        ('/retrieval/config', lambda r, i: {'collection': collection, 'retrieval_mode': 'hybrid',
+                                                            'top_k': i + 1, 'alpha': r / 20, 'ef': 16 + 16 * i,
+                                                            'response_format': 'engineer'})):
+        for r in range(rounds):
+            bodies = [make(r, i) for i in range(width)]
+            with ThreadPoolExecutor(max_workers=width) as pool:
+                results = list(pool.map(lambda body: request(route, body), bodies))
+            failed = [(status, result) for status, result in results if status != 201]
+            assert not failed, (route, r, failed[:3])
+            acknowledged = [result for _, result in results]
+            status, persisted = request(route + '/' + collection)
+            assert status == 200, persisted
+            assert persisted in acknowledged, (route, r, persisted)
+    print('PASS concurrent saves are all acknowledged and publish one complete acknowledged value (ingest and retrieval)', flush=True)
 finally:
     if created:
         status, result = request('/collections/' + collection + '?confirm=true', method='DELETE')
@@ -17241,14 +17342,24 @@ async def additional_vectorizer_and_import_checks(api,client,name,temp,created,j
 
 async def collection_deletion_checks(api,client,name,temp,check):
     from services import sources,ingest_config,retrieval_config
+    from routers import collections as collection_routes
+    from weaviate.exceptions import UnexpectedStatusCodeError
     # Exercise both aliases on the Linux volume, with separate physical paths.
     for use_alias in (True,False):
         canonical=name+('AliasDelete' if use_alias else 'CanonicalDelete')
         alias=canonical[:1].lower()+canonical[1:]
         caller=alias if use_alias else canonical
-        neighbor=canonical+'Neighbor'
+        neighbor=canonical[:-1]+canonical[-1].upper()
+        neighbor_supported=True
         for collection in (canonical,neighbor):
-            await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+            try:
+                await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+            except UnexpectedStatusCodeError as exc:
+                if collection != neighbor or exc.status_code != 422 or 'similar class' not in str(exc):
+                    raise
+                neighbor_supported=False
+                check(True,'backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume')
+                continue
             await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
         identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in (canonical,alias,neighbor)}
         for spelling,sid in identities.items():
@@ -17256,12 +17367,16 @@ async def collection_deletion_checks(api,client,name,temp,check):
             await asyncio.to_thread(ingest_config.save,{'collection':spelling})
             await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
             await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        await asyncio.to_thread(collection_routes._save_registry, {canonical:'owned', alias:'owned', neighbor:'neighbor'})
         response=await api.delete('/collections/'+caller)
+        registry=await asyncio.to_thread(collection_routes._load_registry)
+        check(registry=={neighbor:'neighbor'},'registry removes both aliases and preserves case-distinct neighbor')
         check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
         for spelling in (canonical,alias):
             check(await asyncio.to_thread(lambda:not sources.collection_dir(spelling).exists() and not (Path(temp)/'ingest_configs'/(spelling+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(spelling+'.json')).exists()),'deletion cleans exact source/ingest/retrieval spelling '+spelling)
             check(await asyncio.to_thread(lambda:gs.get_session(identities[spelling])['orphaned'] and json.loads(gs._session_path(identities[spelling]).read_text())['orphaned']),'deletion persists orphan status for '+spelling)
-        check(await asyncio.to_thread(lambda:client.collections.exists(neighbor) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves unrelated collection sidecars and current session')
+            check(gs.get_session(identities[spelling])['orphaned_reason']==f"collection '{canonical}' was deleted",'orphan reason names canonical collection for '+spelling)
+        check(await asyncio.to_thread(lambda:(not neighbor_supported or client.collections.exists(neighbor)) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves case-distinct sidecars and current session')
 
 
 async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
@@ -17277,6 +17392,7 @@ async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,c
     check(stage in removed and not await asyncio.to_thread(client.collections.exists,stage) and await asyncio.to_thread(tuning._existing_records,name)==before and not await asyncio.to_thread(owners),'startup removes exact legacy tuning scratch while preserving original records')
 
 async def main():
+    from routers import collections as collection_routes
     token=uuid.uuid4().hex[:8]; name=owned_name(os.environ.get('RAG_TEST_PREFIX','Vfy49'),token)
     probe=name+'Probe'; sid='gs_'+token; job=None; jobs=[]; checks=0
     await bounded_poll_cases()
@@ -17291,7 +17407,8 @@ async def main():
     temp=temporary.name
     try:
         client=await asyncio.to_thread(wc.get_client)
-        with patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
+        with patch.object(collection_routes,'_REGISTRY_FILE',Path(temp)/'collection_registry.json'), \
+             patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
              patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1), \
              patch.object(gs,'_sessions',{}),patch.object(wc.ingest_config,'_DIR',None),patch.object(wc.retrieval_config,'_DIR',None),patch.object(wc,'_create_collection_sync',side_effect=record_create):
             def check(condition,label):
@@ -17634,6 +17751,37 @@ class DeletedRecoveryTests(unittest.TestCase):
         with patch.object(self.client.collections,'delete',side_effect=OSError('Owned delete failure')):
             with self.assertRaisesRegex(OSError,'Owned delete failure'):self.wc._delete_collection_sync('ownedRecovery')
         self.assertTrue(sources.collection_dir(name).exists());self.assertIsNotNone(ingest_config.load(name));self.assertIsNotNone(retrieval_config.load(name));self.assertFalse(gs.get_session(sid).get('orphaned',False));self.assertIn(name,self.backend)
+    def test_http_delete_removes_both_registry_spellings_only_after_success(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from routers import collections as route
+        for caller in ('OwnedRecovery', 'ownedRecovery'):
+            for fails in (False, True):
+                registry = {'OwnedRecovery': 'canonical', 'ownedRecovery': 'alias', 'Ownedrecovery': 'neighbor'}
+                with self.subTest(caller=caller, fails=fails), \
+                     patch.object(route.wc, 'collection_exists', new=AsyncMock(return_value=True)), \
+                     patch.object(route.wc, 'delete_collection', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
+                     patch.object(route, '_registry_lock', asyncio.Lock()), \
+                     patch.object(route, '_load_registry', return_value=registry), \
+                     patch.object(route, '_save_registry') as save:
+                    asyncio.run(route.delete_collection(caller))
+                    if fails:
+                        save.assert_not_called()
+                        self.assertEqual(len(registry), 3)
+                    else:
+                        save.assert_called_once_with({'Ownedrecovery': 'neighbor'})
+
+    def test_alias_delete_orphan_reason_names_canonical_collection(self):
+        # #140: whichever spelling the caller used, both sessions record the canonical name.
+        import json
+        from services import goldstandard as gs
+        identities={'OwnedRecovery':'gs_14000008','ownedRecovery':'gs_14000009'}
+        for spelling,sid in identities.items():
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        self.wc._delete_collection_sync('ownedRecovery')
+        for sid in identities.values():
+            self.assertEqual(gs.get_session(sid).get('orphaned_reason'),"collection 'OwnedRecovery' was deleted",'in-memory orphan reason must name the canonical collection')
+            self.assertEqual(json.loads(gs._session_path(sid).read_text()).get('orphaned_reason'),"collection 'OwnedRecovery' was deleted",'persisted orphan reason must name the canonical collection')
     def test_deleting_original_preserves_distinct_retained_recovery(self):
         self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
         self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
@@ -17707,7 +17855,7 @@ class LifecycleTests(unittest.TestCase):
         from routers import collections as collections_router
         with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(collections_router,'_REGISTRY_FILE',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
             asyncio.run(run(directory))
-        self.assertEqual(len(checks),12);self.assertEqual(set(backend),{'OwnedVerifierAliasDeleteNeighbor','OwnedVerifierCanonicalDeleteNeighbor'});self.assertEqual(len(created),4)
+        self.assertEqual(len(checks),18);self.assertEqual(set(backend),{'OwnedVerifierAliasDeletE','OwnedVerifierCanonicalDeletE'});self.assertEqual(len(created),4)
     def test_client_failure_still_cleans_temporary_directory(self):
         original_temp=tempfile.TemporaryDirectory;temps=[]
         def create(*args,**kwargs):result=original_temp(*args,**kwargs);temps.append(result.name);return result
@@ -17782,6 +17930,34 @@ def publish(path: Path, config: dict) -> None:
                     log.warning("Could not remove settings temporary file %s", temporary)
 ```
 
+### scripts/tests/test_settings_implementation.py
+
+```python
+"""Host-side source-copy checks; no API runtime dependencies."""
+from pathlib import Path
+import unittest
+
+class ImplementationTests(unittest.TestCase):
+    def test_embedded_sources_match_runtime(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / 'IMPLEMENTATION.md').read_text()
+        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
+                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
+                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py',
+                     'scripts/verify/settings_validation.py', 'api/services/importer.py'):
+            with self.subTest(file=name):
+                fence = '````' if name.endswith('.md') else '```'
+                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
+                header = f'### {name}\n\n{fence}{language}\n'
+                start = text.index(header) + len(header)
+                end = text.index('\n' + fence + '\n', start)
+                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
 ### scripts/tests/test_settings_persistence.py
 
 ```python
@@ -17816,6 +17992,33 @@ class SettingsPersistenceTests(unittest.TestCase):
         field = 'chunk_size' if service is ingest_config else 'top_k'
         return [{**service.DEFAULTS, 'collection': 'ConcurrentSettings', field: value}
                 for value in ((1000, 1100, 1200) if service is ingest_config else (5, 7, 9))]
+
+    def test_import_publication_preserves_config_on_failure_and_uses_shared_lock(self):
+        from services import importer
+        with self.fixture(ingest_config) as root:
+            old, incoming, _ = self.values(ingest_config)
+            ingest_config.save(old)
+            pkg = root / 'package'
+            pkg.mkdir()
+            (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            path = ingest_config._path(old['collection'])
+            before = path.read_bytes()
+            entered = []
+            class ObservedLock:
+                def __enter__(self):
+                    entered.append(True)
+                def __exit__(self, *args):
+                    pass
+            with patch.object(settings_store, '_write_lock', ObservedLock()), \
+                 patch.object(Path, 'replace', side_effect=OSError('owned publication failure')):
+                with self.assertRaises(OSError):
+                    importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            self.assertEqual(entered, [True])
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(path.parent.glob('*.tmp')), [])
+            importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            self.assertEqual(ingest_config.load(old['collection']), incoming)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_contending_saves_publish_their_own_complete_values(self):
         for service in SERVICES:
@@ -17963,22 +18166,6 @@ class SettingsPersistenceTests(unittest.TestCase):
                     service.save({**old, 'unserializable': object()})
                 self.assertEqual(service.load(old['collection']), old)
                 self.assertEqual(list(service._dir().glob('*.tmp')), [])
-
-
-class ImplementationTests(unittest.TestCase):
-    def test_embedded_sources_match_runtime(self):
-        root = Path(__file__).resolve().parents[2]
-        text = (root / 'IMPLEMENTATION.md').read_text()
-        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
-                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
-                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py'):
-            with self.subTest(file=name):
-                fence = '````' if name.endswith('.md') else '```'
-                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
-                header = f'### {name}\n\n{fence}{language}\n'
-                start = text.index(header) + len(header)
-                end = text.index('\n' + fence + '\n', start)
-                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
 
 
 if __name__ == '__main__':

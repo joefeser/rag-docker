@@ -134,6 +134,10 @@ verification run; it does not establish full-stack acceptance by itself.
 
 Suite 04 also registers `test_chunk_sampling.py` through `09_sampling.sh`, including guard release before model generation and after sampling/publication failures.
 
+Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
+(no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
+retrieval route. The persistence cases cover failed import-config publication.
+
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
@@ -403,4 +407,4 @@ node scripts/verify/browser/query_config.js
 The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
-isolated fixture run does not replace the required full live-stack suite.
+isolated fixture run does not replace the full verification suite (`stack.sh run`).
