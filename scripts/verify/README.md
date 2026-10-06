@@ -405,4 +405,4 @@ node scripts/verify/browser/query_config.js
 The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
-isolated fixture run does not replace the required full live-stack suite.
+isolated fixture run does not replace the full verification suite (`stack.sh run`).

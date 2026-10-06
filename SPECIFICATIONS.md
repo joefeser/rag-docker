@@ -2002,6 +2002,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
 
+- [x] Retrieval save confirmations and errors stay with their selection generation. Deferred browser cases verify stale success/failure after switching collections and preserve the newest acknowledged success when a newer save fails, in both response orders.
+
 ### 10.5 Infrastructure
 
 - [x] `docker compose up` brings all five services healthy within 5 minutes on first run (including model pull).

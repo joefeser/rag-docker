@@ -8325,7 +8325,7 @@ interface QueryConfigValue {
   isDefault: boolean
   loading: boolean
   error: string
-  saveConfig: (config: QueryConfig) => Promise<void>
+  saveConfig: (config: QueryConfig) => Promise<boolean>
 }
 
 const QueryConfigContext = createContext<QueryConfigValue | null>(null)
@@ -8352,10 +8352,16 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const requestId = useRef(0)
   const selectedCollection = useRef('')
   const saveId = useRef(0)
+  const selectionId = useRef(0)
+  const latestFailed = useRef(false)
+  const lastSuccess = useRef<{ id: number; value: RetrievalConfig } | null>(null)
 
   const setCollection = useCallback((name: string) => {
     if (name === selectedCollection.current) return
     selectedCollection.current = name
+    selectionId.current++
+    latestFailed.current = false
+    lastSuccess.current = null
     // Invalidate immediately, before the next effect runs. A -> B -> A is
     // also a new generation even though the collection name matches again.
     requestId.current++
@@ -8396,24 +8402,36 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const saveConfig = useCallback(
     async (next: QueryConfig) => {
       if (!collection) throw new Error('Select a collection before saving retrieval settings.')
-      const ticket = requestId.current
+      const selection = selectionId.current
       const saveTicket = ++saveId.current
-      const saved = await api.saveRetrievalConfig({ collection, ...next })
-      // A save belongs to the selection generation that started it. An old
-      // save must not publish into another collection or cancel its load.
-      // Of concurrent saves, only the latest started may publish.
-      if (
-        collection !== selectedCollection.current ||
-        ticket !== requestId.current ||
-        saveTicket !== saveId.current
-      ) return
-      // A completed save supersedes any load still in flight for this
-      // collection, which would otherwise land afterwards with stale values.
-      requestId.current++
-      setConfigState(fromResponse(saved))
-      setIsDefault(saved.is_default)
-      setError('')
-      setLoading(false)
+      latestFailed.current = false
+      const isCurrent = () => selection === selectionId.current && collection === selectedCollection.current
+      const publish = (saved: RetrievalConfig) => {
+        // Cancel pending loads without invalidating other saves in this selection.
+        requestId.current++
+        setConfigState(fromResponse(saved))
+        setIsDefault(saved.is_default)
+        setError('')
+        setLoading(false)
+      }
+      try {
+        const saved = await api.saveRetrievalConfig({ collection, ...next })
+        if (!isCurrent()) return false
+        if (!lastSuccess.current || saveTicket > lastSuccess.current.id) {
+          lastSuccess.current = { id: saveTicket, value: saved }
+        }
+        // If the newest request failed, retain the newest acknowledged success,
+        // even when that older request's response arrives after the failure.
+        if (saveTicket === saveId.current || latestFailed.current) {
+          publish(lastSuccess.current.value)
+        }
+        return saveTicket === saveId.current
+      } catch (e: unknown) {
+        if (!isCurrent() || saveTicket !== saveId.current) return false
+        latestFailed.current = true
+        if (lastSuccess.current) publish(lastSuccess.current.value)
+        throw e
+      }
     },
     [collection],
   )
@@ -9328,6 +9346,7 @@ export default function RetrievalPage() {
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
   const indexRequest = useRef(0)
+  const saveRequest = useRef(0)
 
   useEffect(() => {
     const ticket = ++indexRequest.current
@@ -9354,11 +9373,15 @@ export default function RetrievalPage() {
   }, [config])
 
   useEffect(() => {
+    saveRequest.current++
     setApplied(false)
     setSaveError('')
+    return () => { saveRequest.current++ }
   }, [collection])
 
   async function apply() {
+    const ticket = ++saveRequest.current
+    setApplied(false)
     const next: QueryConfig = {
       retrieval_mode: mode,
       top_k: topK,
@@ -9370,10 +9393,12 @@ export default function RetrievalPage() {
     }
     setSaveError('')
     try {
-      await saveConfig(next)
+      const saved = await saveConfig(next)
+      if (!saved || ticket !== saveRequest.current) return
       setApplied(true)
-      setTimeout(() => setApplied(false), 3000)
+      setTimeout(() => { if (ticket === saveRequest.current) setApplied(false) }, 3000)
     } catch (e: unknown) {
+      if (ticket !== saveRequest.current) return
       setSaveError(e instanceof Error ? e.message : String(e))
     }
   }
@@ -10798,7 +10823,7 @@ node scripts/verify/browser/query_config.js
 The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
-isolated fixture run does not replace the required full live-stack suite.
+isolated fixture run does not replace the full verification suite (`stack.sh run`).
 ````
 
 ### scripts/verify/all.sh
@@ -14761,6 +14786,44 @@ async function runQueryConfigTests(browser, base, reporter) {
     await assertSettings(page, A);
     await assertQuery(page, A);
   }]);
+  // Reviewer cases: what a stale save leaves on the newly selected collection's page.
+  cases.push(['stale A save still persists to A, and B shows no save confirmation', async page => {
+    await save(page);
+    const posted = await page.evaluate(() => window.queryConfigFixture.requests.find(r => r.method === 'POST').body.collection);
+    assert.equal(posted, A.collection, 'the save request must name the collection it was started for');
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false, 'B shows "Saved!" from A\'s stale save');
+    await assertSettings(page, B);
+  }]);
+  cases.push(['stale A save failure is not shown as an error on B', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await release(page, '/api/retrieval/config', { error: { message: 'Fixture stale save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture stale save failed')), false, "B's page shows A's stale save failure");
+    await assertSettings(page, B);
+    await assertQuery(page, B);
+  }]);
+  for (const failureFirst of [true, false]) {
+    cases.push([`older acknowledged save survives newer failure (${failureFirst ? 'failure' : 'success'} first)`, async page => {
+      const saved = { ...A, top_k: 13 };
+      await setValue(page, '() => document.querySelector("input[type=range]")', '13');
+      await save(page);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+      await save(page);
+      await pending(page, '/api/retrieval/config', 'POST', 2);
+      const fail = () => release(page, '/api/retrieval/config', { error: { message: 'Latest save failed' } }, { method: 'POST', status: 500, last: true });
+      if (failureFirst) await fail();
+      await release(page, '/api/retrieval/config', saved, { method: 'POST' });
+      if (!failureFirst) await fail();
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Latest save failed')), true);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+      await assertSettings(page, saved);
+      await assertQuery(page, saved);
+    }]);
+  }
   for (const [name, test] of cases) {
     let s;
     try {
