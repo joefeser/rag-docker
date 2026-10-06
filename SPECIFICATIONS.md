@@ -2178,3 +2178,8 @@ A rebuild from these documents is correct when:
 
 - [x] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
       *Registered `14_reindex.sh`: 24 runtime cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling cases and 44 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*
+
+- [x] Interrupted tuning final writes carry an operation instance token. Startup checks only the matching target against its retained recovery records, marks mismatches or missing targets stale, and preserves both collections and snapshots for inspection. A different target instance, unreadable backend, or missing recovery never authorizes deletion. Completed matching targets are left untouched.
+      *Controlled restart cases in `test_batch_recovery.py`; startup deliberately does not delete targets using mutable recovery data.*
+
+- [x] After an interrupted tuning cutover is checked, startup durably records the outcome (`complete`, `stale`, or `other-instance`) and clears `cutover_pending`, preserving the recovery collection and journal. Later startups do not compare or re-flag that operation. An undecidable check or failed outcome write remains pending for retry.
