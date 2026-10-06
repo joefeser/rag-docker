@@ -8,7 +8,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import UUID
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
@@ -59,6 +59,13 @@ class SelectionTests(unittest.TestCase):
                          set(ids(sample.select_chunk_ids(objects(3),3,2))))
         self.assertNotEqual(ids(sample.select_chunk_ids(objects(20),3,1)),
                             ids(sample.select_chunk_ids(objects(20),3,2)))
+
+    def test_repeated_null_seed_calls_each_draw_their_own_nonce(self):
+        with patch.object(sample.secrets, 'token_bytes', side_effect=[b'a' * 32, b'b' * 32]) as entropy:
+            first = sample.select_chunk_ids(objects(), 3, None)
+            second = sample.select_chunk_ids(objects(), 3, None)
+        self.assertEqual(entropy.call_args_list, [call(32)] * 2)
+        self.assertNotEqual(first, second)
 
     def test_null_seed_draws_one_nonce_seeded_call_uses_no_entropy(self):
         with patch.object(sample.secrets,'token_bytes',return_value=b'a'*32) as entropy:

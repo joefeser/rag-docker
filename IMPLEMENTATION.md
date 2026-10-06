@@ -12713,11 +12713,18 @@ ingest() {
   local collection="$1" strategy="$2" size="$3" minsize="$4"; shift 4
   local args=() f
   for f in "$@"; do args+=(-F "files=@$f"); done
-  curl -s -m 600 -X POST "$API/ingest/upload" \
+  local http_status curl_status
+  http_status=$(curl -s -m 600 -o /tmp/vfy_job.json -w '%{http_code}' -X POST "$API/ingest/upload" \
     -F "collection=$collection" -F "strategy=$strategy" -F "chunk_size=$size" \
-    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}" > /tmp/vfy_job.json
+    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}")
+  curl_status=$?
   local job; job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['job_id'])" 2>/dev/null)
-  [ -n "$job" ] || { printf '{}' > /tmp/vfy_job.json; return 1; }
+  if [ "$curl_status" -ne 0 ] || [[ "$http_status" != 2?? ]] || [ -z "$job" ]; then
+    printf 'Upload failed: curl exit=%s HTTP=%s; response body follows:\n' "$curl_status" "$http_status" >&2
+    cat /tmp/vfy_job.json >&2
+    printf '\n' >&2
+    return 1
+  fi
   wait_for_job "/ingest/job/$job" 900 >/dev/null
   api_get "/ingest/job/$job" > /tmp/vfy_job.json
 }
@@ -13231,7 +13238,7 @@ for body in \
   '{"collection":"MissingSamplingFixture","sample_size":Infinity}'
 do
   code=$(api_post_code /goldstandard/generate "$body")
-  check_eq "invalid sampling request rejected with422: $body" "$code" "422"
+  check_eq "invalid sampling request rejected with 422: $body" "$code" "422"
 done
 summary
 ```
