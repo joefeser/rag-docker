@@ -47,6 +47,87 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         self.assertEqual(sources.load_index("Valid")["documents"].keys(), {digest})
         self.assertEqual(sources.blob_path("Valid", digest).read_bytes(), content)
 
+    def test_manifest_verified_blob_is_hashed_only_once(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        blob = self.package / "sources" / digest
+        blob.write_bytes(content)
+        (blob.parent / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": f"sha256:{digest}"}}
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            packager.verify_digests(self.package, manifest)
+            importer._validate_package_sources(self.package, manifest)
+        hashed.assert_called_once_with(blob)
+
+    def test_verified_manifest_cannot_bless_a_wrong_source_identity(self):
+        content = b"other bytes authenticated by the manifest"
+        digest = hashlib.sha256(b"claimed source").hexdigest()
+        blob = self.package / "sources" / digest
+        blob.write_bytes(content)
+        (blob.parent / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": "sha256:" + hashlib.sha256(content).hexdigest()}}
+        packager.verify_digests(self.package, manifest)
+        with patch.object(packager, "sha256_file", side_effect=AssertionError("second hash")):
+            with self.assertRaises(PackageError) as raised:
+                importer._validate_package_sources(self.package, manifest)
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+
+    def test_tampered_listed_blob_fails_before_source_validation_or_live_work(self):
+        digest = hashlib.sha256(b"claimed source").hexdigest()
+        (self.package / "sources" / digest).write_bytes(b"tampered")
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": f"sha256:{digest}"}}
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+             patch.object(importer, "_validate_package_sources") as validate, \
+             patch.object(importer, "_ensure_models") as models, \
+             patch.object(importer.wc, "get_client") as backend:
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        validate.assert_not_called()
+        models.assert_not_called()
+        backend.assert_not_called()
+
+    def test_restore_ignores_unindexed_blobs_and_indexless_source_folders(self):
+        real = b"retained source"
+        digest = hashlib.sha256(real).hexdigest()
+        future = b"future legitimate source"
+        future_digest = hashlib.sha256(future).hexdigest()
+        src = self.package / "sources"
+        (src / digest).write_bytes(real)
+        (src / future_digest).write_bytes(b"unindexed unrelated bytes")
+        (src / "index.json").write_text(json.dumps(self.index(digest)))
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        importer._restore_sidecars("Imported", self.package, "Original", [])
+        dest = sources.collection_dir("Imported")
+        self.assertEqual({p.name for p in dest.iterdir()}, {digest, "index.json"})
+        self.assertEqual((dest / digest).read_bytes(), real)
+        (src / "index.json").unlink()
+        importer._validate_package_sources(self.package, {"fidelity": "chunks-only"})
+        importer._restore_sidecars("Indexless", self.package, "Original", [])
+        self.assertFalse(sources.collection_dir("Indexless").exists())
+
+    def test_record_only_tuning_does_not_read_invalid_sources(self):
+        from services import tuning
+        for operation in ("reindex", "reembed"):
+            with self.subTest(operation=operation), \
+                 patch.object(tuning, "_jobs", {"owned": {}}), \
+                 patch.object(tuning.sources, "has_sources", side_effect=AssertionError("sources read")), \
+                 patch.object(tuning, "_existing_chunks", return_value=[]), \
+                 patch.object(tuning, "_existing_records", return_value=[]), \
+                 patch.object(tuning, "_rebuild", return_value=0), \
+                 patch.object(tuning.goldstandard, "mark_stale", return_value=0):
+                tuning._run("owned", "Invalid", operation, {})
+                self.assertEqual(tuning._jobs["owned"]["status"], "completed")
+
     def test_import_rejects_paths_before_restoring_sources(self):
         for key in (str(self.outside), "../outside.txt", "a/b", "index.json"):
             with self.subTest(key=key):
@@ -183,6 +264,14 @@ class SourceIndexBoundaryTests(unittest.TestCase):
             self.assertEqual(set(index["documents"]), {available})
             self.assertTrue(any(name.endswith(f"/sources/{available}") for name in names))
             self.assertFalse(any(name.endswith(f"/sources/{missing}") for name in names))
+        # The package that omitted the missing blob passes the import's own
+        # checks 1-3 and the retained-source check (the PR's "remains importable").
+        opened = self.root / "reopened"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        packager.verify_digests(pkg, manifest)
+        self.assertEqual(manifest["fidelity"], "with-sources")
+        importer._validate_package_sources(pkg, manifest)
 
     def test_tune_options_reports_invalid_index_as_typed_error(self):
         from routers import tuning as tuning_router

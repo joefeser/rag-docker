@@ -431,7 +431,20 @@ for mode in abs link; do
   check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
     "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
-  echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation is a typed 409, not a 500, and doesn't
+    # block tuning that never reads sources (reindex copies stored records).
+    check_eq "E29: GET /tune reports an on-disk abs entry as HTTP 409" "$(api_code "$API/tune/$C")" "409"
+    check_eq "E29: ... with error code SOURCE_INDEX_INVALID" \
+      "$(api_get "/tune/$C" | jfield "['error']['code']")" "SOURCE_INDEX_INVALID"
+    api_post "/tune/reindex" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
+    check_eq "E29: re-indexing from stored records still completes with an on-disk abs entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "completed"
+    check_eq "E29: ... and keeps the chunk count (abs)" "$(count_of "$C")" "$chunks_before"
+    leak=$(no_sentinel_in_exports); check "E29: ... and nothing in exports holds outside bytes after it (abs)" $? "$leak"
+  else
+    echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  fi
   plant restore
   check "E29: restored the collection's own source index ($mode)" $?
 done

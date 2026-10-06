@@ -5510,7 +5510,7 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
 
 
 def _validate_package_sources(pkg: Path, manifest: dict) -> None:
-    """Check untrusted retained-source identities before any live mutation."""
+    """Check source identities after verify_digests, before any live mutation."""
     source_dir = pkg / "sources"
     if not source_dir.exists():
         if manifest.get("fidelity") == "with-sources":
@@ -5531,7 +5531,13 @@ def _validate_package_sources(pkg: Path, manifest: dict) -> None:
             blob = source_dir / digest
             if blob.is_symlink() or not blob.is_file():
                 raise ValueError("Retained source blob is missing or is not a regular file")
-            if packager.sha256_file(blob) != digest:
+            # Check 3 already hashed listed files in this private extraction.
+            # Match that verified digest to the content-addressed filename;
+            # legacy unlisted blobs still need their own identity hash.
+            files = manifest.get("files", {})
+            rel = f"sources/{digest}"
+            actual = files[rel] if rel in files else "sha256:" + packager.sha256_file(blob)
+            if actual != f"sha256:{digest}":
                 raise ValueError("Retained source blob does not match its identity")
     except (OSError, ValueError, TypeError) as exc:
         raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
@@ -5608,12 +5614,15 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     notes: list[str] = []
 
     src = pkg / "sources"
-    if src.is_dir():
+    if (src / sources.INDEX_NAME).is_file():
+        # Preflight validated these identities and bytes. Never retain unrelated
+        # package files: their names could shadow a future content-addressed blob.
+        index = sources.validate_index(json.loads((src / sources.INDEX_NAME).read_text()))
         dest = sources.collection_dir(target)
         dest.mkdir(parents=True, exist_ok=True)
-        for item in src.iterdir():
-            if item.is_file():
-                shutil.copyfile(item, dest / item.name)
+        for digest in index["documents"]:
+            shutil.copyfile(src / digest, dest / digest)
+        shutil.copyfile(src / sources.INDEX_NAME, dest / sources.INDEX_NAME)
 
     ingest_cfg = pkg / "ingest_config.json"
     if ingest_cfg.is_file():
@@ -6446,9 +6455,6 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
                         {"collection": collection})
                 properties = _chunks_from_sources(source_collection, **params["chunking"])
                 reason = "the collection was re-chunked and re-embedded"
-            elif has_sources:
-                properties = _existing_chunks(collection)
-                reason = "the collection was re-embedded, so its vectors changed"
             else:
                 properties = _existing_chunks(collection)
                 reason = ("the collection was re-embedded from stored chunk text, "
@@ -13923,7 +13929,20 @@ for mode in abs link; do
   check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
     "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
-  echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation is a typed 409, not a 500, and doesn't
+    # block tuning that never reads sources (reindex copies stored records).
+    check_eq "E29: GET /tune reports an on-disk abs entry as HTTP 409" "$(api_code "$API/tune/$C")" "409"
+    check_eq "E29: ... with error code SOURCE_INDEX_INVALID" \
+      "$(api_get "/tune/$C" | jfield "['error']['code']")" "SOURCE_INDEX_INVALID"
+    api_post "/tune/reindex" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
+    check_eq "E29: re-indexing from stored records still completes with an on-disk abs entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "completed"
+    check_eq "E29: ... and keeps the chunk count (abs)" "$(count_of "$C")" "$chunks_before"
+    leak=$(no_sentinel_in_exports); check "E29: ... and nothing in exports holds outside bytes after it (abs)" $? "$leak"
+  else
+    echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  fi
   plant restore
   check "E29: restored the collection's own source index ($mode)" $?
 done
@@ -18282,6 +18301,87 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         self.assertEqual(sources.load_index("Valid")["documents"].keys(), {digest})
         self.assertEqual(sources.blob_path("Valid", digest).read_bytes(), content)
 
+    def test_manifest_verified_blob_is_hashed_only_once(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        blob = self.package / "sources" / digest
+        blob.write_bytes(content)
+        (blob.parent / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": f"sha256:{digest}"}}
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            packager.verify_digests(self.package, manifest)
+            importer._validate_package_sources(self.package, manifest)
+        hashed.assert_called_once_with(blob)
+
+    def test_verified_manifest_cannot_bless_a_wrong_source_identity(self):
+        content = b"other bytes authenticated by the manifest"
+        digest = hashlib.sha256(b"claimed source").hexdigest()
+        blob = self.package / "sources" / digest
+        blob.write_bytes(content)
+        (blob.parent / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": "sha256:" + hashlib.sha256(content).hexdigest()}}
+        packager.verify_digests(self.package, manifest)
+        with patch.object(packager, "sha256_file", side_effect=AssertionError("second hash")):
+            with self.assertRaises(PackageError) as raised:
+                importer._validate_package_sources(self.package, manifest)
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+
+    def test_tampered_listed_blob_fails_before_source_validation_or_live_work(self):
+        digest = hashlib.sha256(b"claimed source").hexdigest()
+        (self.package / "sources" / digest).write_bytes(b"tampered")
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": f"sha256:{digest}"}}
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+             patch.object(importer, "_validate_package_sources") as validate, \
+             patch.object(importer, "_ensure_models") as models, \
+             patch.object(importer.wc, "get_client") as backend:
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        validate.assert_not_called()
+        models.assert_not_called()
+        backend.assert_not_called()
+
+    def test_restore_ignores_unindexed_blobs_and_indexless_source_folders(self):
+        real = b"retained source"
+        digest = hashlib.sha256(real).hexdigest()
+        future = b"future legitimate source"
+        future_digest = hashlib.sha256(future).hexdigest()
+        src = self.package / "sources"
+        (src / digest).write_bytes(real)
+        (src / future_digest).write_bytes(b"unindexed unrelated bytes")
+        (src / "index.json").write_text(json.dumps(self.index(digest)))
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        importer._restore_sidecars("Imported", self.package, "Original", [])
+        dest = sources.collection_dir("Imported")
+        self.assertEqual({p.name for p in dest.iterdir()}, {digest, "index.json"})
+        self.assertEqual((dest / digest).read_bytes(), real)
+        (src / "index.json").unlink()
+        importer._validate_package_sources(self.package, {"fidelity": "chunks-only"})
+        importer._restore_sidecars("Indexless", self.package, "Original", [])
+        self.assertFalse(sources.collection_dir("Indexless").exists())
+
+    def test_record_only_tuning_does_not_read_invalid_sources(self):
+        from services import tuning
+        for operation in ("reindex", "reembed"):
+            with self.subTest(operation=operation), \
+                 patch.object(tuning, "_jobs", {"owned": {}}), \
+                 patch.object(tuning.sources, "has_sources", side_effect=AssertionError("sources read")), \
+                 patch.object(tuning, "_existing_chunks", return_value=[]), \
+                 patch.object(tuning, "_existing_records", return_value=[]), \
+                 patch.object(tuning, "_rebuild", return_value=0), \
+                 patch.object(tuning.goldstandard, "mark_stale", return_value=0):
+                tuning._run("owned", "Invalid", operation, {})
+                self.assertEqual(tuning._jobs["owned"]["status"], "completed")
+
     def test_import_rejects_paths_before_restoring_sources(self):
         for key in (str(self.outside), "../outside.txt", "a/b", "index.json"):
             with self.subTest(key=key):
@@ -18418,6 +18518,14 @@ class SourceIndexBoundaryTests(unittest.TestCase):
             self.assertEqual(set(index["documents"]), {available})
             self.assertTrue(any(name.endswith(f"/sources/{available}") for name in names))
             self.assertFalse(any(name.endswith(f"/sources/{missing}") for name in names))
+        # The package that omitted the missing blob passes the import's own
+        # checks 1-3 and the retained-source check (the PR's "remains importable").
+        opened = self.root / "reopened"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        packager.verify_digests(pkg, manifest)
+        self.assertEqual(manifest["fidelity"], "with-sources")
+        importer._validate_package_sources(pkg, manifest)
 
     def test_tune_options_reports_invalid_index_as_typed_error(self):
         from routers import tuning as tuning_router
