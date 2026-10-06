@@ -516,6 +516,72 @@ done
 check_eq "E29: the restored index is the original" "$(src_index_hash "$C")" "$idx_before"
 (cd "$REPO_ROOT" && docker compose exec -T api rm -f "$E29_SENT") >/dev/null 2>&1 || true
 
+# ── unindexed package blobs are never retained (E29, #179) ───────────────────
+# A digest-valid package carries an extra sources/ file named after the SHA-256
+# of a document not yet ingested, holding other bytes. Import must not retain
+# it, so a later ingest of that document keeps the document's own bytes.
+E29_FUTURE="$FIX/e29-future-$E29_TAG.txt"
+printf 'E29 future document %s: the bytes a later ingest must retain.\n' "$E29_TAG" > "$E29_FUTURE"
+E29_FDIG=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$E29_FUTURE")
+UNIDX=$(python3 - "$EXPORTS/$PKG" "$E29_FDIG" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, fdig = pathlib.Path(sys.argv[1]), sys.argv[2]
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    index = json.loads((root / "sources" / "index.json").read_text())
+    assert index["documents"] and fdig not in index["documents"]
+    planted = root / "sources" / fdig
+    planted.write_bytes(b"E29 planted unindexed bytes")
+    manifest["files"]["sources/" + fdig] = "sha256:" + hashlib.sha256(planted.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-unindexed.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+)
+run_import "$UNIDX" rename
+read -r ustat uname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+check_eq "E29: a digest-valid package with an unindexed source blob imports (rename)" "$ustat" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$uname" "$E29_FDIG" <<'ENDPY'
+import json, sys
+from services import sources
+d, fdig = sources.collection_dir(sys.argv[1]), sys.argv[2]
+names = {p.name for p in d.iterdir()} if d.is_dir() else set()
+docs = set(json.loads((d / "index.json").read_text())["documents"]) if (d / "index.json").is_file() else set()
+print("    retained:", sorted(names))
+sys.exit(0 if docs and names == docs | {"index.json"} and fdig not in names else 1)
+ENDPY
+)
+check "E29: import retains only the indexed blobs and index.json, not the unindexed one" $?
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$uname" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$E29_FUTURE" > /tmp/vfy_e29ing.json
+check_eq "E29: ingesting the document the planted name targets completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_e29ing.json)" 900)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$uname" "$E29_FDIG" <<'ENDPY'
+import hashlib, sys
+from services import sources
+name, fdig = sys.argv[1], sys.argv[2]
+p = sources.blob_path(name, fdig)
+got = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing"
+print("    retained blob hashes to", got)
+sys.exit(0 if got == fdig and fdig in sources.load_index(name)["documents"] else 1)
+ENDPY
+)
+check "E29: ... and its retained blob holds the document's own bytes" $?
+[ "$uname" != "-" ] && [ "$uname" != "$C" ] && drop_collection "$uname"
+rm -f "$EXPORTS/$UNIDX" "$E29_FUTURE"
+
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")

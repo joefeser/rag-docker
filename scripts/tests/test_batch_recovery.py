@@ -1,5 +1,6 @@
 """Controlled final-flush faults against real writer and recovery services."""
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -280,7 +281,8 @@ class RecoveryTests(unittest.TestCase):
         before = copy.deepcopy(self.cols.get(name).rows)
         recovery.sweep(self.client)
         self.assertEqual(self.cols.get(name).rows, before)
-        self.assertEqual((Path(settings.sources_dir) / name / 'source-blob').read_bytes(), b'original source')
+        blob = hashlib.sha256(b'original source').hexdigest() if record['operation'] == 'import' else 'source-blob'
+        self.assertEqual((Path(settings.sources_dir) / name / blob).read_bytes(), b'original source')
         metadata = recovery._root() / record['operation_id']
         self.assertTrue((metadata / 'goldstandard' / 'gs_0123abcd.json').is_file())
         for kind in ('ingest', 'retrieval'):
@@ -367,7 +369,9 @@ class RecoveryTests(unittest.TestCase):
         (pkg / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in self.original))
         source = pkg / 'sources'
         source.mkdir(exist_ok=True)
-        (source / 'source-blob').write_bytes(b'original source')
+        digest = hashlib.sha256(b'original source').hexdigest()
+        (source / digest).write_bytes(b'original source')
+        (source / 'index.json').write_text(json.dumps({'version': 1, 'documents': {digest: {'filenames': ['source.txt']}}}))
         for kind in ('ingest', 'retrieval'):
             (pkg / f'{kind}_config.json').write_text(json.dumps({'collection': 'Corpus', 'setting': kind}))
         gold = pkg / 'goldstandard'
@@ -420,6 +424,25 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(self.cols.get(record['staging']).rows, {r['id']: r for r in self.original})
                 self.assert_retained(record)
                 recovery.discard(record, self.client)
+
+    def test_failed_replace_recovery_excludes_unindexed_future_blob(self):
+        from services import sources
+        pkg, manifest = self.package()
+        future = b'future legitimate document'
+        digest = hashlib.sha256(future).hexdigest()
+        (pkg / 'sources' / digest).write_bytes(b'planted wrong bytes')
+        (pkg / 'sources' / 'extra-folder').mkdir()
+        self.cols.create_failure = True
+        with patch.object(self, 'package', return_value=(pkg, manifest)):
+            job = self.import_replace()
+        self.assertEqual(job['status'], 'failed')
+        recovered = job['error_detail']['recovered_as']
+        directory = sources.collection_dir(recovered)
+        self.assertEqual({p.name for p in directory.iterdir()},
+                         set(sources.load_index(recovered)['documents']) | {'index.json'})
+        self.assertFalse((directory / digest).exists())
+        sources.store(recovered, 'future.txt', future)
+        self.assertEqual((directory / digest).read_bytes(), future)
 
     def test_replace_restart_after_target_delete_preserves_staging(self):
         self.cols.interrupt = True
