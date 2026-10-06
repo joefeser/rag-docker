@@ -16830,6 +16830,46 @@ print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_dia
         bad=gs._sessions_dir()/'gs_450bad00.json';bad.write_text('{')
         self.assertEqual(len(gs.session_diagnostics()),1);bad.unlink();self.assertEqual(gs.session_diagnostics(),[])
 
+    # Reviewer additions for #127.
+    def test_session_and_pending_marker_files_are_owner_only(self):
+        self.assertEqual(gs._session_path(self.data['session_id']).stat().st_mode&0o777,0o600)
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertEqual(self.pending().stat().st_mode&0o777,0o600)
+
+    def test_pending_marker_after_restart_is_saved_by_next_write(self):
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        state=self.restart();self.assertTrue(state['orphaned']);self.assertTrue(self.pending().is_file())
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}))
+        stored=json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertTrue(stored['orphaned']);self.assertEqual(stored['orphaned_reason'],'Owned completed deletion')
+        self.assertFalse(self.pending().exists());self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_symlinked_pending_storage_is_refused_and_guard_holds(self):
+        outside=Path(self.tmp.name)/'outside';outside.mkdir()
+        self.pending().parent.symlink_to(outside,target_is_directory=True)
+        with self.fail_session_file_replace():
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        self.assertEqual(list(outside.iterdir()),[])
+        with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.save_session(self.data['session_id'],'owned.json'))
+        self.assertEqual(error.exception.code,'HISTORICAL_SESSION')
+        issues={i['filename']:i for i in gs.session_diagnostics()}
+        self.assertIn('until restart',issues['gs_450abcde.json']['message'])
+        self.assertEqual(issues['pending_markers']['code'],'SESSION_READ_FAILED')
+
+    def test_pending_marker_without_session_file_is_ignored(self):
+        self.pending().parent.mkdir()
+        (self.pending().parent/'gs_450dead0.json').write_text(json.dumps({'session_id':'gs_450dead0','orphaned':True,'orphaned_reason':'Owned','orphaned_at':None}))
+        self.restart();self.assertIsNone(gs.get_session('gs_450dead0'));self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_durability_uncertain_marker_keeps_its_own_wording(self):
+        with patch.object(gs,'_sync_directory',side_effect=OSError('Owned directory sync fault')):
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertTrue(json.loads(gs._session_path(self.data['session_id']).read_text())['orphaned'])
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_DURABILITY_UNCERTAIN')
+        self.assertNotIn('pending marker',issue['message'])
+
 if __name__ == '__main__':
     unittest.main()
 ```
