@@ -132,6 +132,8 @@ directories and does not connect to Weaviate or Ollama.
 verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
 verification run; it does not establish full-stack acceptance by itself.
 
+Suite 04 also registers `test_chunk_sampling.py` through `09_sampling.sh`, including guard release before model generation and after sampling/publication failures.
+
 Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
 (no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
 retrieval route. The persistence cases cover failed import-config publication.

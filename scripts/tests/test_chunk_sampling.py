@@ -160,25 +160,118 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_seed_reaches_sampler_actual_size_drives_generation(self):
         chosen=[{'object_id':identity,'content':'Synthetic','source_file':'inert.txt','chunk_index':0} for identity in sample.select_chunk_ids(objects(3),20,7)]
-        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=chosen)) as sampler, \
+        with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=chosen)) as sampler, \
              patch.object(gs,'_store_generated_session',side_effect=lambda session:{**session,'session_id':'gs_460abcdf'}) as save, \
              patch.object(gs,'_run_generation',new=AsyncMock()) as generate:
             result=await gs.start_generation('Inert',20,7)
             await asyncio.sleep(0)
-            sampler.assert_awaited_once_with('Inert',limit=20,seed=7)
+            sampler.assert_called_once_with('Inert',limit=20,seed=7)
             self.assertEqual(result['pairs_total'],3)
             self.assertEqual(save.call_args.args[0]['pairs_total'],3)
             save.assert_called_once()
             generate.assert_awaited_once_with(result['session_id'],chosen)
 
+    async def test_sample_and_publication_serialize_with_replacement_and_deletion(self):
+        import tempfile
+        import threading
+        from config import settings
+        from services.collection_writes import guard
+        for marker in (gs.mark_stale, gs.mark_orphaned):
+            with self.subTest(marker=marker.__name__), tempfile.TemporaryDirectory() as tmp:
+                sampled, release, attempted, entered = (threading.Event() for _ in range(4))
+                def sample_old(*args, **kwargs):
+                    sampled.set()
+                    if not release.wait(5): raise TimeoutError('test publication release')
+                    return [{'content': 'old corpus', 'source_file': 'old.txt', 'chunk_index': 0}]
+                def mutate():
+                    attempted.set()
+                    with guard('inert'):
+                        entered.set()
+                        return marker('Inert', 'Owned corpus mutation')
+                with patch.object(settings, 'upload_dir', tmp), patch.object(gs, '_sessions', {}), patch.object(gs.wc, '_sample_chunks_sync', side_effect=sample_old), patch.object(gs, '_run_generation', new=AsyncMock()):
+                    generation = asyncio.create_task(gs.start_generation('Inert', 1, 7))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(sampled.wait, 5))
+                        mutation = asyncio.create_task(asyncio.to_thread(mutate))
+                        self.assertTrue(await asyncio.to_thread(attempted.wait, 5))
+                        self.assertFalse(await asyncio.to_thread(entered.wait, .1))
+                        # The collection guard does not block unrelated corpora.
+                        def independent():
+                            with guard('Other'): return True
+                        self.assertTrue(await asyncio.wait_for(asyncio.to_thread(independent), 2))
+                    finally:
+                        release.set()
+                    result = await generation
+                    self.assertEqual(await mutation, 1)
+                    await asyncio.gather(*list(gs._tasks))
+                    current = gs.get_session(result['session_id'])
+                    self.assertTrue(current['stale' if marker == gs.mark_stale else 'orphaned'])
+
+    @staticmethod
+    def _guard_free(name, timeout=2):
+        # A fresh thread, so a guard leaked by a reused worker thread (RLock) can't hide.
+        import threading
+        from services.collection_writes import guard
+        acquired = threading.Event()
+        def take():
+            with guard(name): acquired.set()
+        worker = threading.Thread(target=take, daemon=True)
+        worker.start(); worker.join(timeout)
+        return acquired.is_set()
+
+    async def test_guard_is_released_before_model_generation_runs(self):
+        from services import collection_writes as cw
+        chunk = {'content': 'Synthetic', 'source_file': 'inert.txt', 'chunk_index': 0}
+        started, finish = asyncio.Event(), asyncio.Event()
+        async def generating(session_id, chunks):
+            started.set()
+            await finish.wait()
+        with patch.object(gs.wc, '_sample_chunks_sync', new=MagicMock(return_value=[chunk])), \
+             patch.object(gs, '_store_generated_session', side_effect=lambda s: {**s, 'session_id': 'gs_460abcd0'}), \
+             patch.object(gs, '_run_generation', side_effect=generating):
+            result = await gs.start_generation('Inert', 1, 7)
+            try:
+                await asyncio.wait_for(started.wait(), 5)
+                self.assertNotIn(cw.canonical('Inert'), cw._registry, 'guard still registered during generation')
+                for name in ('Inert', 'inert'):
+                    self.assertTrue(await asyncio.to_thread(self._guard_free, name),
+                                    f'mutation of {name} blocked while model generation runs')
+            finally:
+                finish.set()
+                await asyncio.gather(*list(gs._tasks))
+            self.assertEqual(result['session_id'], 'gs_460abcd0')
+
+    async def test_sampling_or_publication_failure_releases_guard_and_starts_no_task(self):
+        from services import collection_writes as cw
+        chunk = {'content': 'Synthetic', 'source_file': 'inert.txt', 'chunk_index': 0}
+        failures = {
+            'sampling': dict(sample=MagicMock(side_effect=RuntimeError('Owned sampling failure')),
+                             store=MagicMock(), raises=RuntimeError),
+            'publication': dict(sample=MagicMock(return_value=[chunk]),
+                                store=MagicMock(side_effect=gs.GoldStandardError('SESSION_WRITE_FAILED', 'Owned publication failure', 503)),
+                                raises=gs.GoldStandardError),
+        }
+        for stage, case in failures.items():
+            with self.subTest(stage=stage), \
+                 patch.object(gs.wc, '_sample_chunks_sync', new=case['sample']), \
+                 patch.object(gs, '_store_generated_session', new=case['store']), \
+                 patch.object(gs, '_run_generation', new=AsyncMock()) as generate, \
+                 patch.object(gs, '_tasks', set()):
+                with self.assertRaises(case['raises']):
+                    await gs.start_generation('Inert', 1, 7)
+                generate.assert_not_called()
+                self.assertEqual(gs._tasks, set())
+                self.assertNotIn(cw.canonical('Inert'), cw._registry, f'guard left registered after {stage} failure')
+                self.assertTrue(await asyncio.to_thread(self._guard_free, 'inert'), f'guard held after {stage} failure')
+
     async def test_invalid_settings_and_selection_failure_prevent_session_and_model_work(self):
-        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(side_effect=ValueError('bad identity'))) as sampler, \
+        with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(side_effect=ValueError('bad identity'))) as sampler, \
              patch.object(gs,'_store_generated_session') as save, \
              patch.object(gs,'_run_generation',new=AsyncMock()) as generate:
             for limit,seed in ((0,7),(101,7),(3,True),(3,float('inf'))):
                 with self.subTest(settings=(limit,seed)), self.assertRaises(ValueError):
                     await gs.start_generation('Inert',limit,seed)
-            sampler.assert_not_awaited()
+            sampler.assert_not_called()
             with self.assertRaises(ValueError):
                 await gs.start_generation('Inert',3,7)
             self.assertEqual(gs._sessions,{})

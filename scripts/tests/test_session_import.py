@@ -296,12 +296,12 @@ class SessionImportTests(unittest.TestCase):
         chunks = [{'content': 'Context', 'source_file': 'source.txt', 'chunk_index': chunk_index}]
 
         async def run():
-            async def sample(collection, limit, seed=None):
+            def sample(collection, limit, seed=None):
                 return chunks
 
             async def chat(system, user):
                 return reply
-            with patch.object(gs.wc, 'sample_chunks', side_effect=sample), \
+            with patch.object(gs.wc, '_sample_chunks_sync', side_effect=sample), \
                  patch.object(gs.ollama, 'chat', side_effect=chat):
                 created = await gs.start_generation('Corpus', 1, None)
                 await asyncio.gather(*list(gs._tasks))

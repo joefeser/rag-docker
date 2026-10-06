@@ -4089,6 +4089,30 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
+def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
+    """Publish the sampled corpus identity before a writer can invalidate it."""
+    from services.collection_writes import guard
+    with guard(collection):
+        all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
+        actual_size = len(all_chunks)
+
+        session = {
+            "session_id": "",
+            "collection": collection,
+            "status": "generating",
+            "pairs_total": actual_size,
+            # `attempted` drives progress and always reaches `total`; `completed`
+            # counts pairs that actually exist. Reporting one number for both made
+            # a session with a failed pair read "3/3" while holding 2.
+            "pairs_attempted": 0,
+            "pairs_completed": 0,
+            "pairs_failed": 0,
+            "pairs": [],
+        }
+        session = _store_generated_session(session)
+        return session, all_chunks
+
+
 async def start_generation(
     collection: str,
     sample_size: int,
@@ -4096,23 +4120,8 @@ async def start_generation(
 ) -> dict:
     from models.schemas import GenerateRequest
     request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
-    all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
-    actual_size = len(all_chunks)
-
-    session = {
-        "session_id": "",
-        "collection": collection,
-        "status": "generating",
-        "pairs_total": actual_size,
-        # `attempted` drives progress and always reaches `total`; `completed`
-        # counts pairs that actually exist. Reporting one number for both made
-        # a session with a failed pair read "3/3" while holding 2.
-        "pairs_attempted": 0,
-        "pairs_completed": 0,
-        "pairs_failed": 0,
-        "pairs": [],
-    }
-    session = await asyncio.to_thread(_store_generated_session, session)
+    session, all_chunks = await asyncio.to_thread(
+        _prepare_generation_sync, collection, request.sample_size, request.seed)
     session_id = session["session_id"]
 
     task = asyncio.create_task(_run_generation(session_id, all_chunks))
@@ -4131,7 +4140,7 @@ async def start_generation(
     return {
         "session_id": session_id,
         "status": "generating",
-        "pairs_total": actual_size,
+        "pairs_total": session["pairs_total"],
         "pairs_completed": 0,
     }
 
@@ -10550,6 +10559,8 @@ directories and does not connect to Weaviate or Ollama.
 verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
 verification run; it does not establish full-stack acceptance by itself.
 
+Suite 04 also registers `test_chunk_sampling.py` through `09_sampling.sh`, including guard release before model generation and after sampling/publication failures.
+
 Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
 (no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
 retrieval route. The persistence cases cover failed import-config publication.
@@ -13139,6 +13150,9 @@ print('PASS owned collection/session/files removed',flush=True)
 set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
 require_stack
+section "Sampling and generation guard regressions"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_chunk_sampling.py)
+check "sampling, publication and generation guard regressions" $?
 section "Evaluation sampling across iterator pages"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/chunk_sampling.py)
 check "seeded selection, iterator paging, bounds and owned-fixture cleanup" $?
@@ -15972,7 +15986,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
     async def generate(self,pair):
         # The real task, done-callback and reporter run; only the model and sampling are owned.
         chunk={'content':'Inert','source_file':'inert.txt','chunk_index':0}
-        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
+        with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
             sid=(await gs.start_generation('OwnedPersistence',1,None))['session_id']
             deadline=time.monotonic()+5
             while gs._tasks:
@@ -16456,7 +16470,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock,patch
+from unittest.mock import AsyncMock,MagicMock,patch
 sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
 from config import settings
 from services import goldstandard as gs,importer
@@ -16550,7 +16564,7 @@ class IdentityTests(unittest.TestCase):
     def test_generation_start_uses_the_same_namespace_without_overwriting_collision(self):
         before=self.path.read_bytes()
         async def run():
-            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()),patch.object(gs.uuid,'uuid4',side_effect=[SimpleNamespace(hex='460abcde'+'0'*24),SimpleNamespace(hex='460abcdf'+'0'*24)]):
+            with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()),patch.object(gs.uuid,'uuid4',side_effect=[SimpleNamespace(hex='460abcde'+'0'*24),SimpleNamespace(hex='460abcdf'+'0'*24)]):
                 result=await gs.start_generation('OwnedGeneration',1,None)
                 await asyncio.gather(*list(gs._tasks))
             self.assertEqual(result['session_id'],'gs_460abcdf')
@@ -16628,7 +16642,7 @@ class IdentityTests(unittest.TestCase):
     def test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503(self):
         before=self.path.read_bytes()
         async def run():
-            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+            with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
                 with self.assertRaises(gs.GoldStandardError) as caught:await gs.start_generation('OwnedGeneration',1,None)
                 generate.assert_not_called()
             return caught.exception
@@ -16663,7 +16677,7 @@ class IdentityTests(unittest.TestCase):
         from models.schemas import GenerateRequest
         before=self.path.read_bytes()
         async def run():
-            with patch.object(route.wc,'collection_exists',new=AsyncMock(return_value=True)),patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+            with patch.object(route.wc,'collection_exists',new=AsyncMock(return_value=True)),patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
                 response=await route.generate(GenerateRequest(collection='OwnedGeneration',sample_size=1,seed=None))
                 generate.assert_not_called()
             return response

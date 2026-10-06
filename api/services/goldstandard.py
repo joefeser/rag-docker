@@ -774,6 +774,30 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
+def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
+    """Publish the sampled corpus identity before a writer can invalidate it."""
+    from services.collection_writes import guard
+    with guard(collection):
+        all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
+        actual_size = len(all_chunks)
+
+        session = {
+            "session_id": "",
+            "collection": collection,
+            "status": "generating",
+            "pairs_total": actual_size,
+            # `attempted` drives progress and always reaches `total`; `completed`
+            # counts pairs that actually exist. Reporting one number for both made
+            # a session with a failed pair read "3/3" while holding 2.
+            "pairs_attempted": 0,
+            "pairs_completed": 0,
+            "pairs_failed": 0,
+            "pairs": [],
+        }
+        session = _store_generated_session(session)
+        return session, all_chunks
+
+
 async def start_generation(
     collection: str,
     sample_size: int,
@@ -781,23 +805,8 @@ async def start_generation(
 ) -> dict:
     from models.schemas import GenerateRequest
     request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
-    all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
-    actual_size = len(all_chunks)
-
-    session = {
-        "session_id": "",
-        "collection": collection,
-        "status": "generating",
-        "pairs_total": actual_size,
-        # `attempted` drives progress and always reaches `total`; `completed`
-        # counts pairs that actually exist. Reporting one number for both made
-        # a session with a failed pair read "3/3" while holding 2.
-        "pairs_attempted": 0,
-        "pairs_completed": 0,
-        "pairs_failed": 0,
-        "pairs": [],
-    }
-    session = await asyncio.to_thread(_store_generated_session, session)
+    session, all_chunks = await asyncio.to_thread(
+        _prepare_generation_sync, collection, request.sample_size, request.seed)
     session_id = session["session_id"]
 
     task = asyncio.create_task(_run_generation(session_id, all_chunks))
@@ -816,7 +825,7 @@ async def start_generation(
     return {
         "session_id": session_id,
         "status": "generating",
-        "pairs_total": actual_size,
+        "pairs_total": session["pairs_total"],
         "pairs_completed": 0,
     }
 
