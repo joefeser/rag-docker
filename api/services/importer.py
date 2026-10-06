@@ -506,7 +506,7 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
 
 
 def _validate_package_sources(pkg: Path, manifest: dict) -> None:
-    """Check untrusted retained-source identities before any live mutation."""
+    """Check source identities after verify_digests, before any live mutation."""
     source_dir = pkg / "sources"
     if not source_dir.exists():
         if manifest.get("fidelity") == "with-sources":
@@ -527,7 +527,13 @@ def _validate_package_sources(pkg: Path, manifest: dict) -> None:
             blob = source_dir / digest
             if blob.is_symlink() or not blob.is_file():
                 raise ValueError("Retained source blob is missing or is not a regular file")
-            if packager.sha256_file(blob) != digest:
+            # Check 3 already hashed listed files in this private extraction.
+            # Match that verified digest to the content-addressed filename;
+            # legacy unlisted blobs still need their own identity hash.
+            files = manifest.get("files", {})
+            rel = f"sources/{digest}"
+            actual = files[rel] if rel in files else "sha256:" + packager.sha256_file(blob)
+            if actual != f"sha256:{digest}":
                 raise ValueError("Retained source blob does not match its identity")
     except (OSError, ValueError, TypeError) as exc:
         raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",

@@ -47,6 +47,55 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         self.assertEqual(sources.load_index("Valid")["documents"].keys(), {digest})
         self.assertEqual(sources.blob_path("Valid", digest).read_bytes(), content)
 
+    def test_manifest_verified_blob_is_hashed_only_once(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        blob = self.package / "sources" / digest
+        blob.write_bytes(content)
+        (blob.parent / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": f"sha256:{digest}"}}
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            packager.verify_digests(self.package, manifest)
+            importer._validate_package_sources(self.package, manifest)
+        hashed.assert_called_once_with(blob)
+
+    def test_verified_manifest_cannot_bless_a_wrong_source_identity(self):
+        content = b"other bytes authenticated by the manifest"
+        digest = hashlib.sha256(b"claimed source").hexdigest()
+        blob = self.package / "sources" / digest
+        blob.write_bytes(content)
+        (blob.parent / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": "sha256:" + hashlib.sha256(content).hexdigest()}}
+        packager.verify_digests(self.package, manifest)
+        with patch.object(packager, "sha256_file", side_effect=AssertionError("second hash")):
+            with self.assertRaises(PackageError) as raised:
+                importer._validate_package_sources(self.package, manifest)
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+
+    def test_tampered_listed_blob_fails_before_source_validation_or_live_work(self):
+        digest = hashlib.sha256(b"claimed source").hexdigest()
+        (self.package / "sources" / digest).write_bytes(b"tampered")
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": f"sha256:{digest}"}}
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+             patch.object(importer, "_validate_package_sources") as validate, \
+             patch.object(importer, "_ensure_models") as models, \
+             patch.object(importer.wc, "get_client") as backend:
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        validate.assert_not_called()
+        models.assert_not_called()
+        backend.assert_not_called()
+
     def test_restore_ignores_unindexed_blobs_and_indexless_source_folders(self):
         real = b"retained source"
         digest = hashlib.sha256(real).hexdigest()

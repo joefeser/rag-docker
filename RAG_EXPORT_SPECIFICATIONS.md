@@ -104,8 +104,10 @@ Retained-source import restores only blobs named by the validated index. Unindex
 files are ignored, including sources in chunks-only packages with no index. Older
 packages whose indexes name missing blobs remain rejected as `PACKAGE_CORRUPT`;
 re-export from the repaired source rather than silently reducing claimed fidelity.
-The source identity hash is checked independently of manifest digests: a manifest
-can authenticate bytes under a filename that is not their content digest.
+After manifest digest verification, each indexed blob’s manifest digest must equal
+`sha256:<filename>`. This preserves content-addressed identity without hashing a
+listed blob twice. Legacy blobs not listed in the manifest are hashed separately;
+a listed digest that differs from the filename is rejected.
 
 ## 3. Prerequisite B — Retrieval Settings Persistence
 
