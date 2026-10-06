@@ -1912,6 +1912,9 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.3 Gold Standard
 
+- [x] Pending stale/orphan markers survive restart and are resolved by the next successful session write. Session and marker files use mode 0600; imported sessions clear persistence_error.
+  *Evidence: session_persistence_cases.py covers owner-only files, marker replay, symlink refusal and durability wording; session-import cases check cleared local persistence errors.*
+
 - [x] Retained stale/orphaned session warnings reach the live API and browser, with reasons/timestamps and legacy defaults. Historical export requires explicit choice, keeps RAGAS compatibility and preserves the original session.
       *Six controlled service/runtime groups plus one twelve-source documentation group cover validity/export and rebuild failure boundaries. Registered real backend/in-process HTTP checks cover actual stale/orphan markers, strict choices, missing sessions, empty history, compatible exports and a failed destructive cutover; browser fixtures cover empty history, failed lookup and duplicate export requests. An actual browser against the built UI and isolated real API shows legacy defaults, warning reasons/timestamps, reset consent after actual deletion, empty historical warnings and explicit four-field RAGAS download. Suite10 is called by05/all.sh; full suite is recorded separately.*
 
