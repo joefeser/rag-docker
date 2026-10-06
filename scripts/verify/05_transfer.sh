@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E29)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E30)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -51,6 +51,71 @@ check_eq "a tuned collection ships retrieve.py" "$script" "True"
 
 python3 ./validate_package.py "$EXPORTS/$PKG" > /tmp/vfy_val.txt 2>&1
 check "package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_val.txt | head -1)"
+
+# ── E30: vectors are attributed to the collection's stored model (#196) ──────
+EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')
+python3 - "$EXPORTS/$PKG" "$EMBED_MODEL" > /tmp/vfy_e30_match.txt 2>&1 <<'ENDPY'
+import json, sys, tarfile
+pkg, model = sys.argv[1], sys.argv[2]
+with tarfile.open(pkg) as t:
+    def read(name):
+        m = next(x for x in t.getmembers() if x.isfile() and x.name.rsplit("/", 1)[-1] == name)
+        return json.load(t.extractfile(m))
+    coll, man = read("collection.json"), read("manifest.json")
+print(f"collection.json={coll.get('embedding_model')!r} manifest={man['embedding']['model']!r} configured={model!r}")
+sys.exit(0 if model and coll.get("embedding_model") == model == man["embedding"]["model"] else 1)
+ENDPY
+check "E30: a matching collection records its stored model in collection.json and the manifest" $? "$(tail -1 /tmp/vfy_e30_match.txt)"
+
+# Collections the API would never create: an equal-width vector from another
+# model's name, a named-vector schema, and no vectorizer. Each export must fail
+# with the re-embedding remedy and leave nothing in the exports folder.
+E30_DRIFT="${PREFIX}E30Drift"; E30_NAMED="${PREFIX}E30Named"; E30_NONE="${PREFIX}E30None"
+e30_collections() {   # create | drop
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" "$C" "$E30_DRIFT" "$E30_NAMED" "$E30_NONE") <<'ENDPY'
+import sys
+from weaviate.classes.config import Configure, DataType, Property
+from config import settings
+from services import weaviate_client as wc
+action, source, drift, named, none = sys.argv[1:6]
+client = wc.get_client()
+for n in (drift, named, none):
+    if client.collections.exists(n):
+        client.collections.delete(n)
+if action == "drop":
+    sys.exit(0)
+endpoint = f"http://{settings.ollama_host}:{settings.ollama_port}"
+props = [Property(name="text", data_type=DataType.TEXT)]
+# Same width as the configured model's vectors: provenance can't come from dimensions.
+width = len(next(client.collections.get(source).iterator(include_vector=True)).vector["default"])
+client.collections.create(drift, properties=props, vectorizer_config=Configure.Vectorizer.text2vec_ollama(
+    api_endpoint=endpoint, model=settings.embed_model + "-e30-other", vectorize_collection_name=False))
+client.collections.get(drift).data.insert({"text": "e30 drift"}, vector=[0.01] * width)
+vectors = getattr(Configure, "Vectors", None)
+named_cfg = (vectors.text2vec_ollama(name="default", api_endpoint=endpoint, model=settings.embed_model)
+             if vectors else Configure.NamedVectors.text2vec_ollama(name="default", api_endpoint=endpoint, model=settings.embed_model))
+client.collections.create(named, properties=props, vector_config=[named_cfg])
+client.collections.create(none, properties=props, vectorizer_config=Configure.Vectorizer.none())
+print(f"created {drift} (width {width}), {named}, {none}")
+ENDPY
+}
+e30_collections create > /tmp/vfy_e30_setup.txt 2>&1
+check "E30: mismatch fixtures created on the verify project" $? "$(tail -1 /tmp/vfy_e30_setup.txt)"
+for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
+  before=$(ls -A "$EXPORTS" | sort)
+  api_post "/export" "{\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
+  e30job=$(jfield "['job_id']" < /tmp/vfy_e30_exp.json)
+  e30status=$(wait_for_job "/export/job/$e30job" 600)
+  e30err=$(api_get "/export/job/$e30job" | jfield "['error']")
+  [ "$e30status" = "failed" ] && [[ "$e30err" == PackageError:*Re-embed* ]]
+  check "E30: export of $e30c refuses with the re-embedding remedy" $? "status '$e30status', error '$e30err'"
+  check_eq "E30: refusal exposes EMBEDDING_MISMATCH" "$(api_get "/export/job/$e30job" | jfield "['error_code']")" "EMBEDDING_MISMATCH"
+  after=$(ls -A "$EXPORTS" | sort)
+  [ "$before" = "$after" ]
+  check "E30: ... and leaves nothing in the exports folder ($e30c)" $? "$(diff <(echo "$before") <(echo "$after") | tail -3)"
+done
+e30_collections drop >/dev/null 2>&1
+check "E30: mismatch fixtures removed" $?
 
 # ── corruption is detected ───────────────────────────────────────────────────
 python3 - "$EXPORTS/$PKG" <<'ENDPY'
