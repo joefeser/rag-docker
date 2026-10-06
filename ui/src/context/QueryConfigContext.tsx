@@ -27,7 +27,7 @@ interface QueryConfigValue {
   isDefault: boolean
   loading: boolean
   error: string
-  saveConfig: (config: QueryConfig) => Promise<void>
+  saveConfig: (config: QueryConfig) => Promise<boolean>
 }
 
 const QueryConfigContext = createContext<QueryConfigValue | null>(null)
@@ -54,10 +54,16 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const requestId = useRef(0)
   const selectedCollection = useRef('')
   const saveId = useRef(0)
+  const selectionId = useRef(0)
+  const latestFailed = useRef(false)
+  const lastSuccess = useRef<{ id: number; value: RetrievalConfig } | null>(null)
 
   const setCollection = useCallback((name: string) => {
     if (name === selectedCollection.current) return
     selectedCollection.current = name
+    selectionId.current++
+    latestFailed.current = false
+    lastSuccess.current = null
     // Invalidate immediately, before the next effect runs. A -> B -> A is
     // also a new generation even though the collection name matches again.
     requestId.current++
@@ -98,24 +104,36 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const saveConfig = useCallback(
     async (next: QueryConfig) => {
       if (!collection) throw new Error('Select a collection before saving retrieval settings.')
-      const ticket = requestId.current
+      const selection = selectionId.current
       const saveTicket = ++saveId.current
-      const saved = await api.saveRetrievalConfig({ collection, ...next })
-      // A save belongs to the selection generation that started it. An old
-      // save must not publish into another collection or cancel its load.
-      // Of concurrent saves, only the latest started may publish.
-      if (
-        collection !== selectedCollection.current ||
-        ticket !== requestId.current ||
-        saveTicket !== saveId.current
-      ) return
-      // A completed save supersedes any load still in flight for this
-      // collection, which would otherwise land afterwards with stale values.
-      requestId.current++
-      setConfigState(fromResponse(saved))
-      setIsDefault(saved.is_default)
-      setError('')
-      setLoading(false)
+      latestFailed.current = false
+      const isCurrent = () => selection === selectionId.current && collection === selectedCollection.current
+      const publish = (saved: RetrievalConfig) => {
+        // Cancel pending loads without invalidating other saves in this selection.
+        requestId.current++
+        setConfigState(fromResponse(saved))
+        setIsDefault(saved.is_default)
+        setError('')
+        setLoading(false)
+      }
+      try {
+        const saved = await api.saveRetrievalConfig({ collection, ...next })
+        if (!isCurrent()) return false
+        if (!lastSuccess.current || saveTicket > lastSuccess.current.id) {
+          lastSuccess.current = { id: saveTicket, value: saved }
+        }
+        // If the newest request failed, retain the newest acknowledged success,
+        // even when that older request's response arrives after the failure.
+        if (saveTicket === saveId.current || latestFailed.current) {
+          publish(lastSuccess.current.value)
+        }
+        return saveTicket === saveId.current
+      } catch (e: unknown) {
+        if (!isCurrent() || saveTicket !== saveId.current) return false
+        latestFailed.current = true
+        if (lastSuccess.current) publish(lastSuccess.current.value)
+        throw e
+      }
     },
     [collection],
   )

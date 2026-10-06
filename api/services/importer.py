@@ -35,6 +35,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
+from services import settings_store
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import model_bundle
@@ -616,7 +617,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
         data["collection"] = target
         out = Path(settings.upload_dir) / "ingest_configs"
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
+        settings_store.publish(out / f"{_safe_file(target)}.json", data)
 
     if validated_retrieval is not None:
         data = {**validated_retrieval, "collection": target}
@@ -738,7 +739,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                 collection_recovery.retain(ownership, package=pkg)
                 staged = True
                 # Counted before the delete, because the delete is what orphans them.
-                orphaned = len(goldstandard.sessions_for(target))
+                orphaned = len({session["session_id"]
+                                for spelling in {target, target[:1].lower() + target[1:]}
+                                for session in goldstandard.sessions_for(spelling)})
                 wc._delete_collection_sync(target)   # also drops its sources + config
                 if orphaned:
                     # Spec §8 rule 4: silently destroying evaluation work is worse

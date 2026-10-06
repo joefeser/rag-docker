@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import uuid
 
 
 def run(api, collection, package):
@@ -43,12 +44,17 @@ def run(api, collection, package):
                 manifest = json.loads(manifest_path.read_text())
                 manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
                 manifest_path.write_text(json.dumps(manifest))
-                with tempfile.NamedTemporaryFile(prefix='vfy-retrieval-', suffix='.tar.gz',
-                                                 dir=package.parent) as output:
-                    with tarfile.open(output.name, 'w:gz') as archive:
+                # Written under a .part name, then renamed into place: on Docker
+                # Desktop the API can read a freshly written bind-mounted file
+                # as empty (#184).
+                output = package.parent / f'vfy-retrieval-{uuid.uuid4().hex[:12]}.tar.gz'
+                part = output.with_name('.' + output.name + '.part')
+                try:
+                    with tarfile.open(part, 'w:gz') as archive:
                         archive.add(root, arcname=root.name)
+                    part.replace(output)
                     for conflict in ('abort', 'rename', 'replace'):
-                        job_id = request('/import', {'filename': Path(output.name).name,
+                        job_id = request('/import', {'filename': output.name,
                                                      'on_conflict': conflict})['job_id']
                         deadline = time.monotonic() + 120
                         while True:
@@ -63,6 +69,9 @@ def run(api, collection, package):
                         assert job['error_detail'] == {'file': 'retrieval_config.json'}, job
                         assert request('/retrieval/config/' + collection) == expected
                         assert collections() == baseline
+                finally:
+                    part.unlink(missing_ok=True)
+                    output.unlink(missing_ok=True)
         print('15 digest-valid malformed retrieval imports rejected; live collections/settings preserved')
     finally:
         request('/retrieval/config', saved)

@@ -594,6 +594,8 @@ rather than silently ignoring one of them.
 
 ### 7.3 Gold-standard invalidation
 
+Invalidation covers both supported first-character collection aliases without changing stored session provenance.
+
 Any operation that changes chunk identity — re-chunking, or re-embedding that
 rebuilds the collection — MUST mark every gold-standard session for that
 collection `stale`, recording why and when. Sessions are not deleted and are not
@@ -704,7 +706,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
-| `SOURCES_REQUIRED` | tuning needs `with-sources`; package is `chunks-only` |
+| `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
@@ -741,11 +743,12 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E10 | `retrieve.py` exits 3 with one sentence when the stack is down |
 | E11 | Import into a clean instance reproduces chunk count and answers equivalently |
 | E12 | Import refuses `EMBEDDING_MISMATCH` when the target uses a different embedding model |
+| E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 | E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
 | E16 | Re-chunking marks the collection's gold-standard sessions `stale` |
-| E17 | Re-chunking a `chunks-only` collection fails `SOURCES_REQUIRED` |
+| E17 | Re-chunking a `chunks-only` or partially retained collection fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
 | E18 | `replace` reports the number of orphaned sessions |
 | E19 | Package `README.md` states the collection name, fidelity and encryption warning |
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
@@ -756,7 +759,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
-| E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals |
+| E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
 | E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths |
 
 ---

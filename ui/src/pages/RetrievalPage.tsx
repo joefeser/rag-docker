@@ -22,6 +22,7 @@ export default function RetrievalPage() {
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
   const indexRequest = useRef(0)
+  const saveRequest = useRef(0)
 
   useEffect(() => {
     const ticket = ++indexRequest.current
@@ -48,11 +49,15 @@ export default function RetrievalPage() {
   }, [config])
 
   useEffect(() => {
+    saveRequest.current++
     setApplied(false)
     setSaveError('')
+    return () => { saveRequest.current++ }
   }, [collection])
 
   async function apply() {
+    const ticket = ++saveRequest.current
+    setApplied(false)
     const next: QueryConfig = {
       retrieval_mode: mode,
       top_k: topK,
@@ -64,10 +69,12 @@ export default function RetrievalPage() {
     }
     setSaveError('')
     try {
-      await saveConfig(next)
+      const saved = await saveConfig(next)
+      if (!saved || ticket !== saveRequest.current) return
       setApplied(true)
-      setTimeout(() => setApplied(false), 3000)
+      setTimeout(() => { if (ticket === saveRequest.current) setApplied(false) }, 3000)
     } catch (e: unknown) {
+      if (ticket !== saveRequest.current) return
       setSaveError(e instanceof Error ? e.message : String(e))
     }
   }

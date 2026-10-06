@@ -99,7 +99,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         (retained / "index.json").write_text(json.dumps(self.index(digest)))
         with patch.object(packager, "exports_dir", return_value=self.root), \
              patch.object(packager, "read_chunks", return_value=iter(())), \
-             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
              patch.object(packager, "_ingest_config", return_value=None), \
              patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
              patch.object(packager, "_goldstandard_sessions", return_value=[]):
@@ -167,7 +167,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
             }}))
         with patch.object(packager, "exports_dir", return_value=self.root), \
              patch.object(packager, "read_chunks", return_value=iter(())), \
-             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
              patch.object(packager.wc, "_meta_sync", return_value={}), \
              patch.object(packager, "_ingest_config", return_value=None), \
              patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
