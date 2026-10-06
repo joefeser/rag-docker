@@ -860,6 +860,8 @@ class ExportJobStatusResponse(BaseModel):
     warnings: list[str]
     error: Optional[str]
 
+    error_code: Optional[str] = None
+    error_detail: Optional[dict] = None
 
 class ImportRequest(BaseModel):
     filename: str
@@ -4942,6 +4944,10 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
 
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
+    except packager.PackageError as exc:
+        _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
+        job.update(status="failed", error=f"PackageError: {exc.message}",
+                   error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
         _log.exception("Export of %r failed", collection)
         job["status"] = "failed"
@@ -4991,6 +4997,8 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         "retrieve_script": None,
         "warnings": [],
         "error": None,
+        "error_code": None,
+        "error_detail": None,
     }
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
@@ -7521,7 +7529,7 @@ it contains.
 ````markdown
 ```
 manifest.json           what this package is; authoritative
-collection.json         schema, index type, distance metric, HNSW parameters
+collection.json         schema, stored embedding_model, index type, distance metric, HNSW parameters
 chunks.jsonl            one JSON object per chunk, with its vector
 ingest_config.json      chunking settings, if the collection had any saved
 retrieval_config.json   the retrieval settings the collection was tuned with
@@ -10759,7 +10767,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E29; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -13497,7 +13505,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E29)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E30)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -13549,6 +13557,71 @@ check_eq "a tuned collection ships retrieve.py" "$script" "True"
 
 python3 ./validate_package.py "$EXPORTS/$PKG" > /tmp/vfy_val.txt 2>&1
 check "package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_val.txt | head -1)"
+
+# ── E30: vectors are attributed to the collection's stored model (#196) ──────
+EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')
+python3 - "$EXPORTS/$PKG" "$EMBED_MODEL" > /tmp/vfy_e30_match.txt 2>&1 <<'ENDPY'
+import json, sys, tarfile
+pkg, model = sys.argv[1], sys.argv[2]
+with tarfile.open(pkg) as t:
+    def read(name):
+        m = next(x for x in t.getmembers() if x.isfile() and x.name.rsplit("/", 1)[-1] == name)
+        return json.load(t.extractfile(m))
+    coll, man = read("collection.json"), read("manifest.json")
+print(f"collection.json={coll.get('embedding_model')!r} manifest={man['embedding']['model']!r} configured={model!r}")
+sys.exit(0 if model and coll.get("embedding_model") == model == man["embedding"]["model"] else 1)
+ENDPY
+check "E30: a matching collection records its stored model in collection.json and the manifest" $? "$(tail -1 /tmp/vfy_e30_match.txt)"
+
+# Collections the API would never create: an equal-width vector from another
+# model's name, a named-vector schema, and no vectorizer. Each export must fail
+# with the re-embedding remedy and leave nothing in the exports folder.
+E30_DRIFT="${PREFIX}E30Drift"; E30_NAMED="${PREFIX}E30Named"; E30_NONE="${PREFIX}E30None"
+e30_collections() {   # create | drop
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" "$C" "$E30_DRIFT" "$E30_NAMED" "$E30_NONE") <<'ENDPY'
+import sys
+from weaviate.classes.config import Configure, DataType, Property
+from config import settings
+from services import weaviate_client as wc
+action, source, drift, named, none = sys.argv[1:6]
+client = wc.get_client()
+for n in (drift, named, none):
+    if client.collections.exists(n):
+        client.collections.delete(n)
+if action == "drop":
+    sys.exit(0)
+endpoint = f"http://{settings.ollama_host}:{settings.ollama_port}"
+props = [Property(name="text", data_type=DataType.TEXT)]
+# Same width as the configured model's vectors: provenance can't come from dimensions.
+width = len(next(client.collections.get(source).iterator(include_vector=True)).vector["default"])
+client.collections.create(drift, properties=props, vectorizer_config=Configure.Vectorizer.text2vec_ollama(
+    api_endpoint=endpoint, model=settings.embed_model + "-e30-other", vectorize_collection_name=False))
+client.collections.get(drift).data.insert({"text": "e30 drift"}, vector=[0.01] * width)
+vectors = getattr(Configure, "Vectors", None)
+named_cfg = (vectors.text2vec_ollama(name="default", api_endpoint=endpoint, model=settings.embed_model)
+             if vectors else Configure.NamedVectors.text2vec_ollama(name="default", api_endpoint=endpoint, model=settings.embed_model))
+client.collections.create(named, properties=props, vector_config=[named_cfg])
+client.collections.create(none, properties=props, vectorizer_config=Configure.Vectorizer.none())
+print(f"created {drift} (width {width}), {named}, {none}")
+ENDPY
+}
+e30_collections create > /tmp/vfy_e30_setup.txt 2>&1
+check "E30: mismatch fixtures created on the verify project" $? "$(tail -1 /tmp/vfy_e30_setup.txt)"
+for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
+  before=$(ls -A "$EXPORTS" | sort)
+  api_post "/export" "{\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
+  e30job=$(jfield "['job_id']" < /tmp/vfy_e30_exp.json)
+  e30status=$(wait_for_job "/export/job/$e30job" 600)
+  e30err=$(api_get "/export/job/$e30job" | jfield "['error']")
+  [ "$e30status" = "failed" ] && [[ "$e30err" == PackageError:*Re-embed* ]]
+  check "E30: export of $e30c refuses with the re-embedding remedy" $? "status '$e30status', error '$e30err'"
+  check_eq "E30: refusal exposes EMBEDDING_MISMATCH" "$(api_get "/export/job/$e30job" | jfield "['error_code']")" "EMBEDDING_MISMATCH"
+  after=$(ls -A "$EXPORTS" | sort)
+  [ "$before" = "$after" ]
+  check "E30: ... and leaves nothing in the exports folder ($e30c)" $? "$(diff <(echo "$before") <(echo "$after") | tail -3)"
+done
+e30_collections drop >/dev/null 2>&1
+check "E30: mismatch fixtures removed" $?
 
 # ── corruption is detected ───────────────────────────────────────────────────
 python3 - "$EXPORTS/$PKG" <<'ENDPY'
@@ -18598,6 +18671,27 @@ IMPORT_NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was 
 
 
 class RetrievalImportTests(unittest.TestCase):
+    def test_export_job_preserves_package_refusal_through_response_schema(self):
+        from services import exporter
+        from models.schemas import ExportJobStatusResponse
+        job = dict(job_id='owned', collection='Owned', status='queued', chunks_written=0,
+                   filename=None, size_bytes=None, source_document_count=None,
+                   fidelity=None, models_bundled=None, retrieve_script=None,
+                   warnings=[], error=None)
+        error = packager.PackageError('EMBEDDING_MISMATCH', 'Re-embed before exporting.', {'model': 'other'})
+        with patch.object(exporter, '_jobs', {'owned': job}), \
+             patch.object(exporter, '_active', {'Owned': 'owned'}), \
+             patch.object(packager, 'build', side_effect=error), \
+             patch.object(exporter._log, 'exception') as traceback:
+            exporter._run('owned', 'Owned', False)
+            result = ExportJobStatusResponse(**job).model_dump()
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error_code'], 'EMBEDDING_MISMATCH')
+            self.assertEqual(result['error_detail'], {'model': 'other'})
+            self.assertIn('Re-embed', result['error'])
+            traceback.assert_not_called()
+            self.assertNotIn('Owned', exporter._active)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

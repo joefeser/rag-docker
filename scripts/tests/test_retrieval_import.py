@@ -34,6 +34,27 @@ IMPORT_NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was 
 
 
 class RetrievalImportTests(unittest.TestCase):
+    def test_export_job_preserves_package_refusal_through_response_schema(self):
+        from services import exporter
+        from models.schemas import ExportJobStatusResponse
+        job = dict(job_id='owned', collection='Owned', status='queued', chunks_written=0,
+                   filename=None, size_bytes=None, source_document_count=None,
+                   fidelity=None, models_bundled=None, retrieve_script=None,
+                   warnings=[], error=None)
+        error = packager.PackageError('EMBEDDING_MISMATCH', 'Re-embed before exporting.', {'model': 'other'})
+        with patch.object(exporter, '_jobs', {'owned': job}), \
+             patch.object(exporter, '_active', {'Owned': 'owned'}), \
+             patch.object(packager, 'build', side_effect=error), \
+             patch.object(exporter._log, 'exception') as traceback:
+            exporter._run('owned', 'Owned', False)
+            result = ExportJobStatusResponse(**job).model_dump()
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error_code'], 'EMBEDDING_MISMATCH')
+            self.assertEqual(result['error_detail'], {'model': 'other'})
+            self.assertIn('Re-embed', result['error'])
+            traceback.assert_not_called()
+            self.assertNotIn('Owned', exporter._active)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
