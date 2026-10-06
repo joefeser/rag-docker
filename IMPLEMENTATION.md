@@ -2565,11 +2565,17 @@ async def hybrid_query(
     return await asyncio.to_thread(_hybrid_query_sync, collection_name, query, alpha, top_k)
 
 
+class CollectionNotFoundError(LookupError):
+    """The collection disappeared before guarded sampling."""
+
+
 def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
     from models.schemas import GenerateRequest
     from services.chunk_sampling import select_chunk_ids
     request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
+    if not client.collections.exists(collection_name):
+        raise CollectionNotFoundError(collection_name)
     coll = client.collections.get(collection_name)
     objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
     identities = select_chunk_ids(objects, request.sample_size, request.seed)
@@ -2585,10 +2591,6 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
              "source_file": by_id[identity].get("source_file", ""),
              "chunk_index": by_id[identity].get("chunk_index", 0)}
             for identity in identities if identity in by_id]
-
-
-async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
-    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit, seed)
 ```
 
 ### api/services/ollama_client.py
@@ -4108,28 +4110,38 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
+_GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
+
+
 def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
     """Publish the sampled corpus identity before a writer can invalidate it."""
-    from services.collection_writes import guard
-    with guard(collection):
-        all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
-        actual_size = len(all_chunks)
+    from services.collection_writes import CollectionBusyError, guard
+    try:
+        with guard(collection, timeout=_GENERATION_GUARD_TIMEOUT_SECONDS):
+            all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
+            actual_size = len(all_chunks)
 
-        session = {
-            "session_id": "",
-            "collection": collection,
-            "status": "generating",
-            "pairs_total": actual_size,
-            # `attempted` drives progress and always reaches `total`; `completed`
-            # counts pairs that actually exist. Reporting one number for both made
-            # a session with a failed pair read "3/3" while holding 2.
-            "pairs_attempted": 0,
-            "pairs_completed": 0,
-            "pairs_failed": 0,
-            "pairs": [],
-        }
-        session = _store_generated_session(session)
-        return session, all_chunks
+            session = {
+                "session_id": "",
+                "collection": collection,
+                "status": "generating",
+                "pairs_total": actual_size,
+                # `attempted` drives progress and always reaches `total`; `completed`
+                # counts pairs that actually exist. Reporting one number for both made
+                # a session with a failed pair read "3/3" while holding 2.
+                "pairs_attempted": 0,
+                "pairs_completed": 0,
+                "pairs_failed": 0,
+                "pairs": [],
+            }
+            session = _store_generated_session(session)
+            return session, all_chunks
+    except CollectionBusyError as exc:
+        raise GoldStandardError("COLLECTION_BUSY",
+            f"Collection '{collection}' is busy. Retry after its current operation finishes.", 409) from exc
+    except wc.CollectionNotFoundError as exc:
+        raise GoldStandardError("COLLECTION_NOT_FOUND",
+            f"Collection '{collection}' not found.", 404) from exc
 
 
 async def start_generation(
@@ -17788,16 +17800,25 @@ def canonical(collection):
     return collection[:1].upper() + collection[1:]
 
 
+class CollectionBusyError(TimeoutError):
+    """A bounded caller could not acquire the collection mutation guard."""
+
+
 @contextmanager
-def guard(collection):
+def guard(collection, timeout=None):
     collection = canonical(collection)
     with _registry_lock:
         entry = _registry.setdefault(collection, [threading.RLock(), 0])
         entry[1] += 1
+    acquired = False
     try:
-        with entry[0]:
-            yield
+        acquired = entry[0].acquire() if timeout is None else entry[0].acquire(timeout=timeout)
+        if not acquired:
+            raise CollectionBusyError(collection)
+        yield
     finally:
+        if acquired:
+            entry[0].release()
         with _registry_lock:
             entry[1] -= 1
             if not entry[1]:
