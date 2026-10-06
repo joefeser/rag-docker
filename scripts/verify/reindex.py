@@ -184,7 +184,7 @@ async def collection_deletion_checks(api,client,name,temp,check):
                 if collection != neighbor or exc.status_code != 422 or 'similar class' not in str(exc):
                     raise
                 neighbor_supported=False
-                check(True,'backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume')
+                print('NOTE backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume', flush=True)
                 continue
             await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
         identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in (canonical,alias,neighbor)}

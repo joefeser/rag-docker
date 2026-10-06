@@ -587,12 +587,10 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
 
 def mark_stale(collection: str, reason: str) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
-    from services.collection_writes import canonical
-    name = canonical(collection)
+    from services.collection_writes import aliases
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
-    aliases = {name, name[:1].lower() + name[1:]}
-    return sum(_flag_sessions(alias, "stale", reason) for alias in sorted(aliases))
+    return sum(_flag_sessions(alias, "stale", reason) for alias in aliases(collection))
 
 
 def mark_orphaned(collection: str, reason: str) -> int:

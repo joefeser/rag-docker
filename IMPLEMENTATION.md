@@ -2247,8 +2247,7 @@ def _delete_collection_sync(name: str) -> int:
     # Older writers saved sidecars under the first-character backend alias.
     # The caller can use either spelling, so clean both after backend deletion.
     # Other case changes can name distinct collections and must be preserved.
-    alias = canonical_name[:1].lower() + canonical_name[1:]
-    spellings = list(dict.fromkeys((canonical_name, alias)))
+    spellings = collection_writes.aliases(canonical_name)
     for spelling in spellings:
         sources.delete(spelling)
         retrieval_config.delete(spelling)
@@ -3902,12 +3901,10 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
 
 def mark_stale(collection: str, reason: str) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
-    from services.collection_writes import canonical
-    name = canonical(collection)
+    from services.collection_writes import aliases
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
-    aliases = {name, name[:1].lower() + name[1:]}
-    return sum(_flag_sessions(alias, "stale", reason) for alias in sorted(aliases))
+    return sum(_flag_sessions(alias, "stale", reason) for alias in aliases(collection))
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
@@ -5753,7 +5750,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                 staged = True
                 # Counted before the delete, because the delete is what orphans them.
                 orphaned = len({session["session_id"]
-                                for spelling in {target, target[:1].lower() + target[1:]}
+                                for spelling in collection_writes.aliases(target)
                                 for session in goldstandard.sessions_for(spelling)})
                 wc._delete_collection_sync(target)   # also drops its sources + config
                 if orphaned:
@@ -6720,7 +6717,7 @@ from models.schemas import (
     CreateCollectionRequest,
 )
 from services import weaviate_client as wc
-from services.collection_writes import canonical
+from services.collection_writes import aliases
 from utils import api_error
 
 router = APIRouter(prefix="/collections")
@@ -6805,8 +6802,7 @@ async def delete_collection(name: str):
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
-        canonical_name = canonical(name)
-        for spelling in {canonical_name, canonical_name[:1].lower() + canonical_name[1:]}:
+        for spelling in aliases(name):
             registry.pop(spelling, None)
         await asyncio.to_thread(_save_registry, registry)
 
@@ -17435,7 +17431,7 @@ async def collection_deletion_checks(api,client,name,temp,check):
                 if collection != neighbor or exc.status_code != 422 or 'similar class' not in str(exc):
                     raise
                 neighbor_supported=False
-                check(True,'backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume')
+                print('NOTE backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume', flush=True)
                 continue
             await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
         identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in (canonical,alias,neighbor)}
@@ -17585,6 +17581,12 @@ def canonical(collection):
     return collection[:1].upper() + collection[1:]
 
 
+def aliases(collection):
+    """Canonical name and its accepted lowercase-first spelling, once each."""
+    name = canonical(collection)
+    return tuple(dict.fromkeys((name, name[:1].lower() + name[1:])))
+
+
 @contextmanager
 def guard(collection):
     collection = canonical(collection)
@@ -17624,6 +17626,12 @@ sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).reso
 from services import collection_writes as writes
 
 class WriterTests(unittest.TestCase):
+    def test_aliases_preserve_other_case_and_remove_duplicates(self):
+        self.assertEqual(writes.aliases('ownedCorpus'), ('OwnedCorpus', 'ownedCorpus'))
+        self.assertEqual(writes.aliases('OwnedCorpus'), ('OwnedCorpus', 'ownedCorpus'))
+        self.assertNotEqual(writes.aliases('OwnedCorpus'), writes.aliases('Ownedcorpus'))
+        self.assertEqual(writes.aliases(''), ('',))
+
     def test_same_collection_waits_until_complete_guard_releases(self):
         attempted=threading.Event();entered=threading.Event()
         def worker():

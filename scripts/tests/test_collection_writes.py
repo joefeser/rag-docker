@@ -6,6 +6,12 @@ sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).reso
 from services import collection_writes as writes
 
 class WriterTests(unittest.TestCase):
+    def test_aliases_preserve_other_case_and_remove_duplicates(self):
+        self.assertEqual(writes.aliases('ownedCorpus'), ('OwnedCorpus', 'ownedCorpus'))
+        self.assertEqual(writes.aliases('OwnedCorpus'), ('OwnedCorpus', 'ownedCorpus'))
+        self.assertNotEqual(writes.aliases('OwnedCorpus'), writes.aliases('Ownedcorpus'))
+        self.assertEqual(writes.aliases(''), ('',))
+
     def test_same_collection_waits_until_complete_guard_releases(self):
         attempted=threading.Event();entered=threading.Event()
         def worker():

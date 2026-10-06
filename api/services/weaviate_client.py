@@ -159,8 +159,7 @@ def _delete_collection_sync(name: str) -> int:
     # Older writers saved sidecars under the first-character backend alias.
     # The caller can use either spelling, so clean both after backend deletion.
     # Other case changes can name distinct collections and must be preserved.
-    alias = canonical_name[:1].lower() + canonical_name[1:]
-    spellings = list(dict.fromkeys((canonical_name, alias)))
+    spellings = collection_writes.aliases(canonical_name)
     for spelling in spellings:
         sources.delete(spelling)
         retrieval_config.delete(spelling)

@@ -749,7 +749,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                 staged = True
                 # Counted before the delete, because the delete is what orphans them.
                 orphaned = len({session["session_id"]
-                                for spelling in {target, target[:1].lower() + target[1:]}
+                                for spelling in collection_writes.aliases(target)
                                 for session in goldstandard.sessions_for(spelling)})
                 wc._delete_collection_sync(target)   # also drops its sources + config
                 if orphaned:

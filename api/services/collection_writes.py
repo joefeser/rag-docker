@@ -17,6 +17,12 @@ def canonical(collection):
     return collection[:1].upper() + collection[1:]
 
 
+def aliases(collection):
+    """Canonical name and its accepted lowercase-first spelling, once each."""
+    name = canonical(collection)
+    return tuple(dict.fromkeys((name, name[:1].lower() + name[1:])))
+
+
 @contextmanager
 def guard(collection):
     collection = canonical(collection)
