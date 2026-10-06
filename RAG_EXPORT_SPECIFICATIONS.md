@@ -250,7 +250,7 @@ One JSON object per line:
  "source_sha256":"…"}
 ```
 
-- `properties` carries the eight stored properties, unchanged.
+- `properties` carries the eight original stored properties, unchanged, plus optional `source_digest` (the raw uploaded bytes’ SHA-256) on chunks ingested with provenance tracking. Missing digests are preserved as legacy unknown provenance; import does not infer them from filenames.
 - `source_sha256` links the chunk to its file in `sources/`, and is `null` in
   `chunks-only` packages.
 - Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%

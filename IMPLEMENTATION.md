@@ -2115,6 +2115,9 @@ DISTANCE_MAP = {
     "l2-squared": VectorDistances.L2_SQUARED,
 }
 
+SOURCE_DIGEST_PROPERTY = Property(name="source_digest", data_type=DataType.TEXT,
+    index_searchable=False, index_filterable=True, skip_vectorization=True)
+
 COLLECTION_PROPERTIES = [
     Property(name="content", data_type=DataType.TEXT, index_searchable=True, index_filterable=True),
     Property(name="source_file", data_type=DataType.TEXT, index_searchable=False, index_filterable=True),
@@ -2124,6 +2127,7 @@ COLLECTION_PROPERTIES = [
     Property(name="chunk_size", data_type=DataType.INT, index_filterable=True),
     Property(name="chunk_overlap", data_type=DataType.INT, index_filterable=True),
     Property(name="created_at", data_type=DataType.DATE, index_filterable=True),
+    SOURCE_DIGEST_PROPERTY,
 ]
 
 
@@ -2180,6 +2184,7 @@ def _create_collection_sync(
     hnsw_config: dict,
     *,
     preserve_hnsw: bool = False,
+    source_digest: bool = True,
     description: str | None = None,
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
@@ -2211,7 +2216,7 @@ def _create_collection_sync(
         description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
-        properties=COLLECTION_PROPERTIES,
+        properties=[p for p in COLLECTION_PROPERTIES if source_digest or p.name != "source_digest"],
     )
 
 
@@ -2408,6 +2413,8 @@ def _validate_reindex_vectorizer_sync(name: str) -> None:
     # old vectors into the fixed schema with different future insert rules.
     expected_properties = {p.name: p._to_dict() for p in COLLECTION_PROPERTIES}
     properties = list(getattr(cfg, "properties", None) or [])
+    if not any(p.name == "source_digest" for p in properties):
+        expected_properties.pop("source_digest")  # Legacy schema remains valid for exact reindex.
     compatible = compatible and len(properties) == len(expected_properties) and {p.name for p in properties} == set(expected_properties)
     for prop in properties:
         expected = expected_properties.get(prop.name)
@@ -2438,6 +2445,9 @@ _INSERT_RETRY_DELAY = 1.0
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
+    if any("source_digest" in chunk for chunk in chunks):
+        if not any(p.name == "source_digest" for p in coll.config.get().properties):
+            coll.config.add_property(SOURCE_DIGEST_PROPERTY)
     for attempt in range(1, _INSERT_ATTEMPTS + 1):
         try:
             # The writer verifies persisted records and removes only UUIDs
@@ -2910,6 +2920,7 @@ def chunk(
 ```python
 from __future__ import annotations
 import asyncio
+import hashlib
 import logging
 import mimetypes
 import os
@@ -3002,11 +3013,13 @@ def _process_job_sync(
                     elements=elements if strategy == "context_aware" else None,
                 )
 
+                source_digest = hashlib.sha256(path.read_bytes()).hexdigest()
                 now = datetime.now(timezone.utc).isoformat()
                 weaviate_chunks = [
                     {
                         "content": c,
                         "source_file": path.name,
+                        "source_digest": source_digest,
                         "source_type": source_type,
                         "chunk_index": i,
                         "chunk_strategy": strategy,
@@ -6137,6 +6150,7 @@ deleted and never remapped (spec §7.3).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import copy
 import logging
 import math
@@ -6226,6 +6240,43 @@ def _verify_records(collection: str, records: list[dict]) -> None:
         raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
 
 
+def require_source_coverage(collection: str, documents: dict | None = None) -> None:
+    documents = sources.load_index(collection)["documents"] if documents is None else documents
+    # A chunks-only import or a failed retention can leave a mixed corpus.
+    # Any retained file is insufficient: replacing from that subset loses the
+    # other chunks and successful cutover discards their recovery copy.
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    uncovered = set()
+    truncated = False
+    for obj in wc.get_client().collections.get(collection).iterator():
+        filename = (obj.properties or {}).get("source_file")
+        digests = by_filename.get(filename, []) if isinstance(filename, str) else []
+        covered = (len(digests) == 1
+                   and (obj.properties or {}).get("source_digest") == digests[0]
+                   and len(documents[digests[0]]["filenames"]) == 1)
+        if not covered:
+            if len(uncovered) < 100:
+                uncovered.add(filename[:256] if isinstance(filename, str) and filename else "<unknown>")
+            else:
+                truncated = True
+    for digest in documents:
+        blob = sources.blob_path(collection, digest)
+        if not blob.is_file() or hashlib.sha256(blob.read_bytes()).hexdigest() != digest:
+            raise PackageError("SOURCES_REQUIRED", "Retained source is missing or differs from its digest.",
+                               {"collection": collection, "digest": digest})
+    if uncovered:
+        raise PackageError(
+            "SOURCES_REQUIRED",
+            "Cannot change chunk boundaries: some stored chunks have missing, unproven or "
+            "ambiguous retained originals. Re-embed without chunking parameters "
+            "or re-index to preserve the existing chunks.",
+            {"collection": collection, "uncovered_source_files": sorted(uncovered), "uncovered_source_files_truncated": truncated})
+
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -6246,25 +6297,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # A chunks-only import or a failed retention can leave a mixed corpus.
-    # Any retained file is insufficient: replacing from that subset loses the
-    # other chunks and successful cutover discards their recovery copy.
-    by_filename: dict[str, list[str]] = {}
-    for digest, entry in documents.items():
-        for filename in entry["filenames"]:
-            by_filename.setdefault(filename, []).append(digest)
-    uncovered = set()
-    for obj in wc.get_client().collections.get(collection).iterator():
-        filename = (obj.properties or {}).get("source_file")
-        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
-            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
-    if uncovered:
-        raise PackageError(
-            "SOURCES_REQUIRED",
-            "Cannot change chunk boundaries: some stored chunks have missing or "
-            "ambiguous retained originals. Re-embed without chunking parameters "
-            "or re-index to preserve the existing chunks.",
-            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+    require_source_coverage(collection, documents)
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -6298,6 +6331,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             out.extend({
                 "content": c,
                 "source_file": staged.name,
+                "source_digest": digest,
                 "source_type": source_type,
                 "chunk_index": i,
                 "chunk_strategy": strategy,
@@ -6331,6 +6365,9 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
+    schema_options = {}
+    if records is not None:
+        schema_options["source_digest"] = any(p["name"] == "source_digest" for p in config.get("properties", []))
     client = wc.get_client()
     ownership = collection_recovery.begin(collection, "tune", client)
     staging = ownership["staging"]
@@ -6338,7 +6375,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     completed = False
     original_intact = False
     try:
-        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True, **schema_options)
         if records is not None:
             _write_records(staging, records)
             # The guard covers application writers; independently connected
@@ -6357,7 +6394,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             before_replace()
         cutover_started = True
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True, **schema_options)
         if records is not None:
             _write_records(collection, records)
             written = len(records)
@@ -7172,17 +7209,22 @@ async def tune_options(collection: str):
     try:
         has_sources = await asyncio.to_thread(sources.has_sources, collection)
         stats = await asyncio.to_thread(sources.stats, collection)
+        can_rechunk = has_sources
+        try:
+            await asyncio.to_thread(tuning.require_source_coverage, collection)
+        except tuning.PackageError:
+            can_rechunk = False
     except ValueError:
         return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",
         source_document_count=stats["document_count"],
-        can_rechunk=has_sources,
+        can_rechunk=can_rechunk,
         can_reembed=True,
         can_reindex=True,
-        note=("Every tuning operation is available." if has_sources else
-              "No original documents were retained, so this collection cannot be "
+        note=("Every tuning operation is available." if can_rechunk else
+              "Stored chunks lack complete, unambiguous source provenance, so this collection cannot be "
               "re-chunked. Re-embedding works from the stored chunk text, which "
               "leaves chunk boundaries unchanged."),
     )
@@ -12312,13 +12354,13 @@ with tempfile.TemporaryDirectory() as td:
         rec = json.loads(line)
         if set(rec) != {"id","vector","properties","source_sha256"}:
             probs.append(f"line {i+1}: keys {sorted(rec)}")
-        elif set(rec["properties"]) != EIGHT:
+        elif set(rec["properties"]) not in (EIGHT, EIGHT | {"source_digest"}):
             probs.append(f"line {i+1}: properties {sorted(rec['properties'])}")
         elif len(rec["vector"]) != manifest["embedding"]["dimensions"]:
             probs.append(f"line {i+1}: vector len {len(rec['vector'])}")
         elif not all(isinstance(v,(int,float)) for v in rec["vector"]):
             probs.append(f"line {i+1}: vector not all numbers")
-    check("§4.5 every chunk has the 4 fields, 8 properties and a full vector",
+    check("§4.5 every chunk has the 4 fields, required properties, optional source provenance and a full vector",
           not probs, "; ".join(probs[:3]))
 
     if fid == "with-sources":
@@ -13521,6 +13563,8 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_provenance.py)
+check "source provenance refusal and bounded diagnostics" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -14142,6 +14186,58 @@ wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-embedding a chunks-only collection with new chunking is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
 drop_collection "$SRCLESS"
+
+# ── a partially retained collection refuses re-chunking (#190) ───────────────
+# Chunks from policies.txt with no retained original, then a normal upload of
+# policies.md that is retained. Re-chunking from the retained subset alone
+# would drop every policies.txt chunk, so it must be refused before staging.
+MIXED="${PREFIX}Mixedsources"
+drop_collection "$MIXED"; make_collection "$MIXED"
+mixed_ingest() {
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$MIXED" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/$1" > /tmp/vfy_m.json
+  wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_m.json)" 900 >/dev/null
+}
+mixed_count() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$MIXED'][0])"; }
+mixed_names() { api_get "/collections" | python3 -c "
+import json,sys; print(sorted(c['name'] for c in json.load(sys.stdin)['collections']))"; }
+mixed_files() { (cd "$REPO_ROOT" && docker compose exec -T api python -c "
+import sys; sys.path.insert(0, '/app')
+from services import weaviate_client as wc
+client = wc.get_client()
+print(sorted({o.properties.get('source_file') for o in client.collections.get('$MIXED').iterator()}))
+client.close()" 2>/dev/null); }
+mixed_ingest policies.txt
+(cd "$REPO_ROOT" && docker compose exec -T api sh -c "rm -rf /app/sources/$MIXED") >/dev/null 2>&1
+mixed_ingest policies.md
+mixed_before=$(mixed_count); names_before=$(mixed_names); files_before=$(mixed_files)
+check_eq "partial sources disable re-chunk in tuning options" "$(api_get "/tune/$MIXED" | jfield "['can_rechunk']")" "False"
+check_eq "the mixed collection holds chunks from both files" "$files_before" "['policies.md', 'policies.txt']"
+for op in rechunk reembed; do
+  api_post "/tune/$op" "{\"collection\":\"$MIXED\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+  tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+  wait_for_job "/tune/job/$tjob" 900 >/dev/null
+  api_get "/tune/job/$tjob" > /tmp/vfy_tjs.json
+  check_eq "#190 $op with new chunking on a partially retained collection is refused" \
+    "$(jfield "['error_code']" < /tmp/vfy_tjs.json)" "SOURCES_REQUIRED"
+  check_eq "#190 ... and names the source file with no retained original" \
+    "$(jfield "['error_detail']['uncovered_source_files']" < /tmp/vfy_tjs.json)" "['policies.txt']"
+  check_eq "#190 ... and leaves every stored chunk in place" "$(mixed_count)" "$mixed_before"
+  check_eq "#190 ... and leaves both source files' chunks in place" "$(mixed_files)" "$files_before"
+  check_eq "#190 ... and leaves no staging or recovery collection behind" "$(mixed_names)" "$names_before"
+done
+api_post "/tune/reembed" "{\"collection\":\"$MIXED\"}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "#190 re-embedding the existing chunk text still completes" \
+  "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+check_eq "#190 ... and keeps every chunk" "$(mixed_count)" "$mixed_before"
+api_post "/tune/reindex" "{\"collection\":\"$MIXED\",\"index_type\":\"flat\",\"distance_metric\":\"cosine\"}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "#190 re-indexing a partially retained collection still completes" \
+  "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+check_eq "#190 ... and keeps both source files' chunks" "$(mixed_files)" "$files_before"
+drop_collection "$MIXED"
 
 # ── the help page and the package README share a source ──────────────────────
 api_get "/help/transfer" > /tmp/vfy_help.json
@@ -17140,7 +17236,7 @@ class ReindexTests(unittest.TestCase):
         self.assertEqual(self.backend.data['OwnedReindex'],self.original);self.stale.assert_not_called()
     def test_vectorizer_validation_checks_model_endpoint_type_and_named_vectors(self):
         from config import settings
-        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=False,vectorize_property_name=True),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES])
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=p._to_dict()["skip_vectorization"],vectorize_property_name=p._to_dict()["vectorize_property_name"]),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES])
         client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
         with patch.object(tuning.wc,'get_client',return_value=client):
             validate_vectorizer('Owned')
@@ -17154,7 +17250,7 @@ class ReindexTests(unittest.TestCase):
             with self.assertRaises(ValueError):validate_vectorizer('Owned')
     def test_vectorizer_refuses_extra_module_options_and_changed_property_inputs(self):
         from config import settings
-        props=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=False,vectorize_property_name=True),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES]
+        props=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=p._to_dict()["skip_vectorization"],vectorize_property_name=p._to_dict()["vectorize_property_name"]),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES]
         cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=props)
         client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
         with patch.object(tuning.wc,'get_client',return_value=client):

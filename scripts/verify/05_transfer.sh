@@ -23,6 +23,8 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_provenance.py)
+check "source provenance refusal and bounded diagnostics" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -644,6 +646,58 @@ wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-embedding a chunks-only collection with new chunking is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
 drop_collection "$SRCLESS"
+
+# ── a partially retained collection refuses re-chunking (#190) ───────────────
+# Chunks from policies.txt with no retained original, then a normal upload of
+# policies.md that is retained. Re-chunking from the retained subset alone
+# would drop every policies.txt chunk, so it must be refused before staging.
+MIXED="${PREFIX}Mixedsources"
+drop_collection "$MIXED"; make_collection "$MIXED"
+mixed_ingest() {
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$MIXED" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/$1" > /tmp/vfy_m.json
+  wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_m.json)" 900 >/dev/null
+}
+mixed_count() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$MIXED'][0])"; }
+mixed_names() { api_get "/collections" | python3 -c "
+import json,sys; print(sorted(c['name'] for c in json.load(sys.stdin)['collections']))"; }
+mixed_files() { (cd "$REPO_ROOT" && docker compose exec -T api python -c "
+import sys; sys.path.insert(0, '/app')
+from services import weaviate_client as wc
+client = wc.get_client()
+print(sorted({o.properties.get('source_file') for o in client.collections.get('$MIXED').iterator()}))
+client.close()" 2>/dev/null); }
+mixed_ingest policies.txt
+(cd "$REPO_ROOT" && docker compose exec -T api sh -c "rm -rf /app/sources/$MIXED") >/dev/null 2>&1
+mixed_ingest policies.md
+mixed_before=$(mixed_count); names_before=$(mixed_names); files_before=$(mixed_files)
+check_eq "partial sources disable re-chunk in tuning options" "$(api_get "/tune/$MIXED" | jfield "['can_rechunk']")" "False"
+check_eq "the mixed collection holds chunks from both files" "$files_before" "['policies.md', 'policies.txt']"
+for op in rechunk reembed; do
+  api_post "/tune/$op" "{\"collection\":\"$MIXED\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+  tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+  wait_for_job "/tune/job/$tjob" 900 >/dev/null
+  api_get "/tune/job/$tjob" > /tmp/vfy_tjs.json
+  check_eq "#190 $op with new chunking on a partially retained collection is refused" \
+    "$(jfield "['error_code']" < /tmp/vfy_tjs.json)" "SOURCES_REQUIRED"
+  check_eq "#190 ... and names the source file with no retained original" \
+    "$(jfield "['error_detail']['uncovered_source_files']" < /tmp/vfy_tjs.json)" "['policies.txt']"
+  check_eq "#190 ... and leaves every stored chunk in place" "$(mixed_count)" "$mixed_before"
+  check_eq "#190 ... and leaves both source files' chunks in place" "$(mixed_files)" "$files_before"
+  check_eq "#190 ... and leaves no staging or recovery collection behind" "$(mixed_names)" "$names_before"
+done
+api_post "/tune/reembed" "{\"collection\":\"$MIXED\"}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "#190 re-embedding the existing chunk text still completes" \
+  "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+check_eq "#190 ... and keeps every chunk" "$(mixed_count)" "$mixed_before"
+api_post "/tune/reindex" "{\"collection\":\"$MIXED\",\"index_type\":\"flat\",\"distance_metric\":\"cosine\"}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "#190 re-indexing a partially retained collection still completes" \
+  "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+check_eq "#190 ... and keeps both source files' chunks" "$(mixed_files)" "$files_before"
+drop_collection "$MIXED"
 
 # ── the help page and the package README share a source ──────────────────────
 api_get "/help/transfer" > /tmp/vfy_help.json

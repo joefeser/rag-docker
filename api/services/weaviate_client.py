@@ -27,6 +27,9 @@ DISTANCE_MAP = {
     "l2-squared": VectorDistances.L2_SQUARED,
 }
 
+SOURCE_DIGEST_PROPERTY = Property(name="source_digest", data_type=DataType.TEXT,
+    index_searchable=False, index_filterable=True, skip_vectorization=True)
+
 COLLECTION_PROPERTIES = [
     Property(name="content", data_type=DataType.TEXT, index_searchable=True, index_filterable=True),
     Property(name="source_file", data_type=DataType.TEXT, index_searchable=False, index_filterable=True),
@@ -36,6 +39,7 @@ COLLECTION_PROPERTIES = [
     Property(name="chunk_size", data_type=DataType.INT, index_filterable=True),
     Property(name="chunk_overlap", data_type=DataType.INT, index_filterable=True),
     Property(name="created_at", data_type=DataType.DATE, index_filterable=True),
+    SOURCE_DIGEST_PROPERTY,
 ]
 
 
@@ -92,6 +96,7 @@ def _create_collection_sync(
     hnsw_config: dict,
     *,
     preserve_hnsw: bool = False,
+    source_digest: bool = True,
     description: str | None = None,
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
@@ -123,7 +128,7 @@ def _create_collection_sync(
         description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
-        properties=COLLECTION_PROPERTIES,
+        properties=[p for p in COLLECTION_PROPERTIES if source_digest or p.name != "source_digest"],
     )
 
 
@@ -320,6 +325,8 @@ def _validate_reindex_vectorizer_sync(name: str) -> None:
     # old vectors into the fixed schema with different future insert rules.
     expected_properties = {p.name: p._to_dict() for p in COLLECTION_PROPERTIES}
     properties = list(getattr(cfg, "properties", None) or [])
+    if not any(p.name == "source_digest" for p in properties):
+        expected_properties.pop("source_digest")  # Legacy schema remains valid for exact reindex.
     compatible = compatible and len(properties) == len(expected_properties) and {p.name for p in properties} == set(expected_properties)
     for prop in properties:
         expected = expected_properties.get(prop.name)
@@ -350,6 +357,9 @@ _INSERT_RETRY_DELAY = 1.0
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
+    if any("source_digest" in chunk for chunk in chunks):
+        if not any(p.name == "source_digest" for p in coll.config.get().properties):
+            coll.config.add_property(SOURCE_DIGEST_PROPERTY)
     for attempt in range(1, _INSERT_ATTEMPTS + 1):
         try:
             # The writer verifies persisted records and removes only UUIDs

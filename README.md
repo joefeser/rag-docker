@@ -724,3 +724,5 @@ curl -s http://localhost:8080/api/collections      # -> "MyDocs"
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
   -F 'collection=mydocs' -F 'files=@/dev/null;type=text/plain'   # -> 404
 ```
+
+Changing chunk boundaries requires complete source provenance: each stored chunk must name one retained original and carry its matching SHA-256 digest. Partial retention, multiple versions or names, and older chunks without a digest are refused before staging. Re-ingest into a new collection to establish provenance for legacy data; re-embedding existing text and reindexing remain available. The tuning options report this check independently of export fidelity.

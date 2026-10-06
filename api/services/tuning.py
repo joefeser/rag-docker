@@ -19,6 +19,7 @@ deleted and never remapped (spec §7.3).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import copy
 import logging
 import math
@@ -108,6 +109,43 @@ def _verify_records(collection: str, records: list[dict]) -> None:
         raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
 
 
+def require_source_coverage(collection: str, documents: dict | None = None) -> None:
+    documents = sources.load_index(collection)["documents"] if documents is None else documents
+    # A chunks-only import or a failed retention can leave a mixed corpus.
+    # Any retained file is insufficient: replacing from that subset loses the
+    # other chunks and successful cutover discards their recovery copy.
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    uncovered = set()
+    truncated = False
+    for obj in wc.get_client().collections.get(collection).iterator():
+        filename = (obj.properties or {}).get("source_file")
+        digests = by_filename.get(filename, []) if isinstance(filename, str) else []
+        covered = (len(digests) == 1
+                   and (obj.properties or {}).get("source_digest") == digests[0]
+                   and len(documents[digests[0]]["filenames"]) == 1)
+        if not covered:
+            if len(uncovered) < 100:
+                uncovered.add(filename[:256] if isinstance(filename, str) and filename else "<unknown>")
+            else:
+                truncated = True
+    for digest in documents:
+        blob = sources.blob_path(collection, digest)
+        if not blob.is_file() or hashlib.sha256(blob.read_bytes()).hexdigest() != digest:
+            raise PackageError("SOURCES_REQUIRED", "Retained source is missing or differs from its digest.",
+                               {"collection": collection, "digest": digest})
+    if uncovered:
+        raise PackageError(
+            "SOURCES_REQUIRED",
+            "Cannot change chunk boundaries: some stored chunks have missing, unproven or "
+            "ambiguous retained originals. Re-embed without chunking parameters "
+            "or re-index to preserve the existing chunks.",
+            {"collection": collection, "uncovered_source_files": sorted(uncovered), "uncovered_source_files_truncated": truncated})
+
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -128,25 +166,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # A chunks-only import or a failed retention can leave a mixed corpus.
-    # Any retained file is insufficient: replacing from that subset loses the
-    # other chunks and successful cutover discards their recovery copy.
-    by_filename: dict[str, list[str]] = {}
-    for digest, entry in documents.items():
-        for filename in entry["filenames"]:
-            by_filename.setdefault(filename, []).append(digest)
-    uncovered = set()
-    for obj in wc.get_client().collections.get(collection).iterator():
-        filename = (obj.properties or {}).get("source_file")
-        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
-            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
-    if uncovered:
-        raise PackageError(
-            "SOURCES_REQUIRED",
-            "Cannot change chunk boundaries: some stored chunks have missing or "
-            "ambiguous retained originals. Re-embed without chunking parameters "
-            "or re-index to preserve the existing chunks.",
-            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+    require_source_coverage(collection, documents)
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -180,6 +200,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             out.extend({
                 "content": c,
                 "source_file": staged.name,
+                "source_digest": digest,
                 "source_type": source_type,
                 "chunk_index": i,
                 "chunk_strategy": strategy,
@@ -213,6 +234,9 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
+    schema_options = {}
+    if records is not None:
+        schema_options["source_digest"] = any(p["name"] == "source_digest" for p in config.get("properties", []))
     client = wc.get_client()
     ownership = collection_recovery.begin(collection, "tune", client)
     staging = ownership["staging"]
@@ -220,7 +244,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     completed = False
     original_intact = False
     try:
-        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True, **schema_options)
         if records is not None:
             _write_records(staging, records)
             # The guard covers application writers; independently connected
@@ -239,7 +263,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             before_replace()
         cutover_started = True
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True, **schema_options)
         if records is not None:
             _write_records(collection, records)
             written = len(records)

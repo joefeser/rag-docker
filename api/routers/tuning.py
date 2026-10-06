@@ -79,17 +79,22 @@ async def tune_options(collection: str):
     try:
         has_sources = await asyncio.to_thread(sources.has_sources, collection)
         stats = await asyncio.to_thread(sources.stats, collection)
+        can_rechunk = has_sources
+        try:
+            await asyncio.to_thread(tuning.require_source_coverage, collection)
+        except tuning.PackageError:
+            can_rechunk = False
     except ValueError:
         return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",
         source_document_count=stats["document_count"],
-        can_rechunk=has_sources,
+        can_rechunk=can_rechunk,
         can_reembed=True,
         can_reindex=True,
-        note=("Every tuning operation is available." if has_sources else
-              "No original documents were retained, so this collection cannot be "
+        note=("Every tuning operation is available." if can_rechunk else
+              "Stored chunks lack complete, unambiguous source provenance, so this collection cannot be "
               "re-chunked. Re-embedding works from the stored chunk text, which "
               "leaves chunk boundaries unchanged."),
     )

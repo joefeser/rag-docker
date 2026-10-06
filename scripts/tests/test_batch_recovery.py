@@ -68,7 +68,7 @@ class Collection:
         self.rows = {}
         self.fault = fault
         self.description = description
-        self.config = SimpleNamespace(get=lambda: SimpleNamespace(name=self.name, description=self.description, vectorizer=None))
+        self.config = SimpleNamespace(get=lambda: SimpleNamespace(name=self.name, description=self.description, vectorizer=None, properties=wc.COLLECTION_PROPERTIES))
         self.batch = Batch(self)
         self.query = SimpleNamespace(fetch_objects=lambda filters, **kwargs: SimpleNamespace(
             objects=[obj for obj in self.iterator(include_vector=True) if str(obj.uuid) in filters.value]))
@@ -926,11 +926,35 @@ class SourceCoverageTests(unittest.TestCase):
                             tuning._run("coverage", "Corpus", operation, {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
                         self.assertEqual(job["status"], "failed")
                         self.assertEqual(job["error_code"], "SOURCES_REQUIRED")
+                        self.assertIn(missing or "<unknown>", job["error_detail"]["uncovered_source_files"])
                         parse.assert_not_called()
                         self.assertEqual(cols.get("Corpus").rows, {r["id"]: r for r in original})
                         self.assertEqual(cols.deleted, [])
                         self.assertEqual(set(cols.items), {"Corpus"})
                         self.assertEqual(list(recovery._root().glob("*.json")), [])
+
+    def test_source_digest_refuses_both_review_drop_cases_and_legacy(self):
+        from services import sources
+        for mode in ('second-name', 'failed-retention', 'legacy'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                cols = Collections()
+                cols.create('Corpus')
+                with patch.object(settings, 'sources_dir', tmp), patch.object(wc, 'get_client', return_value=SimpleNamespace(collections=cols)):
+                    digest = sources.store('Corpus', 'a.txt', b'original')
+                    if mode == 'second-name':
+                        sources.store('Corpus', 'b.txt', b'original')
+                    row = records(1)[0]
+                    row['properties'].update(source_file='b.txt' if mode == 'second-name' else 'a.txt')
+                    if mode != 'legacy':
+                        row['properties']['source_digest'] = digest if mode == 'second-name' else 'f' * 64
+                    cols.get('Corpus').rows[row['id']] = row
+                    before = copy.deepcopy(cols.get('Corpus').rows)
+                    with self.assertRaises(tuning.PackageError) as error:
+                        tuning.require_source_coverage('Corpus')
+                    self.assertEqual(error.exception.code, 'SOURCES_REQUIRED')
+                    self.assertIn(row['properties']['source_file'], error.exception.detail['uncovered_source_files'])
+                    self.assertEqual(cols.get('Corpus').rows, before)
+                    self.assertEqual(cols.deleted, [])
 
     def test_fully_retained_collection_completes_real_cutover(self):
         from services import sources
@@ -941,7 +965,8 @@ class SourceCoverageTests(unittest.TestCase):
             original["properties"]["source_file"] = "retained.txt"
             cols.get("Corpus").rows[original["id"]] = original
             with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(wc, "_create_collection_sync", side_effect=lambda name, *a, **kw: cols.create(name)), patch.object(wc, "_collection_config_sync", return_value={"index_type": "hnsw", "distance_metric": "cosine", "hnsw_config": {}}), patch.object(tuning, "_parse_file", side_effect=lambda p: (p.read_text(), [])), patch.object(tuning, "do_chunk", side_effect=lambda **kw: [kw["text"]]):
-                sources.store("Corpus", "retained.txt", b"retained original")
+                digest = sources.store("Corpus", "retained.txt", b"retained original")
+                original["properties"]["source_digest"] = digest
                 job = {}
                 with patch.dict(tuning._jobs, {"coverage": job}):
                     tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
