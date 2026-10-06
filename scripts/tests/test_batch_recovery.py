@@ -1,4 +1,5 @@
 """Controlled final-flush faults against real writer and recovery services."""
+import asyncio
 import copy
 import json
 import os
@@ -11,7 +12,7 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
@@ -1011,6 +1012,41 @@ class SourceCoverageTests(unittest.TestCase):
                     tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
                 self.assertEqual(job["status"], "completed", job)
                 self.assertEqual([r["properties"]["source_file"] for r in cols.get("Corpus").rows.values()], ["a.txt"])
+
+
+    def test_tune_options_match_the_refusal(self):
+        from routers import tuning as tuning_router
+        from services import sources
+        chunks_only = ("No original documents were retained, so this collection cannot be "
+                       "re-chunked. Re-embedding works from the stored chunk text, which "
+                       "leaves chunk boundaries unchanged.")
+        refused = ("Some stored source files have no single retained original, or a "
+                   "retained original is missing, so this collection cannot be "
+                   "re-chunked. Re-embedding works from the stored chunk text, which "
+                   "leaves chunk boundaries unchanged, and re-indexing is available.")
+        second_name = self.DROP_CASES["second name for the same content"]
+        repeated_set = self.DROP_CASES["re-upload whose retention failed"]
+        cases = {
+            "nothing retained": ([], [("a.txt", 0)], False, chunks_only, False),
+            "fully covered": ([("a.txt", b"v1")], [("a.txt", 0), ("a.txt", 1)], True,
+                              "Every tuning operation is available.", False),
+            "second name for the same content": (second_name[0], second_name[1], False, refused, False),
+            "repeated chunk set": (repeated_set[0], repeated_set[1], False, refused, False),
+            "retained original missing from disk": ([("a.txt", b"v1")], [("a.txt", 0)], False, refused, True),
+        }
+        for case, (retained, chunks, can_rechunk, note, drop_blob) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                cols = Collections()
+                self.corpus(cols, chunks)
+                with patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock, return_value=True):
+                    for name, data in retained:
+                        digest = sources.store("Corpus", name, data)
+                    if drop_blob:
+                        sources.blob_path("Corpus", digest).unlink()
+                    response = asyncio.run(tuning_router.tune_options("Corpus"))
+                self.assertEqual(response.can_rechunk, can_rechunk)
+                self.assertEqual(response.note, note)
+                self.assertEqual(response.fidelity, "with-sources" if retained else "chunks-only")
 
 
 if __name__ == '__main__':

@@ -6262,6 +6262,21 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
     return sorted(uncovered)
 
 
+def can_rechunk(collection: str) -> bool:
+    """Whether re-chunking would pass the checks made before parsing.
+
+    Used by the tuning options, so they offer re-chunking only when the job
+    would accept it. An invalid index or blob path raises ValueError.
+    """
+    documents = sources.load_index(collection)["documents"]
+    if not documents:
+        return False
+    for digest in documents:
+        if not sources.blob_path(collection, digest).is_file():
+            return False
+    return not _uncovered_source_files(collection, documents)
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -7204,19 +7219,28 @@ async def tune_options(collection: str):
     try:
         has_sources = await asyncio.to_thread(sources.has_sources, collection)
         stats = await asyncio.to_thread(sources.stats, collection)
+        can_rechunk = has_sources and await asyncio.to_thread(tuning.can_rechunk, collection)
     except ValueError:
         return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
+    if not has_sources:
+        note = ("No original documents were retained, so this collection cannot be "
+                "re-chunked. Re-embedding works from the stored chunk text, which "
+                "leaves chunk boundaries unchanged.")
+    elif can_rechunk:
+        note = "Every tuning operation is available."
+    else:
+        note = ("Some stored source files have no single retained original, or a "
+                "retained original is missing, so this collection cannot be "
+                "re-chunked. Re-embedding works from the stored chunk text, which "
+                "leaves chunk boundaries unchanged, and re-indexing is available.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",
         source_document_count=stats["document_count"],
-        can_rechunk=has_sources,
+        can_rechunk=can_rechunk,
         can_reembed=True,
         can_reindex=True,
-        note=("Every tuning operation is available." if has_sources else
-              "No original documents were retained, so this collection cannot be "
-              "re-chunked. Re-embedding works from the stored chunk text, which "
-              "leaves chunk boundaries unchanged."),
+        note=note,
     )
 ```
 

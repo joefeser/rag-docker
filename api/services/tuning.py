@@ -144,6 +144,21 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
     return sorted(uncovered)
 
 
+def can_rechunk(collection: str) -> bool:
+    """Whether re-chunking would pass the checks made before parsing.
+
+    Used by the tuning options, so they offer re-chunking only when the job
+    would accept it. An invalid index or blob path raises ValueError.
+    """
+    documents = sources.load_index(collection)["documents"]
+    if not documents:
+        return False
+    for digest in documents:
+        if not sources.blob_path(collection, digest).is_file():
+            return False
+    return not _uncovered_source_files(collection, documents)
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
