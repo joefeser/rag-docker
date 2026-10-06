@@ -136,21 +136,19 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
         for filename in entry["filenames"]:
             by_filename.setdefault(filename, []).append(digest)
     uncovered = set()
-    truncated = False
     for obj in wc.get_client().collections.get(collection).iterator():
         filename = (obj.properties or {}).get("source_file")
         if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
-            if len(uncovered) < 100:
-                uncovered.add(filename[:256] if isinstance(filename, str) and filename else "<unknown>")
-            else:
-                truncated = True
+            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
     if uncovered:
         raise PackageError(
             "SOURCES_REQUIRED",
             "Cannot change chunk boundaries: some stored chunks have missing or "
             "ambiguous retained originals. Re-embed without chunking parameters "
             "or re-index to preserve the existing chunks.",
-            {"collection": collection, "uncovered_source_files": sorted(uncovered), "uncovered_source_files_truncated": truncated})
+            {"collection": collection,
+             "uncovered_source_files": [name[:256] for name in sorted(uncovered)[:100]],
+             "uncovered_source_files_truncated": len(uncovered) > 100})
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
