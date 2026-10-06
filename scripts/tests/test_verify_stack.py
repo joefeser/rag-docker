@@ -16,6 +16,7 @@ import signal
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -464,14 +465,14 @@ class RestartTimingTests(unittest.TestCase):
                 self.assertEqual(result.stdout, str(RESTART_LIMIT_DEFAULT_S))
 
     def test_valid_override(self):
-        for value, limit in (('45', '45'), ('007', '7')):
+        for value, limit in (('45', '45'), ('007', '7'), ('999999', '999999')):
             with self.subTest(value=value):
                 result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, limit)
 
     def test_invalid_values_are_refused(self):
-        for value in ('0', '000', '-5', '1.5', 'abc', '10s', ' 30'):
+        for value in ('0', '000', '-5', '1.5', 'abc', '10s', ' 30', '1000000', '99999999999999999999'):
             with self.subTest(value=value):
                 result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
                 self.assertEqual(result.returncode, 1)
@@ -485,10 +486,21 @@ class RestartTimingTests(unittest.TestCase):
         self.assertRegex(result.stdout, r'^[0-9]+$')
         self.assertLessEqual(int(result.stdout), 1)
 
+    def test_wait_measures_from_the_given_start(self):
+        # The time counts from `down`, not from the first poll.
+        result = self.bash('wait_healthy_timed "$(( $(date +%s) - 5 ))" 30', STUB_CURL_CODE='200',
+                           RAG_API='http://localhost:9/api')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(result.stdout, ('5', '6'))
+
     def test_wait_prints_nothing_at_the_cap(self):
+        started = time.monotonic()
         result = self.bash('wait_healthy_timed "$(date +%s)" 2', STUB_CURL_CODE='000',
                            RAG_API='http://localhost:9/api')
+        # A missing or failing helper also prints nothing, so check it ran and waited.
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '')
+        self.assertGreaterEqual(time.monotonic() - started, 2)
 
     def test_results_report_the_time(self):
         cases = (('300 143', 'PASS', 'restart reaches healthy within 300s (took 143s)'),
@@ -921,7 +933,7 @@ class CraftedPackageWriteTests(unittest.TestCase):
     Desktop the container can read a freshly closed bind-mounted file as empty."""
 
     def test_every_crafted_package_is_renamed_into_place(self):
-        for name, count in (('05_transfer.sh', 4), ('retrieval_settings.py', 1)):
+        for name, count in (('05_transfer.sh', 5), ('retrieval_settings.py', 1)):
             with self.subTest(file=name):
                 source = (VERIFY / name).read_text()
                 opened = re.findall(r"tarfile\.open\(([^,()]+), ['\"]w:gz['\"]\)", source)

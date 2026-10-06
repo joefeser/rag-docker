@@ -278,7 +278,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E29; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -412,8 +412,14 @@ isolated fixture run does not replace the full verification suite (`stack.sh run
 ## Deferred Chunking configuration checks
 
 `browser/chunking_config.js`, registered in `06_ui.sh` through `ui_criteria.js`,
-uses the rendered page with deferred API responses. Six cases cover late loads,
+uses the rendered page with deferred API responses. Ten cases cover late loads,
 failed loads, A→B→A selection, stale save completions, pending saves across
-selection changes, and duplicate-save prevention. Each affected save checks
+selection changes, duplicate-save prevention, late responses against current
+edits and errors, the saved notice on a collection change, a configuration
+returned for another collection, and a failed collections list. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
+
+Retrieval deferred cases also cover superseded success/error notices, notice timer
+ownership, both orders of an acknowledged success and newer failure, and a
+three-save race that must not republish the same result over new edits.
