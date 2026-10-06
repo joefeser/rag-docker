@@ -210,6 +210,37 @@ class DeletedRecoveryTests(unittest.TestCase):
         with patch.object(self.client.collections,'delete',side_effect=OSError('Owned delete failure')):
             with self.assertRaisesRegex(OSError,'Owned delete failure'):self.wc._delete_collection_sync('ownedRecovery')
         self.assertTrue(sources.collection_dir(name).exists());self.assertIsNotNone(ingest_config.load(name));self.assertIsNotNone(retrieval_config.load(name));self.assertFalse(gs.get_session(sid).get('orphaned',False));self.assertIn(name,self.backend)
+    def test_http_delete_removes_both_registry_spellings_only_after_success(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from routers import collections as route
+        for caller in ('OwnedRecovery', 'ownedRecovery'):
+            for fails in (False, True):
+                registry = {'OwnedRecovery': 'canonical', 'ownedRecovery': 'alias', 'Ownedrecovery': 'neighbor'}
+                with self.subTest(caller=caller, fails=fails), \
+                     patch.object(route.wc, 'collection_exists', new=AsyncMock(return_value=True)), \
+                     patch.object(route.wc, 'delete_collection', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
+                     patch.object(route, '_registry_lock', asyncio.Lock()), \
+                     patch.object(route, '_load_registry', return_value=registry), \
+                     patch.object(route, '_save_registry') as save:
+                    asyncio.run(route.delete_collection(caller))
+                    if fails:
+                        save.assert_not_called()
+                        self.assertEqual(len(registry), 3)
+                    else:
+                        save.assert_called_once_with({'Ownedrecovery': 'neighbor'})
+
+    def test_alias_delete_orphan_reason_names_canonical_collection(self):
+        # #140: whichever spelling the caller used, both sessions record the canonical name.
+        import json
+        from services import goldstandard as gs
+        identities={'OwnedRecovery':'gs_14000008','ownedRecovery':'gs_14000009'}
+        for spelling,sid in identities.items():
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        self.wc._delete_collection_sync('ownedRecovery')
+        for sid in identities.values():
+            self.assertEqual(gs.get_session(sid).get('orphaned_reason'),"collection 'OwnedRecovery' was deleted",'in-memory orphan reason must name the canonical collection')
+            self.assertEqual(json.loads(gs._session_path(sid).read_text()).get('orphaned_reason'),"collection 'OwnedRecovery' was deleted",'persisted orphan reason must name the canonical collection')
     def test_deleting_original_preserves_distinct_retained_recovery(self):
         self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
         self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())

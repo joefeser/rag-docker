@@ -341,7 +341,7 @@ Deletes a collection and all its objects. Requires `confirm=true` query paramete
 { "name": "Documents", "status": "deleted", "objects_removed": 1842 }
 ```
 
-Before deletion, resolves the backend's canonical collection name. After successful backend deletion, removes retained source documents and ingest/retrieval configurations for both the canonical name and its lowercase-first-character alias, regardless of the spelling used in the request. Only that first-character alias matches; distinct collection names are not case-folded or swept. Matching sessions for both spellings are preserved and durably marked orphaned. Also removes the caller's entry from `collection_registry.json`. Deleting an original collection preserves distinct retained recovery copies; explicitly deleting a retained recovery collection retires only its matching ownership journal and snapshots.
+Before deletion, resolves the backend's canonical collection name. After successful backend deletion, removes retained source documents and ingest/retrieval configurations for both the canonical name and its lowercase-first-character alias, regardless of the spelling used in the request. Only that first-character alias matches; distinct collection names are not case-folded or swept. Matching sessions for both spellings are preserved and durably marked orphaned. Also removes both spellings from `collection_registry.json`. Import-replace reports the number of retained sessions across both spellings. Deleting an original collection preserves distinct retained recovery copies; explicitly deleting a retained recovery collection retires only its matching ownership journal and snapshots.
 
 **Response 404** if the collection does not exist:
 ```json
@@ -1849,8 +1849,8 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
-- [x] Deleting a collection by either its canonical name or first-character alias removes both spellings' retained sources and configurations, durably orphans both spellings' sessions, and preserves case-distinct neighbours and retained recovery copies.
-      *`test_collection_writes.py` covers both deletion spellings and a case-distinct neighbour; `reindex.py` runs both deletion paths through the HTTP handler against owned backend and sidecar fixtures, with `reindex_verifier_cases.py` checking registration.*
+- [x] Deleting a collection by either its canonical name or first-character alias removes both spellings' retained sources, configurations and registry entries, durably orphans both spellings' sessions, and preserves case-distinct neighbours and retained recovery copies. Import-replace notes count sessions under both spellings.
+      *`test_collection_writes.py` covers both deletion spellings and a case-distinct neighbour; `reindex.py` runs both deletion paths through the HTTP handler against owned backend and sidecar fixtures, with `reindex_verifier_cases.py` checking registration. The live backend rejects case-only neighbouring collections; Linux-volume checks still verify case-distinct sidecar/session preservation, while controlled tests cover both backend collections.*
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
       *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
 - [x] Concurrent ingest/retrieval settings saves publish their own complete values; failed publication preserves the previous valid configuration (#141).

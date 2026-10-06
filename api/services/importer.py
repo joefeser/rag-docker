@@ -739,7 +739,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                 collection_recovery.retain(ownership, package=pkg)
                 staged = True
                 # Counted before the delete, because the delete is what orphans them.
-                orphaned = len(goldstandard.sessions_for(target))
+                orphaned = len({session["session_id"]
+                                for spelling in {target, target[:1].lower() + target[1:]}
+                                for session in goldstandard.sessions_for(spelling)})
                 wc._delete_collection_sync(target)   # also drops its sources + config
                 if orphaned:
                     # Spec §8 rule 4: silently destroying evaluation work is worse
