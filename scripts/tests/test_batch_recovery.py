@@ -443,6 +443,70 @@ class RecoveryTests(unittest.TestCase):
             self.assertTrue(self.cols.exists('Corpus'))
             stale.assert_not_called()
 
+    def interrupted_cutover(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        self.cols.interrupt = False
+        record = self.recovery_record()
+        self.cols.create('Corpus', description=recovery.cutover_description(record))
+        return record
+
+    def test_startup_check_flags_an_interrupted_cutover_only_once(self):
+        record = self.interrupted_cutover()
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+        stale.assert_called_once_with('Corpus', 'interrupted tuning final write; verified recovery retained')
+        checked = self.recovery_record()
+        self.assertFalse(checked['cutover_pending'])
+        self.assertEqual(checked['cutover_checked'], 'stale')
+        self.assertTrue(self.cols.exists(record['staging']))
+        self.assertTrue(self.cols.exists('Corpus'))
+
+    def test_complete_cutover_is_not_rechecked_after_later_mutation(self):
+        record = self.interrupted_cutover()
+        self.cols.get('Corpus').rows = copy.deepcopy(self.cols.get(record['staging']).rows)
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            self.assertEqual(self.recovery_record()['cutover_checked'], 'complete')
+            self.cols.get('Corpus').rows.clear()
+            with patch.object(batch_write, 'verify', side_effect=AssertionError('rechecked')) as verify:
+                recovery.sweep(self.client)
+                verify.assert_not_called()
+            stale.assert_not_called()
+
+    def test_other_instance_decision_is_retired_without_touching_sessions(self):
+        record = self.interrupted_cutover()
+        self.cols.get('Corpus').config = SimpleNamespace(get=lambda: SimpleNamespace(description='later'))
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+            stale.assert_not_called()
+        self.assertEqual(self.recovery_record()['cutover_checked'], 'other-instance')
+        self.assertTrue(self.cols.exists(record['staging']))
+
+    def test_unreadable_cutover_stays_pending_until_check_can_finish(self):
+        record = self.interrupted_cutover()
+        self.cols.get('Corpus').fault = 'read'
+        recovery.sweep(self.client)
+        self.assertTrue(self.recovery_record()['cutover_pending'])
+        self.cols.get('Corpus').fault = None
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+            stale.assert_called_once()
+        self.assertFalse(self.recovery_record()['cutover_pending'])
+
+    def test_failed_outcome_write_keeps_cutover_pending_for_retry(self):
+        self.interrupted_cutover()
+        with patch.object(tuning.goldstandard, 'mark_stale'), patch.object(recovery, '_write', side_effect=OSError('disk full')):
+            recovery.sweep(self.client)
+        self.assertTrue(self.recovery_record()['cutover_pending'])
+        with patch.object(tuning.goldstandard, 'mark_stale'):
+            recovery.sweep(self.client)
+        self.assertFalse(self.recovery_record()['cutover_pending'])
+
     def test_import_replace_note_counts_canonical_and_alias_sessions(self):
         seen = []
         def sessions(name):
