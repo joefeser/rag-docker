@@ -687,7 +687,7 @@ before sampling and publishing its session. A busy collection returns
 deletion removed the collection before sampling, it returns
 `404 COLLECTION_NOT_FOUND`. Retry a busy request after the writer finishes.
 
-Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
+Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most 100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
 
 The iterator caches 100 objects and selection retains at most `sample_size` candidate payloads; the complete corpus is scanned once. Full scans can take longer than fetching an initial prefix. Payload size is inherited from stored chunks; this is a candidate-count bound, not a byte-size limit.
 
@@ -2034,7 +2034,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 `''`; the type name is now always included.
 
 - [x] Seeded selection reaches the complete UUID population, preserves rank order across backend iteration orders, and retrieves payloads only for selected IDs.
-      *19 controlled runtime groups plus one nine-source documentation group cover geometry-independent selection, API validation, missing winners and parked MCP function limits. Suite09, called by04, exercises160 owned synthetic SDK objects across pages; supplied vectors avoid model calls. Its registered live HTTP cases reject invalid generation settings before a missing collection can be queried. This is selection evidence, not deterministic LLM output.*
+      *19 controlled runtime groups plus one nine-source documentation group cover geometry-independent selection, API validation, missing winners and parked MCP function limits. Suite 09, called by 04, exercises 160 owned synthetic SDK objects across pages; supplied vectors avoid model calls. Its registered live HTTP cases reject invalid generation settings before a missing collection can be queried. This is selection evidence, not deterministic LLM output.*
 
 ### 10.4 Web UI
 
