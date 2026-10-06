@@ -10528,6 +10528,8 @@ directories and does not connect to Weaviate or Ollama.
 verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
 verification run; it does not establish full-stack acceptance by itself.
 
+Suite 04 also registers `test_chunk_sampling.py` through `09_sampling.sh`, including guard release before model generation and after sampling/publication failures.
+
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
@@ -13113,6 +13115,9 @@ print('PASS owned collection/session/files removed',flush=True)
 set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
 require_stack
+section "Sampling and generation guard regressions"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_chunk_sampling.py)
+check "sampling, publication and generation guard regressions" $?
 section "Evaluation sampling across iterator pages"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/chunk_sampling.py)
 check "seeded selection, iterator paging, bounds and owned-fixture cleanup" $?

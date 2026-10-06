@@ -3,6 +3,9 @@
 set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
 require_stack
+section "Sampling and generation guard regressions"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_chunk_sampling.py)
+check "sampling, publication and generation guard regressions" $?
 section "Evaluation sampling across iterator pages"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/chunk_sampling.py)
 check "seeded selection, iterator paging, bounds and owned-fixture cleanup" $?

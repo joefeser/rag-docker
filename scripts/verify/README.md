@@ -132,6 +132,8 @@ directories and does not connect to Weaviate or Ollama.
 verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
 verification run; it does not establish full-stack acceptance by itself.
 
+Suite 04 also registers `test_chunk_sampling.py` through `09_sampling.sh`, including guard release before model generation and after sampling/publication failures.
+
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
