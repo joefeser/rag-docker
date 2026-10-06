@@ -418,8 +418,7 @@ curl -X POST http://localhost:8080/api/tune/reindex \
 `chunks-only` collection cannot be re-chunked, because the originals are not
 there to re-split.
 
-Each rebuild is staged and swapped in only once it succeeds, so a failure leaves
-the collection as it was.
+Each rebuild verifies a staging copy before cutover. Failures before cutover leave the original intact; a failure during final replacement can leave its name missing or partial, with a retained recovery copy and historical sessions. Retained sessions can be loaded by ID. Historical export returns `409 HISTORICAL_SESSION` until the user explicitly opts in.
 
 **Gold-standard sessions are flagged, never deleted.** Re-chunking or re-embedding
 changes which chunks exist, so any evaluation pairs built against the old ones no

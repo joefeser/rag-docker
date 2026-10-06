@@ -46,6 +46,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const suffix = require('crypto').randomBytes(4).toString('hex');
     const emptyId = 'gs_' + suffix, currentId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
     const missingId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const histId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const histBodies = [];
     const common = { collection: 'OwnedHistoricalBrowserFixture', status: 'completed', pairs_total: 0, pairs_completed: 0, pairs: [] };
     let exports = 0;
     await s.page.setRequestInterception(true);
@@ -59,6 +61,16 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       }
       if (path === '/api/goldstandard/session/' + missingId) {
         return request.respond({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SESSION_NOT_FOUND', message: 'Unknown fixture session.' } }) });
+      }
+      if (path === '/api/goldstandard/session/' + histId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: histId, pairs_total: 1, pairs_completed: 1, stale: true, stale_reason: 'Synthetic rechunk with pairs', stale_at: '2026-09-28T00:02:00+00:00', pairs: [{ pair_id: 'hist', question: 'Owned historical question', answer: 'Inert', contexts: ['Inert'], ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: 0, status: 'approved' }] }) });
+      }
+      if (path === '/api/goldstandard/save' && JSON.parse(request.postData() || '{}').session_id === histId) {
+        histBodies.push(JSON.parse(request.postData()));
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ filename: 'owned_hist.json', pairs_saved: 1, pairs_excluded: 0, download_url: '/api/goldstandard/download/owned_hist.json', historical: true, session_validity: { stale: true } }) });
+      }
+      if (path === '/api/goldstandard/download/owned_hist.json') {
+        return request.respond({ status: 200, contentType: 'application/json', body: '[]' });
       }
       if (path === '/api/goldstandard/save') {
         exports++; await sleep(500);
@@ -85,6 +97,21 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       r.check('duplicate clicks issue one export and failure clears pending state', exports===1 && await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && document.body.innerText.includes('Synthetic export failure.'); }));
       await load(missingId);
       r.check('a failed retained lookup clears prior pairs and export controls', /Unknown fixture session/.test(await bodyText(s.page)) && await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b=>/Export.*Approved/.test(b.textContent)) && !document.body.innerText.includes('Owned synthetic question')));
+      await load(histId);
+      const histButton = () => s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Historical Approved'); return b ? { disabled: b.disabled } : null; });
+      const histBox = () => s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); const i=c && c.querySelector('input[type=checkbox]'); return i ? i.checked : null; });
+      const hist = await bodyText(s.page);
+      const lockedButton = await histButton();
+      r.check('a stale session with pairs shows the warning and a locked historical export', /Historical evaluation data/.test(hist) && /Synthetic rechunk with pairs/.test(hist) && lockedButton && lockedButton.disabled && (await histBox()) === false, JSON.stringify(lockedButton));
+      await s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); c.querySelector('input[type=checkbox]').click(); });
+      await sleep(100);
+      r.check('ticking the historical choice enables export', (await histButton())?.disabled === false);
+      await load(histId);
+      r.check('refreshing the session resets the historical choice', (await histBox()) === false && (await histButton())?.disabled === true);
+      await s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); c.querySelector('input[type=checkbox]').click(); });
+      await sleep(100);
+      await clickByText(s.page, 'Export Historical Approved'); await sleep(400);
+      r.check('historical export sends allow_historical:true and labels the result', histBodies.length === 1 && histBodies[0].allow_historical === true && /Historical data; not a current collection baseline/.test(await bodyText(s.page)), JSON.stringify(histBodies));
       r.check('historical UI fixtures cause no React page errors', !s.errors.some(error=>error.startsWith('pageerror:')));
     } finally { await s.ctx.close(); } // All synthetic responses/context owned here.
   }

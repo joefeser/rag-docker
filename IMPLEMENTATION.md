@@ -3329,7 +3329,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
-from models.schemas import SessionResponse
+from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 
@@ -3852,7 +3852,7 @@ def _update_session_sync(session_id: str, change):
         return copy.deepcopy(result)
 
 
-def _flag_sessions(collection: str, flag: str, reason: str) -> int:
+def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: bool = False) -> int:
     """Mark every session for a collection, on disk and in memory.
 
     Sessions are never deleted and never remapped. A remap that guesses which
@@ -3897,17 +3897,19 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
                 # An uncertain-durability report keeps its own wording.
                 if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
                     _record_issue(key, "SESSION_WRITE_FAILED", _MARKER_MESSAGES[saved])
+            if require_durable and not saved:
+                raise GoldStandardError("SESSION_WRITE_FAILED", "Cannot replace collection: a historical marker could not be persisted.", 503)
     return marked
 
 
-def mark_stale(collection: str, reason: str) -> int:
+def mark_stale(collection: str, reason: str, *, require_durable: bool = False) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
     from services.collection_writes import canonical
     name = canonical(collection)
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
     aliases = {name, name[:1].lower() + name[1:]}
-    return sum(_flag_sessions(alias, "stale", reason) for alias in sorted(aliases))
+    return sum(_flag_sessions(alias, "stale", reason, require_durable=require_durable) for alias in sorted(aliases))
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
@@ -4211,7 +4213,7 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if session is None:
         return None
 
-    from models.schemas import SessionValidity
+    # Keep direct Python callers as strict as the HTTP request model.
     if not isinstance(allow_historical, bool):
         raise ValueError("allow_historical must be a boolean")
     validity = SessionValidity.model_validate(session).model_dump()
@@ -6472,7 +6474,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
 
         def mark_before_replace() -> None:
             nonlocal stale_count
-            stale_count = goldstandard.mark_stale(source_collection, reason)
+            stale_count = goldstandard.mark_stale(source_collection, reason, require_durable=True)
 
         written = _rebuild(
             collection, properties, params.get("index_type"), params.get("distance_metric"),
@@ -14540,7 +14542,7 @@ with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.ob
         print('PASS live HTTP choices reject bool coercion and nonfinite inputs',flush=True)
         assert client.get('/goldstandard/session/gs_00000000').status_code==404
         assert client.post('/goldstandard/save',json={'session_id':'gs_00000000','allow_historical':True}).status_code==404
-        print('PASS unknown lookup/export remain404',flush=True)
+        print('PASS unknown lookup/export remain 404',flush=True)
         assert gs.mark_stale(collection,'Synthetic chunk-identity change')==1
         response=client.get('/goldstandard/session/'+session_id)
         assert response.json()['stale'] and response.json()['stale_reason']=='Synthetic chunk-identity change'
@@ -14996,6 +14998,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const suffix = require('crypto').randomBytes(4).toString('hex');
     const emptyId = 'gs_' + suffix, currentId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
     const missingId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const histId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const histBodies = [];
     const common = { collection: 'OwnedHistoricalBrowserFixture', status: 'completed', pairs_total: 0, pairs_completed: 0, pairs: [] };
     let exports = 0;
     await s.page.setRequestInterception(true);
@@ -15009,6 +15013,16 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       }
       if (path === '/api/goldstandard/session/' + missingId) {
         return request.respond({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SESSION_NOT_FOUND', message: 'Unknown fixture session.' } }) });
+      }
+      if (path === '/api/goldstandard/session/' + histId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: histId, pairs_total: 1, pairs_completed: 1, stale: true, stale_reason: 'Synthetic rechunk with pairs', stale_at: '2026-09-28T00:02:00+00:00', pairs: [{ pair_id: 'hist', question: 'Owned historical question', answer: 'Inert', contexts: ['Inert'], ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: 0, status: 'approved' }] }) });
+      }
+      if (path === '/api/goldstandard/save' && JSON.parse(request.postData() || '{}').session_id === histId) {
+        histBodies.push(JSON.parse(request.postData()));
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ filename: 'owned_hist.json', pairs_saved: 1, pairs_excluded: 0, download_url: '/api/goldstandard/download/owned_hist.json', historical: true, session_validity: { stale: true } }) });
+      }
+      if (path === '/api/goldstandard/download/owned_hist.json') {
+        return request.respond({ status: 200, contentType: 'application/json', body: '[]' });
       }
       if (path === '/api/goldstandard/save') {
         exports++; await sleep(500);
@@ -15035,6 +15049,21 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       r.check('duplicate clicks issue one export and failure clears pending state', exports===1 && await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && document.body.innerText.includes('Synthetic export failure.'); }));
       await load(missingId);
       r.check('a failed retained lookup clears prior pairs and export controls', /Unknown fixture session/.test(await bodyText(s.page)) && await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b=>/Export.*Approved/.test(b.textContent)) && !document.body.innerText.includes('Owned synthetic question')));
+      await load(histId);
+      const histButton = () => s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Historical Approved'); return b ? { disabled: b.disabled } : null; });
+      const histBox = () => s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); const i=c && c.querySelector('input[type=checkbox]'); return i ? i.checked : null; });
+      const hist = await bodyText(s.page);
+      const lockedButton = await histButton();
+      r.check('a stale session with pairs shows the warning and a locked historical export', /Historical evaluation data/.test(hist) && /Synthetic rechunk with pairs/.test(hist) && lockedButton && lockedButton.disabled && (await histBox()) === false, JSON.stringify(lockedButton));
+      await s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); c.querySelector('input[type=checkbox]').click(); });
+      await sleep(100);
+      r.check('ticking the historical choice enables export', (await histButton())?.disabled === false);
+      await load(histId);
+      r.check('refreshing the session resets the historical choice', (await histBox()) === false && (await histButton())?.disabled === true);
+      await s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); c.querySelector('input[type=checkbox]').click(); });
+      await sleep(100);
+      await clickByText(s.page, 'Export Historical Approved'); await sleep(400);
+      r.check('historical export sends allow_historical:true and labels the result', histBodies.length === 1 && histBodies[0].allow_historical === true && /Historical data; not a current collection baseline/.test(await bodyText(s.page)), JSON.stringify(histBodies));
       r.check('historical UI fixtures cause no React page errors', !s.errors.some(error=>error.startsWith('pageerror:')));
     } finally { await s.ctx.close(); } // All synthetic responses/context owned here.
   }
