@@ -22,7 +22,9 @@ This document translates the decisions in ANALYSIS.md into precise, implementabl
 ```yaml
 services:
   weaviate:
-    image: semitechnologies/weaviate:1.39.4
+    # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
+    # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
+    image: semitechnologies/weaviate:1.39.6
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
@@ -30,35 +32,52 @@ services:
       ENABLE_MODULES: 'text2vec-ollama'
       TEXT2VEC_OLLAMA_APIENDPOINT: http://ollama:11434
       TEXT2VEC_OLLAMA_MODEL: nomic-embed-text
-      # Raft state is keyed by node identity; without a fixed hostname the
-      # recorded identity stops matching after `compose down` and startup dies
-      # with "could not open cloud meta store: bootstrap: context deadline
-      # exceeded".
+      # Weaviate 1.25 persists Raft cluster state keyed by node identity. Without
+      # a fixed CLUSTER_HOSTNAME it derives that identity from the container, so
+      # the IP recorded in weaviate_data no longer matches after `compose down`
+      # and startup dies with:
+      #   "could not open cloud meta store: bootstrap: context deadline exceeded"
+      # Pinning the name keeps the identity stable across container recreation.
       CLUSTER_HOSTNAME: 'node1'
       RAFT_BOOTSTRAP_EXPECT: 1
+      # Without a Raft snapshot, every start replays each collection delete in
+      # Weaviate's Raft log and waits ~150ms on each one (issue #178: 922
+      # deletes, ~145s). A snapshot after 128 entries, checked every 30-60s,
+      # keeps the replayed tail short.
+      RAFT_SNAPSHOT_THRESHOLD: 128
+      RAFT_SNAPSHOT_INTERVAL: 30
     volumes:
       - weaviate_data:/var/lib/weaviate
     ports: []
     networks: [rag-internal]
     healthcheck:
-      # The weaviate image ships busybox wget, NOT curl.
+      # The weaviate image has no curl; busybox wget is what it ships.
+      # The first start on a volume whose Raft log has no snapshot yet (the
+      # first after upgrading to the snapshot settings above) still replays
+      # its whole history before /ready answers: up to 156s on a copy of real
+      # data, 163.5s live (issue #130). Later starts replay only the tail since
+      # the last snapshot. Without start_period, compose marks Weaviate
+      # unhealthy after ~100s and fails the api, ui and proxy behind it.
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/.well-known/ready"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 180s
 
   ollama:
     image: ollama/ollama:0.3.14
-    # Run via bash so the script does not need its executable bit, which is
-    # not reliably preserved when the project is distributed as a zip.
+    # Invoked via bash rather than as ["/entrypoint.sh"] so the script does not
+    # need its executable bit. That bit is not reliably preserved when the
+    # project is distributed as a zip (Finder compress, cloud storage, or a
+    # Windows machine in the transfer path can all drop it), which would
+    # otherwise fail with "permission denied" on a fresh install.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     volumes:
       - ollama_models:/root/.ollama
       - ./ollama/entrypoint.sh:/entrypoint.sh:ro
     networks: [rag-internal]
     healthcheck:
-      # The ollama image ships ONLY the ollama binary -- no curl, wget or nc --
-      # so the CLI is the only usable probe.
+      # The ollama image has no curl/wget; the CLI is the only probe available.
       test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
       interval: 20s
       timeout: 15s
@@ -74,9 +93,9 @@ services:
   api:
     build: ./api
     # Explicit tag so the image name does not depend on the directory name.
-    # Without it compose derives "<project>-api" from the folder, and an offline
-    # install extracted to a differently named folder would not find the loaded
-    # image and would try to rebuild (which needs the internet).
+    # Without it compose derives "<project>-api" from the folder, and an
+    # offline install extracted to a differently named folder would not find
+    # the loaded image and would try to rebuild (which needs the internet).
     image: rag-docker-api:latest
     environment:
       WEAVIATE_HOST: weaviate
@@ -89,8 +108,8 @@ services:
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
       OLLAMA_MODELS_DIR: /ollama
-      # Reported by /health and compared against the memory Docker actually
-      # provides. Raise it if you allocate more to Docker Desktop; no rebuild.
+      # Shown by /health and compared against the memory Docker actually
+      # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
     volumes:
       - ingest_uploads:/app/uploads
@@ -100,7 +119,10 @@ services:
       # reach the file from the host without going through Docker.
       - ./exports:/app/exports
       # Ollama's model store, shared read-write so a package can carry models
-      # into an air-gapped machine.
+      # into an air-gapped machine. Installing a model means writing its exact
+      # manifest and blobs; there is no registry to pull from offline, and
+      # rebuilding a model through the HTTP API would not reproduce its
+      # template, params and license faithfully.
       - ollama_models:/ollama
     networks: [rag-internal]
     depends_on:
@@ -120,18 +142,24 @@ services:
       api: { condition: service_healthy }
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.29-alpine
     ports:
-      # Local unauthenticated workbench: host loopback only.
+      # This unauthenticated workbench is local to the host by default.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
     networks: [rag-internal]
     depends_on: [ui, api]
 
-# The MCP server is PARKED: its service block has been removed from
-# docker-compose.yml and its image is not bundled. Source is preserved in ./mcp
-# and the block to restore is in MCP_IMPLEMENTATION.md §7.
+# ── MCP server: PARKED ────────────────────────────────────────────────────────
+# The MCP server is built and tested but intentionally NOT wired into the stack.
+# Its source lives in ./mcp and its design in MCP_ANALYSIS.md,
+# MCP_SPECIFICATIONS.md and MCP_IMPLEMENTATION.md. Nothing here depends on it,
+# and the offline bundle does not ship its image.
+#
+# To bring it back: restore the service block recorded in MCP_IMPLEMENTATION.md
+# §7, add rag-docker-mcp:latest to the IMAGES array in package-offline.sh, and
+# rebuild. No code changes are needed -- it passed all 16 acceptance criteria.
 
 volumes:
   weaviate_data:
@@ -2006,6 +2034,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Retrieval save confirmations and errors stay with their selection generation. Deferred browser cases verify stale success/failure after switching collections and preserve the newest acknowledged success when a newer save fails, in both response orders.
 
 ### 10.5 Infrastructure
+
+- [x] A restart restores a Raft snapshot and its later operations, preserving objects and deleted collections; the check reports elapsed restart seconds.
+  *Evidence: suite 01 creates 140 schema changes, waits for a snapshot, writes a tail, restarts, and checks the restored snapshot index and data.*
 
 - [x] `docker compose up` brings all five services healthy within 5 minutes on first run (including model pull).
       *Model volume deleted and re-pulled from scratch: **233s (3.9 min)**. Both
