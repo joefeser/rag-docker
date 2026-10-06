@@ -1887,7 +1887,7 @@ now lives once, in `api/services/ingest_config.py`.
       A 513 MB sparse file gets 413.*
 
 - [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
-      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
+      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes 19 checks in 1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
 ### 10.2 Query
 
@@ -2125,3 +2125,5 @@ A rebuild from these documents is correct when:
 
 - [x] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
       *Registered `14_reindex.sh`: 24 runtime cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling cases and 44 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*
+
+Overlap retains internal whitespace-only windows to preserve exact character coverage and overlap; wholly blank input yields no chunks. Hard character boundaries and fixed per-file limits remain the existing contract, rather than changing retrieval behavior in this follow-up.
