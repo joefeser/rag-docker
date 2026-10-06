@@ -417,3 +417,5 @@ failed loads, A→B→A selection, stale save completions, pending saves across
 selection changes, and duplicate-save prevention. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
+
+Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in the API container with its pinned dependencies.
