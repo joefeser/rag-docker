@@ -9227,7 +9227,7 @@ export default function ImportPage() {
 ### ui/src/pages/ChunkingPage.tsx
 
 ```typescript
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api, CollectionInfo, IngestConfig } from '../api/client'
 import StrategyExplainer from '../components/StrategyExplainer'
 import { useRole } from '../context/RoleContext'
@@ -9242,35 +9242,82 @@ export default function ChunkingPage() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
 
+  const [pendingCollections, setPendingCollections] = useState<string[]>([])
+  const saving = pendingCollections.includes(collection)
+  const generation = useRef(0)
+  const loadedGeneration = useRef(-1)
+  const saveTicket = useRef(0)
+  const selected = useRef('')
+  const pendingSaves = useRef(new Set<string>())
+
+  function selectCollection(name: string) {
+    if (name === selected.current) return
+    selected.current = name
+    generation.current++
+    setCollection(name)
+    setConfig(null)
+    setSaved(false)
+    setError('')
+  }
+
   useEffect(() => {
+    let cancelled = false
     api.getCollections().then(r => {
+      if (cancelled) return
       setCollections(r.collections)
-      if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+      if (r.collections.length > 0) selectCollection(r.collections[0].name)
+    }).catch(e => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)) })
+    return () => { cancelled = true; generation.current++ }
   }, [])
 
   useEffect(() => {
-    if (!collection) return
-    api.getIngestConfig(collection).then(setConfig).catch(() => {})
-  }, [collection])
+    if (!collection || saving || loadedGeneration.current === generation.current) return
+    const version = generation.current
+    let cancelled = false
+    api.getIngestConfig(collection).then(value => {
+      if (!cancelled && version === generation.current) {
+        if (value.collection !== collection) throw new Error('The returned configuration belongs to another collection.')
+        loadedGeneration.current = version
+        setConfig(value)
+      }
+    }).catch(e => {
+      if (!cancelled && version === generation.current) setError(e instanceof Error ? e.message : String(e))
+    })
+    return () => { cancelled = true }
+  }, [collection, saving])
 
   async function save() {
-    if (!config) return
+    if (!config || config.collection !== selected.current || pendingSaves.current.has(config.collection)) return
+    const version = generation.current
+    const ticket = ++saveTicket.current
+    const target = config.collection
+    pendingSaves.current.add(target)
+    setPendingCollections([...pendingSaves.current])
+    setSaved(false)
     setError('')
     try {
-      await api.saveIngestConfig({
-        collection,
+      const value = await api.saveIngestConfig({
+        collection: config.collection,
         chunking_strategy: config.chunking_strategy,
         chunk_size: config.chunk_size,
         chunk_overlap: config.chunk_overlap,
         similarity_threshold: config.similarity_threshold,
         min_chunk_size: config.min_chunk_size,
       })
+      if (version !== generation.current || ticket !== saveTicket.current) return
+      if (value.collection !== selected.current) throw new Error('The returned configuration belongs to another collection.')
+      setConfig(value)
       setSaved(true)
-      setTimeout(() => setSaved(false), 3000)
-      api.getIngestConfig(collection).then(setConfig)
+      setTimeout(() => {
+        if (version === generation.current && ticket === saveTicket.current) setSaved(false)
+      }, 3000)
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (version === generation.current && ticket === saveTicket.current) setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      // A pending write belongs to its collection even after A → B → A.
+      // Returning to that collection waits, then reloads the committed value.
+      pendingSaves.current.delete(target)
+      setPendingCollections([...pendingSaves.current])
     }
   }
 
@@ -9282,12 +9329,14 @@ export default function ChunkingPage() {
       <h1 className="text-2xl font-bold mb-6">Chunking Configuration</h1>
       <div className="mb-4">
         <label className="block text-sm font-medium mb-1">Collection</label>
-        <select value={collection} onChange={e => setCollection(e.target.value)} className="border rounded px-3 py-2 text-sm w-full">
+        <select value={collection} onChange={e => selectCollection(e.target.value)} className="border rounded px-3 py-2 text-sm w-full">
           {collections.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
         </select>
       </div>
-      {config && (
-        <>
+      {collection && !config && !error && <p className="text-sm text-gray-600">Loading saved settings…</p>}
+      {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
+      {config && config.collection === collection && (
+        <fieldset disabled={saving}>
           {config.is_default && <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-4">Using system defaults. Save to set a custom configuration for this collection.</p>}
           <div className="mb-4">
             <label className="block text-sm font-medium mb-1">Strategy</label>
@@ -9318,10 +9367,9 @@ export default function ChunkingPage() {
               </div>
             )}
           </div>
-          <button onClick={save} className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700">Save as Default</button>
+          <button onClick={save} className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700">{saving ? 'Saving…' : 'Save as Default'}</button>
           {saved && <span className="ml-3 text-green-600 text-sm">Saved!</span>}
-          {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
-        </>
+        </fieldset>
       )}
     </div>
   )
@@ -10835,6 +10883,15 @@ The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
 isolated fixture run does not replace the full verification suite (`stack.sh run`).
+
+## Deferred Chunking configuration checks
+
+`browser/chunking_config.js`, registered in `06_ui.sh` through `ui_criteria.js`,
+uses the rendered page with deferred API responses. Six cases cover late loads,
+failed loads, A→B→A selection, stale save completions, pending saves across
+selection changes, and duplicate-save prevention. Each affected save checks
+its actual collection and chunk-size payload. These fixtures make no backend
+writes and complement the live settings suite.
 ````
 
 ### scripts/verify/all.sh
@@ -14887,6 +14944,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 (async () => {
   const browser = await launch();
   const r = makeReporter();
+  await require('./chunking_config').runChunkingConfigTests(browser, BASE, r);
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
@@ -18784,6 +18842,140 @@ def run(api, collection, package):
 
 if __name__ == '__main__':
     run(*sys.argv[1:])
+```
+
+### scripts/verify/browser/chunking_config.js
+
+```javascript
+// Deferred API responses against the rendered Chunking page; no backend writes.
+const assert = require('node:assert/strict');
+const { makeReporter, clickByText, setValue } = require('./lib');
+const A = { collection: 'FixtureA', chunking_strategy: 'fixed', chunk_size: 100, chunk_overlap: 0, min_chunk_size: 0, similarity_threshold: null, is_default: false };
+const B = { ...A, collection: 'FixtureB', chunk_size: 2000 };
+const path = name => '/api/ingest/config/' + name;
+async function fixture(browser, base) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.evaluateOnNewDocument((a, b) => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realFetch = window.fetch.bind(window);
+    window.chunkingFixture = { requests: [] };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      if (path === '/api/collections') return Promise.resolve(new Response(JSON.stringify({ collections: [a, b].map(c => ({ name: c.collection, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) }), { status: 200 }));
+      if (path.startsWith('/api/ingest/config')) {
+        const entry = { path, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null, done: false };
+        window.chunkingFixture.requests.push(entry);
+        return new Promise(resolve => { entry.resolve = (value, status) => { entry.done = true; resolve(new Response(JSON.stringify(value), { status })); }; });
+      }
+      return Promise.reject(new Error('Unexpected fixture request ' + path));
+    };
+  }, A, B);
+  await page.goto(base + '/chunking', { waitUntil: 'domcontentloaded' });
+  await pending(page, path(A.collection));
+  return { ctx, page, errors };
+}
+async function pending(page, url, method = 'GET', count = 1) {
+  await page.waitForFunction((p, m, n) => window.chunkingFixture.requests.filter(r => r.path === p && r.method === m && !r.done).length >= n, {}, url, method, count);
+}
+async function release(page, url, value, { method = 'GET', status = 200, last = false } = {}) {
+  await pending(page, url, method);
+  await page.evaluate(async (p, m, v, s, latest) => {
+    const entries = window.chunkingFixture.requests.filter(r => r.path === p && r.method === m && !r.done);
+    (latest ? entries.at(-1) : entries[0]).resolve(v, s);
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }, url, method, value, status, last);
+}
+async function select(page, name) { await page.select('select', name); await pending(page, path(name)); }
+async function assertConfig(page, config) {
+  assert.deepEqual(await page.evaluate(() => ({ collection: document.querySelector('select').value, size: Number(document.querySelector('input[type=range]')?.value) })), { collection: config.collection, size: config.chunk_size });
+}
+async function startSave(page) { assert.equal(await clickByText(page, 'Save as Default'), true); await pending(page, '/api/ingest/config', 'POST'); }
+async function runChunkingConfigTests(browser, base, reporter) {
+  reporter.section('collection-bound Chunking settings (deferred API fixtures)');
+  const cases = [
+    ['late A load cannot overwrite B display or B save payload', async page => {
+      await select(page, B.collection);
+      await release(page, path(B.collection), B);
+      await release(page, path(A.collection), A);
+      await assertConfig(page, B);
+      await startSave(page);
+      const body = await page.evaluate(() => window.chunkingFixture.requests.find(r => r.method === 'POST').body);
+      assert.equal(body.collection, B.collection); assert.equal(body.chunk_size, B.chunk_size);
+    }],
+    ['save is unavailable during a new load and after that load fails', async page => {
+      await release(page, path(A.collection), A);
+      await select(page, B.collection);
+      const enabled = () => [...document.querySelectorAll('button')].some(b => b.textContent === 'Save as Default' && !b.matches(':disabled'));
+      assert.equal(await page.evaluate(enabled), false);
+      await release(page, path(B.collection), { error: { message: 'Owned B load failed' } }, { status: 500 });
+      assert.equal(await page.evaluate(enabled), false);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Owned B load failed')), true);
+    }],
+    ['A to B to A keeps the newest A load', async page => {
+      await select(page, B.collection); await select(page, A.collection);
+      const current = { ...A, chunk_size: 500 };
+      await release(page, path(A.collection), current, { last: true });
+      await release(page, path(B.collection), B);
+      await release(page, path(A.collection), A);
+      await assertConfig(page, current);
+    }],
+    ['an old save cannot refresh or mark the newly selected collection saved', async page => {
+      await release(page, path(A.collection), A); await startSave(page);
+      await select(page, B.collection); await release(page, path(B.collection), B);
+      await release(page, '/api/ingest/config', A, { method: 'POST', status: 201 });
+      // Baseline performs an unguarded reload after saving; release it too.
+      if (await page.evaluate(p => window.chunkingFixture.requests.some(r => r.path === p && !r.done), path(A.collection))) await release(page, path(A.collection), A);
+      await assertConfig(page, B);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+    }],
+    ['returning to A waits for its outstanding save before allowing another write', async page => {
+      await release(page, path(A.collection), A); await startSave(page);
+      await select(page, B.collection); await release(page, path(B.collection), B);
+      await page.select('select', A.collection);
+      await page.waitForFunction(() => document.querySelector('select').value === 'FixtureA');
+      assert.equal(await page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent === 'Save as Default' && !b.matches(':disabled'))), false);
+      assert.equal(await page.evaluate(() => window.chunkingFixture.requests.filter(r => r.method === 'POST').length), 1);
+      await release(page, '/api/ingest/config', A, { method: 'POST', status: 201 });
+      await release(page, path(A.collection), A);
+      await assertConfig(page, A);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '500');
+      await startSave(page);
+      const bodies = await page.evaluate(() => window.chunkingFixture.requests.filter(r => r.method === 'POST').map(r => r.body));
+      assert.deepEqual(bodies.map(b => [b.collection, b.chunk_size]), [[A.collection, 100], [A.collection, 500]]);
+      const updated = { ...A, chunk_size: 500 };
+      await release(page, '/api/ingest/config', updated, { method: 'POST', status: 201 });
+      await assertConfig(page, updated);
+    }],
+    ['duplicate saves are prevented and failed writes preserve the edited draft', async page => {
+      await release(page, path(A.collection), A);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '500');
+      await page.evaluate(() => { const b = [...document.querySelectorAll('button')].find(b => b.textContent === 'Save as Default'); b.click(); b.click(); });
+      await pending(page, '/api/ingest/config', 'POST');
+      assert.equal(await page.evaluate(() => window.chunkingFixture.requests.filter(r => r.method === 'POST').length), 1);
+      await release(page, '/api/ingest/config', { error: { message: 'Owned save failed' } }, { method: 'POST', status: 500 });
+      await assertConfig(page, { ...A, chunk_size: 500 });
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Owned save failed')), true);
+    }],
+  ];
+  for (const [name, test] of cases) {
+    let s;
+    try { s = await fixture(browser, base); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    catch (e) { reporter.check(name, false, e.stack || e.message); }
+    finally { if (s) await s.ctx.close(); }
+  }
+}
+module.exports = { runChunkingConfigTests };
+if (require.main === module) (async () => {
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runChunkingConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
 ```
 
 ### scripts/verify/legacy_retrieval.py

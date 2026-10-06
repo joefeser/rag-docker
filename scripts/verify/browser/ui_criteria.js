@@ -13,6 +13,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 (async () => {
   const browser = await launch();
   const r = makeReporter();
+  await require('./chunking_config').runChunkingConfigTests(browser, BASE, r);
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
