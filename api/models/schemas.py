@@ -183,6 +183,8 @@ class ExportJobStatusResponse(BaseModel):
     warnings: list[str]
     error: Optional[str]
 
+    error_code: Optional[str] = None
+    error_detail: Optional[dict] = None
 
 class ImportRequest(BaseModel):
     filename: str

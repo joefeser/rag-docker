@@ -860,6 +860,8 @@ class ExportJobStatusResponse(BaseModel):
     warnings: list[str]
     error: Optional[str]
 
+    error_code: Optional[str] = None
+    error_detail: Optional[dict] = None
 
 class ImportRequest(BaseModel):
     filename: str
@@ -2017,6 +2019,57 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     record.update(updated)
 
 
+def cutover_description(record: dict) -> str:
+    return "rag-tune:" + record["operation_id"]
+
+
+def begin_cutover(record: dict) -> None:
+    """Persist final-write intent before deleting a tuning target."""
+    updated = {**record, "cutover_pending": True}
+    _write(updated)
+    record.update(updated)
+
+
+def _finish_cutover_check(record: dict, outcome: str) -> None:
+    """Retire only the check; recovery data remains available for inspection."""
+    updated = {**record, "cutover_pending": False, "cutover_checked": outcome}
+    _write(updated)
+    record.update(updated)
+
+
+def _check_tuning_cutover(record: dict, client) -> None:
+    """Check the owned target without deleting data based on mutable recovery."""
+    from services import batch_write, goldstandard
+    target, staging = record["target"], record["staging"]
+    if not client.collections.exists(staging):
+        log.warning("Tuning recovery %r is unavailable; target and journal preserved", staging)
+        return
+    if client.collections.exists(target):
+        collection = client.collections.get(target)
+        if collection.config.get().description != cutover_description(record):
+            log.warning("Tuning target %r has another instance; preserved", target)
+            _finish_cutover_check(record, "other-instance")
+            return
+        def expected():
+            for obj in client.collections.get(staging).iterator(include_vector=True):
+                vector = obj.vector
+                if isinstance(vector, dict):
+                    if set(vector) != {"default"}:
+                        raise ValueError("Unsupported recovery vectors")
+                    vector = vector["default"]
+                yield {"id": str(obj.uuid), "properties": dict(obj.properties or {}), "vector": vector}
+        try:
+            batch_write.verify(collection, expected, exact=True)
+            _finish_cutover_check(record, "complete")
+            return  # Fully written target: no historical flag or deletion.
+        except batch_write.BatchVerificationError:
+            goldstandard.mark_stale(target, "interrupted tuning final write; verified recovery retained")
+            log.warning("Incomplete owned tuning target %r; target and recovery %r preserved for inspection", target, staging)
+    else:
+        goldstandard.mark_stale(target, "interrupted tuning cutover; verified recovery retained")
+    _finish_cutover_check(record, "stale")
+
+
 def sidecar_reference(record: dict) -> str:
     """The snapshot directory relative to UPLOAD_DIR, for job error details.
 
@@ -2065,7 +2118,9 @@ def _read_owned_record(path: Path) -> dict:
             or not re.fullmatch(r"[0-9a-f]{32}", token)
             or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
             or record["staging"] != f"{record['target']}{marker}{token}"
-            or record["state"] not in ("scratch", "recovery", "cleanup")):
+            or record["state"] not in ("scratch", "recovery", "cleanup")
+            or ("cutover_pending" in record and (type(record["cutover_pending"]) is not bool
+                                                  or operation != "tune"))):
         raise ValueError("Invalid collection ownership record")
     return record
 
@@ -2092,6 +2147,8 @@ def sweep(client) -> list[str]:
         try:
             record = _read_owned_record(path)
             if record["state"] == "recovery":
+                if record.get("cutover_pending"):
+                    _check_tuning_cutover(record, client)
                 log.warning("Retained recovery collection %r; sidecar snapshots: %s",
                             record["staging"], _root() / record["operation_id"])
                 continue
@@ -3352,6 +3409,7 @@ from config import settings
 from models.schemas import SessionResponse
 from services import ollama_client as ollama
 from services import weaviate_client as wc
+from services.collection_writes import aliases
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -3922,7 +3980,6 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
 
 def mark_stale(collection: str, reason: str) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
-    from services.collection_writes import aliases
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
     return sum(_flag_sessions(alias, "stale", reason) for alias in aliases(collection))
@@ -4970,6 +5027,10 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
 
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
+    except packager.PackageError as exc:
+        _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
+        job.update(status="failed", error=f"PackageError: {exc.message}",
+                   error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
         _log.exception("Export of %r failed", collection)
         job["status"] = "failed"
@@ -5019,6 +5080,8 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         "retrieve_script": None,
         "warnings": [],
         "error": None,
+        "error_code": None,
+        "error_detail": None,
     }
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
@@ -6421,9 +6484,11 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             collection_recovery.retain(ownership)
         if before_replace:
             before_replace()
+        collection_recovery.begin_cutover(ownership)
         cutover_started = True
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True,
+                                   description=collection_recovery.cutover_description(ownership))
         if records is not None:
             _write_records(collection, records)
             written = len(records)
@@ -7595,7 +7660,7 @@ it contains.
 ````markdown
 ```
 manifest.json           what this package is; authoritative
-collection.json         schema, index type, distance metric, HNSW parameters
+collection.json         schema, stored embedding_model, index type, distance metric, HNSW parameters
 chunks.jsonl            one JSON object per chunk, with its vector
 ingest_config.json      chunking settings, if the collection had any saved
 retrieval_config.json   the retrieval settings the collection was tuned with
@@ -10839,7 +10904,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E29; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -11614,10 +11679,17 @@ case "$CMD" in
     # Its stdin is /dev/null: a background job keeps the terminal otherwise,
     # and run from one, its first read (docker compose exec -T) would be
     # stopped by SIGTTIN and the run would hang.
+    # Record signals until the new process group has a registered owner.
+    SPAWN_SIGNAL=0
+    trap 'SPAWN_SIGNAL=130' INT
+    trap 'SPAWN_SIGNAL=143' TERM
     set -m
-    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} </dev/null &
+    (trap '' TTOU; exec bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"}) </dev/null &
     SUITE=$!
     set +m
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ "$SPAWN_SIGNAL" -eq 0 ] || exit "$SPAWN_SIGNAL"
     wait "$SUITE" || rc=$?
     exit "$rc" ;;
 esac
@@ -11919,6 +11991,8 @@ _rag_lock_owner_ok() {
   [ ! -L "$lock" ] || return 1
   owner=$(cat "$lock/pid" 2>/dev/null) || return 1
   case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  # PID 1 is every orphan’s ancestor; it cannot authorize this run.
+  [ "${#owner}" -le 10 ] && [ "$owner" -gt 1 ] || return 1
   pid=$$
   while [ "$steps" -lt 64 ]; do
     [ "$pid" = "$owner" ] && return 0
@@ -12799,11 +12873,18 @@ ingest() {
   local collection="$1" strategy="$2" size="$3" minsize="$4"; shift 4
   local args=() f
   for f in "$@"; do args+=(-F "files=@$f"); done
-  curl -s -m 600 -X POST "$API/ingest/upload" \
+  local http_status curl_status
+  http_status=$(curl -s -m 600 -o /tmp/vfy_job.json -w '%{http_code}' -X POST "$API/ingest/upload" \
     -F "collection=$collection" -F "strategy=$strategy" -F "chunk_size=$size" \
-    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}" > /tmp/vfy_job.json
+    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}")
+  curl_status=$?
   local job; job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['job_id'])" 2>/dev/null)
-  [ -n "$job" ] || { printf '{}' > /tmp/vfy_job.json; return 1; }
+  if [ "$curl_status" -ne 0 ] || [[ "$http_status" != 2?? ]] || [ -z "$job" ]; then
+    printf 'Upload failed: curl exit=%s HTTP=%s; response body follows:\n' "$curl_status" "$http_status" >&2
+    cat /tmp/vfy_job.json >&2
+    printf '\n' >&2
+    return 1
+  fi
   wait_for_job "/ingest/job/$job" 900 >/dev/null
   api_get "/ingest/job/$job" > /tmp/vfy_job.json
 }
@@ -13317,7 +13398,7 @@ for body in \
   '{"collection":"MissingSamplingFixture","sample_size":Infinity}'
 do
   code=$(api_post_code /goldstandard/generate "$body")
-  check_eq "invalid sampling request rejected with422: $body" "$code" "422"
+  check_eq "invalid sampling request rejected with 422: $body" "$code" "422"
 done
 summary
 ```
@@ -13583,7 +13664,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E29)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E30)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -13618,6 +13699,9 @@ wait_for_job "/ingest/job/$job" 900 >/dev/null
 chunks_before=$(api_get "/collections" | python3 -c "
 import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
 
+# Saved ingest settings (the upload's own values) so the package carries
+# ingest_config.json and import restores it through settings_store (#189).
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
 # Retrieval settings must exist for the package to carry retrieve.py.
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
 
@@ -13635,6 +13719,71 @@ check_eq "a tuned collection ships retrieve.py" "$script" "True"
 
 python3 ./validate_package.py "$EXPORTS/$PKG" > /tmp/vfy_val.txt 2>&1
 check "package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_val.txt | head -1)"
+
+# ── E30: vectors are attributed to the collection's stored model (#196) ──────
+EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')
+python3 - "$EXPORTS/$PKG" "$EMBED_MODEL" > /tmp/vfy_e30_match.txt 2>&1 <<'ENDPY'
+import json, sys, tarfile
+pkg, model = sys.argv[1], sys.argv[2]
+with tarfile.open(pkg) as t:
+    def read(name):
+        m = next(x for x in t.getmembers() if x.isfile() and x.name.rsplit("/", 1)[-1] == name)
+        return json.load(t.extractfile(m))
+    coll, man = read("collection.json"), read("manifest.json")
+print(f"collection.json={coll.get('embedding_model')!r} manifest={man['embedding']['model']!r} configured={model!r}")
+sys.exit(0 if model and coll.get("embedding_model") == model == man["embedding"]["model"] else 1)
+ENDPY
+check "E30: a matching collection records its stored model in collection.json and the manifest" $? "$(tail -1 /tmp/vfy_e30_match.txt)"
+
+# Collections the API would never create: an equal-width vector from another
+# model's name, a named-vector schema, and no vectorizer. Each export must fail
+# with the re-embedding remedy and leave nothing in the exports folder.
+E30_DRIFT="${PREFIX}E30Drift"; E30_NAMED="${PREFIX}E30Named"; E30_NONE="${PREFIX}E30None"
+e30_collections() {   # create | drop
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" "$C" "$E30_DRIFT" "$E30_NAMED" "$E30_NONE") <<'ENDPY'
+import sys
+from weaviate.classes.config import Configure, DataType, Property
+from config import settings
+from services import weaviate_client as wc
+action, source, drift, named, none = sys.argv[1:6]
+client = wc.get_client()
+for n in (drift, named, none):
+    if client.collections.exists(n):
+        client.collections.delete(n)
+if action == "drop":
+    sys.exit(0)
+endpoint = f"http://{settings.ollama_host}:{settings.ollama_port}"
+props = [Property(name="text", data_type=DataType.TEXT)]
+# Same width as the configured model's vectors: provenance can't come from dimensions.
+width = len(next(client.collections.get(source).iterator(include_vector=True)).vector["default"])
+client.collections.create(drift, properties=props, vectorizer_config=Configure.Vectorizer.text2vec_ollama(
+    api_endpoint=endpoint, model=settings.embed_model + "-e30-other", vectorize_collection_name=False))
+client.collections.get(drift).data.insert({"text": "e30 drift"}, vector=[0.01] * width)
+vectors = getattr(Configure, "Vectors", None)
+named_cfg = (vectors.text2vec_ollama(name="default", api_endpoint=endpoint, model=settings.embed_model)
+             if vectors else Configure.NamedVectors.text2vec_ollama(name="default", api_endpoint=endpoint, model=settings.embed_model))
+client.collections.create(named, properties=props, vector_config=[named_cfg])
+client.collections.create(none, properties=props, vectorizer_config=Configure.Vectorizer.none())
+print(f"created {drift} (width {width}), {named}, {none}")
+ENDPY
+}
+e30_collections create > /tmp/vfy_e30_setup.txt 2>&1
+check "E30: mismatch fixtures created on the verify project" $? "$(tail -1 /tmp/vfy_e30_setup.txt)"
+for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
+  before=$(ls -A "$EXPORTS" | sort)
+  api_post "/export" "{\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
+  e30job=$(jfield "['job_id']" < /tmp/vfy_e30_exp.json)
+  e30status=$(wait_for_job "/export/job/$e30job" 600)
+  e30err=$(api_get "/export/job/$e30job" | jfield "['error']")
+  [ "$e30status" = "failed" ] && [[ "$e30err" == PackageError:*Re-embed* ]]
+  check "E30: export of $e30c refuses with the re-embedding remedy" $? "status '$e30status', error '$e30err'"
+  check_eq "E30: refusal exposes EMBEDDING_MISMATCH" "$(api_get "/export/job/$e30job" | jfield "['error_code']")" "EMBEDDING_MISMATCH"
+  after=$(ls -A "$EXPORTS" | sort)
+  [ "$before" = "$after" ]
+  check "E30: ... and leaves nothing in the exports folder ($e30c)" $? "$(diff <(echo "$before") <(echo "$after") | tail -3)"
+done
+e30_collections drop >/dev/null 2>&1
+check "E30: mismatch fixtures removed" $?
 
 # ── corruption is detected ───────────────────────────────────────────────────
 python3 - "$EXPORTS/$PKG" <<'ENDPY'
@@ -14125,6 +14274,12 @@ config=json.load(sys.stdin)
 expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
 sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
 check "renamed import preserves every saved retrieval setting" $?
+api_get "/ingest/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"collection":sys.argv[1],"chunking_strategy":"fixed","chunk_size":150,"min_chunk_size":40}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)' "$iname"
+check "renamed import restores the package's saved ingest settings (#189)" $?
 
 # A successful destructive replace must be exercised as well as abort/rename.
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
@@ -14491,6 +14646,40 @@ def prepare(prefix, state_path):
         else:
             raise AssertionError('tuning final-create fault reported success')
 
+    # Reviewer cases (PR #247): a hard stop during the final tuning write,
+    # once after a partial write and once after a complete one. KeyboardInterrupt
+    # bypasses the job's own exception handling, as an abrupt exit would.
+    state['killed'] = []
+    real_insert = batch_write.insert
+    for suffix, complete in (('TuneKillPartial', False), ('TuneKillDone', True)):
+        name = collection(suffix)
+        sources.store(name, 'synthetic.txt', b'synthetic retained source')
+        session = goldstandard._store_generated_session({
+            'session_id': 'gs_00000000', 'collection': name, 'status': 'completed',
+            'pairs_total': 0, 'pairs_completed': 0, 'pairs': []})
+        def interrupted(target, records, *args, _name=name, _complete=complete, **kwargs):
+            if getattr(target, 'name', None) != _name:
+                return real_insert(target, records, *args, **kwargs)
+            written = list(records() if callable(records) else records)
+            kwargs.pop('expected_count', None)
+            real_insert(target, written if _complete else written[:1], *args, **kwargs)
+            raise KeyboardInterrupt('controlled hard stop during the final tuning write')
+        with patch.object(batch_write, 'insert', side_effect=interrupted):
+            try:
+                tuning._rebuild(name, [row['properties'] for row in rows], None, None, None)
+            except KeyboardInterrupt:
+                pass
+            else:
+                raise AssertionError('interrupted tuning final write reported success')
+        record = next(json.loads(p.read_text()) for p in recovery._root().glob('*.json')
+                      if json.loads(p.read_text()).get('target') == name)
+        expected = list(packager.read_chunks(record['staging']))
+        require(len(expected) == 2, 'interrupted tuning retains every verified record: ' + suffix)
+        state['recoveries'].append({'record': record, 'rows': expected})
+        state['killed'].append({'name': name, 'staging': record['staging'], 'complete': complete,
+                                'sessions': [session['session_id']]})
+        save()
+
     import_name = collection('Import')
     package = Path(settings.upload_dir) / (prefix + '-package')
     package.mkdir()
@@ -14558,6 +14747,33 @@ def check(state):
             'startup finishes interrupted recovery journal cleanup')
     require(not (recovery._root() / cleanup_record['operation_id']).exists(),
             'startup removes remaining cleanup metadata')
+    for entry in state.get('killed', []):
+        name = entry['name']
+        require(client.collections.exists(name) and client.collections.exists(entry['staging']),
+                'interrupted tuning keeps target and recovery after restart: ' + name)
+        session = json.loads(goldstandard._session_path(entry['sessions'][0]).read_text())
+        if entry['complete']:
+            require(not session.get('stale'), 'a fully written tuning target keeps its sessions current: ' + name)
+        else:
+            require(session.get('stale') is True and 'interrupted tuning' in (session.get('stale_reason') or ''),
+                    'startup marks the sessions of a partially written tuning target stale: ' + name)
+        record = json.loads((recovery._root() / (entry['staging'].rsplit('__tuning_', 1)[1] + '.json')).read_text())
+        require(record['state'] == 'recovery' and record.get('cutover_pending') is False
+                and record.get('cutover_checked') == ('complete' if entry['complete'] else 'stale'),
+                'interrupted tuning durably retires its startup check: ' + name)
+        require(client.collections.get(name).config.get().description == 'rag-tune:' + record['operation_id'],
+                'the replacement target carries the operation instance token: ' + name)
+    partial = next((e for e in state.get('killed', []) if not e['complete']), None)
+    if partial:
+        fresh = goldstandard._store_generated_session({
+            'session_id': 'gs_00000000', 'collection': partial['name'], 'status': 'completed',
+            'pairs_total': 0, 'pairs_completed': 0, 'pairs': []})
+        partial['sessions'].append(fresh['session_id'])
+        Path(settings.upload_dir, state['prefix'] + '-acceptance.json').write_text(json.dumps(state, indent=2))
+        recovery.sweep(client)  # the next startup's check, run in this process
+        later = json.loads(goldstandard._session_path(fresh['session_id']).read_text())
+        require(not later.get('stale'),
+                'a later startup does not re-flag a session created after the interruption was reported')
 
 
 def cleanup(state, state_path):
@@ -14571,6 +14787,9 @@ def cleanup(state, state_path):
             sources.delete(name)
             wc.ingest_config.delete(name)
             wc.retrieval_config.delete(name)
+    for entry in state.get('killed', []):
+        for sid in entry['sessions']:
+            goldstandard._session_path(sid).unlink(missing_ok=True)
     for archive in state['archives']:
         Path(archive).unlink(missing_ok=True)
     import shutil
@@ -14760,21 +14979,79 @@ with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.ob
         assert refused.status_code==409 and refused.json()['error']['code']=='HISTORICAL_SESSION',refused.text
         print('PASS actual failed reindex cutover marks retained history and blocks default export',flush=True)
         creation_attempted=False
+        # #191: the real tuning job path marks sessions retained under either
+        # first-character backend alias, with supplied vectors and no model call.
+        # A collection of its own, so only this block's sessions share its spellings.
+        aliased=collection+'Alias'
+        alias=aliased[:1].lower()+aliased[1:]
+        distinct=aliased[:1]+aliased[1:2].swapcase()+aliased[2:]
+        alias_ids=[];alias_names={}
+        def store_alias_sessions():
+            ids={name:'gs_'+uuid.uuid4().hex[:8] for name in (aliased,alias,distinct)}
+            for name,sid in ids.items():
+                gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':copy.deepcopy(pairs)})
+                assert not client.get('/goldstandard/session/'+sid).json()['stale']
+            alias_ids.extend(ids.values());alias_names.update({sid:name for name,sid in ids.items()})
+            return ids
+        def tune(caller,operation,params):
+            job_id='alias'+uuid.uuid4().hex[:8]
+            tuning._jobs[job_id]={'job_id':job_id,'status':'queued','notes':[]}
+            try:
+                with patch.object(wc,'_insert_chunks_sync',side_effect=insert_supplied):
+                    tuning._run(job_id,caller,operation,params,source_collection=caller)
+                return tuning._jobs[job_id]
+            finally:
+                tuning._jobs.pop(job_id,None)
+        response=client.post('/collections',json={'name':aliased})
+        assert response.status_code==201,response.text
+        alias_created=True
+        insert_supplied(aliased,[{'content':'Owned inert chunk','source_file':'inert.txt','chunk_index':0}])
+        ids=store_alias_sessions()
+        job=tune(alias,'reindex',{'index_type':None,'distance_metric':None})
+        assert job['status']=='completed',job
+        for sid in ids.values():
+            assert not client.get('/goldstandard/session/'+sid).json()['stale']
+        print('PASS identity-preserving reindex through an alias leaves every session current',flush=True)
+        for caller in (alias,aliased):
+            ids=store_alias_sessions()
+            job=tune(caller,'reembed',{'chunking':None})
+            assert job['status']=='completed',job
+            expected=sum(name in (aliased,alias) for name in alias_names.values())  # either spelling, every retained one
+            assert any(f'{expected} gold-standard session(s) marked stale' in note for note in job['notes']),(caller,expected,job['notes'])
+            gs._sessions={};gs.load_sessions_from_disk()   # flags must come from disk
+            for name in (aliased,alias):
+                current=client.get('/goldstandard/session/'+ids[name]).json()
+                assert current['stale'] and current['stale_at'] and 're-embedded' in current['stale_reason'],(caller,name,current)
+                assert current['collection']==name,(caller,name,current['collection'])
+                refused=client.post('/goldstandard/save',json={'session_id':ids[name]})
+                assert refused.status_code==409 and refused.json()['error']['code']=='HISTORICAL_SESSION',refused.text
+                allowed=client.post('/goldstandard/save',json={'session_id':ids[name],'allow_historical':True})
+                assert allowed.status_code==200 and allowed.json()['historical'],allowed.text
+            unrelated=client.get('/goldstandard/session/'+ids[distinct]).json()
+            assert not unrelated['stale'] and unrelated['collection']==distinct,unrelated
+        print('PASS real re-embed through either spelling marks both alias sessions on disk, keeps provenance and a case-distinct name',flush=True)
+        response=client.delete('/collections/'+aliased+'?confirm=true')
+        assert response.status_code==200,response.text
+        alias_created=False
 
     finally:
+        if globals().get('alias_created') and wc._collection_exists_sync(aliased):
+            response=client.delete('/collections/'+aliased+'?confirm=true')
+            assert response.status_code==200,response.text
         if creation_attempted and wc._collection_exists_sync(collection):
             response=client.delete('/collections/'+collection+'?confirm=true')
             assert response.status_code==200,response.text
         # Recovery-enabled source combinations may retain a verified stage.
         # Only this helper's unique collection prefix authorizes its cleanup.
         for name in wc.get_client().collections.list_all(simple=True):
-            if name.startswith(collection+'__'):
+            if name.startswith(collection+'__') or name.startswith(collection+'Alias__'):
                 wc.get_client().collections.delete(name)
         gs._sessions.pop(session_id,None)
         if 'empty_id' in locals():gs._sessions.pop(empty_id,None)
         if 'fault_id' in locals():gs._sessions.pop(fault_id,None)
+        for alias_id in locals().get('alias_ids',[]):gs._sessions.pop(alias_id,None)
         wc.close_client()
-assert not wc._collection_exists_sync(collection)
+assert not wc._collection_exists_sync(collection) and not wc._collection_exists_sync(collection+'Alias')
 wc.close_client()
 print('PASS owned collection/session/files removed',flush=True)
 ```
@@ -16555,6 +16832,46 @@ print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_dia
             self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Changed')
         bad=gs._sessions_dir()/'gs_450bad00.json';bad.write_text('{')
         self.assertEqual(len(gs.session_diagnostics()),1);bad.unlink();self.assertEqual(gs.session_diagnostics(),[])
+
+    # Reviewer additions for #127.
+    def test_session_and_pending_marker_files_are_owner_only(self):
+        self.assertEqual(gs._session_path(self.data['session_id']).stat().st_mode&0o777,0o600)
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertEqual(self.pending().stat().st_mode&0o777,0o600)
+
+    def test_pending_marker_after_restart_is_saved_by_next_write(self):
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        state=self.restart();self.assertTrue(state['orphaned']);self.assertTrue(self.pending().is_file())
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}))
+        stored=json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertTrue(stored['orphaned']);self.assertEqual(stored['orphaned_reason'],'Owned completed deletion')
+        self.assertFalse(self.pending().exists());self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_symlinked_pending_storage_is_refused_and_guard_holds(self):
+        outside=Path(self.tmp.name)/'outside';outside.mkdir()
+        self.pending().parent.symlink_to(outside,target_is_directory=True)
+        with self.fail_session_file_replace():
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        self.assertEqual(list(outside.iterdir()),[])
+        with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.save_session(self.data['session_id'],'owned.json'))
+        self.assertEqual(error.exception.code,'HISTORICAL_SESSION')
+        issues={i['filename']:i for i in gs.session_diagnostics()}
+        self.assertIn('until restart',issues['gs_450abcde.json']['message'])
+        self.assertEqual(issues['pending_markers']['code'],'SESSION_READ_FAILED')
+
+    def test_pending_marker_without_session_file_is_ignored(self):
+        self.pending().parent.mkdir()
+        (self.pending().parent/'gs_450dead0.json').write_text(json.dumps({'session_id':'gs_450dead0','orphaned':True,'orphaned_reason':'Owned','orphaned_at':None}))
+        self.restart();self.assertIsNone(gs.get_session('gs_450dead0'));self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_durability_uncertain_marker_keeps_its_own_wording(self):
+        with patch.object(gs,'_sync_directory',side_effect=OSError('Owned directory sync fault')):
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertTrue(json.loads(gs._session_path(self.data['session_id']).read_text())['orphaned'])
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_DURABILITY_UNCERTAIN')
+        self.assertNotIn('pending marker',issue['message'])
 
 if __name__ == '__main__':
     unittest.main()
@@ -18830,6 +19147,27 @@ IMPORT_NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was 
 
 
 class RetrievalImportTests(unittest.TestCase):
+    def test_export_job_preserves_package_refusal_through_response_schema(self):
+        from services import exporter
+        from models.schemas import ExportJobStatusResponse
+        job = dict(job_id='owned', collection='Owned', status='queued', chunks_written=0,
+                   filename=None, size_bytes=None, source_document_count=None,
+                   fidelity=None, models_bundled=None, retrieve_script=None,
+                   warnings=[], error=None)
+        error = packager.PackageError('EMBEDDING_MISMATCH', 'Re-embed before exporting.', {'model': 'other'})
+        with patch.object(exporter, '_jobs', {'owned': job}), \
+             patch.object(exporter, '_active', {'Owned': 'owned'}), \
+             patch.object(packager, 'build', side_effect=error), \
+             patch.object(exporter._log, 'exception') as traceback:
+            exporter._run('owned', 'Owned', False)
+            result = ExportJobStatusResponse(**job).model_dump()
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error_code'], 'EMBEDDING_MISMATCH')
+            self.assertEqual(result['error_detail'], {'model': 'other'})
+            self.assertIn('Re-embed', result['error'])
+            traceback.assert_not_called()
+            self.assertNotIn('Owned', exporter._active)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
