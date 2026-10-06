@@ -650,6 +650,12 @@ Samples chunks from a collection and generates Q&A pairs.
 
 `sample_size`: integer from 1 through 100 (default 20). `seed`: optional integer; null selects with a fresh random nonce. Booleans, non-integral and non-finite values are rejected with 422 before collection lookup, session persistence or generation. Existing integral numeric coercion is retained.
 
+Generation waits at most one second to acquire the collection mutation guard
+before sampling and publishing its session. A busy collection returns
+`409 COLLECTION_BUSY` without creating a session or model task. If a completed
+deletion removed the collection before sampling, it returns
+`404 COLLECTION_NOT_FOUND`. Retry a busy request after the writer finishes.
+
 Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
 
 The iterator caches 100 objects and selection retains at most `sample_size` candidate payloads; the complete corpus is scanned once. Full scans can take longer than fetching an initial prefix. Payload size is inherited from stored chunks; this is a candidate-count bound, not a byte-size limit.
@@ -1132,7 +1138,10 @@ ingest default.
 - **409 `TUNE_IN_PROGRESS`** if the collection is already being tuned.
 - **`SOURCES_REQUIRED`** (through the job) when the operation needs originals the
   collection does not have. Re-embedding a `chunks-only` collection *with*
-  chunking fields is refused rather than half-honoured.
+  chunking fields is refused rather than half-honoured. Re-chunking is also
+  refused when a stored source file has no single retained original (a name
+  uploaded more than once, or a second name for the same content) or a
+  retained original is missing from disk.
 
 Each rebuild is staged into a temporary collection and verified before the
 original is deleted, so a failure before replacement leaves the original
@@ -1151,7 +1160,10 @@ sessions `stale`. `/tune/reindex` does not, because chunk identity is unchanged.
 GET /tune/{collection}
 ```
 
-What this collection can be tuned with, given its fidelity.
+What this collection can be tuned with, given its fidelity. `can_rechunk` is
+`false` when re-chunking would be refused: the collection is `chunks-only`, a
+stored source file has no single retained original, or a retained original is
+missing from disk.
 
 **Response 200:**
 ```json
@@ -1491,8 +1503,12 @@ them. Changing the selection (including leaving and returning to the same
 collection) invalidates pending responses for the prior selection. A stale
 save may finish persisting its original collection, but must not change the
 active settings, loading/error state, or invalidate the new collection's load.
-Within the current generation, only the latest initiated save may publish; a
-successful current save supersedes a pending older load for that collection.
+Within the current generation, the latest initiated save may publish. If it
+fails, the newest acknowledged success may publish, even if its response arrives
+after that failure. Each acknowledged save publishes at most once, so a later
+older completion cannot erase new edits by republishing the same result. Published
+saves supersede pending older loads. Superseded responses show neither Saved! nor
+an error, and an earlier notice timer cannot clear a newer Saved! notice.
 After the selected collection's load resolves, the next Q&A request uses its
 settings, regardless of when a prior collection's save completes.
 
@@ -1949,6 +1965,8 @@ now lives once, in `api/services/ingest_config.py`.
       *Registered `13_identity.sh` exercises controlled collision, concurrent creation, guarded reads, and actual package/HTTP/backend/fresh-process acceptance. The exact current-head counts and full-suite result are recorded in PR #69.*
 - [x] Generation start returns 503 `SESSION_WRITE_FAILED`, writes nothing and records a diagnostic for the candidate session file when identity selection cannot inspect session storage (including a redirected storage directory) or runs out of attempts. Import refuses a source session ID that is not `gs_[0-9a-f]{8}` with `PACKAGE_CORRUPT` naming the sidecar, before restoring anything.
       *Registered `13_identity.sh` runs 21 owned cases in `session_identity_cases.py`. Generation start: `test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503`, `test_generation_allocation_failure_records_diagnostic_for_candidate` (inspection failure and exhaustion), `test_reviewer_generation_redirected_storage_root_is_session_write_failed_503` and `test_reviewer_generate_route_returns_503_session_write_failed_envelope`. Source IDs: `test_noncanonical_source_identity_is_refused_before_restoration` and `test_reviewer_preflight_refuses_near_canonical_and_unbounded_source_ids` (near misses, a 10,003-character ID, an empty string and an integer are refused; `gs_0123abcd` is accepted). The live check in `session_identity.py` imports a digest-valid package with a noncanonical source ID and expects `PACKAGE_CORRUPT` naming the sidecar, nothing restored and the original unchanged. The redirected-storage and route cases fail on the code before #148.*
+- [x] Generation guard contention is bounded to one second and returns `409 COLLECTION_BUSY` without sampling or publication; a completed deletion returns `404 COLLECTION_NOT_FOUND`.
+      *Suite 04 sampling tests cover a timed-out alias writer, waiter cleanup, a real guarded delete, and a writer released before the deadline.*
 - [x] Concurrent edits survive generation, independent-field updates and restart; write faults are not acknowledged, and changed regeneration targets are rejected. Initial chunk sampling and durable session publication share the collection mutation guard so replacement/deletion cannot miss the new snapshot; subsequent model work runs outside that guard.
       *Suite 04 calls `09_sampling.sh`, which runs `test_chunk_sampling.py`: controlled writer contention proves sampling/publication ordering; a paused generation proves both name spellings are unlocked; sampling and publication failures release the guard and start no task.*
       *Registered `12_persistence.sh` runs owned concurrency, interruption and failure-path cases plus real backend/HTTP/fresh-process checks. Exact counts and initial full-suite failures are retained in the PR; this is single-process acceptance.*
@@ -1986,6 +2004,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 ### 10.4 Web UI
 
+- [x] Chunking loads and save results stay with their selection generation, including A→B→A; save is unavailable until the selected config loads. Stale responses preserve current edits and errors, collection changes clear the saved notice, and failed collection lists or mismatched configurations are reported.
+  *Evidence: `scripts/verify/browser/chunking_config.js` deferred load/save, stale failure, edited draft, collection-list failure, mismatched configuration and saved-notice cases in suite 06.*
+
 - [x] Role selection persists across page navigation within same browser session.
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`.*
@@ -2003,7 +2024,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
 
-- [x] Retrieval save confirmations and errors stay with their selection generation. Deferred browser cases verify stale success/failure after switching collections and preserve the newest acknowledged success when a newer save fails, in both response orders.
+- [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
+  *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
 
 ### 10.5 Infrastructure
 

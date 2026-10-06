@@ -80,8 +80,10 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     metadata.mkdir()
     target, staging = source_collection or record["target"], record["staging"]
     upload = Path(settings.upload_dir)
-    _copy(package / "sources" if package else sources.collection_dir(target),
-          sources.collection_dir(staging))
+    if package is not None:
+        sources.restore_package(package, staging)
+    else:
+        _copy(sources.collection_dir(target), sources.collection_dir(staging))
     for kind in ("ingest", "retrieval"):
         origin = package / f"{kind}_config.json" if package else upload / f"{kind}_configs" / f"{target}.json"
         _copy(origin, metadata / f"{kind}_config.json")
