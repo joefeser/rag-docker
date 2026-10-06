@@ -526,10 +526,17 @@ case "$CMD" in
     # Its stdin is /dev/null: a background job keeps the terminal otherwise,
     # and run from one, its first read (docker compose exec -T) would be
     # stopped by SIGTTIN and the run would hang.
+    # Record signals until the new process group has a registered owner.
+    SPAWN_SIGNAL=0
+    trap 'SPAWN_SIGNAL=130' INT
+    trap 'SPAWN_SIGNAL=143' TERM
     set -m
-    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} </dev/null &
+    (trap '' TTOU; exec bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"}) </dev/null &
     SUITE=$!
     set +m
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ "$SPAWN_SIGNAL" -eq 0 ] || exit "$SPAWN_SIGNAL"
     wait "$SUITE" || rc=$?
     exit "$rc" ;;
 esac
