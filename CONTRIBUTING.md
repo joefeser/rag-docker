@@ -47,3 +47,8 @@ the maintainer approves them.
 
 By contributing, you agree that your contributions are licensed under the
 [MIT License](LICENSE).
+
+## Release checklist
+
+- Before publishing a release, confirm that `SECURITY.md` names the supported
+  release policy accurately and links to the latest published release.
