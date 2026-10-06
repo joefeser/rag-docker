@@ -76,6 +76,17 @@ An invalid on-disk index makes tuning options return a typed 409
 need to read retained sources. A failed retention write after chunk storage does
 not misreport the ingested file as failed.
 
+Retained-source import restores only blobs named by the validated index. Unindexed
+files are ignored, including sources in chunks-only packages with no index. Older
+packages whose indexes name missing blobs remain rejected as `PACKAGE_CORRUPT`;
+re-export from the repaired source rather than silently reducing claimed fidelity.
+After manifest digest verification, each indexed blob’s manifest digest must equal
+`sha256:<filename>`. This preserves content-addressed identity without hashing a
+listed blob twice. Indexed blobs not listed in the manifest are hashed separately;
+a listed digest that differs from the filename is rejected.
+The same indexed-only copy rule applies to replace-mode recovery collections;
+unindexed package files cannot survive a failed final cutover.
+
 Retention MUST NOT change chunking, embedding, or any existing response shape.
 
 ### 2.3 Deletion
@@ -99,15 +110,6 @@ minimum, 32 GB recommended) assumes the current behaviour and MUST be restated a
 
 ---
 
-
-Retained-source import restores only blobs named by the validated index. Unindexed
-files are ignored, including sources in chunks-only packages with no index. Older
-packages whose indexes name missing blobs remain rejected as `PACKAGE_CORRUPT`;
-re-export from the repaired source rather than silently reducing claimed fidelity.
-After manifest digest verification, each indexed blob’s manifest digest must equal
-`sha256:<filename>`. This preserves content-addressed identity without hashing a
-listed blob twice. Legacy blobs not listed in the manifest are hashed separately;
-a listed digest that differs from the filename is rejected.
 
 ## 3. Prerequisite B — Retrieval Settings Persistence
 
@@ -758,7 +760,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
 | E16 | Re-chunking and failed destructive cutover mark sessions under both supported first-character collection aliases `stale`; the reported count includes both spellings, and stored provenance is unchanged |
-| E17 | Re-chunking a `chunks-only` or partially retained collection fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
+| E17 | Re-chunking a `chunks-only`, partially retained or ambiguously retained collection (a second name for the same retained content, or a name with more than one chunk set) fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
 | E18 | `replace` reports the number of orphaned sessions |
 | E19 | Package `README.md` states the collection name, fidelity and encryption warning |
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
@@ -770,7 +772,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
-| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import ignores unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, while record-only tuning still works; missing-blob exports pass import preflight |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, while record-only tuning still works; missing-blob exports pass import preflight |
 
 ---
 

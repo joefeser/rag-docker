@@ -1315,6 +1315,23 @@ def _save_index(collection: str, index: dict) -> None:
     tmp.replace(p)
 
 
+def restore_package(package: Path, collection: str) -> None:
+    """Copy only preflighted indexed originals, including into recovery copies.
+
+    Import preflight has checked the private extraction's index and blob bytes.
+    Unindexed files must never become retained originals under a future digest.
+    """
+    src = package / "sources"
+    if not (src / INDEX_NAME).is_file():
+        return
+    index = validate_index(json.loads((src / INDEX_NAME).read_text()))
+    dest = collection_dir(collection)
+    dest.mkdir(parents=True, exist_ok=True)
+    for digest in index["documents"]:
+        shutil.copyfile(src / digest, dest / digest)
+    shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
+
+
 def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
     """Retain one accepted upload. Returns its sha256."""
     digest = hashlib.sha256(data).hexdigest()
@@ -1951,8 +1968,10 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     metadata.mkdir()
     target, staging = source_collection or record["target"], record["staging"]
     upload = Path(settings.upload_dir)
-    _copy(package / "sources" if package else sources.collection_dir(target),
-          sources.collection_dir(staging))
+    if package is not None:
+        sources.restore_package(package, staging)
+    else:
+        _copy(sources.collection_dir(target), sources.collection_dir(staging))
     for kind in ("ingest", "retrieval"):
         origin = package / f"{kind}_config.json" if package else upload / f"{kind}_configs" / f"{target}.json"
         _copy(origin, metadata / f"{kind}_config.json")
@@ -5533,7 +5552,7 @@ def _validate_package_sources(pkg: Path, manifest: dict) -> None:
                 raise ValueError("Retained source blob is missing or is not a regular file")
             # Check 3 already hashed listed files in this private extraction.
             # Match that verified digest to the content-addressed filename;
-            # legacy unlisted blobs still need their own identity hash.
+            # manifest omissions still need their own identity hash.
             files = manifest.get("files", {})
             rel = f"sources/{digest}"
             actual = files[rel] if rel in files else "sha256:" + packager.sha256_file(blob)
@@ -5613,16 +5632,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
-    src = pkg / "sources"
-    if (src / sources.INDEX_NAME).is_file():
-        # Preflight validated these identities and bytes. Never retain unrelated
-        # package files: their names could shadow a future content-addressed blob.
-        index = sources.validate_index(json.loads((src / sources.INDEX_NAME).read_text()))
-        dest = sources.collection_dir(target)
-        dest.mkdir(parents=True, exist_ok=True)
-        for digest in index["documents"]:
-            shutil.copyfile(src / digest, dest / digest)
-        shutil.copyfile(src / sources.INDEX_NAME, dest / sources.INDEX_NAME)
+    sources.restore_package(pkg, target)
 
     ingest_cfg = pkg / "ingest_config.json"
     if ingest_cfg.is_file():
@@ -6226,6 +6236,57 @@ def _verify_records(collection: str, records: list[dict]) -> None:
         raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
 
 
+_MISSING_CHUNK_INDEX = object()
+
+
+def _emitted_name(digest: str, entry: dict) -> str:
+    """The source_file a rebuild writes for this retained digest's chunks."""
+    return Path((entry.get("filenames") or [digest])[0]).name
+
+
+def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
+    """Stored source files a rebuild from the retained originals would not reproduce."""
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    seen: dict[str, set] = {}
+    uncovered = set()
+    for obj in wc.get_client().collections.get(collection).iterator():
+        props = obj.properties or {}
+        filename = props.get("source_file")
+        if not isinstance(filename, str) or not filename:
+            uncovered.add("<unknown>")
+            continue
+        digests = by_filename.get(filename, [])
+        if len(digests) != 1 or _emitted_name(digests[0], documents[digests[0]]) != filename:
+            uncovered.add(filename)
+            continue
+        index = props.get("chunk_index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            index = _MISSING_CHUNK_INDEX
+        indices = seen.setdefault(filename, set())
+        if index in indices:
+            uncovered.add(filename)
+        indices.add(index)
+    return sorted(uncovered)
+
+
+def can_rechunk(collection: str) -> bool:
+    """Whether re-chunking would pass the checks made before parsing.
+
+    Used by the tuning options, so they offer re-chunking only when the job
+    would accept it. An invalid index or blob path raises ValueError.
+    """
+    documents = sources.load_index(collection)["documents"]
+    if not documents:
+        return False
+    for digest in documents:
+        if not sources.blob_path(collection, digest).is_file():
+            return False
+    return not _uncovered_source_files(collection, documents)
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -6246,25 +6307,22 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # A chunks-only import or a failed retention can leave a mixed corpus.
-    # Any retained file is insufficient: replacing from that subset loses the
-    # other chunks and successful cutover discards their recovery copy.
-    by_filename: dict[str, list[str]] = {}
-    for digest, entry in documents.items():
-        for filename in entry["filenames"]:
-            by_filename.setdefault(filename, []).append(digest)
-    uncovered = set()
-    for obj in wc.get_client().collections.get(collection).iterator():
-        filename = (obj.properties or {}).get("source_file")
-        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
-            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
+    # Re-chunking rebuilds one chunk set per retained digest, under its first
+    # name. A stored name is covered only when exactly one digest lists it, it
+    # is that digest's first name, and its chunks form one set (no repeated
+    # chunk_index). A second name for the same content, a re-upload (whether
+    # its retention succeeded or failed) and a name with no retained original
+    # are refused before staging: replacing from the retained subset would
+    # lose chunks, and a successful cutover discards their recovery copy.
+    # Issue #22 lifts this by rebuilding one chunk set per (digest, name).
+    uncovered = _uncovered_source_files(collection, documents)
     if uncovered:
         raise PackageError(
             "SOURCES_REQUIRED",
             "Cannot change chunk boundaries: some stored chunks have missing or "
             "ambiguous retained originals. Re-embed without chunking parameters "
             "or re-index to preserve the existing chunks.",
-            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+            {"collection": collection, "uncovered_source_files": uncovered})
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -6280,8 +6338,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     {"collection": collection, "digest": digest})
             # Parsers dispatch on the file extension, so the original filename
             # has to be restored before parsing.
-            filename = (entry.get("filenames") or [digest])[0]
-            staged = work / Path(filename).name
+            staged = work / _emitted_name(digest, entry)
             shutil.copyfile(blob, staged)
 
             text, elements = _parse_file(staged)
@@ -7172,19 +7229,28 @@ async def tune_options(collection: str):
     try:
         has_sources = await asyncio.to_thread(sources.has_sources, collection)
         stats = await asyncio.to_thread(sources.stats, collection)
+        can_rechunk = has_sources and await asyncio.to_thread(tuning.can_rechunk, collection)
     except ValueError:
         return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
+    if not has_sources:
+        note = ("No original documents were retained, so this collection cannot be "
+                "re-chunked. Re-embedding works from the stored chunk text, which "
+                "leaves chunk boundaries unchanged.")
+    elif can_rechunk:
+        note = "Every tuning operation is available."
+    else:
+        note = ("Some stored source files have no single retained original, or a "
+                "retained original is missing, so this collection cannot be "
+                "re-chunked. Re-embedding works from the stored chunk text, which "
+                "leaves chunk boundaries unchanged, and re-indexing is available.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",
         source_document_count=stats["document_count"],
-        can_rechunk=has_sources,
+        can_rechunk=can_rechunk,
         can_reembed=True,
         can_reindex=True,
-        note=("Every tuning operation is available." if has_sources else
-              "No original documents were retained, so this collection cannot be "
-              "re-chunked. Re-embedding works from the stored chunk text, which "
-              "leaves chunk boundaries unchanged."),
+        note=note,
     )
 ```
 
@@ -13948,6 +14014,72 @@ for mode in abs link; do
 done
 check_eq "E29: the restored index is the original" "$(src_index_hash "$C")" "$idx_before"
 (cd "$REPO_ROOT" && docker compose exec -T api rm -f "$E29_SENT") >/dev/null 2>&1 || true
+
+# ── unindexed package blobs are never retained (E29, #179) ───────────────────
+# A digest-valid package carries an extra sources/ file named after the SHA-256
+# of a document not yet ingested, holding other bytes. Import must not retain
+# it, so a later ingest of that document keeps the document's own bytes.
+E29_FUTURE="$FIX/e29-future-$E29_TAG.txt"
+printf 'E29 future document %s: the bytes a later ingest must retain.\n' "$E29_TAG" > "$E29_FUTURE"
+E29_FDIG=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$E29_FUTURE")
+UNIDX=$(python3 - "$EXPORTS/$PKG" "$E29_FDIG" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, fdig = pathlib.Path(sys.argv[1]), sys.argv[2]
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    index = json.loads((root / "sources" / "index.json").read_text())
+    assert index["documents"] and fdig not in index["documents"]
+    planted = root / "sources" / fdig
+    planted.write_bytes(b"E29 planted unindexed bytes")
+    manifest["files"]["sources/" + fdig] = "sha256:" + hashlib.sha256(planted.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-unindexed.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+)
+run_import "$UNIDX" rename
+read -r ustat uname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+check_eq "E29: a digest-valid package with an unindexed source blob imports (rename)" "$ustat" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$uname" "$E29_FDIG" <<'ENDPY'
+import json, sys
+from services import sources
+d, fdig = sources.collection_dir(sys.argv[1]), sys.argv[2]
+names = {p.name for p in d.iterdir()} if d.is_dir() else set()
+docs = set(json.loads((d / "index.json").read_text())["documents"]) if (d / "index.json").is_file() else set()
+print("    retained:", sorted(names))
+sys.exit(0 if docs and names == docs | {"index.json"} and fdig not in names else 1)
+ENDPY
+)
+check "E29: import retains only the indexed blobs and index.json, not the unindexed one" $?
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$uname" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$E29_FUTURE" > /tmp/vfy_e29ing.json
+check_eq "E29: ingesting the document the planted name targets completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_e29ing.json)" 900)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$uname" "$E29_FDIG" <<'ENDPY'
+import hashlib, sys
+from services import sources
+name, fdig = sys.argv[1], sys.argv[2]
+p = sources.blob_path(name, fdig)
+got = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing"
+print("    retained blob hashes to", got)
+sys.exit(0 if got == fdig and fdig in sources.load_index(name)["documents"] else 1)
+ENDPY
+)
+check "E29: ... and its retained blob holds the document's own bytes" $?
+[ "$uname" != "-" ] && [ "$uname" != "$C" ] && drop_collection "$uname"
+rm -f "$EXPORTS/$UNIDX" "$E29_FUTURE"
 
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json

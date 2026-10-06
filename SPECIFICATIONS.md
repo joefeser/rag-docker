@@ -1132,7 +1132,10 @@ ingest default.
 - **409 `TUNE_IN_PROGRESS`** if the collection is already being tuned.
 - **`SOURCES_REQUIRED`** (through the job) when the operation needs originals the
   collection does not have. Re-embedding a `chunks-only` collection *with*
-  chunking fields is refused rather than half-honoured.
+  chunking fields is refused rather than half-honoured. Re-chunking is also
+  refused when a stored source file has no single retained original (a name
+  uploaded more than once, or a second name for the same content) or a
+  retained original is missing from disk.
 
 Each rebuild is staged into a temporary collection and verified before the
 original is deleted, so a failure before replacement leaves the original
@@ -1151,7 +1154,10 @@ sessions `stale`. `/tune/reindex` does not, because chunk identity is unchanged.
 GET /tune/{collection}
 ```
 
-What this collection can be tuned with, given its fidelity.
+What this collection can be tuned with, given its fidelity. `can_rechunk` is
+`false` when re-chunking would be refused: the collection is `chunks-only`, a
+stored source file has no single retained original, or a retained original is
+missing from disk.
 
 **Response 200:**
 ```json
