@@ -5030,6 +5030,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
+from services import settings_store
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import model_bundle
@@ -5611,7 +5612,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
         data["collection"] = target
         out = Path(settings.upload_dir) / "ingest_configs"
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
+        settings_store.publish(out / f"{_safe_file(target)}.json", data)
 
     if validated_retrieval is not None:
         data = {**validated_retrieval, "collection": target}
@@ -10518,6 +10519,10 @@ directories and does not connect to Weaviate or Ollama.
 `07_settings.sh` runs the controlled persistence cases inside the disposable
 verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
 verification run; it does not establish full-stack acceptance by itself.
+
+Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
+(no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
+retrieval route. The persistence cases cover failed import-config publication.
 
 ## Focused import validation regressions
 
@@ -16199,6 +16204,8 @@ require_stack
 section "Concurrent settings publication and failed-write preservation"
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - SettingsPersistenceTests < scripts/tests/test_settings_persistence.py)
 check "controlled retrieval/ingest concurrency and publication failures" $?
+(cd ../.. && python3 scripts/tests/test_settings_implementation.py)
+check "settings embedded implementation copies match runtime" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?
@@ -16231,7 +16238,11 @@ def request(path, body=None, method=None, raw=None, content_type='application/js
         with urllib.request.urlopen(req, timeout=60) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as response:
-        return response.code, json.load(response)
+        body = response.read()
+        try:
+            return response.code, json.loads(body)
+        except ValueError:  # a server error page that isn't JSON
+            return response.code, body.decode(errors='replace')[:200]
 
 
 def expect(path, body, code):
@@ -16318,6 +16329,28 @@ try:
     assert status == 200
     assert next(c for c in current['collections'] if c['name'] == collection)['object_count'] == 0
     print('PASS invalid multipart settings leave the collection empty', flush=True)
+
+    # #141: concurrent saves through the live routes. Every save must be
+    # acknowledged, and the persisted value must be one acknowledged response,
+    # complete and unmixed (no request publishes another request's temp file).
+    from concurrent.futures import ThreadPoolExecutor
+    rounds, width = 15, 12
+    for route, make in (('/ingest/config', lambda r, i: {'collection': collection, 'chunking_strategy': 'fixed',
+                                                         'chunk_size': 100 + 20 * r + i, 'min_chunk_size': i}),
+                        ('/retrieval/config', lambda r, i: {'collection': collection, 'retrieval_mode': 'hybrid',
+                                                            'top_k': i + 1, 'alpha': r / 20, 'ef': 16 + 16 * i,
+                                                            'response_format': 'engineer'})):
+        for r in range(rounds):
+            bodies = [make(r, i) for i in range(width)]
+            with ThreadPoolExecutor(max_workers=width) as pool:
+                results = list(pool.map(lambda body: request(route, body), bodies))
+            failed = [(status, result) for status, result in results if status != 201]
+            assert not failed, (route, r, failed[:3])
+            acknowledged = [result for _, result in results]
+            status, persisted = request(route + '/' + collection)
+            assert status == 200, persisted
+            assert persisted in acknowledged, (route, r, persisted)
+    print('PASS concurrent saves are all acknowledged and publish one complete acknowledged value (ingest and retrieval)', flush=True)
 finally:
     if created:
         status, result = request('/collections/' + collection + '?confirm=true', method='DELETE')
@@ -17768,6 +17801,34 @@ def publish(path: Path, config: dict) -> None:
                     log.warning("Could not remove settings temporary file %s", temporary)
 ```
 
+### scripts/tests/test_settings_implementation.py
+
+```python
+"""Host-side source-copy checks; no API runtime dependencies."""
+from pathlib import Path
+import unittest
+
+class ImplementationTests(unittest.TestCase):
+    def test_embedded_sources_match_runtime(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / 'IMPLEMENTATION.md').read_text()
+        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
+                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
+                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py',
+                     'scripts/verify/settings_validation.py', 'api/services/importer.py'):
+            with self.subTest(file=name):
+                fence = '````' if name.endswith('.md') else '```'
+                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
+                header = f'### {name}\n\n{fence}{language}\n'
+                start = text.index(header) + len(header)
+                end = text.index('\n' + fence + '\n', start)
+                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
 ### scripts/tests/test_settings_persistence.py
 
 ```python
@@ -17802,6 +17863,33 @@ class SettingsPersistenceTests(unittest.TestCase):
         field = 'chunk_size' if service is ingest_config else 'top_k'
         return [{**service.DEFAULTS, 'collection': 'ConcurrentSettings', field: value}
                 for value in ((1000, 1100, 1200) if service is ingest_config else (5, 7, 9))]
+
+    def test_import_publication_preserves_config_on_failure_and_uses_shared_lock(self):
+        from services import importer
+        with self.fixture(ingest_config) as root:
+            old, incoming, _ = self.values(ingest_config)
+            ingest_config.save(old)
+            pkg = root / 'package'
+            pkg.mkdir()
+            (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            path = ingest_config._path(old['collection'])
+            before = path.read_bytes()
+            entered = []
+            class ObservedLock:
+                def __enter__(self):
+                    entered.append(True)
+                def __exit__(self, *args):
+                    pass
+            with patch.object(settings_store, '_write_lock', ObservedLock()), \
+                 patch.object(Path, 'replace', side_effect=OSError('owned publication failure')):
+                with self.assertRaises(OSError):
+                    importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            self.assertEqual(entered, [True])
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(path.parent.glob('*.tmp')), [])
+            importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            self.assertEqual(ingest_config.load(old['collection']), incoming)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_contending_saves_publish_their_own_complete_values(self):
         for service in SERVICES:
@@ -17949,22 +18037,6 @@ class SettingsPersistenceTests(unittest.TestCase):
                     service.save({**old, 'unserializable': object()})
                 self.assertEqual(service.load(old['collection']), old)
                 self.assertEqual(list(service._dir().glob('*.tmp')), [])
-
-
-class ImplementationTests(unittest.TestCase):
-    def test_embedded_sources_match_runtime(self):
-        root = Path(__file__).resolve().parents[2]
-        text = (root / 'IMPLEMENTATION.md').read_text()
-        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
-                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
-                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py'):
-            with self.subTest(file=name):
-                fence = '````' if name.endswith('.md') else '```'
-                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
-                header = f'### {name}\n\n{fence}{language}\n'
-                start = text.index(header) + len(header)
-                end = text.index('\n' + fence + '\n', start)
-                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
 
 
 if __name__ == '__main__':
