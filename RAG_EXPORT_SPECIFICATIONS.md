@@ -761,7 +761,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
 | E16 | Re-chunking marks the collection's gold-standard sessions `stale` |
-| E17 | Re-chunking a `chunks-only` or partially retained collection fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
+| E17 | Re-chunking a `chunks-only`, partially retained or ambiguously retained collection (a second name for the same retained content, or a name with more than one chunk set) fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
 | E18 | `replace` reports the number of orphaned sessions |
 | E19 | Package `README.md` states the collection name, fidelity and encryption warning |
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
