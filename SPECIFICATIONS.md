@@ -490,7 +490,10 @@ the destination directory and atomically replaces the saved configuration. A 201
 acknowledges that request's complete value was published; a later successful save
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
-Failed saves clean up their own temporary file when filesystem permissions allow. Package import publishes ingest settings through this same lock and atomic writer. Published files use mode 0600 (API owner read/write), including replacements of older files.
+Failed saves clean up their own temporary file when filesystem permissions
+allow. Package import publishes ingest settings through this same lock and
+atomic writer. Published files use mode 0600 (API owner read/write), including
+replacements of older files.
 
 ---
 
