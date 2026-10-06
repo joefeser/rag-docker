@@ -108,6 +108,42 @@ def _verify_records(collection: str, records: list[dict]) -> None:
         raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
 
 
+_MISSING_CHUNK_INDEX = object()
+
+
+def _emitted_name(digest: str, entry: dict) -> str:
+    """The source_file a rebuild writes for this retained digest's chunks."""
+    return Path((entry.get("filenames") or [digest])[0]).name
+
+
+def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
+    """Stored source files a rebuild from the retained originals would not reproduce."""
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    seen: dict[str, set] = {}
+    uncovered = set()
+    for obj in wc.get_client().collections.get(collection).iterator():
+        props = obj.properties or {}
+        filename = props.get("source_file")
+        if not isinstance(filename, str) or not filename:
+            uncovered.add("<unknown>")
+            continue
+        digests = by_filename.get(filename, [])
+        if len(digests) != 1 or _emitted_name(digests[0], documents[digests[0]]) != filename:
+            uncovered.add(filename)
+            continue
+        index = props.get("chunk_index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            index = _MISSING_CHUNK_INDEX
+        indices = seen.setdefault(filename, set())
+        if index in indices:
+            uncovered.add(filename)
+        indices.add(index)
+    return sorted(uncovered)
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -128,25 +164,22 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # A chunks-only import or a failed retention can leave a mixed corpus.
-    # Any retained file is insufficient: replacing from that subset loses the
-    # other chunks and successful cutover discards their recovery copy.
-    by_filename: dict[str, list[str]] = {}
-    for digest, entry in documents.items():
-        for filename in entry["filenames"]:
-            by_filename.setdefault(filename, []).append(digest)
-    uncovered = set()
-    for obj in wc.get_client().collections.get(collection).iterator():
-        filename = (obj.properties or {}).get("source_file")
-        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
-            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
+    # Re-chunking rebuilds one chunk set per retained digest, under its first
+    # name. A stored name is covered only when exactly one digest lists it, it
+    # is that digest's first name, and its chunks form one set (no repeated
+    # chunk_index). A second name for the same content, a re-upload (whether
+    # its retention succeeded or failed) and a name with no retained original
+    # are refused before staging: replacing from the retained subset would
+    # lose chunks, and a successful cutover discards their recovery copy.
+    # Issue #22 lifts this by rebuilding one chunk set per (digest, name).
+    uncovered = _uncovered_source_files(collection, documents)
     if uncovered:
         raise PackageError(
             "SOURCES_REQUIRED",
             "Cannot change chunk boundaries: some stored chunks have missing or "
             "ambiguous retained originals. Re-embed without chunking parameters "
             "or re-index to preserve the existing chunks.",
-            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+            {"collection": collection, "uncovered_source_files": uncovered})
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -162,8 +195,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     {"collection": collection, "digest": digest})
             # Parsers dispatch on the file extension, so the original filename
             # has to be restored before parsing.
-            filename = (entry.get("filenames") or [digest])[0]
-            staged = work / Path(filename).name
+            staged = work / _emitted_name(digest, entry)
             shutil.copyfile(blob, staged)
 
             text, elements = _parse_file(staged)

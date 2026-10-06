@@ -951,5 +951,67 @@ class SourceCoverageTests(unittest.TestCase):
                 self.assertEqual(list(recovery._root().glob("*.json")), [])
 
 
+    # Each case: retained originals as (name, bytes), stored chunks as
+    # (source_file, chunk_index) with None for no chunk_index, and the
+    # names the coverage rule must report.
+    DROP_CASES = {
+        "second name for the same content": (
+            [("a.txt", b"same"), ("b.txt", b"same")], [("a.txt", 0), ("b.txt", 0)], ["b.txt"]),
+        "re-upload whose retention failed": (
+            [("a.txt", b"v1")], [("a.txt", 0), ("a.txt", 1), ("a.txt", 0), ("a.txt", 1)], ["a.txt"]),
+        "identical re-upload, retained twice": (
+            [("a.txt", b"same"), ("a.txt", b"same")], [("a.txt", 0), ("a.txt", 0)], ["a.txt"]),
+        "two chunks with no chunk_index": (
+            [("a.txt", b"v1")], [("a.txt", None), ("a.txt", None)], ["a.txt"]),
+    }
+
+    @staticmethod
+    def corpus(cols, chunks):
+        cols.create("Corpus")
+        rows = records(len(chunks))
+        for row, (name, index) in zip(rows, chunks):
+            row["properties"]["source_file"] = name
+            if index is not None:
+                row["properties"]["chunk_index"] = index
+        cols.get("Corpus").rows = {r["id"]: copy.deepcopy(r) for r in rows}
+        return rows
+
+    def test_rechunk_refuses_names_it_would_drop(self):
+        from services import sources
+        chunking = {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}
+        for operation in ("rechunk", "reembed"):
+            for case, (retained, chunks, expected) in self.DROP_CASES.items():
+                with self.subTest(operation=operation, case=case), tempfile.TemporaryDirectory() as tmp:
+                    cols = Collections()
+                    original = self.corpus(cols, chunks)
+                    with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)):
+                        for name, data in retained:
+                            sources.store("Corpus", name, data)
+                        job = {}
+                        with patch.dict(tuning._jobs, {"coverage": job}), patch.object(tuning, "_parse_file") as parse:
+                            tuning._run("coverage", "Corpus", operation, {"chunking": dict(chunking)})
+                        self.assertEqual(job["status"], "failed")
+                        self.assertEqual(job["error_code"], "SOURCES_REQUIRED")
+                        self.assertEqual(job["error_detail"]["uncovered_source_files"], expected)
+                        parse.assert_not_called()
+                        self.assertEqual(cols.get("Corpus").rows, {r["id"]: r for r in original})
+                        self.assertEqual(cols.deleted, [])
+                        self.assertEqual(set(cols.items), {"Corpus"})
+                        self.assertEqual(list(recovery._root().glob("*.json")), [])
+
+    def test_single_chunk_set_per_name_completes(self):
+        from services import sources
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = Collections()
+            self.corpus(cols, [("a.txt", 0), ("a.txt", 1), ("a.txt", 2)])
+            with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(wc, "_create_collection_sync", side_effect=lambda name, *a, **kw: cols.create(name)), patch.object(wc, "_collection_config_sync", return_value={"index_type": "hnsw", "distance_metric": "cosine", "hnsw_config": {}}), patch.object(tuning, "_parse_file", side_effect=lambda p: (p.read_text(), [])), patch.object(tuning, "do_chunk", side_effect=lambda **kw: [kw["text"]]):
+                sources.store("Corpus", "a.txt", b"retained original")
+                job = {}
+                with patch.dict(tuning._jobs, {"coverage": job}):
+                    tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
+                self.assertEqual(job["status"], "completed", job)
+                self.assertEqual([r["properties"]["source_file"] for r in cols.get("Corpus").rows.values()], ["a.txt"])
+
+
 if __name__ == '__main__':
     unittest.main()
