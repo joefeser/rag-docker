@@ -529,7 +529,7 @@ def _validate_package_sources(pkg: Path, manifest: dict) -> None:
                 raise ValueError("Retained source blob is missing or is not a regular file")
             # Check 3 already hashed listed files in this private extraction.
             # Match that verified digest to the content-addressed filename;
-            # legacy unlisted blobs still need their own identity hash.
+            # manifest omissions still need their own identity hash.
             files = manifest.get("files", {})
             rel = f"sources/{digest}"
             actual = files[rel] if rel in files else "sha256:" + packager.sha256_file(blob)
@@ -609,16 +609,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
-    src = pkg / "sources"
-    if (src / sources.INDEX_NAME).is_file():
-        # Preflight validated these identities and bytes. Never retain unrelated
-        # package files: their names could shadow a future content-addressed blob.
-        index = sources.validate_index(json.loads((src / sources.INDEX_NAME).read_text()))
-        dest = sources.collection_dir(target)
-        dest.mkdir(parents=True, exist_ok=True)
-        for digest in index["documents"]:
-            shutil.copyfile(src / digest, dest / digest)
-        shutil.copyfile(src / sources.INDEX_NAME, dest / sources.INDEX_NAME)
+    sources.restore_package(pkg, target)
 
     ingest_cfg = pkg / "ingest_config.json"
     if ingest_cfg.is_file():

@@ -1,5 +1,7 @@
 """Controlled final-flush faults against real writer and recovery services."""
+import asyncio
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -11,7 +13,7 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
@@ -280,7 +282,8 @@ class RecoveryTests(unittest.TestCase):
         before = copy.deepcopy(self.cols.get(name).rows)
         recovery.sweep(self.client)
         self.assertEqual(self.cols.get(name).rows, before)
-        self.assertEqual((Path(settings.sources_dir) / name / 'source-blob').read_bytes(), b'original source')
+        blob = hashlib.sha256(b'original source').hexdigest() if record['operation'] == 'import' else 'source-blob'
+        self.assertEqual((Path(settings.sources_dir) / name / blob).read_bytes(), b'original source')
         metadata = recovery._root() / record['operation_id']
         self.assertTrue((metadata / 'goldstandard' / 'gs_0123abcd.json').is_file())
         for kind in ('ingest', 'retrieval'):
@@ -367,7 +370,9 @@ class RecoveryTests(unittest.TestCase):
         (pkg / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in self.original))
         source = pkg / 'sources'
         source.mkdir(exist_ok=True)
-        (source / 'source-blob').write_bytes(b'original source')
+        digest = hashlib.sha256(b'original source').hexdigest()
+        (source / digest).write_bytes(b'original source')
+        (source / 'index.json').write_text(json.dumps({'version': 1, 'documents': {digest: {'filenames': ['source.txt']}}}))
         for kind in ('ingest', 'retrieval'):
             (pkg / f'{kind}_config.json').write_text(json.dumps({'collection': 'Corpus', 'setting': kind}))
         gold = pkg / 'goldstandard'
@@ -442,6 +447,25 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(self.cols.get(record['staging']).rows, {r['id']: r for r in self.original})
                 self.assert_retained(record)
                 recovery.discard(record, self.client)
+
+    def test_failed_replace_recovery_excludes_unindexed_future_blob(self):
+        from services import sources
+        pkg, manifest = self.package()
+        future = b'future legitimate document'
+        digest = hashlib.sha256(future).hexdigest()
+        (pkg / 'sources' / digest).write_bytes(b'planted wrong bytes')
+        (pkg / 'sources' / 'extra-folder').mkdir()
+        self.cols.create_failure = True
+        with patch.object(self, 'package', return_value=(pkg, manifest)):
+            job = self.import_replace()
+        self.assertEqual(job['status'], 'failed')
+        recovered = job['error_detail']['recovered_as']
+        directory = sources.collection_dir(recovered)
+        self.assertEqual({p.name for p in directory.iterdir()},
+                         set(sources.load_index(recovered)['documents']) | {'index.json'})
+        self.assertFalse((directory / digest).exists())
+        sources.store(recovered, 'future.txt', future)
+        self.assertEqual((directory / digest).read_bytes(), future)
 
     def test_replace_restart_after_target_delete_preserves_staging(self):
         self.cols.interrupt = True
@@ -971,6 +995,103 @@ class SourceCoverageTests(unittest.TestCase):
                 self.assertEqual([r["properties"]["content"] for r in cols.get("Corpus").rows.values()], ["retained original"])
                 self.assertEqual(set(cols.items), {"Corpus"})
                 self.assertEqual(list(recovery._root().glob("*.json")), [])
+
+
+    # Each case: retained originals as (name, bytes), stored chunks as
+    # (source_file, chunk_index) with None for no chunk_index, and the
+    # names the coverage rule must report.
+    DROP_CASES = {
+        "second name for the same content": (
+            [("a.txt", b"same"), ("b.txt", b"same")], [("a.txt", 0), ("b.txt", 0)], ["b.txt"]),
+        "re-upload whose retention failed": (
+            [("a.txt", b"v1")], [("a.txt", 0), ("a.txt", 1), ("a.txt", 0), ("a.txt", 1)], ["a.txt"]),
+        "identical re-upload, retained twice": (
+            [("a.txt", b"same"), ("a.txt", b"same")], [("a.txt", 0), ("a.txt", 0)], ["a.txt"]),
+        "two chunks with no chunk_index": (
+            [("a.txt", b"v1")], [("a.txt", None), ("a.txt", None)], ["a.txt"]),
+    }
+
+    @staticmethod
+    def corpus(cols, chunks):
+        cols.create("Corpus")
+        rows = records(len(chunks))
+        for row, (name, index) in zip(rows, chunks):
+            row["properties"]["source_file"] = name
+            if index is not None:
+                row["properties"]["chunk_index"] = index
+        cols.get("Corpus").rows = {r["id"]: copy.deepcopy(r) for r in rows}
+        return rows
+
+    def test_rechunk_refuses_names_it_would_drop(self):
+        from services import sources
+        chunking = {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}
+        for operation in ("rechunk", "reembed"):
+            for case, (retained, chunks, expected) in self.DROP_CASES.items():
+                with self.subTest(operation=operation, case=case), tempfile.TemporaryDirectory() as tmp:
+                    cols = Collections()
+                    original = self.corpus(cols, chunks)
+                    with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)):
+                        for name, data in retained:
+                            sources.store("Corpus", name, data)
+                        job = {}
+                        with patch.dict(tuning._jobs, {"coverage": job}), patch.object(tuning, "_parse_file") as parse:
+                            tuning._run("coverage", "Corpus", operation, {"chunking": dict(chunking)})
+                        self.assertEqual(job["status"], "failed")
+                        self.assertEqual(job["error_code"], "SOURCES_REQUIRED")
+                        self.assertEqual(job["error_detail"]["uncovered_source_files"], expected)
+                        parse.assert_not_called()
+                        self.assertEqual(cols.get("Corpus").rows, {r["id"]: r for r in original})
+                        self.assertEqual(cols.deleted, [])
+                        self.assertEqual(set(cols.items), {"Corpus"})
+                        self.assertEqual(list(recovery._root().glob("*.json")), [])
+
+    def test_single_chunk_set_per_name_completes(self):
+        from services import sources
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = Collections()
+            self.corpus(cols, [("a.txt", 0), ("a.txt", 1), ("a.txt", 2)])
+            with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(wc, "_create_collection_sync", side_effect=lambda name, *a, **kw: cols.create(name)), patch.object(wc, "_collection_config_sync", return_value={"index_type": "hnsw", "distance_metric": "cosine", "hnsw_config": {}}), patch.object(tuning, "_parse_file", side_effect=lambda p: (p.read_text(), [])), patch.object(tuning, "do_chunk", side_effect=lambda **kw: [kw["text"]]):
+                sources.store("Corpus", "a.txt", b"retained original")
+                job = {}
+                with patch.dict(tuning._jobs, {"coverage": job}):
+                    tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
+                self.assertEqual(job["status"], "completed", job)
+                self.assertEqual([r["properties"]["source_file"] for r in cols.get("Corpus").rows.values()], ["a.txt"])
+
+
+    def test_tune_options_match_the_refusal(self):
+        from routers import tuning as tuning_router
+        from services import sources
+        chunks_only = ("No original documents were retained, so this collection cannot be "
+                       "re-chunked. Re-embedding works from the stored chunk text, which "
+                       "leaves chunk boundaries unchanged.")
+        refused = ("Some stored source files have no single retained original, or a "
+                   "retained original is missing, so this collection cannot be "
+                   "re-chunked. Re-embedding works from the stored chunk text, which "
+                   "leaves chunk boundaries unchanged, and re-indexing is available.")
+        second_name = self.DROP_CASES["second name for the same content"]
+        repeated_set = self.DROP_CASES["re-upload whose retention failed"]
+        cases = {
+            "nothing retained": ([], [("a.txt", 0)], False, chunks_only, False),
+            "fully covered": ([("a.txt", b"v1")], [("a.txt", 0), ("a.txt", 1)], True,
+                              "Every tuning operation is available.", False),
+            "second name for the same content": (second_name[0], second_name[1], False, refused, False),
+            "repeated chunk set": (repeated_set[0], repeated_set[1], False, refused, False),
+            "retained original missing from disk": ([("a.txt", b"v1")], [("a.txt", 0)], False, refused, True),
+        }
+        for case, (retained, chunks, can_rechunk, note, drop_blob) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                cols = Collections()
+                self.corpus(cols, chunks)
+                with patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock, return_value=True):
+                    for name, data in retained:
+                        digest = sources.store("Corpus", name, data)
+                    if drop_blob:
+                        sources.blob_path("Corpus", digest).unlink()
+                    response = asyncio.run(tuning_router.tune_options("Corpus"))
+                self.assertEqual(response.can_rechunk, can_rechunk)
+                self.assertEqual(response.note, note)
+                self.assertEqual(response.fidelity, "with-sources" if retained else "chunks-only")
 
 
 if __name__ == '__main__':

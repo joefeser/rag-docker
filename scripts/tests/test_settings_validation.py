@@ -422,6 +422,9 @@ class SpecificationTests(unittest.TestCase):
 
 
 class ImplementationTests(unittest.TestCase):
+    def test_ingest_config_has_no_obsolete_strategy_constant(self):
+        self.assertFalse(hasattr(ingest_config, "CHUNKING_STRATEGIES"))
+
     def test_embedded_changed_sources_match_runtime(self):
         parents = Path(__file__).resolve().parents
         root = parents[2] if len(parents) > 2 else None
@@ -430,6 +433,7 @@ class ImplementationTests(unittest.TestCase):
         text = (root / 'IMPLEMENTATION.md').read_text()
         names = ['api/models/schemas.py', 'api/main.py', 'api/routers/ingest.py',
                  'api/services/chunker.py', 'api/services/ingest_pipeline.py',
+                 'api/services/ingest_config.py',
                  'api/services/rag_pipeline.py', 'api/services/weaviate_client.py',
                  'scripts/verify/settings_validation.py', 'scripts/verify/05_transfer.sh',
                  'api/services/tuning.py','api/services/importer.py',

@@ -457,11 +457,17 @@ async def hybrid_query(
     return await asyncio.to_thread(_hybrid_query_sync, collection_name, query, alpha, top_k)
 
 
+class CollectionNotFoundError(LookupError):
+    """The collection disappeared before guarded sampling."""
+
+
 def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
     from models.schemas import GenerateRequest
     from services.chunk_sampling import select_chunk_ids
     request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
+    if not client.collections.exists(collection_name):
+        raise CollectionNotFoundError(collection_name)
     coll = client.collections.get(collection_name)
     objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
     identities = select_chunk_ids(objects, request.sample_size, request.seed)
@@ -477,7 +483,3 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
              "source_file": by_id[identity].get("source_file", ""),
              "chunk_index": by_id[identity].get("chunk_index", 0)}
             for identity in identities if identity in by_id]
-
-
-async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
-    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit, seed)

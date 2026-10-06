@@ -23,16 +23,25 @@ def aliases(collection):
     return tuple(dict.fromkeys((name, name[:1].lower() + name[1:])))
 
 
+class CollectionBusyError(TimeoutError):
+    """A bounded caller could not acquire the collection mutation guard."""
+
+
 @contextmanager
-def guard(collection):
+def guard(collection, timeout=None):
     collection = canonical(collection)
     with _registry_lock:
         entry = _registry.setdefault(collection, [threading.RLock(), 0])
         entry[1] += 1
+    acquired = False
     try:
-        with entry[0]:
-            yield
+        acquired = entry[0].acquire() if timeout is None else entry[0].acquire(timeout=timeout)
+        if not acquired:
+            raise CollectionBusyError(collection)
+        yield
     finally:
+        if acquired:
+            entry[0].release()
         with _registry_lock:
             entry[1] -= 1
             if not entry[1]:
