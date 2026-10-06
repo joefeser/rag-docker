@@ -61,16 +61,29 @@ services:
       # Pinning the name keeps the identity stable across container recreation.
       CLUSTER_HOSTNAME: 'node1'
       RAFT_BOOTSTRAP_EXPECT: 1
+      # Without a Raft snapshot, every start replays each collection delete in
+      # Weaviate's Raft log and waits ~150ms on each one (issue #178: 922
+      # deletes, ~145s). A snapshot after 128 entries, checked every 30-60s,
+      # keeps the replayed tail short.
+      RAFT_SNAPSHOT_THRESHOLD: 128
+      RAFT_SNAPSHOT_INTERVAL: 30
     volumes:
       - weaviate_data:/var/lib/weaviate
     ports: []
     networks: [rag-internal]
     healthcheck:
       # The weaviate image has no curl; busybox wget is what it ships.
+      # The first start on a volume whose Raft log has no snapshot yet (the
+      # first after upgrading to the snapshot settings above) still replays
+      # its whole history before /ready answers: up to 156s on a copy of real
+      # data, 163.5s live (issue #130). Later starts replay only the tail since
+      # the last snapshot. Without start_period, compose marks Weaviate
+      # unhealthy after ~100s and fails the api, ui and proxy behind it.
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/.well-known/ready"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 180s
 
   ollama:
     image: ollama/ollama:0.3.14
@@ -2335,6 +2348,13 @@ def _collection_config_sync(name: str) -> dict:
     coll = get_client().collections.get(name)
     cfg = coll.config.get()
     vi = cfg.vector_index_config
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model_config = getattr(vectorizer, "model", None)
+    embedding_model = (model_config.get("model")
+                       if getattr(kind, "value", kind) == "text2vec-ollama"
+                       and isinstance(model_config, dict)
+                       and not getattr(cfg, "vector_config", None) else None)
 
     index_type = "flat" if "flat" in type(vi).__name__.lower() else "hnsw"
     distance = {
@@ -2353,6 +2373,7 @@ def _collection_config_sync(name: str) -> dict:
 
     return {
         "name": name,
+        "embedding_model": embedding_model,
         "index_type": index_type,
         "distance_metric": distance,
         "hnsw_config": hnsw,
@@ -3881,7 +3902,12 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
 
 def mark_stale(collection: str, reason: str) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
-    return _flag_sessions(collection, "stale", reason)
+    from services.collection_writes import canonical
+    name = canonical(collection)
+    # Backend aliases address the same corpus, but retained provenance keeps
+    # the spelling supplied when a session was created or imported.
+    aliases = {name, name[:1].lower() + name[1:]}
+    return sum(_flag_sessions(alias, "stale", reason) for alias in sorted(aliases))
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
@@ -4526,6 +4552,19 @@ def build(
         # Settings first: a bad config fails before any chunk is streamed.
         retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
 
+        collection_cfg = wc._collection_config_sync(collection)
+        stored_model = collection_cfg.get("embedding_model")
+        if not isinstance(stored_model, str) or not stored_model or stored_model != settings.embed_model:
+            raise PackageError(
+                "EMBEDDING_MISMATCH",
+                f"Collection '{collection}' has embedding model {stored_model!r}, "
+                f"but this instance is configured for {settings.embed_model!r}. "
+                "Export cannot attribute its stored vectors to the configured model. "
+                "Re-embed the collection with the configured model before exporting; "
+                "unknown or named-vector configurations are not supported.",
+                {"collection": collection, "stored_model": stored_model,
+                 "configured_model": settings.embed_model})
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -4553,7 +4592,7 @@ def build(
             progress(chunk_count)
 
         # 2. collection.json
-        b.add_json("collection.json", wc._collection_config_sync(collection))
+        b.add_json("collection.json", collection_cfg)
 
         # 3. configs
         ingest_cfg = _ingest_config(collection)
@@ -6194,6 +6233,26 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "retention was added carry their originals; export shows this as "
             "fidelity 'chunks-only'.",
             {"collection": collection})
+
+    # A chunks-only import or a failed retention can leave a mixed corpus.
+    # Any retained file is insufficient: replacing from that subset loses the
+    # other chunks and successful cutover discards their recovery copy.
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    uncovered = set()
+    for obj in wc.get_client().collections.get(collection).iterator():
+        filename = (obj.properties or {}).get("source_file")
+        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
+            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
+    if uncovered:
+        raise PackageError(
+            "SOURCES_REQUIRED",
+            "Cannot change chunk boundaries: some stored chunks have missing or "
+            "ambiguous retained originals. Re-embed without chunking parameters "
+            "or re-index to preserve the existing chunks.",
+            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -10411,6 +10470,20 @@ What makes it separate from the live stack:
   fails (Weaviate can be slow to report healthy, #130). If it still fails, it
   prints the last log lines of each service that isn't up. `up` then leaves
   the project running for inspection (`down` removes it); `run` removes it.
+- **No suite outlives its run (#184).** `run` starts `all.sh` in a process
+  group of its own. Whenever `run` ends, whether normally, on a failing suite,
+  or on INT or TERM (which now act at once), it first stops that whole group
+  (TERM, then KILL after 5 seconds), so nothing the suites started is left
+  running, and only then tears the project down and releases the lock. A
+  `stack.sh` killed outright (SIGKILL) can't do that. Then the verify lock
+  stops the orphaned suite instead: `lock.sh` trusts an inherited
+  `RAG_VERIFY_LOCK_HELD` only while the lock's pid is that shell or one of its
+  ancestors, and `lib.sh`'s API helpers (`api_get`, `api_post`, `api_code`,
+  `api_post_code`, `drop_collection`, `make_collection` and every
+  `wait_for_job` poll) repeat that check before each request and end the
+  suite, exit 3, when it fails. Not re-checked: direct `curl` and
+  `docker compose exec` calls in the suites, and the Python helpers, which
+  end on their own timeouts (up to 900 s).
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -10494,7 +10567,13 @@ regressions. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
-also checks all saved retrieval fields round-trip. Controlled tests complement,
+also checks all saved retrieval fields round-trip. `legacy_retrieval.py` (E28,
+#184) writes a legacy `ef` and other invalid saved settings into the API
+container, then checks through the real API that a legacy `ef` exports and
+imports as `null` with a warning or note, and that other invalid saved settings
+fail the export early with an actionable error and publish nothing. Crafted
+packages are written under a `.part` name and renamed into place, because on
+Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
@@ -10581,7 +10660,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
-| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
+| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
@@ -10619,6 +10698,7 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
 | `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
@@ -10831,7 +10911,11 @@ exit "$overall"
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
 # (RAG_SKIP_SLOW and RAG_ALLOW_RESTART pass through) and always tears it down,
-# exiting with all.sh's status. `up` leaves the project running and prints the
+# exiting with all.sh's status. all.sh runs in a process group of its own, and
+# before the teardown that whole group is stopped (TERM, then KILL), so no suite
+# outlives the run that started it (#184). INT and TERM act at once. A
+# stack.sh killed outright (SIGKILL) can't do this; then lock.sh and lib.sh's
+# helpers stop the orphaned suite (see lock.sh). `up` leaves the project running and prints the
 # environment that points docker compose and the suites at it; `down` removes
 # it. --checkout picks the checkout to build and test (default: this one).
 #
@@ -10948,9 +11032,26 @@ fi
 # Held for the whole command; the all.sh started below inherits it.
 . "$HARNESS/scripts/verify/lock.sh"
 TEARDOWN=0
+SUITE=""
+# Stops all.sh's process group: everything the suites started, including what
+# they left running in the background after all.sh ended.
+stop_suite() {
+  local i
+  [ -n "$SUITE" ] || return 0
+  kill -TERM -- "-$SUITE" 2>/dev/null
+  for i in $(seq 1 50); do
+    # Zombies count as gone: only this shell can reap all.sh itself.
+    ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$SUITE" '$1 == g && $2 !~ /^Z/ {found=1} END {exit !found}' || break
+    sleep 0.1
+  done
+  kill -KILL -- "-$SUITE" 2>/dev/null
+  wait "$SUITE" 2>/dev/null
+  SUITE=""
+}
 on_exit() {
   local rc=$?
   trap - EXIT
+  stop_suite
   if [ "$TEARDOWN" = 1 ]; then
     TEARDOWN=0
     do_down || rc=2
@@ -11321,7 +11422,17 @@ case "$CMD" in
     TEARDOWN=1
     do_up
     rc=0
-    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+    # In the background with job control on, all.sh leads a process group of
+    # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
+    # command, returns as soon as INT or TERM arrives, so the traps act at once.
+    # Its stdin is /dev/null: a background job keeps the terminal otherwise,
+    # and run from one, its first read (docker compose exec -T) would be
+    # stopped by SIGTTIN and the run would hang.
+    set -m
+    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} </dev/null &
+    SUITE=$!
+    set +m
+    wait "$SUITE" || rc=$?
     exit "$rc" ;;
 esac
 ```
@@ -11388,10 +11499,25 @@ skip() {
 # `expr` is python indexing against the parsed document, e.g. ['status']
 jfield() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)" 2>/dev/null; }
 
-api_get()  { curl -s -m 120 "$API$1"; }
-api_code() { curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
-api_post() { curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
-api_post_code() { curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Every helper below that reaches the API first checks that this suite's verify
+# lock is still held by it or an ancestor (#184). A suite orphaned by a run that
+# died after it passed lock.sh stops at its next helper call, before any
+# request, instead of acting on a later run's verify project. The suite ends
+# even when the helper runs inside $(...) or a pipeline, and its EXIT trap
+# still runs. Not re-checked: direct curl and `docker compose exec` calls in the
+# suites, and the Python helpers, which end on their own timeouts (up to 900 s).
+_rag_require_lock_owner() {
+  _rag_lock_owner_ok && return 0
+  _rag_lock_leftover
+  # In a subshell, exit alone would end only the subshell.
+  [ "${BASHPID:-}" = "$$" ] || kill -TERM "$$" 2>/dev/null
+  exit 3
+}
+
+api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
+api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
+api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 
 require_stack() {
   local code
@@ -11408,6 +11534,7 @@ require_stack() {
 wait_for_job() {
   local path="$1" limit="${2:-600}" waited=0 status=""
   while [ "$waited" -lt "$limit" ]; do
+    _rag_require_lock_owner
     status=$(api_get "$path" | jfield "['status']")
     case "$status" in
       completed|failed|partial|cancelled) printf '%s' "$status"; return 0 ;;
@@ -11421,7 +11548,7 @@ make_collection() {
   api_post "/collections" "{\"name\":\"$1\",\"index_type\":\"${2:-hnsw}\",\"distance_metric\":\"${3:-cosine}\",\"hnsw_config\":{\"efConstruction\":128,\"maxConnections\":64,\"ef\":64}}" >/dev/null
 }
 
-drop_collection() { curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
+drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
 
 # Remove every collection and package this run created.
 cleanup_prefixed() {
@@ -11509,6 +11636,49 @@ restart_refusal_reason() {
   fi
 }
 
+# Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
+# docker-compose.yml plus 60s for `down` and the api's own start.
+RESTART_LIMIT_DEFAULT_S=240
+
+# Prints the restart limit in seconds, or, with status 1, why the value of
+# RAG_RESTART_LIMIT_S is refused. Empty means unset.
+restart_limit() {
+  local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
+  case "$value" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+  esac
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  return 1
+}
+
+# wait_healthy_timed <started-epoch> <cap-seconds>: polls /health every 2s.
+# Prints the whole seconds since <started> once it returns 200, or nothing
+# once <cap> seconds have passed.
+wait_healthy_timed() {
+  local started="$1" cap="$2" code now
+  while :; do
+    code=$(api_code "$API/health")
+    now=$(python3 -c "import time;print(int(time.time()-$started))")
+    if [ "$code" = "200" ]; then printf '%s' "$now"; return 0; fi
+    [ "$now" -lt "$cap" ] || return 0
+    sleep 2
+  done
+}
+
+# restart_timing_check <limit> <elapsed, or empty if never healthy>: the
+# restart timing result, with the measured time on a pass and on a fail.
+restart_timing_check() {
+  local limit="$1" elapsed="$2"
+  if [ -n "$elapsed" ] && [ "$elapsed" -le "$limit" ]; then
+    check "restart reaches healthy within ${limit}s (took ${elapsed}s)" 0
+  elif [ -n "$elapsed" ]; then
+    check "restart reaches healthy within ${limit}s" 1 "took ${elapsed}s"
+  else
+    check "restart reaches healthy within ${limit}s" 1 "not healthy after $((limit * 2))s"
+  fi
+}
+
 # Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
 # that borrow these helpers are not suites and are left alone.
 case "$(basename "$0")" in
@@ -11529,7 +11699,13 @@ esac
 # other run's recreated collection (#95).
 #
 # The first script to source this holds the lock for its whole process tree:
-# it exports RAG_VERIFY_LOCK_HELD, so the suites all.sh starts don't try again.
+# it exports RAG_VERIFY_LOCK_HELD and the lock's path, RAG_VERIFY_LOCK, so the
+# suites all.sh starts don't try again. An inherited RAG_VERIFY_LOCK_HELD is
+# trusted only while the lock's pid is this shell or one of its ancestors
+# (#184). A suite orphaned by a run that died still carries the variable; it
+# exits 3 here instead of acting on a later run's verify project, and never
+# takes the dead holder's lock over. lib.sh's API helpers repeat the check
+# before every request, for a suite that was already past this point.
 #
 # The lock is a directory holding a pid file. mkdir is atomic, so only one run
 # can create it. A lock whose holder has died is taken over, but only under a
@@ -11546,6 +11722,34 @@ _rag_lock_release() {
   [ "$(cat "$RAG_VERIFY_LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
   rm -f "$RAG_VERIFY_LOCK/pid"
   rmdir "$RAG_VERIFY_LOCK" 2>/dev/null || true
+}
+
+# Succeeds only when the lock's pid is this shell ($$) or an ancestor of it.
+# A missing, symlinked or pid-less lock, or a process table that can't be
+# read, counts as not ours. The pid == $$ case needs no ps, which the API
+# container lacks.
+_rag_lock_owner_ok() {
+  local lock="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}" owner pid steps=0
+  [ ! -L "$lock" ] || return 1
+  owner=$(cat "$lock/pid" 2>/dev/null) || return 1
+  case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  pid=$$
+  while [ "$steps" -lt 64 ]; do
+    [ "$pid" = "$owner" ] && return 0
+    [ "$pid" -gt 1 ] || return 1
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    steps=$((steps + 1))
+  done
+  return 1
+}
+
+_rag_lock_leftover() {
+  local lock="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}" owner
+  owner=$(cat "$lock/pid" 2>/dev/null | LC_ALL=C tr -cd '0-9' | cut -c1-20)
+  if [ -n "$owner" ]; then owner="its pid is $owner"; else owner="it has no pid"; fi
+  printf '\nThe verify lock %s is not held by this run or its parents (%s). This is a leftover\nof an earlier verify run, so it stops here.\n\n' \
+    "$lock" "$owner" >&2
 }
 
 _rag_lock_acquire() {
@@ -11614,10 +11818,12 @@ _rag_lock_acquire() {
   return 3
 }
 
-if [ -z "${RAG_VERIFY_LOCK_HELD:-}" ]; then
+if [ -n "${RAG_VERIFY_LOCK_HELD:-}" ]; then
+  _rag_lock_owner_ok || { _rag_lock_leftover; exit 3; }
+else
   RAG_VERIFY_LOCK="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}"
   _rag_lock_acquire "$RAG_VERIFY_LOCK" || exit 3
-  export RAG_VERIFY_LOCK_HELD=1
+  export RAG_VERIFY_LOCK RAG_VERIFY_LOCK_HELD=1
   # Released on exit, after any EXIT trap already set (bash traps replace
   # rather than chain, so keep the earlier one). A suite that sets its own
   # EXIT trap later should call _rag_lock_release in it; if it doesn't, the
@@ -12222,9 +12428,15 @@ check_eq "a recreated collection does not inherit the retrieval config" \
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
   check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ "$restart_limit_ok" != 0 ]; then
+  check "restart, persistence and timing" 1 "$restart_limit"
 elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Save a known config here, right before the restart: the section above ends
   # by recreating $C with no saved config, so relying on earlier state made
@@ -12238,10 +12450,9 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # it is set and is not the live rag-docker project.
   project="$COMPOSE_PROJECT_NAME"
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
-  for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
-  elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
-  [ "$elapsed" -le 120 ]
-  check "restart reaches healthy within 120s" $? "took ${elapsed}s"
+  # Wait up to twice the limit, so a slow restart is still timed (#130).
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  restart_timing_check "$restart_limit" "$elapsed"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -12263,6 +12474,99 @@ sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) e
     "$(jfield "['is_default']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "False"
 else
   skip "restart, persistence and timing" "set RAG_ALLOW_RESTART=1 to include them"
+fi
+
+# ── restart from a Raft snapshot (issue #178; opt-in: it stops the stack) ────
+# The restart above comes too early for a snapshot: few schema changes, under
+# a minute of uptime. Here Weaviate takes one, a tail of changes follows it,
+# and a down/up must restore both: collections and objects from before the
+# snapshot, a create and a delete after it.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -z "$restart_refusal" ] && [ "$restart_limit_ok" = 0 ]; then
+  SNAP_KEEP="${C}SnapKeep"; SNAP_GONE="${C}SnapGone"; SNAP_TAIL="${C}SnapTail"
+  for n in "$SNAP_KEEP" "$SNAP_GONE" "$SNAP_TAIL"; do drop_collection "$n"; done
+  # put_objects <collection> <count>: objects with their own vectors, so no
+  # embedding call is involved.
+  put_objects() {
+    (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" "$2" <<'ENDPY'
+import sys
+from weaviate.classes.data import DataObject
+from services import weaviate_client as wc
+name, count = sys.argv[1], int(sys.argv[2])
+try:
+    result = wc.get_client().collections.get(name).data.insert_many([
+        DataObject(properties={"content": f"snapshot check {i}", "chunk_index": i},
+                   vector=[(i + 1) / (j + 1) for j in range(768)])
+        for i in range(count)])
+    sys.exit(1 if result.has_errors else 0)
+finally:
+    wc.close_client()
+ENDPY
+    ) >/dev/null 2>&1
+  }
+  snapshots() { (cd "$REPO_ROOT" && docker compose exec -T weaviate ls /var/lib/weaviate/raft/snapshots) 2>/dev/null | sort; }
+  make_collection "$SNAP_KEEP"; put_objects "$SNAP_KEEP" 5; keep_ok=$?
+  make_collection "$SNAP_GONE"; put_objects "$SNAP_GONE" 3; gone_ok=$?
+  [ "$keep_ok$gone_ok" = 00 ]
+  check "objects written before the snapshot" $?
+  before_snaps=$(snapshots)
+  # 70 create/delete pairs: 140 Raft entries, over the threshold of 128.
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "${C}Churn" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+client = wc.get_client()
+try:
+    for i in range(70):
+        client.collections.create(f"{sys.argv[1]}{i}")
+        client.collections.delete(f"{sys.argv[1]}{i}")
+finally:
+    wc.close_client()
+ENDPY
+  ) >/dev/null 2>&1
+  check "140 schema changes made" $?
+  # The interval is checked every 30-60s; allow 150s.
+  new_snap=""
+  for _ in $(seq 1 30); do
+    new_snap=$(comm -13 <(printf '%s\n' "$before_snaps") <(snapshots) | grep . | tail -1)
+    [ -n "$new_snap" ] && break
+    sleep 5
+  done
+  [ -n "$new_snap" ]
+  check "Weaviate snapshots its Raft log after 140 schema changes (within 150s)" $? "no new snapshot in /var/lib/weaviate/raft/snapshots"
+  snap_index=$(printf '%s' "$new_snap" | cut -d- -f2)
+  # The tail after the snapshot: one collection created, one deleted.
+  make_collection "$SNAP_TAIL"; put_objects "$SNAP_TAIL" 4
+  check "objects written after the snapshot" $?
+  drop_collection "$SNAP_GONE"
+  started=$(python3 -c "import time;print(time.time())")
+  project="$COMPOSE_PROJECT_NAME"
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  [ -n "$elapsed" ]
+  check "healthy again after a restart from the snapshot" $? "not healthy after $((restart_limit * 2))s"
+  # Weaviate logs the snapshot it started from on "raft node constructed".
+  restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
+import json, sys
+for line in sys.stdin:
+    _, _, body = line.partition('|')
+    try:
+        d = json.loads(body)
+    except ValueError:
+        continue
+    if d.get('msg') == 'raft node constructed':
+        print(d.get('last_snapshot_index', 0))")
+  [ -n "$snap_index" ] && [ "${restored:-0}" -ge "$snap_index" ] 2>/dev/null
+  check "the restart starts from the snapshot" $? "last_snapshot_index on start: ${restored:-none}, snapshot taken at: ${snap_index:-none}"
+  api_get "/collections" | python3 -c "
+import json, sys
+a = {c['name']: c['object_count'] for c in json.load(sys.stdin)['collections']}
+ok = (a.get('$SNAP_KEEP') == 5 and a.get('$SNAP_TAIL') == 4 and '$SNAP_GONE' not in a
+      and not any(n.startswith('${C}Churn') for n in a))
+print(a if not ok else '')
+sys.exit(0 if ok else 1)" > "$RAG_INFRA_TMP/vfy_snap.txt"
+  check "collections and objects before and after the snapshot survive the restart, deletes stay deleted" $? "$(cat "$RAG_INFRA_TMP/vfy_snap.txt")"
+  for n in "$SNAP_KEEP" "$SNAP_TAIL"; do drop_collection "$n"; done
+elif [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "restart from a Raft snapshot" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 # ── startup sweeps leave a clean instance alone ──────────────────────────────
@@ -13155,8 +13459,15 @@ with tempfile.TemporaryDirectory() as td:
     chunks = root / "chunks.jsonl"
     chunks.write_bytes(chunks.read_bytes()[: len(chunks.read_bytes()) // 2])
     out = src.parent / (src.name.replace(".tar.gz", "") + "-corrupt.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
 ENDPY
 CORRUPT=$(python3 - "$EXPORTS/$PKG" <<'ENDPY'
 import pathlib, sys
@@ -13178,6 +13489,10 @@ rm -f "$EXPORTS/$CORRUPT"
 # Digest-valid malformed retrieval settings must fail before every conflict path.
 python3 ./retrieval_settings.py "$API" "$C" "$EXPORTS/$PKG"
 check "invalid retrieval imports preserve live collections and settings" $?
+# Settings saved before PR #108 (#173): a legacy ef exports and imports as null
+# with a warning or note; other invalid saved settings fail the export early.
+python3 ./legacy_retrieval.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
+check "E28: legacy ef is cleared on export and import; invalid saved settings fail early" $?
 
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
@@ -13205,8 +13520,15 @@ with tempfile.TemporaryDirectory() as td:
         "sha256:" + hashlib.sha256(side.read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 }
@@ -13260,8 +13582,15 @@ with tempfile.TemporaryDirectory() as td:
             "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 )
@@ -13342,8 +13671,15 @@ with tempfile.TemporaryDirectory() as td:
     manifest["files"]["sources/index.json"] = "sha256:" + sha(idx_path.read_bytes())
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 }
@@ -17748,7 +18084,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         (retained / "index.json").write_text(json.dumps(self.index(digest)))
         with patch.object(packager, "exports_dir", return_value=self.root), \
              patch.object(packager, "read_chunks", return_value=iter(())), \
-             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
              patch.object(packager, "_ingest_config", return_value=None), \
              patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
              patch.object(packager, "_goldstandard_sessions", return_value=[]):
@@ -17816,7 +18152,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
             }}))
         with patch.object(packager, "exports_dir", return_value=self.root), \
              patch.object(packager, "read_chunks", return_value=iter(())), \
-             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
              patch.object(packager.wc, "_meta_sync", return_value={}), \
              patch.object(packager, "_ingest_config", return_value=None), \
              patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
@@ -17990,20 +18326,40 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertEqual(retrieval_config.validate({'ef': value}, 'Corpus'), cfg)
 
     def test_legacy_ef_import_completes_with_note(self):
-        for value in LEGACY_EF:
-            with self.subTest(ef=value):
-                self.archive(json.dumps({'ef': value, 'top_k': 7}))
-                with patch.object(importer, '_ensure_models', return_value=[]), \
-                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
-                     patch.object(importer, '_build', return_value=0):
+        # Every conflict mode (#184): abort into a new collection, rename beside
+        # an existing one, and replace an existing one through staging.
+        for conflict in ('abort', 'rename', 'replace'):
+            for value in LEGACY_EF:
+                with self.subTest(conflict=conflict, ef=value), ExitStack() as mocks:
+                    self.archive(json.dumps({'ef': value, 'top_k': 7}))
+                    mocks.enter_context(patch.object(importer, '_ensure_models', return_value=[]))
+                    mocks.enter_context(patch.object(importer, '_build', return_value=0))
+                    mocks.enter_context(patch.object(
+                        importer.wc, '_collection_exists_sync',
+                        side_effect=lambda name: conflict != 'abort' and name == 'Corpus'))
+                    if conflict == 'replace':
+                        mocks.enter_context(patch.object(importer.collection_recovery, 'begin',
+                                                         return_value={'staging': 'Corpus__importing_test',
+                                                                       'state': 'scratch'}))
+                        for name in ('retain', 'discard'):
+                            mocks.enter_context(patch.object(importer.collection_recovery, name))
+                        mocks.enter_context(patch.object(importer.wc, 'get_client'))
+                        mocks.enter_context(patch.object(importer.wc, '_delete_collection_sync'))
+                        mocks.enter_context(patch.object(importer.goldstandard, 'sessions_for', return_value=[]))
                     importer._jobs['test'] = {'status': 'queued'}
-                    importer._run('test', 'fixture.tar.gz', 'abort')
-                job = importer._jobs['test']
-                self.assertEqual(job['status'], 'completed')
-                restored = retrieval_config.load('Corpus')
-                self.assertIsNone(restored['ef'])
-                self.assertEqual(restored['top_k'], 7)
-                self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+                    importer._run('test', 'fixture.tar.gz', conflict)
+                    job = importer._jobs['test']
+                    self.assertEqual(job['status'], 'completed', job)
+                    target = job['collection']
+                    if conflict == 'rename':
+                        self.assertTrue(target.startswith('Corpus_imported_'), target)
+                    else:
+                        self.assertEqual(target, 'Corpus')
+                    restored = retrieval_config.load(target)
+                    self.assertIsNone(restored['ef'])
+                    self.assertEqual(restored['top_k'], 7)
+                    self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+                    retrieval_config._path(target).unlink()
 
     def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
         self.archive(json.dumps({'top_k': '8', 'ef': 64}))
@@ -18043,11 +18399,37 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual((args.mode, args.top_k, args.alpha, args.response_format),
                          ('hybrid', 8, 0.25, 'engineer'))
 
+    def test_export_checks_stored_model_before_streaming_or_bundling(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        for model, kind, named in (('old-model', 'text2vec-ollama', None), (None, 'none', None), ('new-model', 'text2vec-ollama', {'named': {}})):
+            with self.subTest(model=model, kind=kind, named=named):
+                cfg = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer=kind, model={'model': model}), vector_config=named)
+                backend = MagicMock()
+                backend.collections.get.return_value.config.get.return_value = cfg
+                with patch.object(settings, 'embed_model', 'new-model'), patch.object(packager.wc, 'get_client', return_value=backend), patch.object(packager, 'read_chunks') as chunks, patch.object(packager.model_bundle, 'export_model') as bundle:
+                    before = sorted(self.exports.iterdir())
+                    with self.assertRaises(packager.PackageError) as caught:
+                        packager.build('Corpus', include_models=True)
+                    self.assertEqual(caught.exception.code, 'EMBEDDING_MISMATCH')
+                    self.assertIn('Re-embed', caught.exception.message)
+                    chunks.assert_not_called()
+                    bundle.assert_not_called()
+                    self.assertEqual(sorted(self.exports.iterdir()), before)
+
+    def test_collection_schema_records_actual_model_not_process_default(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        backend = MagicMock()
+        backend.collections.get.return_value.config.get.return_value = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama', model={'model': 'stored-model'}), vector_config=None)
+        with patch.object(settings, 'embed_model', 'different-model'), patch.object(packager.wc, 'get_client', return_value=backend):
+            self.assertEqual(packager.wc._collection_config_sync('Corpus')['embedding_model'], 'stored-model')
+
     def test_export_emits_normalized_settings_and_executable_defaults(self):
         saved = {'collection': 'Corpus', 'top_k': '7', 'alpha': '0.5', 'ef': 64}
         retrieval_config.save(saved)
         with patch.object(packager, 'read_chunks', return_value=[]), \
-             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
              patch.object(packager, '_ingest_config', return_value=None), \
              patch.object(packager, '_goldstandard_sessions', return_value=[]), \
              patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
@@ -18069,7 +18451,7 @@ class RetrievalImportTests(unittest.TestCase):
         saved = retrieval_config._path('Corpus')
         before = saved.read_bytes()
         with patch.object(packager, 'read_chunks', return_value=[]), \
-             patch.object(packager.wc, '_collection_config_sync', return_value={}), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
              patch.object(packager, '_ingest_config', return_value=None), \
              patch.object(packager, '_goldstandard_sessions', return_value=[]), \
              patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
@@ -18093,7 +18475,7 @@ class RetrievalImportTests(unittest.TestCase):
                 continue
             with self.subTest(value=value), ExitStack() as mocks:
                 chunks = mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
-                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={}))
+                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}))
                 mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
                 mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
                 with self.assertRaises(ValueError) as caught:
@@ -18138,6 +18520,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import uuid
 
 
 def run(api, collection, package):
@@ -18174,12 +18557,17 @@ def run(api, collection, package):
                 manifest = json.loads(manifest_path.read_text())
                 manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
                 manifest_path.write_text(json.dumps(manifest))
-                with tempfile.NamedTemporaryFile(prefix='vfy-retrieval-', suffix='.tar.gz',
-                                                 dir=package.parent) as output:
-                    with tarfile.open(output.name, 'w:gz') as archive:
+                # Written under a .part name, then renamed into place: on Docker
+                # Desktop the API can read a freshly written bind-mounted file
+                # as empty (#184).
+                output = package.parent / f'vfy-retrieval-{uuid.uuid4().hex[:12]}.tar.gz'
+                part = output.with_name('.' + output.name + '.part')
+                try:
+                    with tarfile.open(part, 'w:gz') as archive:
                         archive.add(root, arcname=root.name)
+                    part.replace(output)
                     for conflict in ('abort', 'rename', 'replace'):
-                        job_id = request('/import', {'filename': Path(output.name).name,
+                        job_id = request('/import', {'filename': output.name,
                                                      'on_conflict': conflict})['job_id']
                         deadline = time.monotonic() + 120
                         while True:
@@ -18194,6 +18582,9 @@ def run(api, collection, package):
                         assert job['error_detail'] == {'file': 'retrieval_config.json'}, job
                         assert request('/retrieval/config/' + collection) == expected
                         assert collections() == baseline
+                finally:
+                    part.unlink(missing_ok=True)
+                    output.unlink(missing_ok=True)
         print('15 digest-valid malformed retrieval imports rejected; live collections/settings preserved')
     finally:
         request('/retrieval/config', saved)
@@ -18201,4 +18592,166 @@ def run(api, collection, package):
 
 if __name__ == '__main__':
     run(*sys.argv[1:])
+```
+
+### scripts/verify/legacy_retrieval.py
+
+```python
+"""Live E28 acceptance for retrieval settings saved under an older contract (#173).
+
+Writes the collection's saved settings file directly in the API container, as
+an API from before PR #108 could have, then checks through the real API:
+- a legacy integer ef exports as null with a warning, and the saved file is
+  left alone;
+- a package carrying a legacy ef imports with ef null and a note;
+- other invalid saved settings fail the export before any package is
+  published, with an error naming the fields and the Retrieval page.
+The collection's saved settings are restored on exit.
+"""
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+WARNING = ("saved retrieval setting ef={} is outside 16-512 and was exported as null; "
+           "ef is no longer used. Save this collection's settings on the Retrieval "
+           "page to clear it.")
+NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was restored "
+        "as null; ef is no longer used.")
+
+
+def run(api, collection, exports, repo_root):
+    exports = Path(exports)
+    failures = []
+
+    def request(path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(api.rstrip('/') + path, data=data,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+
+    def wait(path, timeout=900):
+        deadline = time.monotonic() + timeout
+        while True:
+            job = request(path)
+            if job['status'] in ('failed', 'completed'):
+                return job
+            if time.monotonic() >= deadline:
+                raise AssertionError(f'{path} timed out: {job}')
+            time.sleep(0.5)
+
+    def write_saved(value):
+        """Bypass the save contract, as an older API's saved file would."""
+        code = ('import json, sys\n'
+                'from services import retrieval_config\n'
+                'retrieval_config._path(sys.argv[1]).write_text(sys.argv[2])\n')
+        subprocess.run(['docker', 'compose', 'exec', '-T', 'api', 'python', '-c', code,
+                        collection, json.dumps(value)], cwd=repo_root, check=True)
+
+    def expect(name, ok, detail=''):
+        print(('PASS ' if ok else 'FAIL ') + name + ('' if ok else f'  -- {detail}'))
+        if not ok:
+            failures.append(name)
+
+    def listing():
+        return sorted(p.name for p in exports.iterdir())
+
+    saved = request('/retrieval/config/' + collection)
+    renamed = None
+    try:
+        # 1. Export of a legacy ef: null in the package, a warning, file left alone.
+        legacy = {k: saved[k] for k in ('retrieval_mode', 'alpha', 'response_format')}
+        write_saved({**legacy, 'top_k': 7, 'ef': 10000})
+        loaded = request('/retrieval/config/' + collection)
+        expect('legacy ef: the Retrieval page can still load the saved settings',
+               loaded['ef'] == 10000 and loaded['top_k'] == 7, loaded)
+        job = wait('/export/job/' + request('/export', {'collection': collection,
+                                                        'include_models': False})['job_id'])
+        expect('legacy ef: export completes', job['status'] == 'completed', job)
+        package = exports / job['filename']
+        with tarfile.open(package) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            manifest = json.load(archive.extractfile(members['manifest.json']))
+            script = archive.extractfile(members['retrieve.py']).read().decode()
+        warning = WARNING.format(10000)
+        expect('legacy ef: the package carries ef null and the other settings',
+               cfg['ef'] is None and cfg['top_k'] == 7, cfg)
+        expect('legacy ef: the export job warns once', job['warnings'].count(warning) == 1,
+               job['warnings'])
+        expect('legacy ef: the manifest records the warning',
+               manifest['warnings'].count(warning) == 1, manifest['warnings'])
+        expect('legacy ef: retrieve.py carries the saved top_k', 'DEFAULT_TOP_K = 7' in script,
+               [l for l in script.splitlines() if 'TOP_K =' in l])
+        after = request('/retrieval/config/' + collection)
+        expect('legacy ef: export leaves the saved settings alone', after['ef'] == 10000, after)
+
+        # 2. Import of a package with a legacy ef: restored as null, with a note.
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with tarfile.open(package) as archive:
+                archive.extractall(work, filter='data')
+            root = next(p for p in work.iterdir() if p.is_dir())
+            side = root / 'retrieval_config.json'
+            side.write_text(json.dumps({**json.loads(side.read_text()), 'ef': 513}))
+            manifest_path = root / 'manifest.json'
+            manifest = json.loads(manifest_path.read_text())
+            manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
+            manifest_path.write_text(json.dumps(manifest))
+            crafted = exports / (package.name.replace('.tar.gz', '') + '-legacyef.tar.gz')
+            # Write under another name, then rename: on Docker Desktop, the API
+            # container can read a freshly written bind-mounted file as empty.
+            partial = crafted.with_name('.' + crafted.name + '.part')
+            with tarfile.open(partial, 'w:gz') as archive:
+                archive.add(root, arcname=root.name)
+            partial.replace(crafted)
+        try:
+            job = wait('/import/job/' + request('/import', {'filename': crafted.name,
+                                                            'on_conflict': 'rename'})['job_id'])
+        finally:
+            crafted.unlink(missing_ok=True)
+            package.unlink(missing_ok=True)
+        expect('legacy ef: a package with ef=513 imports', job['status'] == 'completed', job)
+        if job['status'] == 'completed':
+            renamed = job['collection']
+            expect('legacy ef: the import notes the cleared ef once',
+                   job['notes'].count(NOTE.format(513)) == 1, job['notes'])
+            restored = request('/retrieval/config/' + renamed)
+            expect('legacy ef: the imported collection has ef null and the package top_k',
+                   restored['ef'] is None and restored['top_k'] == 7
+                   and restored['is_default'] is False, restored)
+
+        # 3. Other invalid saved settings fail early, actionably, publishing nothing.
+        for value, needles in [({**legacy, 'top_k': 0, 'alpha': 2}, ['top_k', 'alpha']),
+                               ({**legacy, 'ef': True}, ['ef']),
+                               ([], ['not a JSON object'])]:
+            write_saved(value)
+            before = listing()
+            job = wait('/export/job/' + request('/export', {'collection': collection,
+                                                            'include_models': False})['job_id'])
+            error = job.get('error') or ''
+            expect(f'invalid saved settings {value!r}: export fails', job['status'] == 'failed', job)
+            expect(f'invalid saved settings {value!r}: the error is actionable',
+                   all(n in error for n in needles) and 'Retrieval page' in error
+                   and f"'{collection}'" in error, error)
+            expect(f'invalid saved settings {value!r}: no package or staging is left',
+                   listing() == before, sorted(set(listing()) ^ set(before)))
+    finally:
+        if renamed:
+            urllib.request.urlopen(urllib.request.Request(
+                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE'),
+                timeout=120).read()
+        request('/retrieval/config', saved)
+    print(f'{len(failures)} legacy/invalid retrieval settings check(s) failed')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(run(*sys.argv[1:]))
 ```

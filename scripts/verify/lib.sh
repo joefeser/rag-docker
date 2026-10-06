@@ -57,10 +57,25 @@ skip() {
 # `expr` is python indexing against the parsed document, e.g. ['status']
 jfield() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)" 2>/dev/null; }
 
-api_get()  { curl -s -m 120 "$API$1"; }
-api_code() { curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
-api_post() { curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
-api_post_code() { curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Every helper below that reaches the API first checks that this suite's verify
+# lock is still held by it or an ancestor (#184). A suite orphaned by a run that
+# died after it passed lock.sh stops at its next helper call, before any
+# request, instead of acting on a later run's verify project. The suite ends
+# even when the helper runs inside $(...) or a pipeline, and its EXIT trap
+# still runs. Not re-checked: direct curl and `docker compose exec` calls in the
+# suites, and the Python helpers, which end on their own timeouts (up to 900 s).
+_rag_require_lock_owner() {
+  _rag_lock_owner_ok && return 0
+  _rag_lock_leftover
+  # In a subshell, exit alone would end only the subshell.
+  [ "${BASHPID:-}" = "$$" ] || kill -TERM "$$" 2>/dev/null
+  exit 3
+}
+
+api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
+api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
+api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 
 require_stack() {
   local code
@@ -77,6 +92,7 @@ require_stack() {
 wait_for_job() {
   local path="$1" limit="${2:-600}" waited=0 status=""
   while [ "$waited" -lt "$limit" ]; do
+    _rag_require_lock_owner
     status=$(api_get "$path" | jfield "['status']")
     case "$status" in
       completed|failed|partial|cancelled) printf '%s' "$status"; return 0 ;;
@@ -90,7 +106,7 @@ make_collection() {
   api_post "/collections" "{\"name\":\"$1\",\"index_type\":\"${2:-hnsw}\",\"distance_metric\":\"${3:-cosine}\",\"hnsw_config\":{\"efConstruction\":128,\"maxConnections\":64,\"ef\":64}}" >/dev/null
 }
 
-drop_collection() { curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
+drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
 
 # Remove every collection and package this run created.
 cleanup_prefixed() {
@@ -175,6 +191,49 @@ restart_refusal_reason() {
     printf 'COMPOSE_PROJECT_NAME is not set, so a restart could reach the live rag-docker stack; run it through scripts/verify/stack.sh'
   elif [ "$project" = "rag-docker" ]; then
     printf 'restarts never run against the live rag-docker project (#152)'
+  fi
+}
+
+# Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
+# docker-compose.yml plus 60s for `down` and the api's own start.
+RESTART_LIMIT_DEFAULT_S=240
+
+# Prints the restart limit in seconds, or, with status 1, why the value of
+# RAG_RESTART_LIMIT_S is refused. Empty means unset.
+restart_limit() {
+  local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
+  case "$value" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+  esac
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  return 1
+}
+
+# wait_healthy_timed <started-epoch> <cap-seconds>: polls /health every 2s.
+# Prints the whole seconds since <started> once it returns 200, or nothing
+# once <cap> seconds have passed.
+wait_healthy_timed() {
+  local started="$1" cap="$2" code now
+  while :; do
+    code=$(api_code "$API/health")
+    now=$(python3 -c "import time;print(int(time.time()-$started))")
+    if [ "$code" = "200" ]; then printf '%s' "$now"; return 0; fi
+    [ "$now" -lt "$cap" ] || return 0
+    sleep 2
+  done
+}
+
+# restart_timing_check <limit> <elapsed, or empty if never healthy>: the
+# restart timing result, with the measured time on a pass and on a fail.
+restart_timing_check() {
+  local limit="$1" elapsed="$2"
+  if [ -n "$elapsed" ] && [ "$elapsed" -le "$limit" ]; then
+    check "restart reaches healthy within ${limit}s (took ${elapsed}s)" 0
+  elif [ -n "$elapsed" ]; then
+    check "restart reaches healthy within ${limit}s" 1 "took ${elapsed}s"
+  else
+    check "restart reaches healthy within ${limit}s" 1 "not healthy after $((limit * 2))s"
   fi
 }
 

@@ -406,6 +406,101 @@ class RestartGuardTests(unittest.TestCase):
                 self.assertLess(ask, min(acts))
         self.assertNotIn('COMPOSE_PROJECT_NAME:-rag-docker', (VERIFY / '01_infrastructure.sh').read_text())
 
+    def test_infrastructure_checks_the_limit_before_restarting(self):
+        # #130: an invalid RAG_RESTART_LIMIT_S fails the check and restarts nothing.
+        text = (VERIFY / '01_infrastructure.sh').read_text()
+        block = text[text.index('if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]'):]
+        down = re.search(r'docker compose[^\n]*down', block)
+        self.assertIsNotNone(down, 'restart command not found')
+        self.assertIn('restart_limit', block[:down.start()])
+
+
+# Weaviate's measured cold start on a copy of real data, rounded up to 30s (#130).
+WEAVIATE_START_PERIOD_S = 180
+# The restart check's default limit: the start period plus 60s (#130).
+RESTART_LIMIT_DEFAULT_S = WEAVIATE_START_PERIOD_S + 60
+
+
+class WeaviateHealthcheckTests(unittest.TestCase):
+    """#130: compose waits out Weaviate's cold start instead of failing its dependants."""
+
+    def test_start_period_covers_the_measured_cold_start(self):
+        import yaml
+        compose = yaml.safe_load((ROOT / 'docker-compose.yml').read_text())
+        self.assertEqual(compose['services']['weaviate']['healthcheck'], {
+            'test': ['CMD', 'wget', '-q', '--spider', 'http://localhost:8080/v1/.well-known/ready'],
+            'interval': '10s',
+            'timeout': '5s',
+            'retries': 10,
+            'start_period': f'{WEAVIATE_START_PERIOD_S}s',
+        })
+
+
+class WeaviateRaftSnapshotTests(unittest.TestCase):
+    """issue #178: Weaviate snapshots its Raft log often, so a start replays only a short tail."""
+
+    def test_snapshot_settings(self):
+        import yaml
+        compose = yaml.safe_load((ROOT / 'docker-compose.yml').read_text())
+        env = compose['services']['weaviate']['environment']
+        self.assertEqual(env.get('RAFT_SNAPSHOT_THRESHOLD'), 128)
+        self.assertEqual(env.get('RAFT_SNAPSHOT_INTERVAL'), 30)
+        self.assertNotIn('RAFT_TRAILING_LOGS', env)
+
+
+class RestartTimingTests(unittest.TestCase):
+    """#130: a configurable restart limit, with the measured time on a pass and a fail."""
+
+    def bash(self, script, **env):
+        box = Sandbox(self)
+        result = box.run(['bash', '-c', f'. "{VERIFY}/lib.sh"; {script}'], **env)
+        return result
+
+    def test_default_limit(self):
+        for value in (None, ''):
+            with self.subTest(value=value):
+                result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, str(RESTART_LIMIT_DEFAULT_S))
+
+    def test_valid_override(self):
+        for value, limit in (('45', '45'), ('007', '7')):
+            with self.subTest(value=value):
+                result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, limit)
+
+    def test_invalid_values_are_refused(self):
+        for value in ('0', '000', '-5', '1.5', 'abc', '10s', ' 30'):
+            with self.subTest(value=value):
+                result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('RAG_RESTART_LIMIT_S', result.stdout)
+                self.assertIn(f"'{value}'", result.stdout)
+
+    def test_wait_reports_seconds_once_healthy(self):
+        result = self.bash('wait_healthy_timed "$(date +%s)" 30', STUB_CURL_CODE='200',
+                           RAG_API='http://localhost:9/api')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r'^[0-9]+$')
+        self.assertLessEqual(int(result.stdout), 1)
+
+    def test_wait_prints_nothing_at_the_cap(self):
+        result = self.bash('wait_healthy_timed "$(date +%s)" 2', STUB_CURL_CODE='000',
+                           RAG_API='http://localhost:9/api')
+        self.assertEqual(result.stdout, '')
+
+    def test_results_report_the_time(self):
+        cases = (('300 143', 'PASS', 'restart reaches healthy within 300s (took 143s)'),
+                 ('300 300', 'PASS', 'restart reaches healthy within 300s (took 300s)'),
+                 ('300 412', 'FAIL', 'took 412s'),
+                 ("300 ''", 'FAIL', 'not healthy after 600s'))
+        for args, verdict, text in cases:
+            with self.subTest(args=args):
+                result = self.bash(f'restart_timing_check {args}')
+                self.assertIn(verdict, result.stdout)
+                self.assertIn(text, result.stdout)
+
 
 class StackArgumentTests(unittest.TestCase):
     """S7 and S8: bad arguments are refused before any Docker command."""
@@ -716,6 +811,123 @@ class StackRunTeardownTests(unittest.TestCase):
         self.assertIn('verify project rag-verify removed', out)
         self.assert_torn_down_after_up(box)
         self.assertFalse(Path(box.env['RAG_VERIFY_LOCK']).exists(), 'the verify lock is released')
+
+
+def alive(pid):
+    """True while pid runs (a zombie, already dead, counts as gone)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
+class StackRunSuiteGroupTests(unittest.TestCase):
+    """#184: `run` stops the suite's whole process group before it tears the
+    project down, so no suite outlives the run that started it."""
+
+    checkout = StackRunTeardownTests.checkout
+    assert_torn_down_after_up = StackRunTeardownTests.assert_torn_down_after_up
+
+    def wait_for(self, path):
+        import time
+        for _ in range(200):
+            if path.exists() and path.read_text().strip():
+                return int(path.read_text().split()[0])
+            time.sleep(0.05)
+        self.fail(f'{path} never appeared')
+
+    def assert_gone(self, *pids):
+        import time
+        for _ in range(100):
+            if not any(alive(p) for p in pids):
+                return
+            time.sleep(0.05)
+        self.fail(f'still running: {[p for p in pids if alive(p)]}')
+
+    def start(self, box, checkout):
+        env = {**box.env, 'STUB_UP_OK': '1', 'STUB_CURL_CODE': '200'}
+        proc = subprocess.Popen(['bash', str(STACK), 'run', '--checkout', str(checkout)], cwd=ROOT, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and (os.killpg(proc.pid, signal.SIGKILL), proc.wait()))
+        return proc
+
+    def test_a_background_child_left_by_the_suite_is_stopped(self):
+        box = Sandbox(self)
+        child = box.root / 'child.pid'
+        checkout = self.checkout(box, f'sleep 300 &\necho $! > "{child}"\nexit 0\n')
+        result = box.run(['bash', str(STACK), 'run', '--checkout', str(checkout)],
+                         STUB_UP_OK='1', STUB_CURL_CODE='200')
+        pid = int(child.read_text())
+        self.addCleanup(lambda: alive(pid) and os.kill(pid, signal.SIGKILL))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_gone(pid)
+        self.assert_torn_down_after_up(box)
+
+    def test_term_to_stack_alone_stops_the_suite_at_once(self):
+        box = Sandbox(self)
+        pids = box.root / 'pids'
+        checkout = self.checkout(box, f'sleep 300 &\necho "$$ $!" > "{pids}"\nsleep 30\nexit 0\n')
+        proc = self.start(box, checkout)
+        self.wait_for(pids)
+        suite, child = map(int, pids.read_text().split())
+        self.addCleanup(lambda: [alive(p) and os.kill(p, signal.SIGKILL) for p in (suite, child)])
+        os.kill(proc.pid, signal.SIGTERM)      # stack.sh only, not its group
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 143, out + err)
+        self.assert_gone(suite, child)
+        self.assertIn('verify project rag-verify removed', out)
+        self.assert_torn_down_after_up(box)
+        self.assertFalse(Path(box.env['RAG_VERIFY_LOCK']).exists(), 'the verify lock is released')
+
+    def test_the_suite_reads_no_terminal(self):
+        # With job control on, a background job keeps the caller's stdin. From
+        # an interactive terminal the suite's first read (docker compose exec
+        # -T) is then stopped by SIGTTIN and the run hangs, so stack.sh gives
+        # the suite /dev/null. Data on stack.sh's stdin must not reach it.
+        box = Sandbox(self)
+        seen = box.root / 'stdin'
+        checkout = self.checkout(box, f'if read -r line; then echo "read:$line"; else echo eof; fi > "{seen}"\n')
+        env = {k: v for k, v in {**box.env, 'STUB_UP_OK': '1', 'STUB_CURL_CODE': '200'}.items() if v is not None}
+        result = subprocess.run(['bash', str(STACK), 'run', '--checkout', str(checkout)], cwd=ROOT, env=env,
+                                input='from-the-terminal\n', capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(seen.read_text().strip(), 'eof')
+
+    def test_the_suite_is_stopped_before_the_teardown(self):
+        box = Sandbox(self)
+        started = box.root / 'started'
+        checkout = self.checkout(box, textwrap.dedent(f'''\
+            trap 'echo '"'"'["suite", "terminated"]'"'"' >> "$STUB_LOG"; exit 143' TERM
+            echo $$ > "{started}"
+            sleep 30 & wait
+            '''))
+        proc = self.start(box, checkout)
+        self.wait_for(started)
+        os.kill(proc.pid, signal.SIGTERM)
+        out, err = proc.communicate(timeout=15)
+        calls = box.calls()
+        self.assertIn(['suite', 'terminated'], calls, out + err)
+        down = ['docker', 'compose', '-p', 'rag-verify', 'down', '-v', '--remove-orphans']
+        last_down = max(i for i, c in enumerate(calls) if c == down)
+        self.assertLess(calls.index(['suite', 'terminated']), last_down)
+
+
+class CraftedPackageWriteTests(unittest.TestCase):
+    """#184: a package the host writes for the API to import is written under
+    a .part name in the same folder and renamed into place, because on Docker
+    Desktop the container can read a freshly closed bind-mounted file as empty."""
+
+    def test_every_crafted_package_is_renamed_into_place(self):
+        for name, count in (('05_transfer.sh', 4), ('retrieval_settings.py', 1)):
+            with self.subTest(file=name):
+                source = (VERIFY / name).read_text()
+                opened = re.findall(r"tarfile\.open\(([^,()]+), ['\"]w:gz['\"]\)", source)
+                self.assertEqual(len(opened), count, opened)
+                self.assertEqual(set(opened), {'part'}, 'written straight to the final name')
+                self.assertEqual(source.count('part.replace('), count)
 
 
 @unittest.skipUnless(shutil.which('sha256sum'), 'needs sha256sum (it runs in the ollama image)')

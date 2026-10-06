@@ -46,6 +46,32 @@ class ValidityServiceTests(unittest.TestCase):
         expected=gs.get_session(self.data['session_id']);gs._sessions={};gs.load_sessions_from_disk()
         self.assertEqual(gs.get_session(self.data['session_id']),expected)
 
+    def test_tuning_invalidates_both_backend_aliases_without_remapping(self):
+        from services import tuning
+        for caller in ('ValidityFixture', 'validityFixture'):
+            for operation in ('reembed', 'rechunk'):
+                with self.subTest(caller=caller, operation=operation):
+                    for sid, name in (('gs_11111111', 'ValidityFixture'), ('gs_22222222', 'validityFixture'), ('gs_33333333', 'Validityfixture')):
+                        data = session()
+                        data.update(session_id=sid, collection=name)
+                        gs.store_session(data)
+                    job = {}
+                    def rebuild(*args, **kwargs):
+                        kwargs['before_replace']()
+                        return 1
+                    with patch.dict(tuning._jobs, {'alias': job}), patch.object(tuning.sources, 'has_sources', return_value=True), patch.object(tuning, '_chunks_from_sources', return_value=[{'content': 'Inert'}]), patch.object(tuning, '_existing_chunks', return_value=[{'content': 'Inert'}]), patch.object(tuning, '_rebuild', side_effect=rebuild):
+                        tuning._run('alias', caller, operation, {'chunking': {} if operation == 'rechunk' else None})
+                    self.assertEqual(job['status'], 'completed')
+                    gs._sessions = {}
+                    gs.load_sessions_from_disk()
+                    for sid, name in (('gs_11111111', 'ValidityFixture'), ('gs_22222222', 'validityFixture')):
+                        current = gs.get_session(sid)
+                        self.assertEqual(current['collection'], name)
+                        self.assertTrue(current['stale'])
+                        with self.assertRaises(gs.GoldStandardError):
+                            asyncio.run(gs.save_session(sid, 'current.json'))
+                    self.assertFalse(gs.get_session('gs_33333333').get('stale', False))
+
     def test_historical_guard_rejects_before_export_writes(self):
         for flags in ({'stale':True},{'orphaned':True},{'stale':True,'orphaned':True}):
             self.data.pop('stale',None);self.data.pop('orphaned',None);self.data.update(flags)
