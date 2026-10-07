@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
-from models.schemas import SessionResponse
+from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 from services.collection_writes import canonical
@@ -538,7 +538,7 @@ def _update_session_sync(session_id: str, change):
         return copy.deepcopy(result)
 
 
-def _flag_sessions(collection: str, flag: str, reason: str) -> int:
+def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: bool = False) -> int:
     """Mark every session for a collection, on disk and in memory.
 
     Sessions are never deleted and never remapped. A remap that guesses which
@@ -583,16 +583,18 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
                 # An uncertain-durability report keeps its own wording.
                 if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
                     _record_issue(key, "SESSION_WRITE_FAILED", _MARKER_MESSAGES[saved])
+            if require_durable and not saved:
+                raise GoldStandardError("SESSION_WRITE_FAILED", "Cannot replace collection: a historical marker could not be persisted.", 503)
     return marked
 
 
-def mark_stale(collection: str, reason: str) -> int:
+def mark_stale(collection: str, reason: str, *, require_durable: bool = False) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
     name = canonical(collection)
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
     aliases = {name, name[:1].lower() + name[1:]}
-    return sum(_flag_sessions(alias, "stale", reason) for alias in sorted(aliases))
+    return sum(_flag_sessions(alias, "stale", reason, require_durable=require_durable) for alias in sorted(aliases))
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
@@ -912,7 +914,7 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if session is None:
         return None
 
-    from models.schemas import SessionValidity
+    # Keep direct Python callers as strict as the HTTP request model.
     if not isinstance(allow_historical, bool):
         raise ValueError("allow_historical must be a boolean")
     validity = SessionValidity.model_validate(session).model_dump()

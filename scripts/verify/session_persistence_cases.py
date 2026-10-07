@@ -403,12 +403,12 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         gs._publish_generation_failure('gs_450abcd2',RuntimeError('Owned failure'),OSError('Owned write fault'))
         self.assertIsNone(gs.get_session('gs_450abcd2'));self.assertEqual(gs._store_revision,before)
 
-    def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
+    def test_tuning_aborts_when_both_historical_marker_writes_fail(self):
         from services import tuning
         job={'status':'queued'};jobid='owned-marker-job'
         with patch.dict(tuning._jobs,{jobid:job}),patch.object(tuning.sources,'has_sources',return_value=False),patch.object(tuning,'_existing_chunks',return_value=[{'content':'Inert'}]),patch.object(tuning,'_rebuild',side_effect=lambda *args,**kwargs:(kwargs['before_replace'](),1)[1]) as rebuild,patch.object(gs.os,'replace',side_effect=OSError('Owned marker failure')):
             tuning._run(jobid,'OwnedPersistence','reembed',{})
-        rebuild.assert_called_once();self.assertEqual(job['status'],'completed');self.assertEqual(job['chunks_written'],1)
+        rebuild.assert_called_once();self.assertEqual(job['status'],'failed');self.assertEqual(job.get('chunks_written',0),0)
         self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
 
 

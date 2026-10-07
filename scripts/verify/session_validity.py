@@ -48,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.ob
         print('PASS live HTTP choices reject bool coercion and nonfinite inputs',flush=True)
         assert client.get('/goldstandard/session/gs_00000000').status_code==404
         assert client.post('/goldstandard/save',json={'session_id':'gs_00000000','allow_historical':True}).status_code==404
-        print('PASS unknown lookup/export remain404',flush=True)
+        print('PASS unknown lookup/export remain 404',flush=True)
         assert gs.mark_stale(collection,'Synthetic chunk-identity change')==1
         response=client.get('/goldstandard/session/'+session_id)
         assert response.json()['stale'] and response.json()['stale_reason']=='Synthetic chunk-identity change'

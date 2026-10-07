@@ -403,7 +403,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
 
         def mark_before_replace() -> None:
             nonlocal stale_count
-            stale_count = goldstandard.mark_stale(source_collection, reason)
+            stale_count = goldstandard.mark_stale(source_collection, reason, require_durable=True)
 
         written = _rebuild(
             collection, properties, params.get("index_type"), params.get("distance_metric"),
