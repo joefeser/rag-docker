@@ -28,9 +28,10 @@ Every PR's work starts in a fresh agent with no earlier context, and produces th
 
 Each document goes through a review loop before the next one starts:
 
-- Review the document, revise it, and repeat. Stop after **two consecutive reviews with no changes**.
+- Review the document, revise it, and repeat. The document passes after **two consecutive reviews with no changes**.
+- A document gets at most **10 reviews**. If the 10th review ends without two consecutive reviews with no changes, the loop fails. Stop there: no further reviews, no next document and no code. Report to the maintainer, who chooses the direction (an agent working on an issue reports to the session that started it, as with questions). The report gives the changes made in the last reviews, from the review log, and the point that keeps changing: where the document got stuck.
 - Every change is checked against the document's source, so that scope doesn't grow or drift: the analysis against the prompt and the issue, the specifications against the analysis, and the plan against the specifications.
-- Each document ends with a review log: one line per review, listing what changed or "no changes".
+- Each document ends with a review log: one line per review, listing what changed or "no changes". A document whose loop failed still ends with its review log.
 
 Then implement the plan and carry on with the usual cycle: verification, PR and `rag-pr-review`.
 
