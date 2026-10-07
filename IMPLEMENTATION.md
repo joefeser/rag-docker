@@ -8173,7 +8173,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
 ```json
 {
   "name": "rag-ui",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "scripts": {
     "dev": "vite",
@@ -11052,6 +11052,8 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
 three-save race that must not republish the same result over new edits.
@@ -12811,7 +12813,7 @@ ENDPY
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
-  check "healthy again after a restart from the snapshot" $? "not healthy after $((restart_limit * 2))s"
+  check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
@@ -13697,6 +13699,8 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
+check "test_batch_implementation.py registered regression checks" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -16167,9 +16171,9 @@ OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 IMAGES=(
   rag-docker-api:latest
   rag-docker-ui:latest
-  semitechnologies/weaviate:1.39.4
+  semitechnologies/weaviate:1.39.6
   ollama/ollama:0.3.14
-  nginx:1.27-alpine
+  nginx:1.29-alpine
 )
 
 echo "==> Checking prerequisites"
@@ -16626,8 +16630,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         sid,response=asyncio.run(run());state=gs.get_session(sid)
         self.assertEqual(state['status'],'failed')
         self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
-        # Untyped on develop; #127 types the same fault as SESSION_WRITE_FAILED.
-        self.assertTrue(any('not a regular file' in e or 'SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+        self.assertTrue(any('SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
 
     def test_cancelled_generation_with_failing_final_write_ends_failed(self):
         fault=threading.Event();original=gs.os.replace
@@ -16667,6 +16670,38 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         finally:release.set();holder.join(5)
         self.assertEqual(seen,[True])
         self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
+
+    def test_uncertain_failure_report_keeps_both_reasons(self):
+        original=gs.GoldStandardError('SESSION_WRITE_FAILED','Original generation write failed',500)
+        report=gs.GoldStandardError('SESSION_DURABILITY_UNCERTAIN','Reporter replace completed but sync failed',500)
+        gs._publish_generation_failure(self.data['session_id'],original,report)
+        current=gs.get_session(self.data['session_id'])
+        self.assertEqual(current['persistence_error']['code'],'SESSION_DURABILITY_UNCERTAIN')
+        self.assertTrue(any('SESSION_WRITE_FAILED' in message for message in current['errors']))
+        self.assertTrue(any('SESSION_DURABILITY_UNCERTAIN' in message for message in current['errors']))
+
+    def test_cached_generation_failure_is_saved_by_next_successful_write(self):
+        # Reviewer (#136 spec sentence): the cache runs ahead of disk until a later successful write saves it.
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def pair(chunk):fault.set();return fixture()['pairs'][0]
+        async def run():
+            with patch.object(gs.os,'replace',side_effect=replace):return await self.generate(pair)
+        sid=asyncio.run(run())
+        self.assertEqual(json.loads(gs._session_path(sid).read_text())['status'],'generating')
+        self.assertEqual(gs.mark_stale('OwnedPersistence','Owned later write'),2)
+        gs._sessions={};gs.load_sessions_from_disk();state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed',state)
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED')
+        self.assertTrue(state['stale'])
+
+    def test_cache_fallback_does_not_recreate_a_removed_session(self):
+        # Reviewer: a session gone from the cache must not be resurrected by the fallback.
+        before=gs._store_revision
+        gs._publish_generation_failure('gs_450abcd2',RuntimeError('Owned failure'),OSError('Owned write fault'))
+        self.assertIsNone(gs.get_session('gs_450abcd2'));self.assertEqual(gs._store_revision,before)
 
     def test_tuning_aborts_when_both_historical_marker_writes_fail(self):
         from services import tuning
@@ -17523,6 +17558,8 @@ bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$bindings" || exit 2
 require_stack
 section "Exact-record reindex"
+python3 ../../scripts/tests/test_reindex_preservation.py
+check "reindex embedded sources match runtime" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_collection_writes.py)
 check "collection writer barrier regressions" $?
 # Transport only these three controlled sources into a temporary API directory.
@@ -19885,4 +19922,58 @@ def run(api, collection, exports, repo_root):
 
 if __name__ == '__main__':
     sys.exit(run(*sys.argv[1:]))
+```
+
+### scripts/verify/llm_sanity.py
+
+```python
+"""Does the LLM still give sensible answers? Run inside the api container.
+
+A degraded Ollama runner can keep listing its models (so /health stays ok)
+while every chat reply is garbage: mixed scripts, fragments of unrelated
+instructions, thousands of characters, or a timeout (#119). Every LLM check
+then fails for reasons that have nothing to do with the code under test.
+
+This asks one question with a known answer and judges only the shape of the
+reply. Exit 0: sensible. Exit 1: degraded. Exit 2: Ollama didn't answer.
+"""
+import sys
+
+import httpx
+
+from config import settings
+
+QUESTION = ("Policy: department managers approve overtime. "
+            "Question: who approves overtime? Answer in one sentence.")
+TIMEOUT_S = 120
+MAX_CHARS = 600
+
+try:
+    resp = httpx.post(
+        f"http://{settings.ollama_host}:{settings.ollama_port}/api/chat",
+        json={"model": settings.llm_model, "stream": False,
+              "options": {"temperature": 0, "num_predict": 80},
+              "messages": [{"role": "user", "content": QUESTION}]},
+        timeout=TIMEOUT_S)
+    resp.raise_for_status()
+    answer = resp.json()["message"]["content"].strip()
+except Exception as exc:  # unreachable, timed out, or not JSON
+    print(f"no answer from {settings.llm_model}: {type(exc).__name__}: {exc}")
+    sys.exit(2)
+
+printable = sum(1 for ch in answer if ch.isascii() and (ch.isprintable() or ch in "\n\r\t"))
+problems = []
+if not answer:
+    problems.append("empty reply")
+if len(answer) > MAX_CHARS:
+    problems.append(f"{len(answer)} characters for a one-sentence question")
+if answer and printable / len(answer) < 0.9:
+    problems.append("mostly non-ASCII text")
+if "manager" not in answer.lower():
+    problems.append("doesn't mention managers")
+
+if problems:
+    print(f"{settings.llm_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
+    sys.exit(1)
+print(f"{settings.llm_model} answers sensibly: {answer[:120]!r}")
 ```
