@@ -34,7 +34,7 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
    - Wait for long runs as "Waiting for long runs" below says.
    - The PR's own changes to the harness (`scripts/verify/stack.sh`, `scripts/verify/lock.sh`, `docker-compose.verify.yml`) don't run here: list each as a consideration with the result `➖ not testable in the evaluation (trusted harness)`. The maintainer may run the PR's copy after review.
    - `stack.sh run` always tears the verify project down. Confirm it as "The verify project" in `reference.md` says. Only then remove a `base/` worktree you created. Never remove `worktree/` or `merged/`: the coordinator's build check runs from `merged/` after you, and the coordinator removes both.
-5. **Loop.** Follow the review loop in `reference.md` until every T is covered and has been run.
+5. **Loop.** Follow the review loop in `reference.md` until every T is covered and has been run, within its cap of 10 passes: a review that hasn't converged by the 10th pass returns `verdict: NOT CONCLUDED` as `reference.md` says.
 
 ## Waiting for long runs
 
