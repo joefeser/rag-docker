@@ -518,6 +518,28 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(set(seen), {'Corpus', 'corpus'})
         self.assertTrue(any('2 gold-standard session(s)' in note for note in job['notes']), job)
 
+    def assert_replace_note_count(self, by_spelling, expected):
+        # #180: the note counts retained sessions across both spellings, each session once.
+        with patch.object(importer.goldstandard, 'sessions_for',
+                          side_effect=lambda name: [{'session_id': sid} for sid in by_spelling.get(name, [])]):
+            job = self.import_replace()
+        self.assertEqual(job['status'], 'completed', job)
+        notes = [note for note in job['notes'] if 'gold-standard session(s) from the replaced' in note]
+        if expected:
+            self.assertEqual(len(notes), 1, job)
+            self.assertTrue(notes[0].startswith(f'{expected} gold-standard session(s)'), notes)
+        else:
+            self.assertEqual(notes, [], job)
+
+    def test_import_replace_note_counts_alias_only_sessions(self):
+        self.assert_replace_note_count({'corpus': ['gs_18000003']}, 1)
+
+    def test_import_replace_note_counts_a_session_under_both_spellings_once(self):
+        self.assert_replace_note_count({'Corpus': ['gs_18000004'], 'corpus': ['gs_18000004']}, 1)
+
+    def test_import_replace_without_retained_sessions_adds_no_note(self):
+        self.assert_replace_note_count({}, 0)
+
     def test_replace_final_create_and_batch_failure_survive_restart(self):
         for fault in ('create', 'reject', 'partial', 'properties', 'vector'):
             with self.subTest(fault=fault):
