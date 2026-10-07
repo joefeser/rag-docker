@@ -294,7 +294,10 @@ class InternalBoundaryTests(unittest.TestCase):
             self.assertEqual(create.call_count,2)
             for call in create.call_args_list:
                 self.assertEqual(call.args[1:],('hnsw','cosine',legacy))
-                self.assertEqual(call.kwargs,{'preserve_hnsw':True})
+                expected = {'preserve_hnsw': True}
+                if call.args[0] == 'ReviewStored':
+                    expected['description'] = 'rag-tune:test'
+                self.assertEqual(call.kwargs, expected)
 
     def test_chunker_rejects_before_semantic_model_or_splitter_work(self):
         for strategy, size, overlap in (('unknown',1000,200), ('semantic',0,200), ('overlap',1000,1000)):

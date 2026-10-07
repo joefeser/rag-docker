@@ -16,8 +16,8 @@ the advisory and credit you unless you'd rather stay anonymous.
 
 ## Supported versions
 
-Releases are tagged with semantic versions (`v1.0.0` onward). Only the latest
-release gets security fixes: currently **1.0.x**. A reported vulnerability is
+Releases are tagged with semantic versions (`v1.0.0` onward). Only the latest tagged
+release receives security fixes; see the [latest release](https://github.com/mikesilvers/rag-docker/releases/latest). A reported vulnerability is
 fixed privately in its advisory, and the fix is published with a release
 alongside the advisory.
 
