@@ -23,6 +23,9 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
+check "test_batch_recovery_fixture.py registered regression checks" $?
+
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
