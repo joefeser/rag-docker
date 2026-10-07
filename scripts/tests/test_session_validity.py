@@ -181,6 +181,76 @@ class ValidityServiceTests(unittest.TestCase):
         self.assertIsNone(rebuild.call_args.kwargs['before_replace']);mark.assert_not_called()
         self.assertEqual(job['status'],'completed');self.assertTrue(any('unchanged' in note for note in job['notes']))
 
+    def test_identity_changing_runs_flag_sessions_before_replacement(self):
+        from services import tuning
+        cases=(('rechunk',{'chunking':{}},True,'re-chunked'),
+               ('reembed',{},True,'re-embedded'),
+               ('reembed',{},False,'stored chunk text'),
+               ('reembed',{'chunking':{}},True,'re-chunked and re-embedded'))
+        for operation,params,has_sources,reason in cases:
+            with self.subTest(operation=operation,params=params,has_sources=has_sources):
+                for key in ('stale','stale_reason','stale_at'):self.data.pop(key,None)
+                gs.store_session(self.data)
+                seen={}
+                def rebuild(collection,properties,index_type,distance_metric,progress,before_replace=None, **kwargs):
+                    self.assertIsNotNone(before_replace)
+                    self.assertFalse(self.data.get('stale'))
+                    before_replace()
+                    current=gs.get_session(self.data['session_id'])
+                    seen['stale']=current.get('stale');seen['reason']=current.get('stale_reason')
+                    with self.assertRaises(gs.GoldStandardError) as error:
+                        asyncio.run(gs.save_session(self.data['session_id'],'guard.json'))
+                    seen['code']=error.exception.code
+                    return 1
+                job={'status':'queued'}
+                with patch.dict(tuning._jobs,{'synthetic':job}), \
+                     patch.object(tuning.sources,'has_sources',return_value=has_sources), \
+                     patch.object(tuning,'_chunks_from_sources',return_value=[{'content':'Inert'}]), \
+                     patch.object(tuning,'_existing_chunks',return_value=[{'content':'Inert'}]), \
+                     patch.object(tuning,'_rebuild',side_effect=rebuild):
+                    tuning._run('synthetic','ValidityFixture',operation,params)
+                self.assertEqual(job['status'],'completed',job)
+                self.assertTrue(seen['stale']);self.assertIn(reason,seen['reason'])
+                self.assertEqual(seen['code'],'HISTORICAL_SESSION')
+                gs._sessions={};gs.load_sessions_from_disk()
+                reloaded=gs.get_session(self.data['session_id'])
+                self.assertTrue(reloaded['stale']);self.assertIn(reason,reloaded['stale_reason'])
+                self.data=reloaded
+
+    def test_cutover_requires_a_durable_session_or_pending_marker(self):
+        from services import tuning
+        for pending_saved in (False, True):
+            with self.subTest(pending_saved=pending_saved):
+                job = {}
+                reached_delete = []
+                def rebuild(*args, **kwargs):
+                    kwargs['before_replace']()
+                    reached_delete.append(True)
+                    return 1
+                with patch.dict(tuning._jobs, {'barrier': job}), \
+                     patch.object(tuning.sources, 'has_sources', return_value=False), \
+                     patch.object(tuning, '_existing_chunks', return_value=[{'content': 'Inert'}]), \
+                     patch.object(tuning, '_rebuild', side_effect=rebuild), \
+                     patch.object(gs, '_save_session_sync', side_effect=OSError('disk full')), \
+                     patch.object(gs, '_write_pending_marker', return_value=pending_saved):
+                    tuning._run('barrier', 'ValidityFixture', 'reembed', {})
+                self.assertEqual(bool(reached_delete), pending_saved)
+                self.assertEqual(job['status'], 'completed' if pending_saved else 'failed')
+                self.data = session()
+                gs.store_session(self.data)
+
+    def test_request_validation_errors_use_project_envelope_without_input(self):
+        from fastapi.testclient import TestClient
+        from main import app
+        client=TestClient(app)
+        response=client.post('/goldstandard/save',json={'filename':'secret-input.json'})
+        self.assertEqual(response.status_code,422,response.text)
+        body=response.json()
+        self.assertEqual(body['error']['code'],'INVALID_PARAMETER')
+        self.assertTrue(body['error']['detail'])
+        self.assertTrue(all('input' not in error and 'ctx' not in error for error in body['error']['detail']))
+        self.assertNotIn('secret-input.json',response.text)
+
 
 class ImplementationTests(unittest.TestCase):
     def test_changed_embedded_sources_match_runtime(self):

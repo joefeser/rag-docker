@@ -420,6 +420,10 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
+
+Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
 three-save race that must not republish the same result over new edits.

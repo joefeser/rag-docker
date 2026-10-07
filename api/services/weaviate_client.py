@@ -14,7 +14,7 @@ from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
-from services import batch_write, collection_recovery
+from services import batch_write
 
 log = logging.getLogger(__name__)
 

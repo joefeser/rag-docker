@@ -325,28 +325,26 @@ class SessionImportTests(unittest.TestCase):
         sid = self._generate('{"question": "Q?", "answer": "A", "ground_truth": "A"}')
         self._assert_generated_session_is_usable(sid)
 
-    def test_app_generated_session_with_non_string_model_values_stays_usable(self):
-        # A model can answer "What year ...?" with a bare JSON number. The
-        # generator stores it as-is; strict validation must not then hide the
-        # session from export and stale/orphan flagging.
-        sid = self._generate('{"question": "Which year?", "answer": 1999, "ground_truth": 1999}')
-        self._assert_generated_session_is_usable(sid)
+    def test_unusable_model_fields_do_not_publish_pairs(self):
+        for value in (None, ["A"], {}, 1999, True, "", "   "):
+            for field in ("question", "answer", "ground_truth"):
+                reply = {"question": "Q?", "answer": "A", "ground_truth": "A"}
+                reply[field] = value
+                with self.subTest(field=field, value=value):
+                    sid = self._generate(json.dumps(reply))
+                    current = gs.get_session(sid)
+                    self.assertEqual(current['status'], 'failed')
+                    self.assertEqual(current['pairs'], [])
+                    self.assertEqual(current['pairs_failed'], 1)
 
-    def test_null_model_fields_stay_usable(self):
-        sid = self._generate('{"question": null, "answer": null, "ground_truth": null}')
-        self._assert_generated_session_is_usable(sid)
-        self.assertEqual(gs.get_session(sid)['pairs'][0]['answer'], 'None')
-
-    def test_list_model_fields_stay_usable(self):
-        sid = self._generate('{"question": ["Q"], "answer": ["A"], "ground_truth": ["A"]}')
-        self._assert_generated_session_is_usable(sid)
-        self.assertEqual(gs.get_session(sid)['pairs'][0]['answer'], "['A']")
-
-    def test_numeric_question_and_ground_truth_fallback_stay_usable(self):
-        sid = self._generate('{"question": 42, "answer": 1999}')
-        self._assert_generated_session_is_usable(sid)
-        pair = gs.get_session(sid)['pairs'][0]
-        self.assertEqual((pair['question'], pair['answer'], pair['ground_truth']), ('42', '1999', '1999'))
+    def test_unusable_reply_is_reprompted_and_null_source_is_normalized(self):
+        with patch.object(gs, '_chat_once', side_effect=[
+                '{"question": null, "answer": "A"}',
+                '{"question": "Q?", "answer": "A"}']) as chat:
+            pair = asyncio.run(gs._generate_pair({'content': 'Context', 'source_file': None}))
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(pair['source_file'], '')
+        self.assertEqual(pair['ground_truth'], 'A')
 
     def test_generated_chunk_index_is_normalized(self):
         sid = self._generate('{"question": "Q?", "answer": "A"}', chunk_index='7')

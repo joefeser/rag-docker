@@ -421,8 +421,7 @@ retained original (a file uploaded more than once under the same name, or the
 same content uploaded under a second name), or where a retained original is
 missing from disk.
 
-Each rebuild is staged and swapped in only once it succeeds, so a failure leaves
-the collection as it was.
+Each rebuild verifies a staging copy before cutover. Failures before cutover leave the original intact; a failure during final replacement can leave its name missing or partial, with a retained recovery copy and historical sessions. Retained sessions can be loaded by ID. Historical export returns `409 HISTORICAL_SESSION` until the user explicitly opts in.
 
 **Gold-standard sessions are flagged, never deleted.** Re-chunking or re-embedding
 changes which chunks exist, so any evaluation pairs built against the old ones no
@@ -727,3 +726,5 @@ curl -s http://localhost:8080/api/collections      # -> "MyDocs"
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
   -F 'collection=mydocs' -F 'files=@/dev/null;type=text/plain'   # -> 404
 ```
+
+Overlap uses exact character windows, including internal whitespace-only windows, so boundaries can split words. Per-file limits are 10,000 chunks and 10 million parsed characters; overlap also caps duplicated output at 10 million characters. At default 1000/200 sizing, more than 8,000,200 characters exceeds the window limit. Split large documents or select suitable chunk settings. These limits bound ingestion work independently of the upload byte limit.

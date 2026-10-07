@@ -1,5 +1,6 @@
 """Overlap window invariants on inert synthetic text and the ingest worker."""
 import os
+import hashlib
 import runpy
 import sys
 import tempfile
@@ -8,7 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
-from services import chunker, ingest_pipeline
+from services import chunker, ingest_pipeline, tuning
 
 NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
 
@@ -35,6 +36,68 @@ class OverlapTests(unittest.TestCase):
         bound = size + max(0, min(size, minimum - 1) - overlap)
         self.assertTrue(all(len(c) <= bound for c in chunks))
         return chunks
+
+    def test_default_strategy_boundary_at_the_per_file_window_cap(self):
+        # At the project's own defaults (chunk_size=1000, chunk_overlap=200),
+        # the 10,000-window cap is reached at exactly 8,000,200 characters:
+        # windows = 1 + ceil((L - 1000) / 800). A file this size or smaller
+        # ingested successfully before this PR (CharacterTextSplitter had no
+        # size cap); one character over now fails every default-strategy
+        # ingest of it, not just paragraph-less ones. See chunker.py's
+        # MAX_OVERLAP_WINDOWS and the coding review's Medium finding on this
+        # regression.
+        boundary = 8_000_200
+        chunks = chunker.chunk_overlap('x' * boundary, 1000, 200, 100)
+        self.assertEqual(len(chunks), chunker.MAX_OVERLAP_WINDOWS)
+        with self.assertRaisesRegex(ValueError, 'per-file limit'):
+            chunker.chunk_overlap('x' * (boundary + 1), 1000, 200, 100)
+
+    def test_internal_whitespace_run_can_produce_a_blank_stored_window(self):
+        # SPECIFICATIONS.md documents that "blank-only input yields no chunks"
+        # but says nothing about a single window inside otherwise-nonblank
+        # text. The old splitter stripped and dropped blank chunks
+        # (`_enforce_min_chunk_size` filters `c.strip()`); raw character
+        # windows keep every slice, so a long enough internal whitespace run
+        # is stored as a chunk that is entirely blank. This pins down and
+        # documents that behavior change rather than leaving it implicit.
+        text = 'a' * 50 + ' ' * 2000 + 'b' * 50
+        chunks = self.check_windows(text, size=200, overlap=20, minimum=50)
+        self.assertTrue(any(c.strip() == '' for c in chunks),
+                         'expected at least one whitespace-only window; '
+                         'chunk lengths were ' + str([len(c) for c in chunks]))
+
+    def test_tuning_rechunk_over_budget_fails_before_rebuild(self):
+        # The coding review noted (by inspection, not a test) that
+        # tuning._chunks_from_sources raises before _rebuild is called, so a
+        # re-chunk that now hits chunk_overlap's per-file limit fails the
+        # tuning job as TUNE_FAILED without touching the live collection.
+        # This exercises that path instead of just trusting the inspection.
+        with tempfile.TemporaryDirectory() as directory:
+            src_dir = Path(directory)
+            digest = hashlib.sha256(b'irrelevant retained bytes').hexdigest()
+            (src_dir / digest).write_bytes(b'irrelevant retained bytes')
+            job_id = 'tune-budget-test'
+            tuning._jobs[job_id] = {'job_id': job_id}
+            params = {'chunking': {'strategy': 'overlap', 'chunk_size': 1000,
+                                    'chunk_overlap': 999, 'similarity_threshold': 0.85,
+                                    'min_chunk_size': 100}}
+            with patch.object(tuning.settings, 'upload_dir', directory), \
+                 patch.object(tuning.sources, 'has_sources', return_value=True), \
+                 patch.object(tuning.sources, 'load_index',
+                               return_value={'documents': {digest: {'filenames': ['big.txt']}}}), \
+                 patch.object(tuning.sources, 'collection_dir', return_value=src_dir), \
+                 patch.object(tuning, '_parse_file', return_value=('x' * 100000, [])), \
+                 patch.object(tuning, '_rebuild') as rebuild, \
+                 patch.object(tuning.wc, 'get_client') as get_client:
+                get_client.return_value.collections.get.return_value.iterator.return_value = []
+                tuning._run(job_id, 'ReviewTuneBudget', 'rechunk', params)
+            job = tuning._jobs.pop(job_id)
+            self.assertEqual(job['status'], 'failed', job)
+            self.assertEqual(job.get('error_code'), 'TUNE_FAILED', job)
+            self.assertIn('per-file limit', job.get('error', ''), job)
+            rebuild.assert_not_called()
+            # Coverage now reads the existing collection; destructive rebuild is still unreachable.
+
 
     def test_long_token_has_bounded_windows_and_exact_coverage(self):
         chunks = self.check_windows('x' * 10000)

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
-from models.schemas import SessionResponse
+from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 from services.collection_writes import aliases
@@ -538,7 +538,7 @@ def _update_session_sync(session_id: str, change):
         return copy.deepcopy(result)
 
 
-def _flag_sessions(collection: str, flag: str, reason: str) -> int:
+def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: bool = False) -> int:
     """Mark every session for a collection, on disk and in memory.
 
     Sessions are never deleted and never remapped. A remap that guesses which
@@ -583,14 +583,16 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
                 # An uncertain-durability report keeps its own wording.
                 if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
                     _record_issue(key, "SESSION_WRITE_FAILED", _MARKER_MESSAGES[saved])
+            if require_durable and not saved:
+                raise GoldStandardError("SESSION_WRITE_FAILED", "Cannot replace collection: a historical marker could not be persisted.", 503)
     return marked
 
 
-def mark_stale(collection: str, reason: str) -> int:
+def mark_stale(collection: str, reason: str, *, require_durable: bool = False) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
-    return sum(_flag_sessions(alias, "stale", reason) for alias in aliases(collection))
+    return sum(_flag_sessions(alias, "stale", reason, require_durable=require_durable) for alias in aliases(collection))
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
@@ -669,7 +671,13 @@ async def _generate_pair(chunk: dict) -> dict:
         system = GS_SYSTEM if attempt == 0 else GS_SYSTEM + GS_RETRY_SUFFIX
         raw = await _chat_once(system, user_msg)
         try:
-            data = _parse_gs_json(raw)
+            candidate = _parse_gs_json(raw)
+            for field in ("question", "answer", "ground_truth"):
+                value = candidate.get(field, candidate.get("answer") if field == "ground_truth" else None)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"Model {field} must be a nonempty string")
+                candidate[field] = value
+            data = candidate
             break
         except Exception as exc:                      # noqa: BLE001
             last_error = exc
@@ -680,11 +688,11 @@ async def _generate_pair(chunk: dict) -> dict:
 
     return {
         "pair_id": f"p_{uuid.uuid4().hex[:8]}",
-        "question": str(data.get("question", "")),
-        "answer": str(data.get("answer", "")),
+        "question": data["question"],
+        "answer": data["answer"],
         "contexts": [chunk["content"]],
-        "ground_truth": str(data.get("ground_truth", data.get("answer", ""))),
-        "source_file": chunk.get("source_file", ""),
+        "ground_truth": data["ground_truth"],
+        "source_file": str(chunk.get("source_file") or ""),
         "chunk_index": int(chunk.get("chunk_index", 0)),
         "status": "pending",
     }
@@ -904,7 +912,7 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if session is None:
         return None
 
-    from models.schemas import SessionValidity
+    # Keep direct Python callers as strict as the HTTP request model.
     if not isinstance(allow_historical, bool):
         raise ValueError("allow_historical must be a boolean")
     validity = SessionValidity.model_validate(session).model_dump()

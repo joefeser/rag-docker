@@ -2178,7 +2178,7 @@ from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
-from services import batch_write, collection_recovery
+from services import batch_write
 
 log = logging.getLogger(__name__)
 
@@ -3406,7 +3406,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
-from models.schemas import SessionResponse
+from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 from services.collection_writes import aliases
@@ -3930,7 +3930,7 @@ def _update_session_sync(session_id: str, change):
         return copy.deepcopy(result)
 
 
-def _flag_sessions(collection: str, flag: str, reason: str) -> int:
+def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: bool = False) -> int:
     """Mark every session for a collection, on disk and in memory.
 
     Sessions are never deleted and never remapped. A remap that guesses which
@@ -3975,14 +3975,16 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
                 # An uncertain-durability report keeps its own wording.
                 if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
                     _record_issue(key, "SESSION_WRITE_FAILED", _MARKER_MESSAGES[saved])
+            if require_durable and not saved:
+                raise GoldStandardError("SESSION_WRITE_FAILED", "Cannot replace collection: a historical marker could not be persisted.", 503)
     return marked
 
 
-def mark_stale(collection: str, reason: str) -> int:
+def mark_stale(collection: str, reason: str, *, require_durable: bool = False) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
-    return sum(_flag_sessions(alias, "stale", reason) for alias in aliases(collection))
+    return sum(_flag_sessions(alias, "stale", reason, require_durable=require_durable) for alias in aliases(collection))
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
@@ -4061,7 +4063,13 @@ async def _generate_pair(chunk: dict) -> dict:
         system = GS_SYSTEM if attempt == 0 else GS_SYSTEM + GS_RETRY_SUFFIX
         raw = await _chat_once(system, user_msg)
         try:
-            data = _parse_gs_json(raw)
+            candidate = _parse_gs_json(raw)
+            for field in ("question", "answer", "ground_truth"):
+                value = candidate.get(field, candidate.get("answer") if field == "ground_truth" else None)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"Model {field} must be a nonempty string")
+                candidate[field] = value
+            data = candidate
             break
         except Exception as exc:                      # noqa: BLE001
             last_error = exc
@@ -4072,11 +4080,11 @@ async def _generate_pair(chunk: dict) -> dict:
 
     return {
         "pair_id": f"p_{uuid.uuid4().hex[:8]}",
-        "question": str(data.get("question", "")),
-        "answer": str(data.get("answer", "")),
+        "question": data["question"],
+        "answer": data["answer"],
         "contexts": [chunk["content"]],
-        "ground_truth": str(data.get("ground_truth", data.get("answer", ""))),
-        "source_file": chunk.get("source_file", ""),
+        "ground_truth": data["ground_truth"],
+        "source_file": str(chunk.get("source_file") or ""),
         "chunk_index": int(chunk.get("chunk_index", 0)),
         "status": "pending",
     }
@@ -4296,7 +4304,7 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if session is None:
         return None
 
-    from models.schemas import SessionValidity
+    # Keep direct Python callers as strict as the HTTP request model.
     if not isinstance(allow_historical, bool):
         raise ValueError("allow_historical must be a boolean")
     validity = SessionValidity.model_validate(session).model_dump()
@@ -6603,7 +6611,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
 
         def mark_before_replace() -> None:
             nonlocal stale_count
-            stale_count = goldstandard.mark_stale(source_collection, reason)
+            stale_count = goldstandard.mark_stale(source_collection, reason, require_durable=True)
 
         written = _rebuild(
             collection, properties, params.get("index_type"), params.get("distance_metric"),
@@ -8167,7 +8175,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
 ```json
 {
   "name": "rag-ui",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "scripts": {
     "dev": "vite",
@@ -11046,6 +11054,10 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
+
+Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
 three-save race that must not republish the same result over new edits.
@@ -12109,7 +12121,7 @@ set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
 require_stack
 section "Bounded overlap text storage"
-(cd ../.. && docker compose exec -T -e RAG_OVERLAP_REAL_EMBEDDING="${RAG_OVERLAP_REAL_EMBEDDING:-0}" api python - < scripts/verify/overlap_chunks.py)
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" -e RAG_OVERLAP_REAL_EMBEDDING="${RAG_OVERLAP_REAL_EMBEDDING:-0}" api python - < scripts/verify/overlap_chunks.py)
 check "overlap coverage, bounds, budget rejection and owned-fixture cleanup" $?
 summary
 ```
@@ -12134,7 +12146,7 @@ from weaviate.classes.config import Configure, VectorDistances
 from config import settings
 from services import chunker, ingest_pipeline, weaviate_client as wc
 
-collection = 'VfyOverlap' + uuid.uuid4().hex[:12]
+collection = os.environ.get('RAG_TEST_PREFIX', 'Vfy') + 'Overlap' + uuid.uuid4().hex[:12]
 assert not wc._collection_exists_sync(collection)
 created = False
 try:
@@ -12182,8 +12194,10 @@ try:
                     print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
                 finally:
                     ingest_pipeline._jobs.pop(job_id,None)
-        stage=root/'budget';stage.mkdir()
-        source=stage/'over-budget.txt';source.write_text('x'*100000)
+        stage = root / 'budget'
+        stage.mkdir()
+        source = stage / 'over-budget.txt'
+        source.write_text('x' * 100000)
         job_id='overlap-budget-'+uuid.uuid4().hex[:8]
         job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
         ingest_pipeline._jobs[job_id]=job
@@ -12194,7 +12208,8 @@ try:
             stored=list(wc.get_client().collections.get(collection).iterator())
             assert not any(o.properties['source_file']==source.name for o in stored)
             print('PASS excessive overlap output fails before object storage',flush=True)
-        finally: ingest_pipeline._jobs.pop(job_id,None)
+        finally:
+            ingest_pipeline._jobs.pop(job_id, None)
     print('PASS owned temporary source paths removed', flush=True)
 finally:
     if created:
@@ -12802,7 +12817,7 @@ ENDPY
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
-  check "healthy again after a restart from the snapshot" $? "not healthy after $((restart_limit * 2))s"
+  check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
@@ -13688,6 +13703,11 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
+check "test_batch_recovery_fixture.py registered regression checks" $?
+
+python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
+check "test_batch_implementation.py registered regression checks" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -14911,7 +14931,7 @@ with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.ob
         print('PASS live HTTP choices reject bool coercion and nonfinite inputs',flush=True)
         assert client.get('/goldstandard/session/gs_00000000').status_code==404
         assert client.post('/goldstandard/save',json={'session_id':'gs_00000000','allow_historical':True}).status_code==404
-        print('PASS unknown lookup/export remain404',flush=True)
+        print('PASS unknown lookup/export remain 404',flush=True)
         assert gs.mark_stale(collection,'Synthetic chunk-identity change')==1
         response=client.get('/goldstandard/session/'+session_id)
         assert response.json()['stale'] and response.json()['stale_reason']=='Synthetic chunk-identity change'
@@ -15484,6 +15504,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const suffix = require('crypto').randomBytes(4).toString('hex');
     const emptyId = 'gs_' + suffix, currentId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
     const missingId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const histId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const histBodies = [];
     const common = { collection: 'OwnedHistoricalBrowserFixture', status: 'completed', pairs_total: 0, pairs_completed: 0, pairs: [] };
     let exports = 0;
     await s.page.setRequestInterception(true);
@@ -15497,6 +15519,16 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       }
       if (path === '/api/goldstandard/session/' + missingId) {
         return request.respond({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SESSION_NOT_FOUND', message: 'Unknown fixture session.' } }) });
+      }
+      if (path === '/api/goldstandard/session/' + histId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: histId, pairs_total: 1, pairs_completed: 1, stale: true, stale_reason: 'Synthetic rechunk with pairs', stale_at: '2026-09-28T00:02:00+00:00', pairs: [{ pair_id: 'hist', question: 'Owned historical question', answer: 'Inert', contexts: ['Inert'], ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: 0, status: 'approved' }] }) });
+      }
+      if (path === '/api/goldstandard/save' && JSON.parse(request.postData() || '{}').session_id === histId) {
+        histBodies.push(JSON.parse(request.postData()));
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ filename: 'owned_hist.json', pairs_saved: 1, pairs_excluded: 0, download_url: '/api/goldstandard/download/owned_hist.json', historical: true, session_validity: { stale: true } }) });
+      }
+      if (path === '/api/goldstandard/download/owned_hist.json') {
+        return request.respond({ status: 200, contentType: 'application/json', body: '[]' });
       }
       if (path === '/api/goldstandard/save') {
         exports++; await sleep(500);
@@ -15523,6 +15555,21 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       r.check('duplicate clicks issue one export and failure clears pending state', exports===1 && await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && document.body.innerText.includes('Synthetic export failure.'); }));
       await load(missingId);
       r.check('a failed retained lookup clears prior pairs and export controls', /Unknown fixture session/.test(await bodyText(s.page)) && await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b=>/Export.*Approved/.test(b.textContent)) && !document.body.innerText.includes('Owned synthetic question')));
+      await load(histId);
+      const histButton = () => s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Historical Approved'); return b ? { disabled: b.disabled } : null; });
+      const histBox = () => s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); const i=c && c.querySelector('input[type=checkbox]'); return i ? i.checked : null; });
+      const hist = await bodyText(s.page);
+      const lockedButton = await histButton();
+      r.check('a stale session with pairs shows the warning and a locked historical export', /Historical evaluation data/.test(hist) && /Synthetic rechunk with pairs/.test(hist) && lockedButton && lockedButton.disabled && (await histBox()) === false, JSON.stringify(lockedButton));
+      await s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); c.querySelector('input[type=checkbox]').click(); });
+      await sleep(100);
+      r.check('ticking the historical choice enables export', (await histButton())?.disabled === false);
+      await load(histId);
+      r.check('refreshing the session resets the historical choice', (await histBox()) === false && (await histButton())?.disabled === true);
+      await s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); c.querySelector('input[type=checkbox]').click(); });
+      await sleep(100);
+      await clickByText(s.page, 'Export Historical Approved'); await sleep(400);
+      r.check('historical export sends allow_historical:true and labels the result', histBodies.length === 1 && histBodies[0].allow_historical === true && /Historical data; not a current collection baseline/.test(await bodyText(s.page)), JSON.stringify(histBodies));
       r.check('historical UI fixtures cause no React page errors', !s.errors.some(error=>error.startsWith('pageerror:')));
     } finally { await s.ctx.close(); } // All synthetic responses/context owned here.
   }
@@ -16131,9 +16178,9 @@ OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 IMAGES=(
   rag-docker-api:latest
   rag-docker-ui:latest
-  semitechnologies/weaviate:1.39.4
+  semitechnologies/weaviate:1.39.6
   ollama/ollama:0.3.14
-  nginx:1.27-alpine
+  nginx:1.29-alpine
 )
 
 echo "==> Checking prerequisites"
@@ -16590,8 +16637,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         sid,response=asyncio.run(run());state=gs.get_session(sid)
         self.assertEqual(state['status'],'failed')
         self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
-        # Untyped on develop; #127 types the same fault as SESSION_WRITE_FAILED.
-        self.assertTrue(any('not a regular file' in e or 'SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+        self.assertTrue(any('SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
 
     def test_cancelled_generation_with_failing_final_write_ends_failed(self):
         fault=threading.Event();original=gs.os.replace
@@ -16632,12 +16678,44 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         self.assertEqual(seen,[True])
         self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
 
-    def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
+    def test_uncertain_failure_report_keeps_both_reasons(self):
+        original=gs.GoldStandardError('SESSION_WRITE_FAILED','Original generation write failed',500)
+        report=gs.GoldStandardError('SESSION_DURABILITY_UNCERTAIN','Reporter replace completed but sync failed',500)
+        gs._publish_generation_failure(self.data['session_id'],original,report)
+        current=gs.get_session(self.data['session_id'])
+        self.assertEqual(current['persistence_error']['code'],'SESSION_DURABILITY_UNCERTAIN')
+        self.assertTrue(any('SESSION_WRITE_FAILED' in message for message in current['errors']))
+        self.assertTrue(any('SESSION_DURABILITY_UNCERTAIN' in message for message in current['errors']))
+
+    def test_cached_generation_failure_is_saved_by_next_successful_write(self):
+        # Reviewer (#136 spec sentence): the cache runs ahead of disk until a later successful write saves it.
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def pair(chunk):fault.set();return fixture()['pairs'][0]
+        async def run():
+            with patch.object(gs.os,'replace',side_effect=replace):return await self.generate(pair)
+        sid=asyncio.run(run())
+        self.assertEqual(json.loads(gs._session_path(sid).read_text())['status'],'generating')
+        self.assertEqual(gs.mark_stale('OwnedPersistence','Owned later write'),2)
+        gs._sessions={};gs.load_sessions_from_disk();state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed',state)
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED')
+        self.assertTrue(state['stale'])
+
+    def test_cache_fallback_does_not_recreate_a_removed_session(self):
+        # Reviewer: a session gone from the cache must not be resurrected by the fallback.
+        before=gs._store_revision
+        gs._publish_generation_failure('gs_450abcd2',RuntimeError('Owned failure'),OSError('Owned write fault'))
+        self.assertIsNone(gs.get_session('gs_450abcd2'));self.assertEqual(gs._store_revision,before)
+
+    def test_tuning_aborts_when_both_historical_marker_writes_fail(self):
         from services import tuning
         job={'status':'queued'};jobid='owned-marker-job'
         with patch.dict(tuning._jobs,{jobid:job}),patch.object(tuning.sources,'has_sources',return_value=False),patch.object(tuning,'_existing_chunks',return_value=[{'content':'Inert'}]),patch.object(tuning,'_rebuild',side_effect=lambda *args,**kwargs:(kwargs['before_replace'](),1)[1]) as rebuild,patch.object(gs.os,'replace',side_effect=OSError('Owned marker failure')):
             tuning._run(jobid,'OwnedPersistence','reembed',{})
-        rebuild.assert_called_once();self.assertEqual(job['status'],'completed');self.assertEqual(job['chunks_written'],1)
+        rebuild.assert_called_once();self.assertEqual(job['status'],'failed');self.assertEqual(job.get('chunks_written',0),0)
         self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
 
 
@@ -17487,6 +17565,8 @@ bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$bindings" || exit 2
 require_stack
 section "Exact-record reindex"
+python3 ../../scripts/tests/test_reindex_preservation.py
+check "reindex embedded sources match runtime" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_collection_writes.py)
 check "collection writer barrier regressions" $?
 # Transport only these three controlled sources into a temporary API directory.
@@ -19861,4 +19941,58 @@ def run(api, collection, exports, repo_root):
 
 if __name__ == '__main__':
     sys.exit(run(*sys.argv[1:]))
+```
+
+### scripts/verify/llm_sanity.py
+
+```python
+"""Does the LLM still give sensible answers? Run inside the api container.
+
+A degraded Ollama runner can keep listing its models (so /health stays ok)
+while every chat reply is garbage: mixed scripts, fragments of unrelated
+instructions, thousands of characters, or a timeout (#119). Every LLM check
+then fails for reasons that have nothing to do with the code under test.
+
+This asks one question with a known answer and judges only the shape of the
+reply. Exit 0: sensible. Exit 1: degraded. Exit 2: Ollama didn't answer.
+"""
+import sys
+
+import httpx
+
+from config import settings
+
+QUESTION = ("Policy: department managers approve overtime. "
+            "Question: who approves overtime? Answer in one sentence.")
+TIMEOUT_S = 120
+MAX_CHARS = 600
+
+try:
+    resp = httpx.post(
+        f"http://{settings.ollama_host}:{settings.ollama_port}/api/chat",
+        json={"model": settings.llm_model, "stream": False,
+              "options": {"temperature": 0, "num_predict": 80},
+              "messages": [{"role": "user", "content": QUESTION}]},
+        timeout=TIMEOUT_S)
+    resp.raise_for_status()
+    answer = resp.json()["message"]["content"].strip()
+except Exception as exc:  # unreachable, timed out, or not JSON
+    print(f"no answer from {settings.llm_model}: {type(exc).__name__}: {exc}")
+    sys.exit(2)
+
+printable = sum(1 for ch in answer if ch.isascii() and (ch.isprintable() or ch in "\n\r\t"))
+problems = []
+if not answer:
+    problems.append("empty reply")
+if len(answer) > MAX_CHARS:
+    problems.append(f"{len(answer)} characters for a one-sentence question")
+if answer and printable / len(answer) < 0.9:
+    problems.append("mostly non-ASCII text")
+if "manager" not in answer.lower():
+    problems.append("doesn't mention managers")
+
+if problems:
+    print(f"{settings.llm_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
+    sys.exit(1)
+print(f"{settings.llm_model} answers sensibly: {answer[:120]!r}")
 ```
