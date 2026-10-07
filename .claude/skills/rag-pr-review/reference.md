@@ -53,17 +53,17 @@ Then list every changed file and hunk from `diff.patch` (H1, H2, …).
 
 ## The review loop
 
-Run passes until the review converges, for at most 10 passes. Each pass has three steps:
+Run passes until the review converges. Each pass has three steps:
 
 1. **Review.** For every hunk, apply your specialist checklist. Read the surrounding unchanged code too: callers, callees, the spec section, and existing tests. Many defects come from what a change *doesn't* touch.
 2. **Verify every finding.** Cite `path:line` at the reviewed SHA. Show the evidence: the code path, a command you ran and its output, or a failing test. Drop any finding you cannot verify, or make it a Low phrased as a question.
 3. **Update the ledger.** Mark every requirement `met`, `partly met`, `not met`, `deferred (Part of)` or `not applicable to <specialty>`. Mark every hunk `reviewed`.
 
 The review has **converged** when both of these are true:
-- two consecutive full passes produced no new, changed or dropped findings;
+- a full pass produced no new, changed or dropped findings;
 - the ledger has no unreviewed hunk and no requirement left without a status.
 
-Stop at 10 passes. A review that converges on the 10th pass has converged. If it hasn't converged by the end of the 10th pass, stop and return `verdict: NOT CONCLUDED`, and say in the result block's `notes` where the loop got stuck: the findings or requirements that kept changing between passes. Your findings file's `section` stays in its usual format and doesn't carry it. The coordinator reports where the loop got stuck to the maintainer, who chooses the direction.
+Stop at 5 passes. If it hasn't converged by then, return `verdict: NOT CONCLUDED` with the reason, and the coordinator decides what to do.
 
 ## Findings file (specialists)
 
