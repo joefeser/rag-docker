@@ -683,6 +683,11 @@ async def _chat_once(system: str, user: str) -> str:
 # Each attempt costs an LLM call, so the budget is small and fixed.
 _GENERATION_ATTEMPTS = 3
 
+# Three validation attempts, each allowing two nominal 300s transport calls.
+# Bound the whole model operation: per-read transport timeouts are not a total
+# wall-clock deadline. nginx and verification clients allow completion headroom.
+_REGENERATION_TIMEOUT_SECONDS = 1800
+
 
 async def _generate_pair(chunk: dict) -> dict:
     user_msg = f"Chunk:\n{chunk['content']}"
@@ -722,7 +727,7 @@ async def _generate_pair(chunk: dict) -> dict:
 def _failed_generation(current: dict, exc: Exception) -> None:
     current["status"] = "failed"
     reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
-              else f"{type(exc).__name__}: {exc}")
+              else str(exc) or type(exc).__name__)
     errors = current.setdefault("errors", [])
     if reason not in errors:
         errors.append(reason)
@@ -896,7 +901,13 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
                 "chunk_index": pair["chunk_index"],
             }
             try:
-                new_pair = await _generate_pair(chunk)
+                new_pair = await asyncio.wait_for(
+                    _generate_pair(chunk), timeout=_REGENERATION_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise GoldStandardError(
+                    "PAIR_GENERATION_TIMEOUT",
+                    "The model exceeded the regeneration time limit. "
+                    "The existing pair is unchanged; try again.", 504) from exc
             except Exception as exc:                  # noqa: BLE001
                 # The model regularly returns unparseable JSON. Generation
                 # records that and moves on; regeneration used to let it escape

@@ -74,7 +74,98 @@ asyncio.run(run())
         gs._sessions = {}
         gs.load_sessions_from_disk()
         gs.reconcile_interrupted_generations()
-        self.assertEqual(gs.get_session(self.data['session_id'])['status'], 'failed')
+        on_disk = json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertEqual(on_disk['status'], 'failed')
+        self.assertTrue(any('interrupted by API restart' in e for e in on_disk['errors']))
+        self.assertEqual(gs.get_session(self.data['session_id']), on_disk)
+
+    def test_startup_settles_only_interrupted_session_keeping_edits_and_flags(self):
+        done_before = gs._session_path(self.data['session_id']).read_bytes()
+        live = fixture(); live['session_id'] = 'gs_450fedcb'
+        live['pairs'][0].update(status='edited', question='Reviewer edit')
+        live.update(status='generating', pairs_total=4, pairs_attempted=2,
+                    pairs_failed=0, stale=True, stale_reason='Old corpus',
+                    stale_at='2026-01-01T00:00:00+00:00', orphaned=True,
+                    orphaned_reason='Collection deleted', orphaned_at='2026-01-02T00:00:00+00:00')
+        gs.store_session(live)
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        gs.reconcile_interrupted_generations()
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), done_before)
+        settled = json.loads(gs._session_path(live['session_id']).read_text())
+        self.assertEqual(settled['status'], 'failed')
+        for field in ('pairs', 'pairs_total', 'pairs_attempted', 'pairs_completed',
+                      'pairs_failed', 'stale', 'stale_reason', 'stale_at',
+                      'orphaned', 'orphaned_reason', 'orphaned_at'):
+            self.assertEqual(settled[field], live[field], field)
+        self.assertEqual(settled['errors'], ['Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.'])
+        self.assertNotIn('persistence_error', settled)
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        self.assertEqual(gs.get_session(live['session_id']), settled)
+        new_pair = {**live['pairs'][1], 'question': 'Regenerated'}
+        with patch.object(gs, '_generate_pair', new=AsyncMock(return_value=new_pair)):
+            result = asyncio.run(gs.regenerate_pair(live['session_id'], live['pairs'][1]['pair_id']))
+        self.assertEqual(result['question'], 'Regenerated')
+        stored = json.loads(gs._session_path(live['session_id']).read_text())
+        self.assertEqual(stored['pairs'], [live['pairs'][0], new_pair])
+
+    def test_reconcile_refuses_to_run_while_generation_workers_exist(self):
+        self.data['status'] = 'generating'; gs.store_session(self.data)
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        with patch.object(gs, '_tasks', {object()}):
+            with self.assertRaisesRegex(RuntimeError, 'before workers start'):
+                gs.reconcile_interrupted_generations()
+        self.assertEqual(gs.get_session(self.data['session_id']), self.data)
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+
+    def test_generation_accounts_for_partial_and_total_model_failure(self):
+        for succeeds in (True, False):
+            with self.subTest(succeeds=succeeds):
+                data=fixture(); data.update(status='generating', pairs=[], pairs_total=2,
+                                           pairs_completed=0, pairs_attempted=0, pairs_failed=0, errors=[])
+                gs.store_session(data)
+                effects=[fixture()['pairs'][0] if succeeds else ValueError('Invalid first pair'),
+                         httpx.ReadTimeout('')]
+                with patch.object(gs, '_generate_pair', new=AsyncMock(side_effect=effects)):
+                    asyncio.run(gs._run_generation(data['session_id'], [{'content':'a'}, {'content':'b'}]))
+                result=json.loads(gs._session_path(data['session_id']).read_text())
+                self.assertEqual(result['status'], 'completed' if succeeds else 'failed')
+                self.assertEqual(result['pairs_completed'], len(result['pairs']))
+                self.assertEqual(result['pairs_completed'], int(succeeds))
+                self.assertEqual(result['pairs_completed']+result['pairs_failed'], 2)
+                self.assertEqual(result['pairs_attempted'], 2)
+                self.assertEqual(len(result['errors']), result['pairs_failed'])
+                self.assertTrue(all(reason.strip() for reason in result['errors']))
+
+    def test_regeneration_deadline_returns_typed_error_and_preserves_pair(self):
+        before=gs._session_path(self.data['session_id']).read_bytes()
+        cancelled=[]
+        async def delayed(chunk):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(True)
+        async def run():
+            with patch.object(gs, '_generate_pair', side_effect=delayed), patch.object(gs, '_REGENERATION_TIMEOUT_SECONDS', 0.01):
+                async with client() as c:
+                    return await c.post('/goldstandard/regenerate', json={'session_id':self.data['session_id'], 'pair_id':'p_0'})
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code, 504, response.text)
+        self.assertEqual(response.json()['error']['code'], 'PAIR_GENERATION_TIMEOUT')
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(gs.get_session(self.data['session_id']), self.data)
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+
+    def test_regeneration_retains_validation_and_transport_retry_budget(self):
+        valid=json.dumps({'question':'Regenerated', 'answer':'Answer', 'ground_truth':'Truth'})
+        replies=[httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), valid]
+        with patch.object(gs.ollama, 'chat', new=AsyncMock(side_effect=replies)) as chat:
+            result=asyncio.run(gs.regenerate_pair(self.data['session_id'], 'p_0'))
+        self.assertEqual(chat.await_count, 6)
+        self.assertEqual(result['question'], 'Regenerated')
+        self.assertEqual(result['pair_id'], 'p_0')
+        stored=json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertEqual(stored['pairs'][1], self.data['pairs'][1])
+        self.assertEqual(stored['pairs'][0], result)
 
     def test_startup_leaves_completed_sessions_unchanged(self):
         before = gs._session_path(self.data['session_id']).read_bytes()

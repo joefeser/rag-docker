@@ -297,6 +297,18 @@ http {
     server {
         listen 80;
 
+        # Regeneration permits three model attempts with a transport retry each.
+        # The API bounds model work at 1800s; leave time for durable commit and
+        # its typed response instead of terminating at the generic 300s limit.
+        location = /api/goldstandard/regenerate {
+            proxy_pass http://api/goldstandard/regenerate;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_read_timeout 1860s;
+            proxy_connect_timeout 10s;
+        }
+
         location /api/ {
             # nginx's default request-body limit is 1 MB, which rejected most
             # real PDFs with a 413 before the API saw them (issue #21). 512 MB
@@ -4075,6 +4087,11 @@ async def _chat_once(system: str, user: str) -> str:
 # Each attempt costs an LLM call, so the budget is small and fixed.
 _GENERATION_ATTEMPTS = 3
 
+# Three validation attempts, each allowing two nominal 300s transport calls.
+# Bound the whole model operation: per-read transport timeouts are not a total
+# wall-clock deadline. nginx and verification clients allow completion headroom.
+_REGENERATION_TIMEOUT_SECONDS = 1800
+
 
 async def _generate_pair(chunk: dict) -> dict:
     user_msg = f"Chunk:\n{chunk['content']}"
@@ -4114,7 +4131,7 @@ async def _generate_pair(chunk: dict) -> dict:
 def _failed_generation(current: dict, exc: Exception) -> None:
     current["status"] = "failed"
     reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
-              else f"{type(exc).__name__}: {exc}")
+              else str(exc) or type(exc).__name__)
     errors = current.setdefault("errors", [])
     if reason not in errors:
         errors.append(reason)
@@ -4288,7 +4305,13 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
                 "chunk_index": pair["chunk_index"],
             }
             try:
-                new_pair = await _generate_pair(chunk)
+                new_pair = await asyncio.wait_for(
+                    _generate_pair(chunk), timeout=_REGENERATION_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise GoldStandardError(
+                    "PAIR_GENERATION_TIMEOUT",
+                    "The model exceeded the regeneration time limit. "
+                    "The existing pair is unchanged; try again.", 504) from exc
             except Exception as exc:                  # noqa: BLE001
                 # The model regularly returns unparseable JSON. Generation
                 # records that and moves on; regeneration used to let it escape
@@ -13554,13 +13577,21 @@ done
 wait_for_job "/goldstandard/session/$SID" 1800 >/dev/null
 api_get "/goldstandard/session/$SID" > /tmp/vfy_sess.json
 
-# ── every requested pair exists, and the counters agree ──────────────────────
+# ── every sampled chunk is accounted for, including visible model failures ──────────────────────
 read -r total attempted completed failed actual <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_sess.json'))
 print(d['pairs_total'], d.get('pairs_attempted','?'), d['pairs_completed'],
       d.get('pairs_failed','?'), len(d['pairs']))")"
-[ "$completed" = "$total" ] && [ "$actual" = "$total" ]
-check "generate returns sample_size pairs" $? \
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_sess.json'))
+completed,failed,total = d['pairs_completed'],d['pairs_failed'],d['pairs_total']
+errors=d.get('errors',[])
+ok=(d['status']=='completed' and completed>0 and completed+failed==total
+    and d['pairs_attempted']==total and completed==len(d['pairs'])
+    and len(errors)==failed and all(isinstance(e,str) and e.strip() for e in errors))
+print('reported failures:', errors)
+sys.exit(0 if ok else 1)"
+check "generate accounts for every sampled chunk with useful pairs and explicit failures" $? \
   "total=$total completed=$completed actual=$actual failed=$failed"
 [ "$completed" = "$actual" ]
 check "pairs_completed matches the pairs that exist" $? \
@@ -13575,6 +13606,11 @@ sys.exit(0 if d['pairs'] and all(all(p.get(f) for f in need) for p in d['pairs']
 check "every pair has question, answer, ground_truth and contexts" $?
 
 # ── the PATCH audit rule ─────────────────────────────────────────────────────
+if [ "$actual" -lt 1 ]; then
+  drop_collection "$C"
+  cleanup_prefixed
+  summary; exit $?
+fi
 PID=$(python3 -c "import json;print(json.load(open('/tmp/vfy_sess.json'))['pairs'][0]['pair_id'])")
 code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
@@ -13592,16 +13628,25 @@ check_eq "a status-only change is accepted" "$code" "200"
 # ── regenerate replaces exactly one pair ─────────────────────────────────────
 if [ "$actual" -ge 2 ]; then
   TARGET=$(python3 -c "import json;print(json.load(open('/tmp/vfy_sess.json'))['pairs'][1]['pair_id'])")
-  api_post "/goldstandard/regenerate" "{\"session_id\":\"$SID\",\"pair_id\":\"$TARGET\"}" > /tmp/vfy_regen.json
+  code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+    "$API/goldstandard/session/$SID/pair/$TARGET" -H 'Content-Type: application/json' \
+    -d '{"status":"edited","question":"Owned regeneration replacement sentinel"}')
+  check_eq "regeneration target edit is accepted" "$code" "200"
+  # Snapshot after edits, so every non-target pair must remain byte-for-byte equal.
+  api_get "/goldstandard/session/$SID" > /tmp/vfy_regen_before.json
+  code=$(curl -s -m 1920 -o /tmp/vfy_regen.json -w '%{http_code}' -X POST \
+    "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+    -d "{\"session_id\":\"$SID\",\"pair_id\":\"$TARGET\"}")
+  check_eq "regenerate returns a successful API response" "$code" "200"
   api_get "/goldstandard/session/$SID" > /tmp/vfy_after.json
   python3 - "$TARGET" <<'ENDPY'
 import json, sys
 target = sys.argv[1]
-before = {p['pair_id']: p for p in json.load(open('/tmp/vfy_sess.json'))['pairs']}
+before = {p['pair_id']: p for p in json.load(open('/tmp/vfy_regen_before.json'))['pairs']}
 after = {p['pair_id']: p for p in json.load(open('/tmp/vfy_after.json'))['pairs']}
 changed = [k for k in before if k in after and before[k] != after[k]]
-# The first pair was edited above, so it is expected to differ too.
-unexpected = [k for k in changed if k != target and k != list(before)[0]]
+# Only the requested pair may differ from the immediate pre-request snapshot.
+unexpected = [k for k in changed if k != target]
 sys.exit(0 if set(before) == set(after) and target in changed and not unexpected else 1)
 ENDPY
   check "regenerate replaces only the targeted pair, ids stable" $?
@@ -13666,6 +13711,7 @@ if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_r
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
   check "sessions survive an API restart" 1 "$restart_refusal"
 elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  api_get "/goldstandard/session/$SID" > /tmp/vfy_after.json
   (cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ../..)" && docker compose restart api >/dev/null 2>&1)
   for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
   api_get "/goldstandard/session/$SID" > /tmp/vfy_post.json
@@ -13676,6 +13722,60 @@ sys.exit(0 if [p['pair_id'] for p in a['pairs']] == [p['pair_id'] for p in b['pa
   check "sessions survive an API restart" $?
 else
   skip "session survives a restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
+# ── hard-stop recovery retains pairs and unblocks regeneration ───────────────
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -z "$restart_refusal" ]; then
+  api_post "/goldstandard/generate" "{\"collection\":\"$C\",\"sample_size\":5}" > /tmp/vfy_gen2.json
+  SID2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen2.json'))['session_id'])")
+  st=""; n=0
+  for _ in $(seq 1 240); do
+    api_get "/goldstandard/session/$SID2" > /tmp/vfy_gen2_pre.json
+    read -r st n <<<"$(python3 -c "import json;d=json.load(open('/tmp/vfy_gen2_pre.json'));print(d['status'],len(d['pairs']))")"
+    { [ "$st" != generating ] || [ "$n" -ge 1 ]; } && break
+    sleep 1
+  done
+  if [ "$st" = generating ] && [ "$n" -ge 1 ]; then
+    # Recheck ownership immediately before the destructive disposable-project action.
+    _rag_require_lock_owner
+    if refusal=$(restart_refusal_reason) && [ -z "$refusal" ] && [ "${COMPOSE_PROJECT_NAME:-}" = rag-verify ]; then
+      (cd "$(git rev-parse --show-toplevel)" && docker compose kill -s SIGKILL api >/dev/null 2>&1 && docker compose start api >/dev/null 2>&1)
+      check "hard API stop and start succeeds" $?
+      for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
+      api_get "/goldstandard/session/$SID2" > /tmp/vfy_gen2_post.json
+      python3 - <<'ENDPY'
+import json,sys
+before=json.load(open('/tmp/vfy_gen2_pre.json')); after=json.load(open('/tmp/vfy_gen2_post.json'))
+retained={p['pair_id']:p for p in after['pairs']}
+ok=(after['status']=='failed' and all(retained.get(p['pair_id'])==p for p in before['pairs'])
+    and any(e.startswith('Generation interrupted by API restart.') for e in after.get('errors',[])))
+print(after['status'], after.get('errors'))
+sys.exit(0 if ok else 1)
+ENDPY
+      check "hard stop settles generation with a plain reason and retained pairs" $?
+      pid2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen2_post.json'))['pairs'][0]['pair_id'])")
+      code=$(curl -s -m 1920 -o /tmp/vfy_gen2_regen.json -w '%{http_code}' -X POST \
+        "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+        -d "{\"session_id\":\"$SID2\",\"pair_id\":\"$pid2\"}")
+      check_eq "regeneration succeeds after startup settlement" "$code" "200"
+      api_get "/goldstandard/session/$SID2" > /tmp/vfy_gen2_final.json
+      python3 - "$pid2" <<'ENDPY'
+import json,sys
+pair=json.load(open('/tmp/vfy_gen2_regen.json'))
+state=json.load(open('/tmp/vfy_gen2_final.json'))
+sys.exit(0 if pair.get('pair_id')==sys.argv[1] and pair in state['pairs'] else 1)
+ENDPY
+      check "regenerated retained pair is present in session" $?
+    else
+      check "hard-stop target is disposable" 1 "${refusal:-expected compose project rag-verify}"
+    fi
+  else
+    skip "hard stop with retained pair" "no interrupted session with a pair within 240s (status=$st pairs=$n)"
+  fi
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  check "hard-stop target is disposable" 1 "$restart_refusal"
+else
+  skip "hard stop during generation" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 drop_collection "$C"
@@ -16403,7 +16503,98 @@ asyncio.run(run())
         gs._sessions = {}
         gs.load_sessions_from_disk()
         gs.reconcile_interrupted_generations()
-        self.assertEqual(gs.get_session(self.data['session_id'])['status'], 'failed')
+        on_disk = json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertEqual(on_disk['status'], 'failed')
+        self.assertTrue(any('interrupted by API restart' in e for e in on_disk['errors']))
+        self.assertEqual(gs.get_session(self.data['session_id']), on_disk)
+
+    def test_startup_settles_only_interrupted_session_keeping_edits_and_flags(self):
+        done_before = gs._session_path(self.data['session_id']).read_bytes()
+        live = fixture(); live['session_id'] = 'gs_450fedcb'
+        live['pairs'][0].update(status='edited', question='Reviewer edit')
+        live.update(status='generating', pairs_total=4, pairs_attempted=2,
+                    pairs_failed=0, stale=True, stale_reason='Old corpus',
+                    stale_at='2026-01-01T00:00:00+00:00', orphaned=True,
+                    orphaned_reason='Collection deleted', orphaned_at='2026-01-02T00:00:00+00:00')
+        gs.store_session(live)
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        gs.reconcile_interrupted_generations()
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), done_before)
+        settled = json.loads(gs._session_path(live['session_id']).read_text())
+        self.assertEqual(settled['status'], 'failed')
+        for field in ('pairs', 'pairs_total', 'pairs_attempted', 'pairs_completed',
+                      'pairs_failed', 'stale', 'stale_reason', 'stale_at',
+                      'orphaned', 'orphaned_reason', 'orphaned_at'):
+            self.assertEqual(settled[field], live[field], field)
+        self.assertEqual(settled['errors'], ['Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.'])
+        self.assertNotIn('persistence_error', settled)
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        self.assertEqual(gs.get_session(live['session_id']), settled)
+        new_pair = {**live['pairs'][1], 'question': 'Regenerated'}
+        with patch.object(gs, '_generate_pair', new=AsyncMock(return_value=new_pair)):
+            result = asyncio.run(gs.regenerate_pair(live['session_id'], live['pairs'][1]['pair_id']))
+        self.assertEqual(result['question'], 'Regenerated')
+        stored = json.loads(gs._session_path(live['session_id']).read_text())
+        self.assertEqual(stored['pairs'], [live['pairs'][0], new_pair])
+
+    def test_reconcile_refuses_to_run_while_generation_workers_exist(self):
+        self.data['status'] = 'generating'; gs.store_session(self.data)
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        with patch.object(gs, '_tasks', {object()}):
+            with self.assertRaisesRegex(RuntimeError, 'before workers start'):
+                gs.reconcile_interrupted_generations()
+        self.assertEqual(gs.get_session(self.data['session_id']), self.data)
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+
+    def test_generation_accounts_for_partial_and_total_model_failure(self):
+        for succeeds in (True, False):
+            with self.subTest(succeeds=succeeds):
+                data=fixture(); data.update(status='generating', pairs=[], pairs_total=2,
+                                           pairs_completed=0, pairs_attempted=0, pairs_failed=0, errors=[])
+                gs.store_session(data)
+                effects=[fixture()['pairs'][0] if succeeds else ValueError('Invalid first pair'),
+                         httpx.ReadTimeout('')]
+                with patch.object(gs, '_generate_pair', new=AsyncMock(side_effect=effects)):
+                    asyncio.run(gs._run_generation(data['session_id'], [{'content':'a'}, {'content':'b'}]))
+                result=json.loads(gs._session_path(data['session_id']).read_text())
+                self.assertEqual(result['status'], 'completed' if succeeds else 'failed')
+                self.assertEqual(result['pairs_completed'], len(result['pairs']))
+                self.assertEqual(result['pairs_completed'], int(succeeds))
+                self.assertEqual(result['pairs_completed']+result['pairs_failed'], 2)
+                self.assertEqual(result['pairs_attempted'], 2)
+                self.assertEqual(len(result['errors']), result['pairs_failed'])
+                self.assertTrue(all(reason.strip() for reason in result['errors']))
+
+    def test_regeneration_deadline_returns_typed_error_and_preserves_pair(self):
+        before=gs._session_path(self.data['session_id']).read_bytes()
+        cancelled=[]
+        async def delayed(chunk):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(True)
+        async def run():
+            with patch.object(gs, '_generate_pair', side_effect=delayed), patch.object(gs, '_REGENERATION_TIMEOUT_SECONDS', 0.01):
+                async with client() as c:
+                    return await c.post('/goldstandard/regenerate', json={'session_id':self.data['session_id'], 'pair_id':'p_0'})
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code, 504, response.text)
+        self.assertEqual(response.json()['error']['code'], 'PAIR_GENERATION_TIMEOUT')
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(gs.get_session(self.data['session_id']), self.data)
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+
+    def test_regeneration_retains_validation_and_transport_retry_budget(self):
+        valid=json.dumps({'question':'Regenerated', 'answer':'Answer', 'ground_truth':'Truth'})
+        replies=[httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), valid]
+        with patch.object(gs.ollama, 'chat', new=AsyncMock(side_effect=replies)) as chat:
+            result=asyncio.run(gs.regenerate_pair(self.data['session_id'], 'p_0'))
+        self.assertEqual(chat.await_count, 6)
+        self.assertEqual(result['question'], 'Regenerated')
+        self.assertEqual(result['pair_id'], 'p_0')
+        stored=json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertEqual(stored['pairs'][1], self.data['pairs'][1])
+        self.assertEqual(stored['pairs'][0], result)
 
     def test_startup_leaves_completed_sessions_unchanged(self):
         before = gs._session_path(self.data['session_id']).read_bytes()

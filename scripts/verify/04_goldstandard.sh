@@ -53,13 +53,21 @@ done
 wait_for_job "/goldstandard/session/$SID" 1800 >/dev/null
 api_get "/goldstandard/session/$SID" > /tmp/vfy_sess.json
 
-# ── every requested pair exists, and the counters agree ──────────────────────
+# ── every sampled chunk is accounted for, including visible model failures ──────────────────────
 read -r total attempted completed failed actual <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_sess.json'))
 print(d['pairs_total'], d.get('pairs_attempted','?'), d['pairs_completed'],
       d.get('pairs_failed','?'), len(d['pairs']))")"
-[ "$completed" = "$total" ] && [ "$actual" = "$total" ]
-check "generate returns sample_size pairs" $? \
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_sess.json'))
+completed,failed,total = d['pairs_completed'],d['pairs_failed'],d['pairs_total']
+errors=d.get('errors',[])
+ok=(d['status']=='completed' and completed>0 and completed+failed==total
+    and d['pairs_attempted']==total and completed==len(d['pairs'])
+    and len(errors)==failed and all(isinstance(e,str) and e.strip() for e in errors))
+print('reported failures:', errors)
+sys.exit(0 if ok else 1)"
+check "generate accounts for every sampled chunk with useful pairs and explicit failures" $? \
   "total=$total completed=$completed actual=$actual failed=$failed"
 [ "$completed" = "$actual" ]
 check "pairs_completed matches the pairs that exist" $? \
@@ -74,6 +82,11 @@ sys.exit(0 if d['pairs'] and all(all(p.get(f) for f in need) for p in d['pairs']
 check "every pair has question, answer, ground_truth and contexts" $?
 
 # ── the PATCH audit rule ─────────────────────────────────────────────────────
+if [ "$actual" -lt 1 ]; then
+  drop_collection "$C"
+  cleanup_prefixed
+  summary; exit $?
+fi
 PID=$(python3 -c "import json;print(json.load(open('/tmp/vfy_sess.json'))['pairs'][0]['pair_id'])")
 code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
@@ -91,16 +104,25 @@ check_eq "a status-only change is accepted" "$code" "200"
 # ── regenerate replaces exactly one pair ─────────────────────────────────────
 if [ "$actual" -ge 2 ]; then
   TARGET=$(python3 -c "import json;print(json.load(open('/tmp/vfy_sess.json'))['pairs'][1]['pair_id'])")
-  api_post "/goldstandard/regenerate" "{\"session_id\":\"$SID\",\"pair_id\":\"$TARGET\"}" > /tmp/vfy_regen.json
+  code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+    "$API/goldstandard/session/$SID/pair/$TARGET" -H 'Content-Type: application/json' \
+    -d '{"status":"edited","question":"Owned regeneration replacement sentinel"}')
+  check_eq "regeneration target edit is accepted" "$code" "200"
+  # Snapshot after edits, so every non-target pair must remain byte-for-byte equal.
+  api_get "/goldstandard/session/$SID" > /tmp/vfy_regen_before.json
+  code=$(curl -s -m 1920 -o /tmp/vfy_regen.json -w '%{http_code}' -X POST \
+    "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+    -d "{\"session_id\":\"$SID\",\"pair_id\":\"$TARGET\"}")
+  check_eq "regenerate returns a successful API response" "$code" "200"
   api_get "/goldstandard/session/$SID" > /tmp/vfy_after.json
   python3 - "$TARGET" <<'ENDPY'
 import json, sys
 target = sys.argv[1]
-before = {p['pair_id']: p for p in json.load(open('/tmp/vfy_sess.json'))['pairs']}
+before = {p['pair_id']: p for p in json.load(open('/tmp/vfy_regen_before.json'))['pairs']}
 after = {p['pair_id']: p for p in json.load(open('/tmp/vfy_after.json'))['pairs']}
 changed = [k for k in before if k in after and before[k] != after[k]]
-# The first pair was edited above, so it is expected to differ too.
-unexpected = [k for k in changed if k != target and k != list(before)[0]]
+# Only the requested pair may differ from the immediate pre-request snapshot.
+unexpected = [k for k in changed if k != target]
 sys.exit(0 if set(before) == set(after) and target in changed and not unexpected else 1)
 ENDPY
   check "regenerate replaces only the targeted pair, ids stable" $?
@@ -165,6 +187,7 @@ if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_r
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
   check "sessions survive an API restart" 1 "$restart_refusal"
 elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  api_get "/goldstandard/session/$SID" > /tmp/vfy_after.json
   (cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ../..)" && docker compose restart api >/dev/null 2>&1)
   for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
   api_get "/goldstandard/session/$SID" > /tmp/vfy_post.json
@@ -175,6 +198,60 @@ sys.exit(0 if [p['pair_id'] for p in a['pairs']] == [p['pair_id'] for p in b['pa
   check "sessions survive an API restart" $?
 else
   skip "session survives a restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
+# ── hard-stop recovery retains pairs and unblocks regeneration ───────────────
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -z "$restart_refusal" ]; then
+  api_post "/goldstandard/generate" "{\"collection\":\"$C\",\"sample_size\":5}" > /tmp/vfy_gen2.json
+  SID2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen2.json'))['session_id'])")
+  st=""; n=0
+  for _ in $(seq 1 240); do
+    api_get "/goldstandard/session/$SID2" > /tmp/vfy_gen2_pre.json
+    read -r st n <<<"$(python3 -c "import json;d=json.load(open('/tmp/vfy_gen2_pre.json'));print(d['status'],len(d['pairs']))")"
+    { [ "$st" != generating ] || [ "$n" -ge 1 ]; } && break
+    sleep 1
+  done
+  if [ "$st" = generating ] && [ "$n" -ge 1 ]; then
+    # Recheck ownership immediately before the destructive disposable-project action.
+    _rag_require_lock_owner
+    if refusal=$(restart_refusal_reason) && [ -z "$refusal" ] && [ "${COMPOSE_PROJECT_NAME:-}" = rag-verify ]; then
+      (cd "$(git rev-parse --show-toplevel)" && docker compose kill -s SIGKILL api >/dev/null 2>&1 && docker compose start api >/dev/null 2>&1)
+      check "hard API stop and start succeeds" $?
+      for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
+      api_get "/goldstandard/session/$SID2" > /tmp/vfy_gen2_post.json
+      python3 - <<'ENDPY'
+import json,sys
+before=json.load(open('/tmp/vfy_gen2_pre.json')); after=json.load(open('/tmp/vfy_gen2_post.json'))
+retained={p['pair_id']:p for p in after['pairs']}
+ok=(after['status']=='failed' and all(retained.get(p['pair_id'])==p for p in before['pairs'])
+    and any(e.startswith('Generation interrupted by API restart.') for e in after.get('errors',[])))
+print(after['status'], after.get('errors'))
+sys.exit(0 if ok else 1)
+ENDPY
+      check "hard stop settles generation with a plain reason and retained pairs" $?
+      pid2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen2_post.json'))['pairs'][0]['pair_id'])")
+      code=$(curl -s -m 1920 -o /tmp/vfy_gen2_regen.json -w '%{http_code}' -X POST \
+        "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+        -d "{\"session_id\":\"$SID2\",\"pair_id\":\"$pid2\"}")
+      check_eq "regeneration succeeds after startup settlement" "$code" "200"
+      api_get "/goldstandard/session/$SID2" > /tmp/vfy_gen2_final.json
+      python3 - "$pid2" <<'ENDPY'
+import json,sys
+pair=json.load(open('/tmp/vfy_gen2_regen.json'))
+state=json.load(open('/tmp/vfy_gen2_final.json'))
+sys.exit(0 if pair.get('pair_id')==sys.argv[1] and pair in state['pairs'] else 1)
+ENDPY
+      check "regenerated retained pair is present in session" $?
+    else
+      check "hard-stop target is disposable" 1 "${refusal:-expected compose project rag-verify}"
+    fi
+  else
+    skip "hard stop with retained pair" "no interrupted session with a pair within 240s (status=$st pairs=$n)"
+  fi
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  check "hard-stop target is disposable" 1 "$restart_refusal"
+else
+  skip "hard stop during generation" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 drop_collection "$C"
