@@ -3785,6 +3785,27 @@ def load_sessions_from_disk() -> None:
     _scan_sessions()
 
 
+def reconcile_interrupted_generations() -> None:
+    """Startup only: no generation worker survives a process restart."""
+    if _tasks:
+        raise RuntimeError("Generation recovery must run before workers start")
+    interruption = RuntimeError("Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.")
+    with _state_lock:
+        interrupted = [sid for sid, value in _sessions.items() if value.get("status") == "generating"]
+    for session_id in interrupted:
+        def settle(current):
+            if current.get("status") == "generating":
+                _failed_generation(current, interruption)
+        try:
+            _update_session_sync(session_id, settle)
+        except Exception as write_error:
+            # Keep the stored snapshot for a later retry, but never advertise a
+            # live worker that does not exist. Existing diagnostics expose the
+            # persistence failure and a subsequent restart retries settlement.
+            log.exception("Could not persist interrupted generation %s", session_id)
+            _publish_generation_failure(session_id, interruption, write_error)
+
+
 def _sessions_on_disk() -> list[dict]:
     """Return detached, validated files for export without changing the cache."""
     try:
@@ -8085,6 +8106,7 @@ async def lifespan(app: FastAPI):
     from services import goldstandard, metrics
     from services import weaviate_client as wc
     goldstandard.load_sessions_from_disk()
+    goldstandard.reconcile_interrupted_generations()
     metrics.load_from_disk()
     # Sweep only durably owned scratch. Verified recovery collections and
     # unowned marker-like names must survive startup.
@@ -16339,6 +16361,54 @@ class PersistenceTests(unittest.TestCase):
 
     def restart(self):
         gs._sessions={};gs.load_sessions_from_disk();return gs.get_session(self.data['session_id'])
+
+    def test_startup_settles_interrupted_generation_durably_in_fresh_process(self):
+        self.data.update(status='generating', pairs_total=5, pairs_attempted=2, stale=True, stale_reason='Old corpus')
+        gs.store_session(self.data)
+        script = """
+import asyncio, json, sys
+from unittest.mock import patch, AsyncMock
+from config import settings
+settings.upload_dir = sys.argv[1]
+from main import app, lifespan
+from services import goldstandard as gs, weaviate_client as wc, importer
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]):
+        async with lifespan(app):
+            print(json.dumps(gs.get_session('gs_450abcde')))
+asyncio.run(run())
+"""
+        first = json.loads(subprocess.check_output([sys.executable, '-c', script, self.tmp.name], env=child_env(), text=True))
+        second = json.loads(subprocess.check_output([sys.executable, '-c', script, self.tmp.name], env=child_env(), text=True))
+        self.assertEqual(first, second)
+        self.assertEqual(first['status'], 'failed')
+        for field in ('pairs', 'pairs_total', 'pairs_attempted', 'pairs_completed', 'stale', 'stale_reason'):
+            self.assertEqual(first[field], self.data[field])
+        self.assertTrue(any('interrupted by API restart' in error for error in first['errors']))
+        self.assertEqual(json.loads(gs._session_path(self.data['session_id']).read_text()), first)
+
+    def test_startup_write_failure_is_visible_and_ordinary_scans_leave_workers_alone(self):
+        self.data['status'] = 'generating'
+        gs.store_session(self.data)
+        gs.session_diagnostics()
+        self.assertEqual(gs.get_session(self.data['session_id'])['status'], 'generating')
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        with patch.object(gs.os, 'replace', side_effect=OSError('Owned startup write fault')):
+            gs.reconcile_interrupted_generations()
+        current = gs.get_session(self.data['session_id'])
+        self.assertEqual(current['status'], 'failed')
+        self.assertEqual(current['persistence_error']['code'], 'SESSION_WRITE_FAILED')
+        self.assertEqual(current['pairs'], self.data['pairs'])
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+        gs._sessions = {}
+        gs.load_sessions_from_disk()
+        gs.reconcile_interrupted_generations()
+        self.assertEqual(gs.get_session(self.data['session_id'])['status'], 'failed')
+
+    def test_startup_leaves_completed_sessions_unchanged(self):
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        gs.reconcile_interrupted_generations()
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
 
     def test_parallel_acknowledged_fields_survive_restart(self):
         data=fixture();data["pairs"]=[{**data["pairs"][0],"pair_id":"p_"+str(i)} for i in range(8)];data.update(pairs_total=8,pairs_completed=8);gs.store_session(data)

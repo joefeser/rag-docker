@@ -1997,7 +1997,7 @@ now lives once, in `api/services/ingest_config.py`.
       status still read "pending" — an export could ship text nobody approved
       under a status saying otherwise. **Fixed**: a model validator requires
       `status="edited"` whenever content fields are present.*
-- [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`).
+- [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`). Startup settles interrupted generations as failed, preserving completed pairs, counters and validity metadata; ordinary scans leave active generation alone.
 - [x] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
       *Registered `13_identity.sh` exercises controlled collision, concurrent creation, guarded reads, and actual package/HTTP/backend/fresh-process acceptance. The exact current-head counts and full-suite result are recorded in PR #69.*
 - [x] Generation start returns 503 `SESSION_WRITE_FAILED`, writes nothing and records a diagnostic for the candidate session file when identity selection cannot inspect session storage (including a redirected storage directory) or runs out of attempts. Import refuses a source session ID that is not `gs_[0-9a-f]{8}` with `PACKAGE_CORRUPT` naming the sidecar, before restoring anything.

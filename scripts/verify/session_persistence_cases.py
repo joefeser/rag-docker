@@ -33,6 +33,54 @@ class PersistenceTests(unittest.TestCase):
     def restart(self):
         gs._sessions={};gs.load_sessions_from_disk();return gs.get_session(self.data['session_id'])
 
+    def test_startup_settles_interrupted_generation_durably_in_fresh_process(self):
+        self.data.update(status='generating', pairs_total=5, pairs_attempted=2, stale=True, stale_reason='Old corpus')
+        gs.store_session(self.data)
+        script = """
+import asyncio, json, sys
+from unittest.mock import patch, AsyncMock
+from config import settings
+settings.upload_dir = sys.argv[1]
+from main import app, lifespan
+from services import goldstandard as gs, weaviate_client as wc, importer
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]):
+        async with lifespan(app):
+            print(json.dumps(gs.get_session('gs_450abcde')))
+asyncio.run(run())
+"""
+        first = json.loads(subprocess.check_output([sys.executable, '-c', script, self.tmp.name], env=child_env(), text=True))
+        second = json.loads(subprocess.check_output([sys.executable, '-c', script, self.tmp.name], env=child_env(), text=True))
+        self.assertEqual(first, second)
+        self.assertEqual(first['status'], 'failed')
+        for field in ('pairs', 'pairs_total', 'pairs_attempted', 'pairs_completed', 'stale', 'stale_reason'):
+            self.assertEqual(first[field], self.data[field])
+        self.assertTrue(any('interrupted by API restart' in error for error in first['errors']))
+        self.assertEqual(json.loads(gs._session_path(self.data['session_id']).read_text()), first)
+
+    def test_startup_write_failure_is_visible_and_ordinary_scans_leave_workers_alone(self):
+        self.data['status'] = 'generating'
+        gs.store_session(self.data)
+        gs.session_diagnostics()
+        self.assertEqual(gs.get_session(self.data['session_id'])['status'], 'generating')
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        with patch.object(gs.os, 'replace', side_effect=OSError('Owned startup write fault')):
+            gs.reconcile_interrupted_generations()
+        current = gs.get_session(self.data['session_id'])
+        self.assertEqual(current['status'], 'failed')
+        self.assertEqual(current['persistence_error']['code'], 'SESSION_WRITE_FAILED')
+        self.assertEqual(current['pairs'], self.data['pairs'])
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+        gs._sessions = {}
+        gs.load_sessions_from_disk()
+        gs.reconcile_interrupted_generations()
+        self.assertEqual(gs.get_session(self.data['session_id'])['status'], 'failed')
+
+    def test_startup_leaves_completed_sessions_unchanged(self):
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        gs.reconcile_interrupted_generations()
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+
     def test_parallel_acknowledged_fields_survive_restart(self):
         data=fixture();data["pairs"]=[{**data["pairs"][0],"pair_id":"p_"+str(i)} for i in range(8)];data.update(pairs_total=8,pairs_completed=8);gs.store_session(data)
         barrier=threading.Barrier(16)
