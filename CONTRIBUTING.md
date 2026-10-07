@@ -48,6 +48,8 @@ the maintainer approves them.
 By contributing, you agree that your contributions are licensed under the
 [MIT License](LICENSE).
 
+First-party UI and MCP versions track the repository release. When preparing a release, update `ui/package.json`, the root package versions in `ui/package-lock.json`, and `mcp/mcpapp.py` together with their embedded documentation.
+
 ## Release checklist
 
 - Before publishing a release, confirm that `SECURITY.md` names the supported
