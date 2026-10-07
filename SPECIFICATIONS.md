@@ -2194,6 +2194,8 @@ A rebuild from these documents is correct when:
 
 Tuning requires each pre-cutover historical marker to be durable, either in its session or a pending marker. If both writes fail, replacement aborts before deleting the target. Post-mutation marker reporting retains its best-effort diagnostic contract.
 
+Generated model questions, answers and ground truths must be nonempty strings. Invalid field types consume the same bounded reprompt budget as malformed JSON; exhausted attempts fail the pair rather than publishing Python representations. An omitted ground truth defaults to the validated answer, and null source filenames normalize to an empty string.
+
 Overlap retains internal whitespace-only windows to preserve exact character coverage and overlap; wholly blank input yields no chunks. Hard character boundaries and fixed per-file limits remain the existing contract, rather than changing retrieval behavior in this follow-up.
 
 - [x] Interrupted tuning final writes carry an operation instance token. Startup checks only the matching target against its retained recovery records, marks mismatches or missing targets stale, and preserves both collections and snapshots for inspection. A different target instance, unreadable backend, or missing recovery never authorizes deletion. Completed matching targets are left untouched.
