@@ -207,7 +207,7 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
                 with ot.bind((runtime,None)),ot.span('rag.request',server=True,method='GET') as request:
                     with ot.span('rag.export'):
                         ot.call('weaviate.query',lambda:None)
-                provider=next(p for p in runtime.providers if hasattr(p,'_multi_log_record_processor'))
+                provider=next(p for p in runtime._providers if hasattr(p,'_multi_log_record_processor'))
                 processor=provider._multi_log_record_processor._log_record_processors[0]._batch_processor
                 queued=list(processor._queue)
                 self.assertEqual({r.log_record.body for r in queued},ot.LOG_BODIES)
