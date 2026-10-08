@@ -807,7 +807,7 @@ def outcome(value, exc=None, target=None):
     if not isinstance(value, str) or value not in ENUMS["rag.outcome"]:
         return
     attribute("rag.outcome", value, target)
-    if exc is not None:
+    if exc is not None and value != "cancelled":
         attribute("error.type", error_type(exc), target)
     runtime = _runtime.get()
     if runtime is None or runtime.tracer is None:
@@ -959,11 +959,11 @@ def remote_link(headers):
             if value is not None or len(candidate) != 55:
                 return ()
             value = candidate
-    if value is None or not re.fullmatch(rb"00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]", value):
+    if value is None or not re.fullmatch(rb"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", value):
         return ()
     from opentelemetry.trace import SpanContext, TraceFlags, TraceState, Link
     _, tid, sid, flags = value.split(b"-")
-    c = SpanContext(int(tid, 16), int(sid, 16), True, TraceFlags(int(flags, 16)), TraceState())
+    c = SpanContext(int(tid, 16), int(sid, 16), True, TraceFlags(int(flags, 16) & 1), TraceState())
     return (Link(c),) if c.is_valid else ()
 
 

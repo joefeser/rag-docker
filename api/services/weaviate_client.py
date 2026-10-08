@@ -77,8 +77,8 @@ def _check_health_sync() -> bool:
     answers "ready" while every client call fails, so health reports green
     during a total outage of Weaviate functionality.
     """
-    client = get_client()
     with telemetry.span("weaviate.health"):
+        client = get_client()
         ready = bool(client.is_ready())
         if not ready:
             telemetry.outcome("error")
