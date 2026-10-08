@@ -546,6 +546,10 @@ def bootstrap(env=None):
                 record = copy.copy(record)
                 if isinstance(record, ReadWriteLogRecord):
                     record.log_record = copy.copy(record.log_record)
+                target = record.log_record if isinstance(record, ReadWriteLogRecord) else record
+                target.attributes = safe_attributes(target.attributes)
+            else:
+                kwargs["attributes"] = safe_attributes(kwargs.get("attributes"))
             return self._logger.emit(record, **kwargs)
 
     class SafeBatchLogs(BatchLogRecordProcessor):

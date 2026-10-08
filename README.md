@@ -774,7 +774,10 @@ the runtime drops arbitrary text and rebuilds queued scope/resource metadata,
 context and log limits without retaining exception objects. The runtime logger
 copies supplied plain records and both wrapper layers before SDK normalization
 or exception expansion, preserving caller-owned inputs. Keyword emission is
-also supported. Wire resources contain only the three explicit
+also supported. Approved string attributes are snapshotted before SDK delegation;
+forbidden mutable values are discarded rather than recursively copied. Callers
+must not mutate mappings during snapshot construction. Wire resources contain
+only the three explicit
 service fields; scope is `rag.telemetry`. Request names use the fixed registered
 HTTP method and route template, with `rag.request` for unmatched routes. Dynamic
 path values and query strings are never recorded. Other names are finite
