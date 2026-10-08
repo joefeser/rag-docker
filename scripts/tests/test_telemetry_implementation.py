@@ -8,6 +8,15 @@ FILES += [('scripts/verify/stack.sh', 'bash'), ('scripts/verify/service_inventor
 
 
 class EmbeddedTelemetryTests(unittest.TestCase):
+    def test_normative_telemetry_dependencies_match_inputs_and_lock(self):
+        spec = (ROOT/'SPECIFICATIONS.md').read_text()
+        inputs = (ROOT/'api/requirements.in').read_text().splitlines()
+        lock = (ROOT/'api/requirements.txt').read_text().splitlines()
+        for dependency in ('opentelemetry-sdk==1.44.0', 'opentelemetry-exporter-otlp-proto-http==1.44.0'):
+            self.assertIn(dependency, spec)
+            self.assertIn(dependency, inputs)
+            self.assertIn(dependency, lock)
+
     def test_embedded_files_match(self):
         document = (ROOT/'IMPLEMENTATION.md').read_text()
         for name, language in FILES:

@@ -86,7 +86,15 @@ class Config:
                     raw = source.read(8193)
                 if len(raw) > 8192:
                     raise ValueError
-                headers = json.loads(raw)
+                def header_pairs(pairs):
+                    result = {}
+                    for key, val in pairs:
+                        canonical = {"authorization": "Authorization", "x-api-key": "X-Api-Key"}.get(key.lower())
+                        if canonical is None or canonical in result:
+                            raise ValueError
+                        result[canonical] = val
+                    return result
+                headers = json.loads(raw, object_pairs_hook=header_pairs)
                 if (not isinstance(headers, dict) or len(headers) > 8
                     or any(not isinstance(k, str) or not isinstance(v, str)
                            or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", k)
@@ -96,6 +104,8 @@ class Config:
                     raise ValueError
             except (OSError, ValueError, TypeError):
                 raise TelemetryConfigError("Invalid RAG_OTEL_HEADERS_FILE") from None
+        if headers and url.scheme != "https":
+            raise TelemetryConfigError("RAG_OTEL_HEADERS_FILE requires HTTPS RAG_OTEL_ENDPOINT")
         queue = number("QUEUE_SIZE", 256, 1, 4096)
         batch = number("BATCH_SIZE", 64, 1, 512)
         if batch > queue:
@@ -243,6 +253,71 @@ class SafeMeter:
         return self._create("create_up_down_counter", name)
 
 
+def _metric_point_attributes(name, point):
+    keys = METRICS[name][2]
+    approved = [a.key for a in point.attributes if a.key in keys]
+    if len(set(approved)) != len(approved):
+        return None
+    raw = {a.key: a.value.string_value for a in point.attributes
+           if a.value.WhichOneof("value") == "string_value"}
+    if raw.get("rag.outcome") == "partial":
+        return None
+    return metric_attributes(name, raw)
+
+
+def _valid_metric(record):
+    """Admit every point before reserving a name or allocating output.
+
+    The foundation probe has one dimensionless point. Operational instruments
+    retain all distinct permitted series; malformed records cannot consume the
+    capacity of a later valid record, even when it uses the same metric name.
+    """
+    kind = record.WhichOneof("data")
+    if record.name not in METRIC_NAMES or kind not in ("sum", "gauge", "histogram"):
+        return False
+    probe = record.name == "rag.telemetry.check"
+    factory = METRICS[record.name][0]
+    if not probe and kind != ("histogram" if factory == "create_histogram" else "sum"):
+        return False
+    data = getattr(record, kind)
+    if not 1 <= len(data.data_points) <= metric_series_limit(record.name):
+        return False
+    if kind != "gauge" and data.aggregation_temporality not in (1, 2):
+        return False
+    if not probe and kind == "sum" and data.is_monotonic != (factory == "create_counter"):
+        return False
+    seen = set()
+    for point in data.data_points:
+        clean = _metric_point_attributes(record.name, point)
+        if clean is None:
+            return False
+        identity = tuple(sorted(clean.items()))
+        if identity in seen:
+            return False
+        seen.add(identity)
+        if kind != "histogram":
+            value = point.WhichOneof("value")
+            if (value is None or not math.isfinite(getattr(point, value))
+                or (not probe and factory == "create_counter" and getattr(point, value) < 0)):
+                return False
+            continue
+        bounds, buckets = point.explicit_bounds, point.bucket_counts
+        if not (len(bounds) <= 31 and len(buckets) == len(bounds) + 1
+                and point.count >= 0 and all(n >= 0 for n in buckets)
+                and sum(buckets) == point.count
+                and all(math.isfinite(n) for n in bounds)
+                and all(a < b for a, b in zip(bounds, bounds[1:]))
+                and all(not point.HasField(f) or math.isfinite(getattr(point, f))
+                        for f in ("sum", "min", "max"))
+                and (not (point.HasField("min") and point.HasField("max"))
+                     or point.min <= point.max)):
+            return False
+        if not probe and (tuple(bounds) != BUCKETS or any(
+                point.HasField(f) and getattr(point, f) < 0 for f in ("sum", "min", "max"))):
+            return False
+    return True
+
+
 def sanitize_wire(data, signal, config):
     """Rebuild protobuf, dropping all fields not explicitly copied below."""
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -276,8 +351,10 @@ def sanitize_wire(data, signal, config):
             for record in getattr(ss, records):
                 if signal != "metrics" and count >= config.batch_size:
                     break
-                if signal == "metrics" and record.name not in METRIC_NAMES:
-                    continue
+                if signal == "metrics":
+                    if not _valid_metric(record) or record.name in metric_records:
+                        continue
+                    metric_records.add(record.name)
                 count += 1
                 dest = getattr(scope, records).add()
                 if signal == "traces":
@@ -297,63 +374,29 @@ def sanitize_wire(data, signal, config):
                     dest.body.string_value = record.body.string_value if record.body.string_value in LOG_BODIES else "rag.operation"
                     attrs(record.attributes, dest.attributes)
                 else:
-                    # A malformed/oversized metric request fails as a whole.
-                    # Never silently truncate legitimate finite series.
-                    if record.name in metric_records:
-                        raise ValueError("Duplicate telemetry metric")
-                    metric_records.add(record.name)
                     dest.name = record.name
-                    factory, dest.unit, keys = METRICS[record.name]
+                    dest.unit = METRICS[record.name][1]
                     kind = record.WhichOneof("data")
-                    expected = "histogram" if factory == "create_histogram" else "sum"
-                    # The original schema probe also accepts a bounded histogram.
-                    if kind != expected and not (record.name == "rag.telemetry.check" and kind == "histogram"):
-                        raise ValueError("Invalid telemetry metric type")
                     src_data, dst_data = getattr(record, kind), getattr(dest, kind)
-                    if record.name != "rag.telemetry.check" and src_data.aggregation_temporality not in (1, 2):
-                        raise ValueError("Invalid telemetry temporality")
-                    dst_data.aggregation_temporality = src_data.aggregation_temporality
+                    if kind != "gauge":
+                        dst_data.aggregation_temporality = src_data.aggregation_temporality
                     if kind == "sum":
-                        if record.name != "rag.telemetry.check" and src_data.is_monotonic != (factory == "create_counter"):
-                            raise ValueError("Invalid telemetry monotonicity")
-                        dst_data.is_monotonic = factory == "create_counter"
-                    if len(src_data.data_points) > metric_series_limit(record.name):
-                        raise ValueError("Too many telemetry metric points")
-                    seen_points = set()
+                        dst_data.is_monotonic = src_data.is_monotonic
+                    # Admission validated all finite series; preserve them all.
                     for point in src_data.data_points:
-                        approved = [a.key for a in point.attributes if a.key in keys]
-                        if len(set(approved)) != len(approved):
-                            raise ValueError("Duplicate telemetry dimension")
-                        raw = {a.key: a.value.string_value for a in point.attributes if a.value.WhichOneof("value") == "string_value"}
-                        clean = metric_attributes(record.name, raw)
-                        if clean is None or raw.get("rag.outcome") == "partial":
-                            raise ValueError("Invalid telemetry metric dimensions")
-                        identity = tuple(sorted(clean.items()))
-                        if identity in seen_points:
-                            raise ValueError("Duplicate telemetry metric point")
-                        seen_points.add(identity)
                         dp = dst_data.data_points.add()
                         dp.start_time_unix_nano, dp.time_unix_nano = point.start_time_unix_nano, point.time_unix_nano
-                        for key, value in clean.items():
+                        for key, value in _metric_point_attributes(record.name, point).items():
                             dp.attributes.add(key=key).value.string_value = value
                         if kind == "histogram":
-                            if (len(point.explicit_bounds) > 31
-                                or len(point.bucket_counts) != len(point.explicit_bounds) + 1
-                                or sum(point.bucket_counts) != point.count
-                                or not math.isfinite(point.sum) or point.sum < 0
-                                or any(not math.isfinite(v) for v in point.explicit_bounds)
-                                or (record.name != "rag.telemetry.check" and tuple(point.explicit_bounds) != BUCKETS)):
-                                if record.name == "rag.telemetry.check":
-                                    dst_data.data_points.pop()
-                                    continue
-                                raise ValueError("Invalid telemetry histogram")
-                            dp.count, dp.sum = point.count, point.sum
+                            dp.count = point.count
+                            for field_name in ("sum", "min", "max"):
+                                if point.HasField(field_name):
+                                    setattr(dp, field_name, getattr(point, field_name))
                             dp.bucket_counts.extend(point.bucket_counts)
                             dp.explicit_bounds.extend(point.explicit_bounds)
                         else:
                             val = point.WhichOneof("value")
-                            if val is None or not math.isfinite(getattr(point, val)) or (factory == "create_counter" and getattr(point, val) < 0):
-                                raise ValueError("Invalid telemetry metric value")
                             setattr(dp, val, getattr(point, val))
     return output.SerializeToString()
 
@@ -470,10 +513,14 @@ def bootstrap(env=None):
     class SafeBatchSpans(BatchSpanProcessor):
         def on_end(self, span):
             from opentelemetry.sdk.trace import ReadableSpan
-            from opentelemetry.trace import Status
+            from opentelemetry.trace import Status, SpanContext
+            def clean_context(context):
+                return None if context is None else SpanContext(
+                    trace_id=context.trace_id, span_id=context.span_id,
+                    is_remote=context.is_remote, trace_flags=context.trace_flags)
             clean = ReadableSpan(
                 name=span.name if span.name in SPAN_NAMES else "rag.operation",
-                context=span.context, parent=span.parent, resource=resource,
+                context=clean_context(span.context), parent=clean_context(span.parent), resource=resource,
                 links=safe_links(span.links),
                 attributes=safe_attributes(span.attributes), kind=span.kind,
                 status=Status(span.status.status_code), start_time=span.start_time,

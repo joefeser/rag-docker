@@ -752,7 +752,9 @@ Service metadata is explicitly operator-selected public telemetry data: use
 non-sensitive identifiers (1–64 ASCII letters, digits, dots, underscores or
 hyphens, starting with a letter/digit). Do not put customer names or secrets in
 these fields. Headers belong in an uncommitted mounted secret file, never in
-service metadata. Exporter transport ignores ambient proxies/netrc and uses TLS
+service metadata. Credential headers require HTTPS, including loopback destinations;
+HTTP is accepted only without credentials. Header names are case-insensitive and
+duplicate names (including repeated JSON keys) are rejected. Exporter transport ignores ambient proxies/netrc and uses TLS
 verification; redirects are refused. Other `OTEL_*` variables are not a supported
 configuration interface for this private runtime.
 
@@ -781,7 +783,11 @@ The operational metric allowlist and finite dimensions are documented below.
 The private meter validates values before SDK aggregation; instrument-specific
 views and the final export boundary enforce its schema. Export removes arbitrary
 descriptions and exemplars and preserves only fixed declared units. The original
-dimensionless `rag.telemetry.check` counter remains a synthetic schema probe.
+dimensionless `rag.telemetry.check` remains a one-point synthetic schema probe.
+All points in a metric are validated before admitting the record. Histograms
+require at most 31 finite, strictly increasing boundaries, consistent bucket
+totals and finite optional sum/min/max with min no greater than max. Invalid
+records cannot reserve a name or consume valid metric capacity.
 Do not pass content into instrumentation even though the exporter excludes it:
 active SDK spans may retain inputs until completion.
 
@@ -867,8 +873,9 @@ close is cancellation. Model token usage is not available and is not invented.
 Histograms use explicit boundaries in seconds: 0.005, 0.01, 0.025, 0.05, 0.1,
 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300 (plus the implicit overflow bucket).
 All valid finite series survive export regardless of the trace/log batch size.
-Malformed, duplicate or excess metric points reject the metric export request;
-they do not silently truncate otherwise valid series. SDK aggregation cannot
+Malformed, duplicate or excess points reject their entire metric record before
+admission; later valid records remain eligible, including the same metric name.
+Each valid name is admitted once. No valid multi-series record is truncated. SDK aggregation cannot
 allocate a series for arbitrary values under permitted keys. Job IDs, user IDs,
 collection names, filenames, prompts, raw exceptions and trace exemplars never
 become metric dimensions.

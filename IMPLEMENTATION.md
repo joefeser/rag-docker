@@ -20567,7 +20567,15 @@ class Config:
                     raw = source.read(8193)
                 if len(raw) > 8192:
                     raise ValueError
-                headers = json.loads(raw)
+                def header_pairs(pairs):
+                    result = {}
+                    for key, val in pairs:
+                        canonical = {"authorization": "Authorization", "x-api-key": "X-Api-Key"}.get(key.lower())
+                        if canonical is None or canonical in result:
+                            raise ValueError
+                        result[canonical] = val
+                    return result
+                headers = json.loads(raw, object_pairs_hook=header_pairs)
                 if (not isinstance(headers, dict) or len(headers) > 8
                     or any(not isinstance(k, str) or not isinstance(v, str)
                            or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", k)
@@ -20577,6 +20585,8 @@ class Config:
                     raise ValueError
             except (OSError, ValueError, TypeError):
                 raise TelemetryConfigError("Invalid RAG_OTEL_HEADERS_FILE") from None
+        if headers and url.scheme != "https":
+            raise TelemetryConfigError("RAG_OTEL_HEADERS_FILE requires HTTPS RAG_OTEL_ENDPOINT")
         queue = number("QUEUE_SIZE", 256, 1, 4096)
         batch = number("BATCH_SIZE", 64, 1, 512)
         if batch > queue:
@@ -20724,6 +20734,71 @@ class SafeMeter:
         return self._create("create_up_down_counter", name)
 
 
+def _metric_point_attributes(name, point):
+    keys = METRICS[name][2]
+    approved = [a.key for a in point.attributes if a.key in keys]
+    if len(set(approved)) != len(approved):
+        return None
+    raw = {a.key: a.value.string_value for a in point.attributes
+           if a.value.WhichOneof("value") == "string_value"}
+    if raw.get("rag.outcome") == "partial":
+        return None
+    return metric_attributes(name, raw)
+
+
+def _valid_metric(record):
+    """Admit every point before reserving a name or allocating output.
+
+    The foundation probe has one dimensionless point. Operational instruments
+    retain all distinct permitted series; malformed records cannot consume the
+    capacity of a later valid record, even when it uses the same metric name.
+    """
+    kind = record.WhichOneof("data")
+    if record.name not in METRIC_NAMES or kind not in ("sum", "gauge", "histogram"):
+        return False
+    probe = record.name == "rag.telemetry.check"
+    factory = METRICS[record.name][0]
+    if not probe and kind != ("histogram" if factory == "create_histogram" else "sum"):
+        return False
+    data = getattr(record, kind)
+    if not 1 <= len(data.data_points) <= metric_series_limit(record.name):
+        return False
+    if kind != "gauge" and data.aggregation_temporality not in (1, 2):
+        return False
+    if not probe and kind == "sum" and data.is_monotonic != (factory == "create_counter"):
+        return False
+    seen = set()
+    for point in data.data_points:
+        clean = _metric_point_attributes(record.name, point)
+        if clean is None:
+            return False
+        identity = tuple(sorted(clean.items()))
+        if identity in seen:
+            return False
+        seen.add(identity)
+        if kind != "histogram":
+            value = point.WhichOneof("value")
+            if (value is None or not math.isfinite(getattr(point, value))
+                or (not probe and factory == "create_counter" and getattr(point, value) < 0)):
+                return False
+            continue
+        bounds, buckets = point.explicit_bounds, point.bucket_counts
+        if not (len(bounds) <= 31 and len(buckets) == len(bounds) + 1
+                and point.count >= 0 and all(n >= 0 for n in buckets)
+                and sum(buckets) == point.count
+                and all(math.isfinite(n) for n in bounds)
+                and all(a < b for a, b in zip(bounds, bounds[1:]))
+                and all(not point.HasField(f) or math.isfinite(getattr(point, f))
+                        for f in ("sum", "min", "max"))
+                and (not (point.HasField("min") and point.HasField("max"))
+                     or point.min <= point.max)):
+            return False
+        if not probe and (tuple(bounds) != BUCKETS or any(
+                point.HasField(f) and getattr(point, f) < 0 for f in ("sum", "min", "max"))):
+            return False
+    return True
+
+
 def sanitize_wire(data, signal, config):
     """Rebuild protobuf, dropping all fields not explicitly copied below."""
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -20757,8 +20832,10 @@ def sanitize_wire(data, signal, config):
             for record in getattr(ss, records):
                 if signal != "metrics" and count >= config.batch_size:
                     break
-                if signal == "metrics" and record.name not in METRIC_NAMES:
-                    continue
+                if signal == "metrics":
+                    if not _valid_metric(record) or record.name in metric_records:
+                        continue
+                    metric_records.add(record.name)
                 count += 1
                 dest = getattr(scope, records).add()
                 if signal == "traces":
@@ -20778,63 +20855,29 @@ def sanitize_wire(data, signal, config):
                     dest.body.string_value = record.body.string_value if record.body.string_value in LOG_BODIES else "rag.operation"
                     attrs(record.attributes, dest.attributes)
                 else:
-                    # A malformed/oversized metric request fails as a whole.
-                    # Never silently truncate legitimate finite series.
-                    if record.name in metric_records:
-                        raise ValueError("Duplicate telemetry metric")
-                    metric_records.add(record.name)
                     dest.name = record.name
-                    factory, dest.unit, keys = METRICS[record.name]
+                    dest.unit = METRICS[record.name][1]
                     kind = record.WhichOneof("data")
-                    expected = "histogram" if factory == "create_histogram" else "sum"
-                    # The original schema probe also accepts a bounded histogram.
-                    if kind != expected and not (record.name == "rag.telemetry.check" and kind == "histogram"):
-                        raise ValueError("Invalid telemetry metric type")
                     src_data, dst_data = getattr(record, kind), getattr(dest, kind)
-                    if record.name != "rag.telemetry.check" and src_data.aggregation_temporality not in (1, 2):
-                        raise ValueError("Invalid telemetry temporality")
-                    dst_data.aggregation_temporality = src_data.aggregation_temporality
+                    if kind != "gauge":
+                        dst_data.aggregation_temporality = src_data.aggregation_temporality
                     if kind == "sum":
-                        if record.name != "rag.telemetry.check" and src_data.is_monotonic != (factory == "create_counter"):
-                            raise ValueError("Invalid telemetry monotonicity")
-                        dst_data.is_monotonic = factory == "create_counter"
-                    if len(src_data.data_points) > metric_series_limit(record.name):
-                        raise ValueError("Too many telemetry metric points")
-                    seen_points = set()
+                        dst_data.is_monotonic = src_data.is_monotonic
+                    # Admission validated all finite series; preserve them all.
                     for point in src_data.data_points:
-                        approved = [a.key for a in point.attributes if a.key in keys]
-                        if len(set(approved)) != len(approved):
-                            raise ValueError("Duplicate telemetry dimension")
-                        raw = {a.key: a.value.string_value for a in point.attributes if a.value.WhichOneof("value") == "string_value"}
-                        clean = metric_attributes(record.name, raw)
-                        if clean is None or raw.get("rag.outcome") == "partial":
-                            raise ValueError("Invalid telemetry metric dimensions")
-                        identity = tuple(sorted(clean.items()))
-                        if identity in seen_points:
-                            raise ValueError("Duplicate telemetry metric point")
-                        seen_points.add(identity)
                         dp = dst_data.data_points.add()
                         dp.start_time_unix_nano, dp.time_unix_nano = point.start_time_unix_nano, point.time_unix_nano
-                        for key, value in clean.items():
+                        for key, value in _metric_point_attributes(record.name, point).items():
                             dp.attributes.add(key=key).value.string_value = value
                         if kind == "histogram":
-                            if (len(point.explicit_bounds) > 31
-                                or len(point.bucket_counts) != len(point.explicit_bounds) + 1
-                                or sum(point.bucket_counts) != point.count
-                                or not math.isfinite(point.sum) or point.sum < 0
-                                or any(not math.isfinite(v) for v in point.explicit_bounds)
-                                or (record.name != "rag.telemetry.check" and tuple(point.explicit_bounds) != BUCKETS)):
-                                if record.name == "rag.telemetry.check":
-                                    dst_data.data_points.pop()
-                                    continue
-                                raise ValueError("Invalid telemetry histogram")
-                            dp.count, dp.sum = point.count, point.sum
+                            dp.count = point.count
+                            for field_name in ("sum", "min", "max"):
+                                if point.HasField(field_name):
+                                    setattr(dp, field_name, getattr(point, field_name))
                             dp.bucket_counts.extend(point.bucket_counts)
                             dp.explicit_bounds.extend(point.explicit_bounds)
                         else:
                             val = point.WhichOneof("value")
-                            if val is None or not math.isfinite(getattr(point, val)) or (factory == "create_counter" and getattr(point, val) < 0):
-                                raise ValueError("Invalid telemetry metric value")
                             setattr(dp, val, getattr(point, val))
     return output.SerializeToString()
 
@@ -20951,10 +20994,14 @@ def bootstrap(env=None):
     class SafeBatchSpans(BatchSpanProcessor):
         def on_end(self, span):
             from opentelemetry.sdk.trace import ReadableSpan
-            from opentelemetry.trace import Status
+            from opentelemetry.trace import Status, SpanContext
+            def clean_context(context):
+                return None if context is None else SpanContext(
+                    trace_id=context.trace_id, span_id=context.span_id,
+                    is_remote=context.is_remote, trace_flags=context.trace_flags)
             clean = ReadableSpan(
                 name=span.name if span.name in SPAN_NAMES else "rag.operation",
-                context=span.context, parent=span.parent, resource=resource,
+                context=clean_context(span.context), parent=clean_context(span.parent), resource=resource,
                 links=safe_links(span.links),
                 attributes=safe_attributes(span.attributes), kind=span.kind,
                 status=Status(span.status.status_code), start_time=span.start_time,
@@ -21415,7 +21462,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
-from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire
+from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
 from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
@@ -21478,6 +21525,105 @@ class TelemetryTests(unittest.TestCase):
             Config.from_env({'RAG_OTEL_ENABLED': 'true', 'RAG_OTEL_ENDPOINT': 'https://localhost', 'RAG_OTEL_HEADERS_FILE': SECRET})
         self.assertNotIn(SECRET, str(err.exception))
 
+    def test_credentials_require_https_and_unambiguous_header_identity(self):
+        for header in ('Authorization', 'authorization', 'X-Api-Key', 'x-API-key'):
+            with tempfile.NamedTemporaryFile(mode='w') as f:
+                f.write('{"'+header+'":"'+SECRET+'"}'); f.flush()
+                for origin in ('http://localhost:4318', 'http://collector.example', 'https://collector.example'):
+                    env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':origin, 'RAG_OTEL_HEADERS_FILE':f.name}
+                    if origin.startswith('https:'):
+                        cfg = Config.from_env(env)
+                        self.assertEqual(list(cfg.headers), ['Authorization' if header.lower() == 'authorization' else 'X-Api-Key'])
+                    else:
+                        with patch('services.telemetry._session', side_effect=AssertionError), self.assertRaises(TelemetryConfigError) as error:
+                            bootstrap(env)
+                        self.assertNotIn(SECRET, str(error.exception))
+        for names in (('Authorization', 'authorization'), ('X-Api-Key', 'x-api-key'), ('Authorization', 'Authorization')):
+            with tempfile.NamedTemporaryFile(mode='w') as f:
+                f.write('{"'+names[0]+'":"first","'+names[1]+'":"'+SECRET+'"}'); f.flush()
+                with self.assertRaises(TelemetryConfigError):
+                    Config.from_env({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost', 'RAG_OTEL_HEADERS_FILE':f.name})
+
+    def test_remote_trace_state_removed_before_queue_and_at_receiver(self):
+        from opentelemetry.trace import SpanContext, TraceFlags, TraceState, NonRecordingSpan, set_span_in_context
+        parent = SpanContext(123, 456, True, TraceFlags(1), TraceState([('secret', SECRET)]))
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                with runtime.tracer.start_as_current_span('rag.query', context=set_span_in_context(NonRecordingSpan(parent))) as span:
+                    child = span.get_span_context()
+                processor = runtime.providers[0]._active_span_processor._span_processors[0]._batch_processor
+                queued = processor._queue[0]
+                for clean, original in ((queued.context, child), (queued.parent, parent)):
+                    self.assertFalse(clean.trace_state)
+                    self.assertEqual((clean.trace_id, clean.span_id, clean.trace_flags, clean.is_remote),
+                                     (original.trace_id, original.span_id, original.trace_flags, original.is_remote))
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/traces']
+                self.assertNotIn(SECRET.encode(), payload)
+                exported = ExportTraceServiceRequest.FromString(payload).resource_spans[0].scope_spans[0].spans[0]
+                self.assertEqual(int.from_bytes(exported.parent_span_id, 'big'), 456)
+                self.assertEqual(int.from_bytes(exported.trace_id, 'big'), 123)
+            finally:
+                runtime.shutdown()
+
+    def test_metric_admission_invariants_at_real_wire_boundary(self):
+        from opentelemetry.proto.metrics.v1.metrics_pb2 import Metric
+        def numeric(kind='gauge', value=7):
+            metric = Metric(name='rag.telemetry.check')
+            data = getattr(metric, kind)
+            if kind == 'sum': data.aggregation_temporality = 2
+            data.data_points.add(as_double=value)
+            return metric
+        def histogram(**changes):
+            metric = Metric(name='rag.telemetry.check')
+            metric.histogram.aggregation_temporality = 2
+            values = dict(count=3, sum=4, min=0, max=3, bucket_counts=[1,1,1], explicit_bounds=[1,2])
+            values.update(changes)
+            metric.histogram.data_points.add(**values)
+            return metric
+        invalid = [Metric(name='rag.telemetry.check'), numeric(value=float('nan')), numeric(value=float('inf'))]
+        for kind in ('gauge', 'sum', 'histogram'):
+            metric = histogram() if kind == 'histogram' else numeric(kind)
+            getattr(metric, kind).data_points.add().CopyFrom(getattr(metric, kind).data_points[0])
+            invalid.append(metric)
+            empty = Metric(name='rag.telemetry.check'); getattr(empty, kind).SetInParent(); invalid.append(empty)
+        missing = Metric(name='rag.telemetry.check'); missing.gauge.data_points.add(); invalid.append(missing)
+        bad_temporality = numeric('sum'); bad_temporality.sum.aggregation_temporality = 0; invalid.append(bad_temporality)
+        for changes in (dict(explicit_bounds=[2,1]), dict(explicit_bounds=[1,1]),
+                        dict(explicit_bounds=[1,float('inf')]), dict(explicit_bounds=[float('nan'),2]),
+                        dict(sum=float('nan')), dict(min=float('-inf')), dict(max=float('inf')),
+                        dict(min=4,max=3), dict(count=4), dict(bucket_counts=[1,2]),
+                        dict(explicit_bounds=list(range(32)),bucket_counts=[0]*33,count=0)):
+            invalid.append(histogram(**changes))
+        # Protobuf uint64 fields reject negative values before sanitizer admission.
+        for changes in (dict(count=-1), dict(bucket_counts=[-1,2,2])):
+            with self.assertRaises(ValueError): histogram(**changes)
+        with receiver() as (env, records):
+            config = Config.from_env({**env, 'RAG_OTEL_BATCH_SIZE':'1'})
+            with _session('metrics', config) as session:
+                for bad in invalid:
+                    source = ExportMetricsServiceRequest()
+                    metrics = source.resource_metrics.add().scope_metrics.add().metrics
+                    metrics.add().CopyFrom(bad); metrics.add().CopyFrom(numeric())
+                    response = session.post('', data=source.SerializeToString())
+                    self.assertEqual(response.status_code, 200)
+                    output = ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual(len(output), 1)
+                    self.assertEqual(output[0].WhichOneof('data'), 'gauge')
+                    self.assertEqual(output[0].gauge.data_points[0].as_double, 7)
+                absent_statistics = histogram()
+                for field in ('sum', 'min', 'max'):
+                    absent_statistics.histogram.data_points[0].ClearField(field)
+                for good in (numeric('sum'), histogram(), absent_statistics,
+                             histogram(count=0,sum=0,min=0,max=0,bucket_counts=[0,0,0])):
+                    source = ExportMetricsServiceRequest()
+                    source.resource_metrics.add().scope_metrics.add().metrics.add().CopyFrom(good)
+                    session.post('', data=source.SerializeToString())
+                    output = ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual(len(output), 1)
+                    self.assertEqual(output[0], good)
+
     def test_real_sdk_all_signals_safe_on_receiver(self):
         with receiver() as (env, records), patch.dict(os.environ, {'OTEL_RESOURCE_ATTRIBUTES': 'secret='+SECRET,
                  'OTEL_SERVICE_NAME': SECRET, 'OTEL_EXPORTER_OTLP_HEADERS': 'authorization='+SECRET}):
@@ -21536,7 +21682,7 @@ class TelemetryTests(unittest.TestCase):
         point=metric.histogram.data_points.add(count=40, sum=40)
         point.bucket_counts.extend([1]*40);point.explicit_bounds.extend(range(39))
         result=ExportMetricsServiceRequest.FromString(sanitize_wire(source.SerializeToString(),'metrics',Config()))
-        self.assertFalse(result.resource_metrics[0].scope_metrics[0].metrics[0].histogram.data_points)
+        self.assertFalse(result.resource_metrics[0].scope_metrics[0].metrics)
 
     def test_bounded_queue_under_blocked_export(self):
         from opentelemetry.sdk.trace.export import SpanExportResult
@@ -21646,6 +21792,15 @@ FILES += [('scripts/verify/stack.sh', 'bash'), ('scripts/verify/service_inventor
 
 
 class EmbeddedTelemetryTests(unittest.TestCase):
+    def test_normative_telemetry_dependencies_match_inputs_and_lock(self):
+        spec = (ROOT/'SPECIFICATIONS.md').read_text()
+        inputs = (ROOT/'api/requirements.in').read_text().splitlines()
+        lock = (ROOT/'api/requirements.txt').read_text().splitlines()
+        for dependency in ('opentelemetry-sdk==1.44.0', 'opentelemetry-exporter-otlp-proto-http==1.44.0'):
+            self.assertIn(dependency, spec)
+            self.assertIn(dependency, inputs)
+            self.assertIn(dependency, lock)
+
     def test_embedded_files_match(self):
         document = (ROOT/'IMPLEMENTATION.md').read_text()
         for name, language in FILES:
@@ -22264,20 +22419,67 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(children),2)
             self.assertEqual({r.trace_id for r in children},{log.trace_id})
 
-    async def test_wire_rejects_malformed_instead_of_truncating(self):
-        def payload(count=1):
-            source=ExportMetricsServiceRequest()
-            metric=source.resource_metrics.add().scope_metrics.add().metrics.add(name='rag.job.completed')
+    async def test_wire_admission_rejects_bad_records_without_consuming_names(self):
+        from opentelemetry.proto.metrics.v1.metrics_pb2 import Metric
+        def numeric():
+            metric=Metric(name='rag.job.completed')
             metric.sum.aggregation_temporality=2;metric.sum.is_monotonic=True
-            for _ in range(count):
+            for operation in ('export','import'):
                 point=metric.sum.data_points.add(as_int=1)
-                for k,v in {'rag.operation':'export','rag.outcome':'ok'}.items():point.attributes.add(key=k).value.string_value=v
-            return source
-        with self.assertRaises(ValueError):ot.sanitize_wire(payload(2).SerializeToString(),'metrics',ot.Config())
-        source=payload();source.resource_metrics[0].scope_metrics[0].metrics[0].sum.data_points[0].as_double=float('nan')
-        with self.assertRaises(ValueError):ot.sanitize_wire(source.SerializeToString(),'metrics',ot.Config())
-        source=payload();source.resource_metrics[0].scope_metrics[0].metrics[0].sum.data_points[0].attributes[0].value.string_value=SECRET
-        with self.assertRaises(ValueError):ot.sanitize_wire(source.SerializeToString(),'metrics',ot.Config())
+                for k,v in {'rag.operation':operation,'rag.outcome':'ok'}.items():
+                    point.attributes.add(key=k).value.string_value=v
+            return metric
+        def histogram(**changes):
+            metric=Metric(name='rag.job.duration')
+            metric.histogram.aggregation_temporality=2
+            values=dict(count=1,sum=0.001,min=0.001,max=0.001,
+                        bucket_counts=[1]+[0]*len(ot.BUCKETS),explicit_bounds=ot.BUCKETS)
+            values.update(changes)
+            for operation in ('export','import'):
+                point=metric.histogram.data_points.add(**values)
+                for k,v in {'rag.operation':operation,'rag.outcome':'ok'}.items():
+                    point.attributes.add(key=k).value.string_value=v
+            return metric
+        invalid=[]
+        duplicate=numeric();duplicate.sum.data_points[1].CopyFrom(duplicate.sum.data_points[0]);invalid.append(duplicate)
+        missing=numeric();missing.sum.data_points[1].ClearField('as_int');invalid.append(missing)
+        for value in (float('nan'),float('inf'),-1):
+            bad=numeric();bad.sum.data_points[1].as_double=value;invalid.append(bad)
+        bad=numeric();bad.sum.data_points[1].attributes[0].value.string_value=SECRET;invalid.append(bad)
+        bad=numeric();bad.sum.data_points[1].attributes.add().CopyFrom(bad.sum.data_points[1].attributes[0]);invalid.append(bad)
+        bad=numeric();bad.sum.aggregation_temporality=0;invalid.append(bad)
+        bad=numeric();bad.sum.is_monotonic=False;invalid.append(bad)
+        for changes in (dict(sum=float('nan')),dict(min=float('-inf')),dict(max=float('inf')),
+                        dict(min=3,max=2),dict(count=2),dict(sum=-1),
+                        dict(explicit_bounds=tuple(reversed(ot.BUCKETS))),
+                        dict(explicit_bounds=[0.1]*len(ot.BUCKETS))):
+            invalid.append(histogram(**changes))
+        good_count,good_hist=numeric(),histogram()
+        # All malformed points include an initially valid series: partial
+        # admission must not reserve the name or discard later valid series.
+        with receiver() as (env,records):
+            config=ot.Config.from_env({**env,'RAG_OTEL_BATCH_SIZE':'1'})
+            with ot._session('metrics',config) as session:
+                for bad in invalid:
+                    source=ExportMetricsServiceRequest()
+                    metrics=source.resource_metrics.add().scope_metrics.add().metrics
+                    for metric in (bad,good_count,good_hist):metrics.add().CopyFrom(metric)
+                    self.assertEqual(session.post('',data=source.SerializeToString()).status_code,200)
+                    output=ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual({m.name for m in output},{'rag.job.completed','rag.job.duration'})
+                    by_name={m.name:m for m in output}
+                    good_count.unit='{job}';good_hist.unit='s'
+                    self.assertEqual(by_name['rag.job.completed'],good_count)
+                    self.assertEqual(by_name['rag.job.duration'],good_hist)
+                absent=histogram()
+                for point in absent.histogram.data_points:
+                    for field in ('sum','min','max'):point.ClearField(field)
+                source=ExportMetricsServiceRequest()
+                source.resource_metrics.add().scope_metrics.add().metrics.add().CopyFrom(absent)
+                session.post('',data=source.SerializeToString())
+                exported=ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics[0]
+                self.assertEqual(len(exported.histogram.data_points),2)
+                self.assertTrue(all(not p.HasField(f) for p in exported.histogram.data_points for f in ('sum','min','max')))
 
     async def test_disabled_and_export_failure_preserve_results(self):
         with patch.object(ot,'_session',side_effect=AssertionError('no exporter')):

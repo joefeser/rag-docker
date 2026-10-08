@@ -975,6 +975,8 @@ langchain-text-splitters>=0.3
 sentence-transformers>=3.0
 python-multipart>=0.0.9
 aiofiles>=23.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
 ```
 
 **Dependency pinning (normative).** The list above is *intent*, held in
@@ -985,16 +987,16 @@ is current: that is exactly how `weaviate-client` drifted to a release requiring
 newer Weaviate server than the one pinned here, breaking every collection call
 while the stack still reported healthy.
 
-Regenerate the lock from the repo root after editing `requirements.in`:
+The SDK and OTLP HTTP exporter entries in `api/requirements.in` are required
+for enabled telemetry startup; lock regeneration must retain both at 1.44.0
+and resolve their transitive dependencies.
 
-```bash
-docker compose build api
-docker run --rm rag-docker-api:latest pip freeze \
-  | grep -viE '^(torch|torchvision)==' | LC_ALL=C sort > /tmp/pins.txt
-awk '/^[a-zA-Z0-9]/{exit} {print}' api/requirements.txt > /tmp/header.txt
-cat /tmp/header.txt /tmp/pins.txt > api/requirements.txt
-docker compose build api          # confirm the lock installs cleanly
-```
+Regenerate the lock from the repo root using the procedure at the top of
+`api/requirements.in`: resolve the edited inputs against the current API image
+with `pip install --dry-run --report`, incorporate the resolved pins into the
+sorted lock, rebuild, and compare the resulting image's `pip freeze` (excluding
+torch/torchvision) to the lock. Editing the input and rebuilding alone does not
+resolve new dependencies, because the Dockerfile installs only the lock.
 
 `LC_ALL=C` keeps ordering stable so a re-lock produces a clean diff.
 
@@ -2281,7 +2283,11 @@ scope exit and represent current process concurrency, not persisted history.
 Finite dimensions are validated before aggregation, restricted per instrument
 by SDK views, and checked again during protobuf rebuilding. Valid multiple
 series survive export even with tiny trace/log batches. Malformed, duplicate or
-excess metric data fails the export rather than truncating valid measurements.
+excess metric data rejects its record before admission. Other valid records
+remain eligible, and each valid name is admitted once; valid multi-series
+measurements are never truncated. Histogram statistics must be finite when
+present and preserve their optional presence, with ordered boundaries and
+consistent bucket totals.
 No job IDs, trace exemplars, collection names, user IDs, paths, content or raw
 exception values may become metric dimensions. Token usage is not fabricated.
 

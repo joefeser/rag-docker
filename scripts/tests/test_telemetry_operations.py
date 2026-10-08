@@ -237,20 +237,67 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(children),2)
             self.assertEqual({r.trace_id for r in children},{log.trace_id})
 
-    async def test_wire_rejects_malformed_instead_of_truncating(self):
-        def payload(count=1):
-            source=ExportMetricsServiceRequest()
-            metric=source.resource_metrics.add().scope_metrics.add().metrics.add(name='rag.job.completed')
+    async def test_wire_admission_rejects_bad_records_without_consuming_names(self):
+        from opentelemetry.proto.metrics.v1.metrics_pb2 import Metric
+        def numeric():
+            metric=Metric(name='rag.job.completed')
             metric.sum.aggregation_temporality=2;metric.sum.is_monotonic=True
-            for _ in range(count):
+            for operation in ('export','import'):
                 point=metric.sum.data_points.add(as_int=1)
-                for k,v in {'rag.operation':'export','rag.outcome':'ok'}.items():point.attributes.add(key=k).value.string_value=v
-            return source
-        with self.assertRaises(ValueError):ot.sanitize_wire(payload(2).SerializeToString(),'metrics',ot.Config())
-        source=payload();source.resource_metrics[0].scope_metrics[0].metrics[0].sum.data_points[0].as_double=float('nan')
-        with self.assertRaises(ValueError):ot.sanitize_wire(source.SerializeToString(),'metrics',ot.Config())
-        source=payload();source.resource_metrics[0].scope_metrics[0].metrics[0].sum.data_points[0].attributes[0].value.string_value=SECRET
-        with self.assertRaises(ValueError):ot.sanitize_wire(source.SerializeToString(),'metrics',ot.Config())
+                for k,v in {'rag.operation':operation,'rag.outcome':'ok'}.items():
+                    point.attributes.add(key=k).value.string_value=v
+            return metric
+        def histogram(**changes):
+            metric=Metric(name='rag.job.duration')
+            metric.histogram.aggregation_temporality=2
+            values=dict(count=1,sum=0.001,min=0.001,max=0.001,
+                        bucket_counts=[1]+[0]*len(ot.BUCKETS),explicit_bounds=ot.BUCKETS)
+            values.update(changes)
+            for operation in ('export','import'):
+                point=metric.histogram.data_points.add(**values)
+                for k,v in {'rag.operation':operation,'rag.outcome':'ok'}.items():
+                    point.attributes.add(key=k).value.string_value=v
+            return metric
+        invalid=[]
+        duplicate=numeric();duplicate.sum.data_points[1].CopyFrom(duplicate.sum.data_points[0]);invalid.append(duplicate)
+        missing=numeric();missing.sum.data_points[1].ClearField('as_int');invalid.append(missing)
+        for value in (float('nan'),float('inf'),-1):
+            bad=numeric();bad.sum.data_points[1].as_double=value;invalid.append(bad)
+        bad=numeric();bad.sum.data_points[1].attributes[0].value.string_value=SECRET;invalid.append(bad)
+        bad=numeric();bad.sum.data_points[1].attributes.add().CopyFrom(bad.sum.data_points[1].attributes[0]);invalid.append(bad)
+        bad=numeric();bad.sum.aggregation_temporality=0;invalid.append(bad)
+        bad=numeric();bad.sum.is_monotonic=False;invalid.append(bad)
+        for changes in (dict(sum=float('nan')),dict(min=float('-inf')),dict(max=float('inf')),
+                        dict(min=3,max=2),dict(count=2),dict(sum=-1),
+                        dict(explicit_bounds=tuple(reversed(ot.BUCKETS))),
+                        dict(explicit_bounds=[0.1]*len(ot.BUCKETS))):
+            invalid.append(histogram(**changes))
+        good_count,good_hist=numeric(),histogram()
+        # All malformed points include an initially valid series: partial
+        # admission must not reserve the name or discard later valid series.
+        with receiver() as (env,records):
+            config=ot.Config.from_env({**env,'RAG_OTEL_BATCH_SIZE':'1'})
+            with ot._session('metrics',config) as session:
+                for bad in invalid:
+                    source=ExportMetricsServiceRequest()
+                    metrics=source.resource_metrics.add().scope_metrics.add().metrics
+                    for metric in (bad,good_count,good_hist):metrics.add().CopyFrom(metric)
+                    self.assertEqual(session.post('',data=source.SerializeToString()).status_code,200)
+                    output=ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual({m.name for m in output},{'rag.job.completed','rag.job.duration'})
+                    by_name={m.name:m for m in output}
+                    good_count.unit='{job}';good_hist.unit='s'
+                    self.assertEqual(by_name['rag.job.completed'],good_count)
+                    self.assertEqual(by_name['rag.job.duration'],good_hist)
+                absent=histogram()
+                for point in absent.histogram.data_points:
+                    for field in ('sum','min','max'):point.ClearField(field)
+                source=ExportMetricsServiceRequest()
+                source.resource_metrics.add().scope_metrics.add().metrics.add().CopyFrom(absent)
+                session.post('',data=source.SerializeToString())
+                exported=ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics[0]
+                self.assertEqual(len(exported.histogram.data_points),2)
+                self.assertTrue(all(not p.HasField(f) for p in exported.histogram.data_points for f in ('sum','min','max')))
 
     async def test_disabled_and_export_failure_preserve_results(self):
         with patch.object(ot,'_session',side_effect=AssertionError('no exporter')):

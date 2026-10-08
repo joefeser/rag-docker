@@ -61,7 +61,10 @@ operator. Do not print resolved secret fragments when troubleshooting.
 Application-direct destination credentials use the different foundation format:
 `RAG_OTEL_HEADERS_FILE` names a mounted JSON file. The local overlay requires no
 such credentials; mount that file and add its environment setting explicitly
-in an operator overlay if bypassing the Collector.
+in an operator overlay if bypassing the Collector. Any application-direct
+credential requires an HTTPS endpoint, including loopback; plaintext HTTP
+is accepted only without credentials. Duplicate header names are rejected
+case-insensitively, including repeated JSON keys.
 
 ## Bounds, sampling and diagnosis
 
