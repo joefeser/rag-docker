@@ -390,6 +390,19 @@ def bootstrap(env=None):
                 end_time=span.end_time, instrumentation_scope=scope)
             super().on_end(clean)
 
+    class SafeLogger:
+        """Keep SDK normalization/exception expansion off caller-owned records."""
+        def __init__(self, logger):
+            self._logger = logger
+
+        def emit(self, record=None, **kwargs):
+            if record is not None:
+                import copy
+                record = copy.copy(record)
+                if isinstance(record, ReadWriteLogRecord):
+                    record.log_record = copy.copy(record.log_record)
+            return self._logger.emit(record, **kwargs)
+
     class SafeBatchLogs(BatchLogRecordProcessor):
         def on_emit(self, record):
             # Rebuild both layers: shallow copies retain caller-owned metadata
@@ -434,7 +447,7 @@ def bootstrap(env=None):
             provider = LoggerProvider(resource=resource, shutdown_on_exit=False, meter_provider=internal_meter)
             runtime.providers.append(provider)
             provider.add_log_record_processor(SafeBatchLogs(exporter(OTLPLogExporter, "logs"), **batch))
-            runtime.logger = provider.get_logger("rag.telemetry")
+            runtime.logger = SafeLogger(provider.get_logger("rag.telemetry"))
         if config.metrics:
             reader = PeriodicExportingMetricReader(exporter(OTLPMetricExporter, "metrics"),
                                                   export_interval_millis=config.interval_ms,
