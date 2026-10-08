@@ -49,7 +49,7 @@ class TelemetryTests(unittest.TestCase):
         with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
             runtime = bootstrap({'RAG_OTEL_HEADERS_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
             self.assertFalse(runtime.config.enabled)
-            self.assertEqual(runtime.providers, [])
+            self.assertEqual(runtime._providers, [])
             self.assertTrue(runtime.force_flush())
             self.assertTrue(runtime.shutdown())
 
@@ -67,7 +67,7 @@ class TelemetryTests(unittest.TestCase):
                         self.assertNotIn(SECRET, str(error.exception))
                     runtime = bootstrap({**env, 'RAG_OTEL_ENABLED':'false'})
                     self.assertFalse(runtime.config.enabled)
-                    self.assertEqual(runtime.providers, [])
+                    self.assertEqual(runtime._providers, [])
                     self.assertTrue(runtime.force_flush())
                     self.assertTrue(runtime.shutdown())
                 self.assertEqual(dict(os.environ), before)
@@ -91,6 +91,31 @@ class TelemetryTests(unittest.TestCase):
                         self.assertTrue(runtime.shutdown())
                     self.assertEqual({path for path, _ in records}, {'/v1/traces', '/v1/logs', '/v1/metrics'})
                 self.assertEqual(dict(os.environ), before)
+
+    def test_supported_runtime_api_hides_raw_providers_and_retains_lifecycle(self):
+        with receiver() as (env, records), patch.dict(os.environ, {'OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT':SECRET}):
+            for enabled in ('false', 'true'):
+                with self.subTest(enabled=enabled):
+                    runtime = bootstrap({**env, 'RAG_OTEL_ENABLED':enabled, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false'})
+                    try:
+                        with self.assertRaises(AttributeError):
+                            getattr(runtime, 'providers')
+                        for name, value in vars(runtime).items():
+                            if not name.startswith('_'):
+                                self.assertFalse(hasattr(value, 'get_logger'), name)
+                        if enabled == 'true':
+                            runtime.logger.emit(body=SECRET, attributes={'rag.outcome':'error'}, exception=RuntimeError(SECRET))
+                        else:
+                            self.assertIsNone(runtime.logger)
+                        self.assertTrue(runtime.force_flush())
+                    finally:
+                        self.assertTrue(runtime.shutdown())
+                        self.assertTrue(runtime.shutdown())
+            self.assertEqual(len(records), 1)
+            payload = records[0][1]
+            self.assertNotIn(SECRET.encode(), payload)
+            log = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records[0]
+            self.assertEqual({a.key:a.value.string_value for a in log.attributes}, {'rag.outcome':'error'})
 
     def test_invalid_configuration_is_value_free(self):
         fields = {'ENABLED': '1', 'PROTOCOL': 'grpc', 'ENDPOINT': 'http://user:secret@example.com',
@@ -142,7 +167,7 @@ class TelemetryTests(unittest.TestCase):
             try:
                 with runtime.tracer.start_as_current_span('rag.query', context=set_span_in_context(NonRecordingSpan(parent))) as span:
                     child = span.get_span_context()
-                processor = runtime.providers[0]._active_span_processor._span_processors[0]._batch_processor
+                processor = runtime._providers[0]._active_span_processor._span_processors[0]._batch_processor
                 queued = processor._queue[0]
                 for clean, original in ((queued.context, child), (queued.parent, parent)):
                     self.assertFalse(clean.trace_state)
@@ -323,7 +348,7 @@ class TelemetryTests(unittest.TestCase):
                     runtime.logger.emit(record=exception_record)
                     self.assertIs(exception_record.exception, error)
                     self.assertEqual(dict(exception_record.attributes), {'rag.outcome':'error'})
-                processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                 self.assertEqual(len(processor._queue), 2)
                 for queued in processor._queue:
                     self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.1.0', 'deployment.environment.name':'development'})
@@ -368,7 +393,7 @@ class TelemetryTests(unittest.TestCase):
         with receiver() as (env, records):
             runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
             try:
-                processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                 for form in ('wrapper', 'plain', 'keyword'):
                     for has_exception in (False, True):
                         for factory in factories:
@@ -430,7 +455,7 @@ class TelemetryTests(unittest.TestCase):
         with receiver() as (env, records):
             runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
             try:
-                processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                 for form in ('wrapper', 'plain', 'keyword'):
                     for has_exception in (False, True):
                         for index, factory in enumerate(factories):
@@ -489,7 +514,7 @@ class TelemetryTests(unittest.TestCase):
                     with self.subTest(field=field, value=value), patch.dict(os.environ, {field:value}):
                         runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
                         try:
-                            processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                            processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                             for form in ('wrapper', 'plain', 'keyword'):
                                 for has_exception in (False, True):
                                     attributes = dict(approved)
@@ -529,7 +554,7 @@ class TelemetryTests(unittest.TestCase):
             runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false',
                                  'RAG_OTEL_INTERVAL_MS':'60000', 'RAG_OTEL_BATCH_SIZE':'128'})
             try:
-                processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                 for form in ('wrapper', 'plain', 'keyword'):
                     for has_exception in (False, True):
                         for attributes in malformed:
@@ -572,12 +597,12 @@ class TelemetryTests(unittest.TestCase):
         with receiver() as (env, records):
             runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
             try:
-                tracer = runtime.providers[0].get_tracer(SECRET, instrumenting_library_version=SECRET,
+                tracer = runtime._providers[0].get_tracer(SECRET, instrumenting_library_version=SECRET,
                                                        schema_url=SECRET, attributes={'secret':SECRET})
                 with tracer.start_as_current_span('rag.query') as original:
                     pass
                 self.assertEqual(original.instrumentation_scope.name, SECRET)
-                processor = runtime.providers[0]._active_span_processor._span_processors[0]._batch_processor
+                processor = runtime._providers[0]._active_span_processor._span_processors[0]._batch_processor
                 queued = processor._queue[0]
                 self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
                 self.assertFalse(queued.instrumentation_scope.version)
@@ -627,7 +652,7 @@ class TelemetryTests(unittest.TestCase):
                 self.assertTrue(entered.wait(1))
                 for _ in range(20):
                     with runtime.tracer.start_as_current_span(SECRET):pass
-                processor=runtime.providers[0]._active_span_processor._span_processors[0]._batch_processor
+                processor=runtime._providers[0]._active_span_processor._span_processors[0]._batch_processor
                 self.assertEqual(len(processor._queue),4)
                 self.assertTrue(all(s.name=='rag.operation' for s in processor._queue))
             finally:release.set();runtime.shutdown()
@@ -693,7 +718,7 @@ class TelemetryTests(unittest.TestCase):
             closed=0
             def force_flush(self, **kwargs):release.wait();return True
             def shutdown(self):self.closed+=1
-        runtime=Runtime(Config(enabled=True,shutdown_ms=100));provider=Stalled();runtime.providers=[provider]
+        runtime=Runtime(Config(enabled=True,shutdown_ms=100));provider=Stalled();runtime._providers=[provider]
         try:
             started=time.monotonic()
             self.assertFalse(runtime.force_flush())

@@ -280,7 +280,7 @@ def _session(signal, config):
 class Runtime:
     def __init__(self, config):
         self.config = config
-        self.providers = []
+        self._providers = []
         self.tracer = self.logger = self.meter = None
         self._lock = threading.Lock()
         self._worker = None
@@ -291,7 +291,7 @@ class Runtime:
     def _run(self, shutdown):
         ok = True
         try:
-            for provider in self.providers:
+            for provider in self._providers:
                 try:
                     if shutdown:
                         provider.shutdown()
@@ -435,12 +435,12 @@ def bootstrap(env=None):
                                      sampler=TraceIdRatioBased(config.sample_ratio),
                                      span_limits=SpanLimits(max_attributes=16, max_events=0, max_links=0,
                                                             max_attribute_length=128))
-            runtime.providers.append(provider)
+            runtime._providers.append(provider)
             provider.add_span_processor(SafeBatchSpans(exporter(OTLPSpanExporter, "traces"), **batch))
             runtime.tracer = provider.get_tracer("rag.telemetry")
         if config.logs:
             provider = LoggerProvider(resource=resource, shutdown_on_exit=False, meter_provider=internal_meter)
-            runtime.providers.append(provider)
+            runtime._providers.append(provider)
             provider.add_log_record_processor(SafeBatchLogs(exporter(OTLPLogExporter, "logs"), **batch))
             runtime.logger = SafeLogger(provider.get_logger("rag.telemetry"))
         if config.metrics:
@@ -451,7 +451,7 @@ def bootstrap(env=None):
                                      exemplar_filter=AlwaysOffExemplarFilter(),
                                      views=[View(instrument_name="*", aggregation=DropAggregation()),
                                             *[View(instrument_name=name, attribute_keys=set()) for name in METRIC_NAMES]])
-            runtime.providers.append(provider)
+            runtime._providers.append(provider)
             runtime.meter = provider.get_meter("rag.telemetry")
     except Exception:
         runtime.shutdown()
