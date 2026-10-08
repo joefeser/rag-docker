@@ -5,6 +5,7 @@ Every mutation is limited to the explicit guarded rag-verify project.
 """
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -27,10 +28,105 @@ def owner():
                     'telemetry-lock', str(ROOT)], check=True, stdout=subprocess.DEVNULL)
 
 
-def compose(*args, timeout=120):
+def compose(*args, timeout=120, capture_stderr=False):
     owner()
     return subprocess.check_output(['docker', 'compose', '-p', 'rag-verify', *args],
-                                   text=True, timeout=timeout)
+                                   text=True, timeout=timeout, stderr=subprocess.PIPE if capture_stderr else None)
+
+
+def safe_failure(exc):
+    """Only typed numeric diagnostics; never exporter output, URLs, bodies or argv."""
+    result = {'type': type(exc).__name__[:64]}
+    if isinstance(exc, subprocess.CalledProcessError):
+        result['exit_code'] = exc.returncode
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        result['timeout_seconds'] = exc.timeout
+    elif isinstance(exc, urllib.error.HTTPError):
+        result['http_status'] = exc.code
+    return result
+
+
+def stats_snapshot(collector_running):
+    result = {}
+    # Compose stats accepts one SERVICE argument (unlike docker stats).
+    # Explicit per-service calls also establish which required sample was absent.
+    for service in ('api', 'otel-collector'):
+        if service == 'otel-collector' and not collector_running:
+            result[service] = {'state': 'stopped_by_test'}
+            continue
+        raw = compose('stats', '--no-stream', '--format', 'json', service,
+                      timeout=8, capture_stderr=True)
+        if len(raw) > 8192:
+            raise ValueError('oversized resource sample')
+        try:
+            rows = json.loads(raw)
+        except json.JSONDecodeError:
+            rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise ValueError('missing or ambiguous resource sample')
+        # Docker's stats fields contain measurements. Keep only the expected
+        # numeric display fields; container names and other metadata are unnecessary.
+        fields = ('CPUPerc', 'MemUsage', 'MemPerc', 'PIDs', 'BlockIO', 'NetIO')
+        sample = {k: rows[0][k] for k in fields if k in rows[0]}
+        if not all(k in sample for k in ('CPUPerc', 'MemUsage')):
+            raise ValueError('CPU or memory resource evidence missing')
+        if any(not isinstance(v, str) or len(v) > 128 for v in sample.values()):
+            raise ValueError('malformed resource measurement')
+        result[service] = sample
+    return result
+
+
+@contextmanager
+def resource_samples(collector_running):
+    measurements, failures = [], []
+    stopped = threading.Event()
+    def sample_stats():
+        while not stopped.is_set():
+            try:
+                measurements.append({'monotonic': time.monotonic(),
+                                     'stats': stats_snapshot(collector_running)})
+            except Exception as exc:
+                failures.append(safe_failure(exc))
+                return
+            stopped.wait(5)
+    sampler = threading.Thread(target=sample_stats, daemon=True)
+    sampler.start()
+    primary = None
+    try:
+        yield measurements
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        stopped.set()
+        sampler.join(20)
+        if sampler.is_alive():
+            failures.append({'type': 'SamplerJoinTimeout', 'timeout_seconds': 20})
+        if not measurements and not failures:
+            failures.append({'type': 'NoResourceSamples'})
+        if failures:
+            detail = 'resource sampling failed: ' + json.dumps(failures[:4], sort_keys=True)
+            if primary is not None:
+                primary.add_note(detail)
+            else:
+                raise AssertionError(detail) from None
+
+
+def cleanup(actions, primary=None):
+    failures = []
+    for stage, action in actions:
+        try:
+            action()
+        except Exception as exc:
+            failures.append({'stage': stage, **safe_failure(exc)})
+    if failures:
+        detail = 'telemetry cleanup failed: ' + json.dumps(failures[:4], sort_keys=True)
+        if primary is not None:
+            primary.add_note(detail)
+        else:
+            raise AssertionError(detail) from None
 
 
 def sink(path, post=False):
@@ -254,6 +350,7 @@ def main():
     report = {'workload': '5 warm-up +20 timed health requests,1 real query,2 concurrent export jobs per mode',
               'limits': 'small synthetic sample; health timings include host lock checks; no production SLO claim',
               'modes': {}}
+    primary = None
     try:
         for c in collections:
             request('/collections', {'name': c, 'index_type': 'hnsw', 'distance_metric': 'cosine',
@@ -270,25 +367,8 @@ def main():
                 compose('stop', '-t', '10', 'otel-collector')
             if mode == 'slow':
                 sink('/slow', True)
-            statistics_samples, stats_errors = [], []
-            stopped = threading.Event()
-            def sample_stats():
-                while not stopped.is_set():
-                    try:
-                        statistics_samples.append({'monotonic': time.monotonic(), 'stats':
-                            compose('stats', '--no-stream', '--format', 'json', 'api', 'otel-collector', timeout=15)})
-                    except Exception as exc:
-                        stats_errors.append(type(exc).__name__)
-                        return
-                    stopped.wait(5)
-            sampler = threading.Thread(target=sample_stats, daemon=True)
-            sampler.start()
-            try:
+            with resource_samples(mode != 'unavailable') as statistics_samples:
                 result, expected = samples(collections)
-            finally:
-                stopped.set()
-                sampler.join(20)
-            assert not sampler.is_alive() and not stats_errors, 'resource sampling failed'
             result['container_stats_samples'] = statistics_samples
             if mode == 'healthy':
                 captured = await_capture(expected)
@@ -327,12 +407,15 @@ def main():
         _, expected = samples(collections)
         await_capture(expected)
         print(json.dumps(report, indent=2))
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        sink('/healthy', True)
-        compose('start', 'otel-collector')
-        enabled(True)
-        for c in collections:
-            request('/collections/'+c+'?confirm=true', method='DELETE')
+        cleanup([('receiver', lambda: sink('/healthy', True)),
+                 ('collector', lambda: compose('start', 'otel-collector')),
+                 ('api_mode', lambda: enabled(True)),
+                 *[('collection', lambda c=c: request('/collections/'+c+'?confirm=true', method='DELETE'))
+                   for c in collections]], primary)
 
 
 if __name__ == '__main__':

@@ -6,6 +6,8 @@ import copy
 from pathlib import Path
 import threading
 import unittest
+from unittest.mock import patch
+import subprocess
 import urllib.error
 import urllib.request
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -109,6 +111,71 @@ class EvidenceTests(unittest.TestCase):
         m = load('e2e', 'scripts/verify/telemetry_e2e.py')
         with self.assertRaisesRegex(AssertionError, 'overflow'):
             m.inspect({'overflow': 1, 'batches': []}, [])
+
+
+class SamplingTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load('e2e_sampling', 'scripts/verify/telemetry_e2e.py')
+
+    def test_compose_stats_queries_one_service_per_command(self):
+        value = json.dumps({'CPUPerc':'1.0%', 'MemUsage':'10MiB /256MiB', 'PIDs':'2'})
+        with patch.object(self.m, 'compose', return_value=value) as call:
+            samples = self.m.stats_snapshot(True)
+        self.assertEqual(set(samples), {'api','otel-collector'})
+        self.assertEqual([c.args for c in call.call_args_list], [
+            ('stats','--no-stream','--format','json','api'),
+            ('stats','--no-stream','--format','json','otel-collector')])
+        self.assertTrue(all(c.kwargs['capture_stderr'] for c in call.call_args_list))
+
+    def test_unavailable_collector_still_requires_api_measurement(self):
+        with patch.object(self.m,'compose',return_value='{"CPUPerc":"1%","MemUsage":"10MiB /256MiB"}') as call:
+            samples = self.m.stats_snapshot(False)
+        self.assertEqual(call.call_count,1)
+        self.assertEqual(samples['otel-collector'], {'state':'stopped_by_test'})
+        with patch.object(self.m,'compose',return_value='[]'):
+            with self.assertRaisesRegex(ValueError,'missing'):
+                self.m.stats_snapshot(False)
+
+    def test_sampling_failure_fails_acceptance_without_raw_diagnostics(self):
+        error = subprocess.CalledProcessError(2,['SECRET_COMMAND'],stderr='SENTINEL_SECRET_OUTPUT')
+        reached = threading.Event()
+        def fail(_):
+            reached.set()
+            raise error
+        with patch.object(self.m,'stats_snapshot',side_effect=fail):
+            with self.assertRaisesRegex(AssertionError,'resource sampling failed') as caught:
+                with self.m.resource_samples(True):
+                    self.assertTrue(reached.wait(2))
+        self.assertIn('"exit_code": 2',str(caught.exception))
+        self.assertNotIn('SECRET',str(caught.exception))
+
+    def test_workload_failure_preserved_with_sampler_diagnostic_note(self):
+        reached = threading.Event()
+        def fail(_):
+            reached.set()
+            raise subprocess.TimeoutExpired('SECRET_COMMAND',8,stderr='SECRET_OUTPUT')
+        original = ValueError('primary workload failure')
+        with patch.object(self.m,'stats_snapshot',side_effect=fail):
+            with self.assertRaises(ValueError) as caught:
+                with self.m.resource_samples(True):
+                    self.assertTrue(reached.wait(2))
+                    raise original
+        self.assertIs(caught.exception, original)
+        self.assertIn('TimeoutExpired',' '.join(original.__notes__))
+        self.assertNotIn('SECRET',' '.join(original.__notes__))
+
+    def test_cleanup_preserves_primary_and_attempts_all_actions(self):
+        original = ValueError('primary workload failure')
+        reached = []
+        def fail():
+            reached.append('first')
+            raise subprocess.CalledProcessError(4,['secret'],stderr='secret')
+        self.m.cleanup([('receiver',fail), ('collector',lambda:reached.append('second'))],original)
+        self.assertEqual(reached,['first','second'])
+        self.assertIn('"exit_code": 4',' '.join(original.__notes__))
+        self.assertNotIn('secret',' '.join(original.__notes__))
+        with self.assertRaisesRegex(AssertionError,'cleanup failed'):
+            self.m.cleanup([('receiver',fail)])
 
 
 if __name__ == '__main__':
