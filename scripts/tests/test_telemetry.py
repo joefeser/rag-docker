@@ -418,6 +418,63 @@ class TelemetryTests(unittest.TestCase):
             finally:
                 self.assertTrue(runtime.shutdown())
 
+    def test_attribute_snapshot_precedes_sdk_delegation_for_all_emit_forms(self):
+        from types import MappingProxyType
+        from opentelemetry._logs import LogRecord
+        from opentelemetry.sdk._logs import ReadWriteLogRecord
+        from opentelemetry.attributes import BoundedAttributes
+        factories = (lambda values: (values, values),
+                     lambda values: (MappingProxyType(values), values),
+                     lambda values: (BoundedAttributes(maxlen=8, attributes=values, immutable=False,
+                                                       extended_attributes=True), None))
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                for form in ('wrapper', 'plain', 'keyword'):
+                    for has_exception in (False, True):
+                        for index, factory in enumerate(factories):
+                            with self.subTest(form=form, exception=has_exception, mapping=index):
+                                attributes, backing = factory({'rag.outcome':'error', 'secret':{'nested':[SECRET]},
+                                                               'rag.operation':['query']})
+                                if backing is None:
+                                    backing = attributes
+                                exception = RuntimeError(SECRET) if has_exception else None
+                                source = LogRecord(body=SECRET, attributes=attributes, exception=exception)
+                                wrapper = ReadWriteLogRecord(source) if form == 'wrapper' else None
+                                source.attributes = attributes
+                                real_emit = runtime.logger._logger.emit
+                                def at_sdk_boundary(record=None, **kwargs):
+                                    delegated = (record.log_record if isinstance(record, ReadWriteLogRecord) else record)
+                                    snapshot = delegated.attributes if delegated is not None else kwargs['attributes']
+                                    self.assertIsNot(snapshot, attributes)
+                                    self.assertEqual(snapshot, {'rag.outcome':'error'})
+                                    # Simulate a caller write after delegation begins, before SDK normalization.
+                                    backing['rag.outcome'] = 'ok'
+                                    backing['secret'] = {'nested':[SECRET+'-changed']}
+                                    self.assertEqual(snapshot, {'rag.outcome':'error'})
+                                    return real_emit(record, **kwargs)
+                                with patch.object(runtime.logger._logger, 'emit', side_effect=at_sdk_boundary):
+                                    if form == 'keyword':
+                                        runtime.logger.emit(body=SECRET, attributes=attributes, exception=exception)
+                                    else:
+                                        runtime.logger.emit(wrapper if wrapper else source)
+                                self.assertIs(source.attributes, attributes)
+                                self.assertIs(source.exception, exception)
+                                self.assertEqual(attributes['rag.outcome'], 'ok')
+                                self.assertNotIn('exception.message', attributes)
+                                queued = processor._queue[0].log_record
+                                self.assertEqual(dict(queued.attributes), {'rag.outcome':'error'})
+                                self.assertIsNone(queued.exception)
+                self.assertEqual(len(processor._queue), 18)
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/logs']
+                self.assertNotIn(SECRET.encode(), payload)
+                logs = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual(len(logs), 18)
+            finally:
+                self.assertTrue(runtime.shutdown())
+
     def test_caller_selected_span_scope_is_rebuilt_before_queue(self):
         with receiver() as (env, records):
             runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
