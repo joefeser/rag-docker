@@ -776,7 +776,10 @@ copies supplied plain records and both wrapper layers before SDK normalization
 or exception expansion, preserving caller-owned inputs. Keyword emission is
 also supported. Approved string attributes are snapshotted before SDK delegation;
 forbidden mutable values are discarded rather than recursively copied. Callers
-must not mutate mappings during snapshot construction. Wire resources contain
+must not mutate mappings during snapshot construction. Non-mapping attributes
+become empty. Every form receives fixed limits before SDK processing (16
+attributes, 128 characters); ambient log or general attribute limits cannot
+truncate approved values or cause emission errors. Wire resources contain
 only the three explicit
 service fields; scope is `rag.telemetry`. Request names use the fixed registered
 HTTP method and route template, with `rag.request` for unmatched routes. Dynamic

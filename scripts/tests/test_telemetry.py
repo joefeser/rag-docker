@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
-from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session
+from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session, safe_attributes
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
 from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
@@ -474,6 +474,99 @@ class TelemetryTests(unittest.TestCase):
                 self.assertEqual(len(logs), 18)
             finally:
                 self.assertTrue(runtime.shutdown())
+
+    def test_all_log_forms_ignore_ambient_attribute_limits(self):
+        from opentelemetry._logs import LogRecord
+        from opentelemetry.sdk._logs import ReadWriteLogRecord, LogRecordLimits
+        limits = LogRecordLimits(max_attributes=16, max_attribute_length=128,
+                                 max_log_record_attributes=16, max_log_record_attribute_length=128)
+        approved = {'rag.operation':'query', 'rag.outcome':'error', 'error.type':'internal'}
+        fields = ('OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT', 'OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT',
+                  'OTEL_ATTRIBUTE_COUNT_LIMIT', 'OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT')
+        with receiver() as (env, records):
+            for field in fields:
+                for value in (SECRET, '-1', '0', '1'):
+                    with self.subTest(field=field, value=value), patch.dict(os.environ, {field:value}):
+                        runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+                        try:
+                            processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                            for form in ('wrapper', 'plain', 'keyword'):
+                                for has_exception in (False, True):
+                                    attributes = dict(approved)
+                                    exception = RuntimeError(SECRET) if has_exception else None
+                                    source = LogRecord(body=SECRET, attributes=attributes, exception=exception)
+                                    wrapper = ReadWriteLogRecord(source, limits=limits) if form == 'wrapper' else None
+                                    source.attributes = attributes
+                                    if form == 'keyword':
+                                        runtime.logger.emit(body=SECRET, attributes=attributes, exception=exception)
+                                    else:
+                                        runtime.logger.emit(wrapper if wrapper else source)
+                                    self.assertIs(source.attributes, attributes)
+                                    self.assertEqual(attributes, approved)
+                                    queued = processor._queue[0].log_record
+                                    self.assertEqual(dict(queued.attributes), approved)
+                                    self.assertIsNone(queued.exception)
+                            self.assertEqual(len(processor._queue), 6)
+                            self.assertTrue(runtime.force_flush())
+                            payload = dict(records)['/v1/logs']
+                            self.assertNotIn(SECRET.encode(), payload)
+                            logs = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records
+                            self.assertEqual(len(logs), 6)
+                            for log in logs:
+                                self.assertEqual({a.key:a.value.string_value for a in log.attributes}, approved)
+                            self.assertEqual(os.environ[field], value)
+                        finally:
+                            self.assertTrue(runtime.shutdown())
+
+    def test_nonmapping_attributes_are_empty_for_all_log_forms(self):
+        from opentelemetry._logs import LogRecord
+        from opentelemetry.sdk._logs import ReadWriteLogRecord
+        class HostileNonMapping:
+            def __bool__(self): raise AssertionError('truthiness must not be inspected')
+            def items(self): raise AssertionError('nonmapping items must not be called')
+        malformed = (None, False, True, 0, 1, '', SECRET, [], [SECRET], (), (SECRET,), set(), {SECRET}, HostileNonMapping())
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false',
+                                 'RAG_OTEL_INTERVAL_MS':'60000', 'RAG_OTEL_BATCH_SIZE':'128'})
+            try:
+                processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                for form in ('wrapper', 'plain', 'keyword'):
+                    for has_exception in (False, True):
+                        for attributes in malformed:
+                            with self.subTest(form=form, exception=has_exception, type=type(attributes)):
+                                self.assertEqual(safe_attributes(attributes), {})
+                                exception = RuntimeError(SECRET) if has_exception else None
+                                source = LogRecord(body=SECRET, exception=exception)
+                                wrapper = ReadWriteLogRecord(source) if form == 'wrapper' else None
+                                source.attributes = attributes
+                                if form == 'keyword':
+                                    runtime.logger.emit(body=SECRET, attributes=attributes, exception=exception)
+                                else:
+                                    runtime.logger.emit(wrapper if wrapper else source)
+                                self.assertIs(source.attributes, attributes)
+                                self.assertIs(source.exception, exception)
+                                self.assertFalse(processor._queue[0].log_record.attributes)
+                self.assertEqual(len(processor._queue), len(malformed)*6)
+                self.assertTrue(runtime.force_flush())
+                self.assertNotIn(SECRET.encode(), dict(records)['/v1/logs'])
+            finally:
+                self.assertTrue(runtime.shutdown())
+
+    def test_adapter_preserves_body_for_processor_schema_extensions(self):
+        from opentelemetry._logs import LogRecord
+        from opentelemetry.sdk._logs import ReadWriteLogRecord
+        runtime = bootstrap({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:1',
+                             'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false'})
+        try:
+            body = 'rag.startup.completed'
+            for record in (LogRecord(body=body), ReadWriteLogRecord(LogRecord(body=body)), None):
+                with patch.object(runtime.logger._logger, 'emit') as emit:
+                    runtime.logger.emit(record, body=body)
+                    delegated = emit.call_args.args[0]
+                    self.assertIsInstance(delegated, ReadWriteLogRecord)
+                    self.assertEqual(delegated.log_record.body, body)
+        finally:
+            self.assertTrue(runtime.shutdown())
 
     def test_caller_selected_span_scope_is_rebuilt_before_queue(self):
         with receiver() as (env, records):
