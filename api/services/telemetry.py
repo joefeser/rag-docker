@@ -85,7 +85,15 @@ class Config:
                     raw = source.read(8193)
                 if len(raw) > 8192:
                     raise ValueError
-                headers = json.loads(raw)
+                def header_pairs(pairs):
+                    result = {}
+                    for key, val in pairs:
+                        canonical = {"authorization": "Authorization", "x-api-key": "X-Api-Key"}.get(key.lower())
+                        if canonical is None or canonical in result:
+                            raise ValueError
+                        result[canonical] = val
+                    return result
+                headers = json.loads(raw, object_pairs_hook=header_pairs)
                 if (not isinstance(headers, dict) or len(headers) > 8
                     or any(not isinstance(k, str) or not isinstance(v, str)
                            or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", k)
@@ -95,6 +103,8 @@ class Config:
                     raise ValueError
             except (OSError, ValueError, TypeError):
                 raise TelemetryConfigError("Invalid RAG_OTEL_HEADERS_FILE") from None
+        if headers and url.scheme != "https":
+            raise TelemetryConfigError("RAG_OTEL_HEADERS_FILE requires HTTPS RAG_OTEL_ENDPOINT")
         queue = number("QUEUE_SIZE", 256, 1, 4096)
         batch = number("BATCH_SIZE", 64, 1, 512)
         if batch > queue:
@@ -138,6 +148,36 @@ def safe_attributes(attributes):
             if k in ENUMS and isinstance(v, str) and v in ENUMS[k]}
 
 
+def _valid_metric(record):
+    """Admit a complete dimensionless stream before allocating batch capacity.
+
+    Multiple input points are rejected: stripping their labels would merge
+    distinct streams without a defined aggregation policy.
+    """
+    kind = record.WhichOneof("data")
+    if record.name not in METRIC_NAMES or kind not in ("sum", "gauge", "histogram"):
+        return False
+    data = getattr(record, kind)
+    if len(data.data_points) != 1:
+        return False
+    if kind != "gauge" and data.aggregation_temporality not in (1, 2):
+        return False
+    point = data.data_points[0]
+    if kind != "histogram":
+        value = point.WhichOneof("value")
+        return value is not None and math.isfinite(getattr(point, value))
+    bounds, buckets = point.explicit_bounds, point.bucket_counts
+    return (len(bounds) <= 31 and len(buckets) == len(bounds) + 1
+            and point.count >= 0 and all(n >= 0 for n in buckets)
+            and sum(buckets) == point.count
+            and all(math.isfinite(n) for n in bounds)
+            and all(a < b for a, b in zip(bounds, bounds[1:]))
+            and all(not point.HasField(f) or math.isfinite(getattr(point, f))
+                    for f in ("sum", "min", "max"))
+            and (not (point.HasField("min") and point.HasField("max"))
+                 or point.min <= point.max))
+
+
 def sanitize_wire(data, signal, config):
     """Rebuild protobuf, dropping all fields not explicitly copied below."""
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -169,7 +209,7 @@ def sanitize_wire(data, signal, config):
             for record in getattr(ss, records):
                 if count >= config.batch_size:
                     break
-                if signal == "metrics" and record.name not in METRIC_NAMES:
+                if signal == "metrics" and not _valid_metric(record):
                     continue
                 count += 1
                 dest = getattr(scope, records).add()
@@ -192,9 +232,6 @@ def sanitize_wire(data, signal, config):
                 else:
                     dest.name = record.name
                     kind = record.WhichOneof("data")
-                    if kind not in ("sum", "gauge", "histogram"):
-                        getattr(scope, records).pop()
-                        continue
                     src_data, dst_data = getattr(record, kind), getattr(dest, kind)
                     if kind != "gauge":
                         dst_data.aggregation_temporality = src_data.aggregation_temporality
@@ -202,16 +239,14 @@ def sanitize_wire(data, signal, config):
                         dst_data.is_monotonic = src_data.is_monotonic
                     # No dimensions or exemplars in the foundation; views also
                     # remove labels before SDK aggregation to bound cardinality.
-                    for point in src_data.data_points[:1]:
+                    for point in src_data.data_points:
                         dp = dst_data.data_points.add()
                         dp.start_time_unix_nano, dp.time_unix_nano = point.start_time_unix_nano, point.time_unix_nano
                         if kind == "histogram":
-                            if (len(point.explicit_bounds) > 31
-                                or len(point.bucket_counts) != len(point.explicit_bounds) + 1
-                                or sum(point.bucket_counts) != point.count):
-                                dst_data.data_points.pop()
-                                continue
-                            dp.count, dp.sum = point.count, point.sum
+                            dp.count = point.count
+                            for field_name in ("sum", "min", "max"):
+                                if point.HasField(field_name):
+                                    setattr(dp, field_name, getattr(point, field_name))
                             dp.bucket_counts.extend(point.bucket_counts)
                             dp.explicit_bounds.extend(point.explicit_bounds)
                         else:
@@ -333,10 +368,14 @@ def bootstrap(env=None):
     class SafeBatchSpans(BatchSpanProcessor):
         def on_end(self, span):
             from opentelemetry.sdk.trace import ReadableSpan
-            from opentelemetry.trace import Status
+            from opentelemetry.trace import Status, SpanContext
+            def clean_context(context):
+                return None if context is None else SpanContext(
+                    trace_id=context.trace_id, span_id=context.span_id,
+                    is_remote=context.is_remote, trace_flags=context.trace_flags)
             clean = ReadableSpan(
                 name=span.name if span.name in SPAN_NAMES else "rag.operation",
-                context=span.context, parent=span.parent, resource=resource,
+                context=clean_context(span.context), parent=clean_context(span.parent), resource=resource,
                 links=safe_links(span.links),
                 attributes=safe_attributes(span.attributes), kind=span.kind,
                 status=Status(span.status.status_code), start_time=span.start_time,
