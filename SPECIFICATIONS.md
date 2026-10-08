@@ -2238,7 +2238,10 @@ supplied plain records and wrapper/inner records before SDK processing so both
 normalization and exception expansion preserve caller-owned inputs; keyword
 emission remains supported. All three forms snapshot finite schema-approved
 attribute strings before SDK delegation, excluding forbidden mutable values;
-concurrent caller mutation during snapshot construction is unsupported.
+concurrent caller mutation during snapshot construction is unsupported. All
+non-mapping attributes normalize to empty. Each emission form is wrapped with
+runtime-owned limits before SDK processing, independent of ambient log/global
+attribute count and length limits.
 The private meter provider explicitly disables exemplar sampling so
 attributes removed by metric views cannot remain in exemplar reservoirs; ambient
 exemplar filter settings cannot override this policy. Existing application logging

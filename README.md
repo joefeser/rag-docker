@@ -778,6 +778,10 @@ so caller-owned records remain unchanged. For supplied records and keyword
 emission, only schema-approved attribute strings are snapshotted before SDK
 delegation; forbidden mutable values are discarded, not recursively copied.
 Callers must not mutate their mappings while that snapshot is being constructed.
+Non-mapping attributes consistently become empty. Every emission form receives
+runtime-owned limits before SDK processing (16 attributes, 128 characters), so
+ambient `OTEL_LOGRECORD_ATTRIBUTE_*` and `OTEL_ATTRIBUTE_*` limits cannot truncate
+approved log attributes or cause emission errors.
 Wire resources contain only the three explicit
 service fields; scope is `rag.telemetry`. Span names are `rag.` plus startup,
 query, ingest, export, import, tuning or evaluation (unknown names become
