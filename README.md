@@ -771,7 +771,10 @@ request, worker and dependency instrumentation uses `app.state.telemetry`'s priv
 
 Before trace/log queueing and again at the final protobuf transport boundary,
 the runtime drops arbitrary text and rebuilds queued scope/resource metadata,
-context and log limits without retaining exception objects. Wire resources contain only the three explicit
+context and log limits without retaining exception objects. The runtime logger
+copies supplied plain records and both wrapper layers before SDK normalization
+or exception expansion, preserving caller-owned inputs. Keyword emission is
+also supported. Wire resources contain only the three explicit
 service fields; scope is `rag.telemetry`. Request names use the fixed registered
 HTTP method and route template, with `rag.request` for unmatched routes. Dynamic
 path values and query strings are never recorded. Other names are finite

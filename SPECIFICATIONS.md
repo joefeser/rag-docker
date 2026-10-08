@@ -2234,7 +2234,10 @@ restricted to the finite operational schema in #284. The
 export boundary rebuilds protobuf records; trace/log queue inputs are sanitized
 as well, including runtime-owned resource/scope metadata and log limits; queued
 logs retain neither exception objects nor caller context references. Processor
-sanitization must not modify caller-owned records. The private meter provider explicitly disables exemplar sampling so
+sanitization must not modify caller-owned records. The runtime logger copies
+supplied plain records and wrapper/inner records before SDK processing so both
+normalization and exception expansion preserve caller-owned inputs; keyword
+emission remains supported. The private meter provider explicitly disables exemplar sampling so
 attributes removed by metric views cannot remain in exemplar reservoirs; ambient
 exemplar filter settings cannot override this policy. Existing application logging
 remains unchanged. Bounded SDK queues,
