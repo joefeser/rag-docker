@@ -263,7 +263,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
-    hnsw = telemetry.call("weaviate.config", config.get, "hnsw_config") or {}
+    hnsw = config.get("hnsw_config") or {}
     client = wc.get_client()
     ownership = collection_recovery.begin(collection, "tune", client)
     staging = ownership["staging"]

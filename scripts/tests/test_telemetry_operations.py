@@ -50,6 +50,8 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
     async def test_exact_job_dependency_deltas_and_nested_outcomes(self):
         # Unknown token usage is absent. Stage spans do not add job counts.
         with ot.bind((self.runtime,None)), ot.span('rag.export'):
+            for invalid in (SECRET,None,1,True,[],{},('error',)):
+                ot.outcome(invalid,ValueError(SECRET))
             with ot.span('rag.package'):
                 ot.call('weaviate.query', lambda: None)
         with ot.bind((self.runtime,None)), ot.span('rag.import'):
@@ -69,6 +71,8 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
         outcomes={p.attributes['rag.operation']:p.attributes['rag.outcome'] for p in self.metrics()['rag.job.completed'].data.data_points}
         self.assertEqual(outcomes,{'export':'ok','import':'error','ingest':'error','evaluation':'cancelled'})
         self.assertEqual(len(self.logs),6)
+        self.assertTrue(all('error.type' not in log['attributes'] for log in self.logs
+                            if log['attributes']['rag.outcome']=='cancelled'))
         self.assertTrue(all('rag.job_token' in log['attributes'] for log in self.logs))
         self.assertEqual(self.logs[0]['attributes']['rag.job_token'], self.logs[1]['attributes']['rag.job_token'])
         self.assertNotIn('token.usage',self.metrics())
@@ -390,6 +394,35 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
         await tracing_fixture.TracingTests.test_export_admission_concurrency_and_after_response(self)
         self.assert_jobs({('export','ok'):2})
         self.assertEqual(len({r['attributes']['rag.job_token'] for r in self.logs if r['body']=='rag.job.completed'}),2)
+
+    async def test_real_tuning_config_metrics_count_only_remote_fetch(self):
+        await tracing_fixture.TracingTests.test_rebuild_config_span_tracks_only_backend_fetch(self)
+        data=self.reader.get_metrics_data()
+        metrics={m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+        points=[p for p in metrics['rag.dependency.calls'].data.data_points
+                if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual({p.attributes['rag.outcome']:p.value for p in points},{'ok':1,'error':1})
+        durations=[p for p in metrics['rag.dependency.duration'].data.data_points
+                   if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual(sum(p.count for p in durations),2)
+        errors=[p for p in metrics['rag.dependency.errors'].data.data_points
+                if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual(sum(p.value for p in errors),1)
+        self.assertEqual(len([r for r in self.logs
+            if r['attributes'].get('rag.dependency')=='weaviate.config']),2)
+
+    async def test_real_iterator_terminal_cancellation_metrics(self):
+        await tracing_fixture.TracingTests.test_iterator_terminal_outcomes_and_context(self)
+        self.assert_jobs({('export','ok'):13})
+        data=self.reader.get_metrics_data()
+        metrics={m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+        calls={p.attributes['rag.outcome']:p.value for p in metrics['rag.dependency.calls'].data.data_points}
+        self.assertEqual(calls,{'cancelled':9,'error':4,'ok':1})
+        self.assertEqual(sum(p.count for p in metrics['rag.dependency.duration'].data.data_points),14)
+        self.assertEqual(sum(p.value for p in metrics['rag.dependency.errors'].data.data_points),4)
+        cancelled=[r for r in self.logs if r['attributes']['rag.outcome']=='cancelled']
+        self.assertEqual(len(cancelled),9)
+        self.assertTrue(all('error.type' not in r['attributes'] for r in cancelled))
 
     async def test_real_evaluation_cancellation_and_failure(self):
         await tracing_fixture.TracingTests.test_generation_cancellation_and_failure_reporter(self)

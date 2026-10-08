@@ -832,7 +832,8 @@ deployed end-to-end acceptance remain separate work.
 Each request starts a locally sampled trace. One strictly valid version-00 W3C
 `traceparent` can supply a correlation link; duplicated, malformed, oversized,
 zero-ID and unsupported-version headers are ignored. Caller sampled flags do
-not control local sampling. `tracestate` and `baggage` are ignored. Headers never
+not control local sampling. Valid flag bytes span 00–ff; only the sampled bit
+is retained on the link. `tracestate` and `baggage` are ignored. Headers never
 change application identity, permissions, service metadata or response headers.
 
 Query spans cover reformulation, retrieval and synthesis. Ingest covers parsing,
