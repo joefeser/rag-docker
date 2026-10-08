@@ -251,6 +251,50 @@ class TelemetryTests(unittest.TestCase):
             self.assertFalse(metric.sum.data_points[0].attributes)
             self.assertEqual(metric.sum.data_points[0].as_int, 200)
 
+    def test_exemplar_reservoir_never_receives_dropped_attributes(self):
+        from opentelemetry.sdk.metrics._internal.exemplar.exemplar_reservoir import FixedSizeExemplarReservoirABC
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+        original_offer = FixedSizeExemplarReservoirABC.offer
+        original_export = OTLPMetricExporter.export
+        for ambient in (None, 'always_on'):
+            with self.subTest(ambient=ambient), patch.dict(os.environ):
+                if ambient is None:
+                    os.environ.pop('OTEL_METRICS_EXEMPLAR_FILTER', None)
+                else:
+                    os.environ['OTEL_METRICS_EXEMPLAR_FILTER'] = ambient
+                collected = []
+                def capture(exporter, metrics_data, *args, **kwargs):
+                    collected.append(metrics_data)
+                    return original_export(exporter, metrics_data, *args, **kwargs)
+                with receiver() as (env, records), patch.object(
+                        FixedSizeExemplarReservoirABC, 'offer', autospec=True, side_effect=original_offer) as offer, patch.object(
+                        OTLPMetricExporter, 'export', autospec=True, side_effect=capture):
+                    runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+                    try:
+                        counter = runtime.meter.create_counter('rag.telemetry.check')
+                        with runtime.tracer.start_as_current_span('rag.query') as span:
+                            self.assertTrue(span.get_span_context().trace_flags.sampled)
+                            counter.add(2, {'secret':SECRET})
+                        counter.add(3, {'secret':SECRET+'-outside-span'})
+                        # Before collection/serialization, nothing entered a reservoir.
+                        offer.assert_not_called()
+                        self.assertTrue(runtime.force_flush())
+                        points = [point for data in collected for resource in data.resource_metrics
+                                  for scope in resource.scope_metrics for metric in scope.metrics
+                                  for point in metric.data.data_points]
+                        self.assertTrue(points)
+                        for point in points:
+                            self.assertEqual(point.value, 5)
+                            self.assertFalse(point.attributes)
+                            self.assertFalse(point.exemplars)
+                        payload = dict(records)['/v1/metrics']
+                        self.assertNotIn(SECRET.encode(), payload)
+                        metric = ExportMetricsServiceRequest.FromString(payload).resource_metrics[0].scope_metrics[0].metrics[0]
+                        self.assertEqual(metric.sum.data_points[0].as_int, 5)
+                    finally:
+                        self.assertTrue(runtime.shutdown())
+                    offer.assert_not_called()
+
     def test_wire_rebuilds_scope_resource_and_free_text(self):
         source = ExportTraceServiceRequest()
         rs = source.resource_spans.add(schema_url=SECRET)
