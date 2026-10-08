@@ -785,8 +785,10 @@ text and arbitrary log bodies are removed; log body becomes `rag.operation`.
 At most one link survives, containing only fixed-size nonzero trace/span IDs and
 a sampled flag. Trace/span IDs remain correlation fields, never authentication.
 The foundation metric allowlist is `rag.telemetry.check`; SDK views remove all
-metric dimensions before aggregation, and export removes descriptions, units
-and exemplars. Export admits exactly one finite data point per metric; empty,
+metric dimensions before aggregation. An explicit always-off exemplar filter
+prevents original measurement attributes from entering SDK exemplar reservoirs,
+even with ambient `OTEL_METRICS_EXEMPLAR_FILTER=always_on`. Export removes
+descriptions, units and exemplars. Export admits exactly one finite data point per metric; empty,
 malformed and multi-point metrics are rejected before consuming batch capacity.
 Multi-point input cannot be merged safely after removing dimensions. Histograms
 require at most 31 finite, strictly increasing boundaries, consistent bucket
