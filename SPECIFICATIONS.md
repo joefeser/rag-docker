@@ -2221,7 +2221,8 @@ are included in this foundation.
 Only explicit service resource metadata, fixed instrumentation scope, finite
 operation/outcome/error values and trace identifiers may leave through OTLP.
 Prompts, answers, request/response bodies, credentials, filenames, paths,
-document text, free-form errors/events and metric dimensions are excluded. The
+document text and free-form errors/events are excluded. Metric dimensions are
+restricted to the finite operational schema in #284. The
 export boundary rebuilds protobuf records; trace/log queue inputs are sanitized
 as well. Existing application logging remains unchanged. Bounded SDK queues,
 one-attempt HTTP export and bounded lifecycle caller waits keep collector outages
@@ -2263,5 +2264,41 @@ thread/task transitions with fake dependencies: parentage after 202, concurrent
 isolation, cancellation/timeout, dependency errors/timing, batch/iterator calls,
 header trust, disabled/failing telemetry, and sentinel-free serialized OTLP.
 Infrastructure suite 01 registers these checks; full acceptance remains on the
-disposable verify project. Metrics/log correlation and collector setup remain
-separate stories.
+disposable verify project. Collector setup remains a separate story.
+
+
+## Operational metrics and correlated logs (#284)
+
+The private runtime records API completion/duration/active work, dependency
+calls/duration/errors and job completion/duration/active work, using the exact
+names, units, finite dimensions and histogram buckets in README.md. No automatic
+instrumentation duplicates these manual counts. Nested stages do not count as
+additional jobs or requests. Metrics operate independently of trace recording,
+sampling and log signal toggles. Only executed work contributes; cancelled
+waiters cannot finish still-running workers. Active UpDownCounters settle on
+scope exit and represent current process concurrency, not persisted history.
+
+Finite dimensions are validated before aggregation, restricted per instrument
+by SDK views, and checked again during protobuf rebuilding. Valid multiple
+series survive export even with tiny trace/log batches. Malformed, duplicate or
+excess metric data fails the export rather than truncating valid measurements.
+No job IDs, trace exemplars, collection names, user IDs, paths, content or raw
+exception values may become metric dimensions. Token usage is not fabricated.
+
+Structured operation completion logs have fixed bodies and finite attributes,
+current trace/span context when available, and a newly generated opaque job
+execution token for job/dependency correlation. No durable or supplied job ID
+is exported. Context survives admitted worker handoffs without leaking across
+concurrent jobs or into caller code across iterator yields. Sanitization occurs
+before queueing and at the wire boundary. Existing Python logs are not bridged.
+The log and metric schemas do not change application errors, durable statuses,
+cancellation behavior or existing latency responses. Partial status normalizes
+to metric error while retaining partial in logs and durable storage.
+
+Suite 01 registers deterministic real-SDK tests for exact success/error/cancelled
+counts, durations and settled active work, actual job producer outcomes,
+concurrent correlation isolation, cardinality under changing IDs, multiple wire
+series, disabled/sampled-out tracing, telemetry faults and receiver errors.
+Synthetic dependencies require no hosted service; deployment acceptance remains
+#285. Abrupt process death or surviving workers after shutdown may lose final
+records; operational telemetry is not durable audit storage (#29).

@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import threading
 import time
+import uuid
 from urllib.parse import urlsplit
 
 
@@ -130,12 +131,116 @@ SPAN_NAMES |= ROUTES | frozenset(("rag.request", "rag.reformulate", "rag.retriev
     "weaviate.exists", "weaviate.list", "weaviate.meta", "weaviate.config",
     "weaviate.aggregate", "weaviate.query", "weaviate.iterate", "weaviate.batch"))
 
-METRIC_NAMES = frozenset(("rag.telemetry.check",))
+# Separate finite metric schemas: correlation never enters SDK aggregation.
+JOB_NAMES = frozenset("rag." + v for v in ("ingest", "export", "import", "tuning", "evaluation"))
+DEPENDENCIES = frozenset(n for n in SPAN_NAMES if n.startswith(("ollama.", "weaviate.")))
+ENUMS.update({"http.method": frozenset(("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT", "unknown")),
+              "rag.dependency": DEPENDENCIES})
+ENUMS["http.status_class"] |= {"unknown"}
+BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300)
+_API_KEYS = ("http.route", "http.method", "http.status_class", "rag.outcome")
+_DEP_KEYS = ("rag.dependency", "rag.outcome")
+_JOB_KEYS = ("rag.operation", "rag.outcome")
+# name -> (instrument factory, unit, exact dimension keys)
+METRICS = {
+    "rag.telemetry.check": ("create_counter", "", ()),
+    "rag.api.requests": ("create_counter", "{request}", _API_KEYS),
+    "rag.api.duration": ("create_histogram", "s", _API_KEYS),
+    "rag.api.active": ("create_up_down_counter", "{request}", ("http.method",)),
+    "rag.dependency.calls": ("create_counter", "{call}", _DEP_KEYS),
+    "rag.dependency.duration": ("create_histogram", "s", _DEP_KEYS),
+    "rag.dependency.errors": ("create_counter", "{error}", ("rag.dependency", "error.type")),
+    "rag.job.completed": ("create_counter", "{job}", _JOB_KEYS),
+    "rag.job.duration": ("create_histogram", "s", _JOB_KEYS),
+    "rag.job.active": ("create_up_down_counter", "{job}", ("rag.operation",)),
+}
+METRIC_NAMES = frozenset(METRICS)
+LOG_BODIES = frozenset(("rag.api.completed", "rag.dependency.completed", "rag.job.completed"))
 
 
 def safe_attributes(attributes):
-    return {k: v for k, v in (attributes or {}).items()
-            if k in ENUMS and isinstance(v, str) and v in ENUMS[k]}
+    result = {k: v for k, v in (attributes or {}).items()
+              if k in ENUMS and isinstance(v, str) and v in ENUMS[k]}
+    token = (attributes or {}).get("rag.job_token")
+    if isinstance(token, str) and re.fullmatch(r"[0-9a-f]{32}", token):
+        result["rag.job_token"] = token
+    return result
+
+
+def metric_values(name, key):
+    if key == "rag.outcome":
+        return ENUMS[key] - {"partial"}
+    if name.startswith("rag.job.") and key == "rag.operation":
+        return frozenset(n[4:] for n in JOB_NAMES)
+    return ENUMS[key]
+
+
+def metric_attributes(name, attributes):
+    keys = METRICS[name][2]
+    clean = {k: v for k, v in (attributes or {}).items() if k in keys}
+    # Missing/invalid approved dimensions are rejected, never allocated as a
+    # new series. Unapproved keys (including job IDs) cannot affect aggregation.
+    if clean.get("rag.outcome") == "partial":
+        clean["rag.outcome"] = "error"
+    if set(clean) != set(keys) or any(not isinstance(v, str) or v not in metric_values(name, k) for k, v in clean.items()):
+        return None
+    return clean
+
+
+def metric_series_limit(name):
+    return math.prod(len(metric_values(name, key)) for key in METRICS[name][2])
+
+
+class SafeInstrument:
+    def __init__(self, name, instrument=None):
+        self.name, self.instrument = name, instrument
+
+    def _measure(self, method, value, attributes):
+        if self.instrument is None:
+            return False
+        try:
+            clean = metric_attributes(self.name, attributes)
+            if clean is None or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return False
+            if METRICS[self.name][0] != "create_up_down_counter" and value < 0:
+                return False
+            getattr(self.instrument, method)(value, clean)
+            return True
+        except Exception:
+            return False
+
+    def add(self, amount, attributes=None, context=None):
+        return self._measure("add", amount, attributes)
+
+    def record(self, amount, attributes=None, context=None):
+        return self._measure("record", amount, attributes)
+
+
+class SafeMeter:
+    """Private validated facade: even direct instrumentation has finite series."""
+    def __init__(self, meter):
+        self._meter = meter
+        self._instruments = {}
+        self._lock = threading.Lock()
+
+    def _create(self, kind, name):
+        schema = METRICS.get(name)
+        if schema is None or schema[0] != kind:
+            return SafeInstrument(name)
+        with self._lock:
+            if name not in self._instruments:
+                instrument = getattr(self._meter, kind)(name, unit=schema[1])
+                self._instruments[name] = SafeInstrument(name, instrument)
+            return self._instruments[name]
+
+    def create_counter(self, name, unit="", description="", **kwargs):
+        return self._create("create_counter", name)
+
+    def create_histogram(self, name, unit="", description="", **kwargs):
+        return self._create("create_histogram", name)
+
+    def create_up_down_counter(self, name, unit="", description="", **kwargs):
+        return self._create("create_up_down_counter", name)
 
 
 def sanitize_wire(data, signal, config):
@@ -160,14 +265,16 @@ def sanitize_wire(data, signal, config):
         seen = set()
         for a in src:
             if (a.key not in seen and a.value.WhichOneof("value") == "string_value"
-                and a.value.string_value in ENUMS.get(a.key, ())):
+                and (a.value.string_value in ENUMS.get(a.key, ())
+                     or (a.key == "rag.job_token" and re.fullmatch(r"[0-9a-f]{32}", a.value.string_value)))):
                 dst.add().CopyFrom(a)
                 seen.add(a.key)
     count = 0
+    metric_records = set()
     for rs in getattr(source, resources):
         for ss in getattr(rs, scopes):
             for record in getattr(ss, records):
-                if count >= config.batch_size:
+                if signal != "metrics" and count >= config.batch_size:
                     break
                 if signal == "metrics" and record.name not in METRIC_NAMES:
                     continue
@@ -187,37 +294,67 @@ def sanitize_wire(data, signal, config):
                     dest.time_unix_nano, dest.observed_time_unix_nano = record.time_unix_nano, record.observed_time_unix_nano
                     dest.trace_id, dest.span_id = record.trace_id, record.span_id
                     dest.severity_number = record.severity_number
-                    dest.body.string_value = "rag.operation"
+                    dest.body.string_value = record.body.string_value if record.body.string_value in LOG_BODIES else "rag.operation"
                     attrs(record.attributes, dest.attributes)
                 else:
+                    # A malformed/oversized metric request fails as a whole.
+                    # Never silently truncate legitimate finite series.
+                    if record.name in metric_records:
+                        raise ValueError("Duplicate telemetry metric")
+                    metric_records.add(record.name)
                     dest.name = record.name
+                    factory, dest.unit, keys = METRICS[record.name]
                     kind = record.WhichOneof("data")
-                    if kind not in ("sum", "gauge", "histogram"):
-                        getattr(scope, records).pop()
-                        continue
+                    expected = "histogram" if factory == "create_histogram" else "sum"
+                    # The original schema probe also accepts a bounded histogram.
+                    if kind != expected and not (record.name == "rag.telemetry.check" and kind == "histogram"):
+                        raise ValueError("Invalid telemetry metric type")
                     src_data, dst_data = getattr(record, kind), getattr(dest, kind)
-                    if kind != "gauge":
-                        dst_data.aggregation_temporality = src_data.aggregation_temporality
+                    if record.name != "rag.telemetry.check" and src_data.aggregation_temporality not in (1, 2):
+                        raise ValueError("Invalid telemetry temporality")
+                    dst_data.aggregation_temporality = src_data.aggregation_temporality
                     if kind == "sum":
-                        dst_data.is_monotonic = src_data.is_monotonic
-                    # No dimensions or exemplars in the foundation; views also
-                    # remove labels before SDK aggregation to bound cardinality.
-                    for point in src_data.data_points[:1]:
+                        if record.name != "rag.telemetry.check" and src_data.is_monotonic != (factory == "create_counter"):
+                            raise ValueError("Invalid telemetry monotonicity")
+                        dst_data.is_monotonic = factory == "create_counter"
+                    if len(src_data.data_points) > metric_series_limit(record.name):
+                        raise ValueError("Too many telemetry metric points")
+                    seen_points = set()
+                    for point in src_data.data_points:
+                        approved = [a.key for a in point.attributes if a.key in keys]
+                        if len(set(approved)) != len(approved):
+                            raise ValueError("Duplicate telemetry dimension")
+                        raw = {a.key: a.value.string_value for a in point.attributes if a.value.WhichOneof("value") == "string_value"}
+                        clean = metric_attributes(record.name, raw)
+                        if clean is None or raw.get("rag.outcome") == "partial":
+                            raise ValueError("Invalid telemetry metric dimensions")
+                        identity = tuple(sorted(clean.items()))
+                        if identity in seen_points:
+                            raise ValueError("Duplicate telemetry metric point")
+                        seen_points.add(identity)
                         dp = dst_data.data_points.add()
                         dp.start_time_unix_nano, dp.time_unix_nano = point.start_time_unix_nano, point.time_unix_nano
+                        for key, value in clean.items():
+                            dp.attributes.add(key=key).value.string_value = value
                         if kind == "histogram":
                             if (len(point.explicit_bounds) > 31
                                 or len(point.bucket_counts) != len(point.explicit_bounds) + 1
-                                or sum(point.bucket_counts) != point.count):
-                                dst_data.data_points.pop()
-                                continue
+                                or sum(point.bucket_counts) != point.count
+                                or not math.isfinite(point.sum) or point.sum < 0
+                                or any(not math.isfinite(v) for v in point.explicit_bounds)
+                                or (record.name != "rag.telemetry.check" and tuple(point.explicit_bounds) != BUCKETS)):
+                                if record.name == "rag.telemetry.check":
+                                    dst_data.data_points.pop()
+                                    continue
+                                raise ValueError("Invalid telemetry histogram")
                             dp.count, dp.sum = point.count, point.sum
                             dp.bucket_counts.extend(point.bucket_counts)
                             dp.explicit_bounds.extend(point.explicit_bounds)
                         else:
                             val = point.WhichOneof("value")
-                            if val:
-                                setattr(dp, val, getattr(point, val))
+                            if val is None or not math.isfinite(getattr(point, val)) or (factory == "create_counter" and getattr(point, val) < 0):
+                                raise ValueError("Invalid telemetry metric value")
+                            setattr(dp, val, getattr(point, val))
     return output.SerializeToString()
 
 
@@ -325,7 +462,7 @@ def bootstrap(env=None):
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-    from opentelemetry.sdk.metrics.view import View, DropAggregation
+    from opentelemetry.sdk.metrics.view import View, DropAggregation, ExplicitBucketHistogramAggregation
     from opentelemetry.exporter.otlp.proto.http import Compression
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
@@ -350,7 +487,7 @@ def bootstrap(env=None):
             import copy
             clean = copy.copy(record)
             clean.log_record = copy.copy(record.log_record)
-            clean.log_record.body = "rag.operation"
+            clean.log_record.body = record.log_record.body if isinstance(record.log_record.body, str) and record.log_record.body in LOG_BODIES else "rag.operation"
             clean.log_record.severity_text = ""
             clean.log_record.event_name = None
             clean.log_record.attributes = safe_attributes(record.log_record.attributes)
@@ -387,9 +524,11 @@ def bootstrap(env=None):
                                                   export_timeout_millis=config.timeout_ms)
             provider = MeterProvider(resource=resource, shutdown_on_exit=False, metric_readers=[reader],
                                      views=[View(instrument_name="*", aggregation=DropAggregation()),
-                                            *[View(instrument_name=name, attribute_keys=set()) for name in METRIC_NAMES]])
+                                            *[View(instrument_name=name, attribute_keys=set(schema[2]),
+                                                   aggregation=ExplicitBucketHistogramAggregation(BUCKETS) if schema[0] == "create_histogram" else None)
+                                              for name, schema in METRICS.items()]])
             runtime.providers.append(provider)
-            runtime.meter = provider.get_meter("rag.telemetry")
+            runtime.meter = SafeMeter(provider.get_meter("rag.telemetry"))
     except Exception:
         runtime.shutdown()
         raise TelemetryConfigError("Telemetry initialization failed") from None
@@ -403,6 +542,77 @@ from functools import wraps
 import inspect
 
 _runtime = ContextVar("rag_telemetry_runtime", default=None)
+_operation = ContextVar("rag_telemetry_operation", default=None)
+_job_token = ContextVar("rag_telemetry_job_token", default=None)
+
+
+class Operation:
+    """Per-execution state, independent of sampling and recording spans."""
+    def __init__(self, runtime, name, current=None):
+        self.runtime, self.current = runtime, current
+        self.category = "api" if name == "rag.request" else ("job" if name in JOB_NAMES else ("dependency" if name in DEPENDENCIES else None))
+        self.attributes = {"rag.outcome": "ok"}
+        self.started = time.monotonic()
+        self.active = None
+        self.closed = False
+        if self.category == "job":
+            self.attributes["rag.operation"] = name[4:]
+        elif self.category == "dependency":
+            self.attributes["rag.dependency"] = name
+        elif self.category == "api":
+            self.attributes.update({"http.route": "unmatched", "http.method": "unknown", "http.status_class": "unknown"})
+
+    def measure(self, name, value, attributes):
+        try:
+            if self.runtime.meter is not None:
+                kind = METRICS[name][0]
+                instrument = getattr(self.runtime.meter, kind)(name)
+                return (instrument.record if kind == "create_histogram" else instrument.add)(value, attributes) is not False
+        except Exception:
+            pass
+        return False
+
+    def enter(self):
+        if self.category in ("api", "job"):
+            keys = METRICS["rag." + self.category + ".active"][2]
+            attributes = {key: self.attributes[key] for key in keys}
+            if self.measure("rag." + self.category + ".active", 1, attributes):
+                self.active = attributes
+
+    def finish(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.category is None:
+            return
+        prefix = "rag." + self.category
+        if self.active is not None:
+            self.measure(prefix + ".active", -1, self.active)
+        attrs = dict(self.attributes)
+        attrs["rag.outcome"] = "error" if attrs["rag.outcome"] == "partial" else attrs["rag.outcome"]
+        count = {"api": ".requests", "job": ".completed", "dependency": ".calls"}[self.category]
+        self.measure(prefix + count, 1, attrs)
+        self.measure(prefix + ".duration", max(0, time.monotonic() - self.started), attrs)
+        if self.category == "dependency" and attrs["rag.outcome"] == "error":
+            attrs.setdefault("error.type", "internal")
+            self.measure(prefix + ".errors", 1, attrs)
+        try:
+            if self.runtime.logger is not None:
+                from opentelemetry._logs import SeverityNumber
+                from opentelemetry import context, trace
+                log_context = context.Context()
+                if self.current is not None:
+                    log_context = trace.set_span_in_context(self.current, log_context)
+                attrs = dict(self.attributes)
+                token = _job_token.get()
+                if token is not None:
+                    attrs["rag.job_token"] = token
+                self.runtime.logger.emit(body=prefix + ".completed", context=log_context,
+                    severity_number=SeverityNumber.INFO if attrs["rag.outcome"] == "ok" else SeverityNumber.WARN,
+                    attributes=safe_attributes(attrs))
+        except Exception:
+            pass
+
 
 
 def safe_links(links):
@@ -429,9 +639,11 @@ def capture():
 
 
 @contextmanager
-def bind(snapshot):
+def bind(snapshot, *, job_token=None):
     runtime, parent = snapshot
     token = _runtime.set(runtime)
+    operation_token = _operation.set(None)
+    job_context = _job_token.set(job_token)
     attached = None
     try:
         try:
@@ -450,27 +662,29 @@ def bind(snapshot):
                 context.detach(attached)
             except Exception:
                 pass
+        _job_token.reset(job_context)
+        _operation.reset(operation_token)
         _runtime.reset(token)
 
 
 def admitted(fn):
     """Capture now, bind inside actual execution (including raw executors)."""
     snapshot = capture()
+    job_token = _job_token.get()
     if inspect.iscoroutinefunction(fn):
         @wraps(fn)
         async def run(*args, **kwargs):
-            with bind(snapshot):
+            with bind(snapshot, job_token=job_token):
                 return await fn(*args, **kwargs)
     else:
         @wraps(fn)
         def run(*args, **kwargs):
-            with bind(snapshot):
+            with bind(snapshot, job_token=job_token):
                 return fn(*args, **kwargs)
     return run
 
 
 def error_type(exc):
-    import asyncio
     import httpx
     if isinstance(exc, (TimeoutError, httpx.TimeoutException)) or isinstance(exc.__cause__, (TimeoutError, httpx.TimeoutException)):
         return "timeout"
@@ -482,8 +696,11 @@ def error_type(exc):
 
 
 def attribute(key, value, target=None):
-    if key not in ENUMS or value not in ENUMS[key]:
+    if key not in ENUMS or not isinstance(value, str) or value not in ENUMS[key]:
         return
+    state = _operation.get()
+    if state is not None and (target is None or state.current is target):
+        state.attributes[key] = value
     try:
         if target is None:
             runtime = _runtime.get()
@@ -497,35 +714,44 @@ def attribute(key, value, target=None):
 
 
 def outcome(value, exc=None, target=None):
+    if not isinstance(value, str) or value not in ENUMS["rag.outcome"]:
+        return
+    attribute("rag.outcome", value, target)
+    if exc is not None:
+        attribute("error.type", error_type(exc), target)
     runtime = _runtime.get()
     if runtime is None or runtime.tracer is None:
         return
     try:
         from opentelemetry import trace
-        span = target if target is not None else trace.get_current_span()
-        span.set_attribute("rag.outcome", value)
+        current = target if target is not None else trace.get_current_span()
         if value != "ok":
-            span.set_status(trace.Status(trace.StatusCode.ERROR))
-        if exc is not None:
-            span.set_attribute("error.type", error_type(exc))
+            current.set_status(trace.Status(trace.StatusCode.ERROR))
     except Exception:
         pass
 
 
 @contextmanager
-def span(name, *, links=(), server=False):
+def span(name, *, links=(), server=False, method=None):
     runtime = _runtime.get()
     current = None
     token = None
     try:
         if runtime is not None and runtime.tracer is not None:
             from opentelemetry import trace, context
-            kind = trace.SpanKind.SERVER if server else (trace.SpanKind.CLIENT if name.startswith(("ollama.", "weaviate.")) else trace.SpanKind.INTERNAL)
+            kind = trace.SpanKind.SERVER if server else (trace.SpanKind.CLIENT if name in DEPENDENCIES else trace.SpanKind.INTERNAL)
             current = runtime.tracer.start_span(name, kind=kind, links=links,
                                                 attributes={"rag.outcome": "ok"})
             token = context.attach(trace.set_span_in_context(current))
     except Exception:
         pass
+    state = Operation(runtime, name, current) if runtime is not None else None
+    state_token = _operation.set(state)
+    job_context = _job_token.set(uuid.uuid4().hex) if name in JOB_NAMES and runtime is not None else None
+    if state is not None:
+        if state.category == "api":
+            attribute("http.method", method if method in ENUMS["http.method"] else "unknown", current)
+        state.enter()
     try:
         yield current
     except BaseException as exc:
@@ -533,6 +759,14 @@ def span(name, *, links=(), server=False):
         outcome("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc, current)
         raise
     finally:
+        try:
+            if state is not None:
+                state.finish()
+        except Exception:
+            pass
+        if job_context is not None:
+            _job_token.reset(job_context)
+        _operation.reset(state_token)
         if token is not None:
             try:
                 context.detach(token)
@@ -567,50 +801,65 @@ def call(name, fn, /, *args, **kwargs):
 
 
 def iterate(fn, /, *args, **kwargs):
-    # Keep one bounded span for the iterator, but activate it only while pulling
-    # an item: generator yield must never leave context attached in its caller.
+    # One lifetime, activated only during pulls. Neither tracing nor operation
+    # context may escape a generator yield into the consuming caller.
     runtime = _runtime.get()
-    if runtime is None or runtime.tracer is None:
-        yield from fn(*args, **kwargs)
-        return
-    from opentelemetry import trace, context
-    try:
-        current = runtime.tracer.start_span("weaviate.iterate", kind=trace.SpanKind.CLIENT,
-                                            attributes={"rag.outcome": "ok"})
-    except Exception:
-        yield from fn(*args, **kwargs)
-        return
-    iterator = None
+    current = None
+    if runtime is not None and runtime.tracer is not None:
+        try:
+            from opentelemetry import trace, context
+            current = runtime.tracer.start_span("weaviate.iterate", kind=trace.SpanKind.CLIENT,
+                                                attributes={"rag.outcome": "ok"})
+        except Exception:
+            pass
+    state = Operation(runtime, "weaviate.iterate", current) if runtime is not None else None
+    job_token = _job_token.get()
+    def mark(value, exc):
+        state_context = _operation.set(state)
+        try:
+            outcome(value, exc, current)
+        finally:
+            _operation.reset(state_context)
     try:
         iterator = iter(fn(*args, **kwargs))
         while True:
             token = None
+            state_context = _operation.set(state)
             try:
-                token = context.attach(trace.set_span_in_context(current))
+                if current is not None:
+                    token = context.attach(trace.set_span_in_context(current))
             except Exception:
                 pass
             try:
                 item = next(iterator)
             except StopIteration:
                 return
-            except BaseException as exc:
-                outcome("error", exc)
-                raise
             finally:
+                _operation.reset(state_context)
                 if token is not None:
                     try:
                         context.detach(token)
                     except Exception:
                         pass
             yield item
-    except Exception as exc:
-        outcome("error", exc, current)
+    except BaseException as exc:
+        import asyncio
+        mark("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc)
         raise
     finally:
+        job_context = _job_token.set(job_token)
         try:
-            current.end()
+            if state is not None:
+                state.finish()
         except Exception:
             pass
+        finally:
+            _job_token.reset(job_context)
+        if current is not None:
+            try:
+                current.end()
+            except Exception:
+                pass
 
 
 def remote_link(headers):
@@ -634,29 +883,32 @@ class RequestTracing:
 
     async def __call__(self, scope, receive, send):
         runtime = getattr(getattr(scope.get("app"), "state", None), "telemetry", None)
-        if scope["type"] != "http" or runtime is None or runtime.tracer is None:
+        if scope["type"] != "http" or runtime is None or not any((runtime.tracer, runtime.meter, runtime.logger)):
             return await self.app(scope, receive, send)
         # Always a local root. External IDs can correlate but cannot sample it.
         with bind((runtime, None)):
-            with span("rag.request", links=remote_link(scope.get("headers", ())), server=True) as request_span:
+            with span("rag.request", links=remote_link(scope.get("headers", ())) if runtime.tracer is not None else (), server=True, method=scope.get("method")) as request_span:
+                request_state = _operation.get()
                 async def traced_send(message):
                     if message["type"] == "http.response.start":
-                        status = message["status"]
-                        if request_span is not None:
+                        # A streaming producer may have its own active scope.
+                        # Response metadata belongs to the request in all cases.
+                        state_context = _operation.set(request_state)
+                        try:
+                            status = message["status"]
                             attribute("http.status_class", str(status // 100) + "xx", request_span)
-                        if status >= 400:
-                            outcome("error")
+                            if status >= 400:
+                                outcome("error", target=request_span)
+                        finally:
+                            _operation.reset(state_context)
                     await send(message)
                 try:
                     await self.app(scope, receive, traced_send)
-                except Exception:
-                    attribute("http.status_class", "5xx", request_span)
-                    raise
                 finally:
                     route = getattr(scope.get("route"), "path", "")
                     label = scope.get("method", "") + " " + route
+                    attribute("http.route", label if label in ROUTES else "unmatched", request_span)
                     if request_span is not None:
-                        attribute("http.route", label if label in ROUTES else "unmatched", request_span)
                         if label in ROUTES:
                             try:
                                 request_span.update_name(label)

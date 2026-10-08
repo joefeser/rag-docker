@@ -770,16 +770,18 @@ path values and query strings are never recorded. Other names are finite
 listed in `api/services/telemetry.py`; unknown names become `rag.operation`.
 Attributes are finite operation, outcome (ok/error/cancelled/partial), error type
 (timeout/connection/validation/internal), registered method-and-route,
-HTTP status class (1xx–5xx) and tuning operation values. Raw exception messages,
+HTTP status class (1xx–5xx or unknown), method, dependency and tuning operation values. Raw exception messages,
 job/session identifiers, model names, customer names and content are excluded.
 All other attributes, span events, trace state, status descriptions, log severity
-text and arbitrary log bodies are removed; log body becomes `rag.operation`.
+text and arbitrary log bodies are removed. Only the fixed completion bodies
+documented below survive; other bodies become `rag.operation`.
 At most one link survives, containing only fixed-size nonzero trace/span IDs and
 a sampled flag. Trace/span IDs remain correlation fields, never authentication.
-The foundation metric allowlist is `rag.telemetry.check`; SDK views remove all
-metric dimensions before aggregation, and export removes descriptions, units
-and exemplars. Larger/invalid histograms (over 31 boundaries) are dropped.
-Later stories extend this schema deliberately.
+The operational metric allowlist and finite dimensions are documented below.
+The private meter validates values before SDK aggregation; instrument-specific
+views and the final export boundary enforce its schema. Export removes arbitrary
+descriptions and exemplars and preserves only fixed declared units. The original
+dimensionless `rag.telemetry.check` counter remains a synthetic schema probe.
 Do not pass content into instrumentation even though the exporter excludes it:
 active SDK spans may retain inputs until completion.
 
@@ -825,5 +827,68 @@ waiter does not stop a running thread; that thread's span ends when its actual
 work exits. Async cancellation and existing timeouts close their spans. The API
 does not gain a worker drain, new retry or new deadline. Forced process death or
 workers surviving telemetry shutdown can lose their final spans; traces are not
-a durable execution ledger. Operational metrics/log correlation and a collector
-profile are subsequent stories.
+a durable execution ledger. Collector provisioning and deployed acceptance remain
+a separate story.
+
+
+### Operational metrics and correlated logs (#284)
+
+The private meter records executions independently of trace sampling or the
+traces flag. No automatic HTTP/client instrumentation is installed. Request,
+job and dependency measurements have separate denominators; nested stage spans
+do not increment these counts. Every completed execution, including failure or
+cancellation, contributes one count and one monotonic duration in seconds.
+
+| Instrument | Type / unit | Finite dimensions |
+| --- | --- | --- |
+| `rag.api.requests` | Counter / `{request}` | `http.route`, `http.method`, `http.status_class`, `rag.outcome` |
+| `rag.api.duration` | Histogram / `s` | Same as API requests |
+| `rag.api.active` | UpDownCounter / `{request}` | `http.method` |
+| `rag.dependency.calls` | Counter / `{call}` | `rag.dependency`, `rag.outcome` |
+| `rag.dependency.duration` | Histogram / `s` | Same as dependency calls |
+| `rag.dependency.errors` | Counter / `{error}` | `rag.dependency`, `error.type` |
+| `rag.job.completed` | Counter / `{job}` | `rag.operation`, `rag.outcome` |
+| `rag.job.duration` | Histogram / `s` | Same as job completions |
+| `rag.job.active` | UpDownCounter / `{job}` | `rag.operation` |
+
+Routes are the finite METHOD plus route-template strings in `ROUTES` in
+`api/services/telemetry.py`, or `unmatched`. Raw paths are never dimensions.
+Methods are GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT or
+`unknown`. Status classes are 1xx–5xx or `unknown` when no response start was
+observed. Outcomes are `ok`, `error` or `cancelled`; partial job results count as
+`error` and remain `partial` in logs and durable job status. HTTP 4xx/5xx count
+as errors. Dependency errors exclude cancellation; their error type is
+`timeout`, `connection`, `validation` or `internal`. Jobs cover ingest, export,
+import, tuning and evaluation generation. Dependency operations are the finite
+`ollama.*` and `weaviate.*` names in the same source registry. Iterator duration
+covers its entire consumption lifetime, including time between pulls; premature
+close is cancellation. Model token usage is not available and is not invented.
+
+Histograms use explicit boundaries in seconds: 0.005, 0.01, 0.025, 0.05, 0.1,
+0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300 (plus the implicit overflow bucket).
+All valid finite series survive export regardless of the trace/log batch size.
+Malformed, duplicate or excess metric points reject the metric export request;
+they do not silently truncate otherwise valid series. SDK aggregation cannot
+allocate a series for arbitrary values under permitted keys. Job IDs, user IDs,
+collection names, filenames, prompts, raw exceptions and trace exemplars never
+become metric dimensions.
+
+Active instruments report process-local concurrency as the sum of increments
+and decrements. They start at actual scope entry and settle at scope exit.
+Cancelling a thread's waiter does not finish its running worker. A task cancelled
+before execution has no started/completed measurement. Process death resets
+active state and cannot synthesize historical completions. Existing job status
+and `/metrics/latency` contracts are unchanged.
+
+Explicit structured completion logs use `rag.api.completed`,
+`rag.dependency.completed` or `rag.job.completed` bodies, INFO for successful
+work and WARN otherwise. Finite attributes carry outcomes and categories;
+trace/span IDs correlate with the owning scope. Each job execution generates a
+32-character random hexadecimal `rag.job_token`, inherited by its dependency
+logs and restored after execution. This token is never a durable/application
+job or session ID, metric dimension, authorization value or durable lookup key.
+Concurrent jobs receive separate tokens. With tracing disabled, operation logs
+still emit, with absent trace/span IDs. Logs can be disabled independently.
+Existing application log messages are not forwarded to OTLP: exception text,
+credentials, document content and arbitrary bodies remain excluded. Telemetry
+measurement or logger failures do not change application results.
