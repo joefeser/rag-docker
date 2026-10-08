@@ -578,6 +578,8 @@ def attribute(key, value, target=None):
 
 
 def outcome(value, exc=None, target=None):
+    if not isinstance(value, str) or value not in ENUMS["rag.outcome"]:
+        return
     runtime = _runtime.get()
     if runtime is None or runtime.tracer is None:
         return
@@ -587,7 +589,7 @@ def outcome(value, exc=None, target=None):
         span.set_attribute("rag.outcome", value)
         if value != "ok":
             span.set_status(trace.Status(trace.StatusCode.ERROR))
-        if exc is not None:
+        if exc is not None and value != "cancelled":
             span.set_attribute("error.type", error_type(exc))
     except Exception:
         pass
@@ -674,9 +676,6 @@ def iterate(fn, /, *args, **kwargs):
                 item = next(iterator)
             except StopIteration:
                 return
-            except BaseException as exc:
-                outcome("error", exc)
-                raise
             finally:
                 if token is not None:
                     try:
@@ -684,8 +683,9 @@ def iterate(fn, /, *args, **kwargs):
                     except Exception:
                         pass
             yield item
-    except Exception as exc:
-        outcome("error", exc, current)
+    except BaseException as exc:
+        import asyncio
+        outcome("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc, current)
         raise
     finally:
         try:
@@ -701,11 +701,11 @@ def remote_link(headers):
             if value is not None or len(candidate) != 55:
                 return ()
             value = candidate
-    if value is None or not re.fullmatch(rb"00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]", value):
+    if value is None or not re.fullmatch(rb"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", value):
         return ()
     from opentelemetry.trace import SpanContext, TraceFlags, TraceState, Link
     _, tid, sid, flags = value.split(b"-")
-    c = SpanContext(int(tid, 16), int(sid, 16), True, TraceFlags(int(flags, 16)), TraceState())
+    c = SpanContext(int(tid, 16), int(sid, 16), True, TraceFlags(int(flags, 16) & 1), TraceState())
     return (Link(c),) if c.is_valid else ()
 
 

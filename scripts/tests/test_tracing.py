@@ -121,6 +121,151 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         await self.client.get('/'+SECRET, headers={'traceparent': good[:-2]+'01'})
         self.assertEqual(len(self.spans()), count)
 
+    async def test_outcome_admission_and_classification(self):
+        with ot.bind((self.runtime, None)):
+            for explicit in (False, True):
+                with ot.span('rag.query') as current:
+                    for invalid in (SECRET, None, 1, True, [], {}, ('error',)):
+                        ot.outcome(invalid, ValueError(SECRET), current if explicit else None)
+                        self.assertEqual(dict(current.attributes), {'rag.outcome': 'ok'})
+                        self.assertEqual(current.status.status_code, trace.StatusCode.UNSET)
+            for value in ('ok', 'error', 'partial', 'cancelled'):
+                with ot.span('rag.query') as current:
+                    ot.outcome(value, ValueError(SECRET))
+                result = self.spans('rag.query')[-1]
+                self.assertEqual(result.attributes['rag.outcome'], value)
+                self.assertEqual(result.attributes.get('error.type'),
+                                 'validation' if value != 'cancelled' else None)
+            for exc, category in ((TimeoutError(SECRET), 'timeout'),
+                                  (ConnectionError(SECRET), 'connection'),
+                                  (ValueError(SECRET), 'validation'),
+                                  (RuntimeError(SECRET), 'internal')):
+                with self.assertRaises(type(exc)) as caught:
+                    with ot.span('rag.query'):
+                        raise exc
+                self.assertIs(caught.exception, exc)
+                self.assertEqual(self.spans('rag.query')[-1].attributes['error.type'], category)
+        self.wire()
+
+    async def test_span_cancellation_has_no_internal_error(self):
+        with ot.bind((self.runtime, None)):
+            for exc in (asyncio.CancelledError(SECRET), GeneratorExit(SECRET)):
+                with ot.span('rag.query') as parent:
+                    with self.assertRaises(type(exc)) as caught:
+                        with ot.span('rag.retrieval'):
+                            raise exc
+                    self.assertIs(caught.exception, exc)
+                    self.assertIs(trace.get_current_span(), parent)
+                result = self.spans('rag.retrieval')[-1]
+                self.assertEqual(result.attributes['rag.outcome'], 'cancelled')
+                self.assertNotIn('error.type', result.attributes)
+        self.wire()
+
+    async def test_iterator_terminal_outcomes_and_context(self):
+        for phase in ('factory', 'iter', 'next', 'yield'):
+            for exc in (asyncio.CancelledError(SECRET), GeneratorExit(SECRET), ValueError(SECRET)):
+                with self.subTest(phase=phase, exc=type(exc).__name__):
+                    def fail():
+                        raise exc
+                    class Source:
+                        def __iter__(self):
+                            if phase == 'iter':
+                                fail()
+                            return self
+                        def __next__(self):
+                            if phase == 'next':
+                                fail()
+                            return 1
+                    factory = fail if phase == 'factory' else Source
+                    before = len(self.spans('weaviate.iterate'))
+                    with ot.bind((self.runtime, None)), ot.span('rag.export') as parent:
+                        iterator = ot.iterate(factory)
+                        with self.assertRaises(type(exc)) as caught:
+                            if phase == 'yield':
+                                self.assertEqual(next(iterator), 1)
+                                self.assertIs(trace.get_current_span(), parent)
+                                iterator.throw(exc)
+                            else:
+                                next(iterator)
+                        self.assertIs(caught.exception, exc)
+                        self.assertIs(trace.get_current_span(), parent)
+                        iterator.close()
+                    self.assertEqual(len(self.spans('weaviate.iterate')), before + 1)
+                    result = self.spans('weaviate.iterate')[-1]
+                    cancelled = isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+                    self.assertEqual(result.attributes['rag.outcome'], 'cancelled' if cancelled else 'error')
+                    self.assertEqual(result.attributes.get('error.type'), None if cancelled else 'validation')
+                    self.assertEqual(result.parent.span_id, parent.get_span_context().span_id)
+        with ot.bind((self.runtime, None)), ot.span('rag.export') as parent:
+            iterator = ot.iterate(lambda: iter([1, 2]))
+            self.assertEqual(next(iterator), 1)
+            iterator.close()
+            self.assertEqual(self.spans('weaviate.iterate')[-1].attributes['rag.outcome'], 'cancelled')
+            self.assertNotIn('error.type', self.spans('weaviate.iterate')[-1].attributes)
+            self.assertIs(trace.get_current_span(), parent)
+            self.assertEqual(list(ot.iterate(lambda: iter([1, 2]))), [1, 2])
+            self.assertEqual(self.spans('weaviate.iterate')[-1].attributes['rag.outcome'], 'ok')
+            self.assertIs(trace.get_current_span(), parent)
+        self.wire()
+
+    async def test_health_covers_connection_and_readiness(self):
+        exc = ConnectionError(SECRET)
+        with patch.object(wc, '_client', None), patch.object(wc.weaviate, 'connect_to_custom', side_effect=exc), ot.bind((self.runtime, None)):
+            with self.assertRaises(ConnectionError) as caught:
+                await wc.check_health()
+        self.assertIs(caught.exception, exc)
+        health = self.spans('weaviate.health')[-1]
+        connect = self.spans('weaviate.connect')[-1]
+        self.assertEqual(connect.parent.span_id, health.context.span_id)
+        for result in (health, connect):
+            self.assertEqual(result.attributes['rag.outcome'], 'error')
+            self.assertEqual(result.attributes['error.type'], 'connection')
+        for ready in (True, False, TimeoutError(SECRET)):
+            def check():
+                if isinstance(ready, BaseException):
+                    raise ready
+                return ready
+            with patch.object(wc, 'get_client', return_value=NS(is_ready=check)), ot.bind((self.runtime, None)):
+                if isinstance(ready, BaseException):
+                    with self.assertRaises(TimeoutError) as caught:
+                        await wc.check_health()
+                    self.assertEqual(caught.exception.args, ready.args)
+                else:
+                    self.assertIs(await wc.check_health(), ready)
+            result = self.spans('weaviate.health')[-1]
+            self.assertEqual(result.attributes['rag.outcome'], 'ok' if ready is True else 'error')
+            self.assertEqual(result.attributes.get('error.type'), 'timeout' if isinstance(ready, BaseException) else None)
+        self.wire()
+
+    async def test_all_trace_flag_bytes_preserve_only_sampled_bit(self):
+        tid, sid = 'a' * 32, 'b' * 16
+        for flags in range(256):
+            value = f'00-{tid}-{sid}-{flags:02x}'
+            links = ot.remote_link([(b'traceparent', value.encode())])
+            self.assertEqual(len(links), 1)
+            self.assertEqual(int(links[0].context.trace_flags), flags & 1)
+        for flags in ('02', '03', 'fe', 'ff'):
+            await self.client.get('/' + SECRET, headers={'traceparent': f'00-{tid}-{sid}-{flags}'})
+            server = self.spans('rag.request')[-1]
+            self.assertIsNone(server.parent)
+            self.assertNotEqual(server.context.trace_id, int(tid, 16))
+            self.assertEqual(server.links[0].context.trace_id, int(tid, 16))
+            self.assertEqual(int(server.links[0].context.trace_flags), int(flags, 16) & 1)
+        for flags in ('0G', 'FF', 'g0', '0', '000', ' 1'):
+            self.assertFalse(ot.remote_link([(b'traceparent', f'00-{tid}-{sid}-{flags}'.encode())]))
+        for result in self.wire():
+            self.assertEqual(len(result.links), 1)
+            self.assertLessEqual(result.links[0].flags & 255, 1)
+        zero = TracerProvider(sampler=TraceIdRatioBased(0), shutdown_on_exit=False)
+        zero.add_span_processor(SimpleSpanProcessor(self.memory))
+        try:
+            self.runtime.tracer = zero.get_tracer('zero')
+            count = len(self.spans())
+            await self.client.get('/' + SECRET, headers={'traceparent': f'00-{tid}-{sid}-ff'})
+            self.assertEqual(len(self.spans()), count)
+        finally:
+            zero.shutdown()
+
     async def test_export_admission_concurrency_and_after_response(self):
         release = threading.Event()
         entered = []
