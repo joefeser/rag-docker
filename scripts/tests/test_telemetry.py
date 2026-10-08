@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
-from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire
+from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
 from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
@@ -76,6 +76,105 @@ class TelemetryTests(unittest.TestCase):
             Config.from_env({'RAG_OTEL_ENABLED': 'true', 'RAG_OTEL_ENDPOINT': 'https://localhost', 'RAG_OTEL_HEADERS_FILE': SECRET})
         self.assertNotIn(SECRET, str(err.exception))
 
+    def test_credentials_require_https_and_unambiguous_header_identity(self):
+        for header in ('Authorization', 'authorization', 'X-Api-Key', 'x-API-key'):
+            with tempfile.NamedTemporaryFile(mode='w') as f:
+                f.write('{"'+header+'":"'+SECRET+'"}'); f.flush()
+                for origin in ('http://localhost:4318', 'http://collector.example', 'https://collector.example'):
+                    env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':origin, 'RAG_OTEL_HEADERS_FILE':f.name}
+                    if origin.startswith('https:'):
+                        cfg = Config.from_env(env)
+                        self.assertEqual(list(cfg.headers), ['Authorization' if header.lower() == 'authorization' else 'X-Api-Key'])
+                    else:
+                        with patch('services.telemetry._session', side_effect=AssertionError), self.assertRaises(TelemetryConfigError) as error:
+                            bootstrap(env)
+                        self.assertNotIn(SECRET, str(error.exception))
+        for names in (('Authorization', 'authorization'), ('X-Api-Key', 'x-api-key'), ('Authorization', 'Authorization')):
+            with tempfile.NamedTemporaryFile(mode='w') as f:
+                f.write('{"'+names[0]+'":"first","'+names[1]+'":"'+SECRET+'"}'); f.flush()
+                with self.assertRaises(TelemetryConfigError):
+                    Config.from_env({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost', 'RAG_OTEL_HEADERS_FILE':f.name})
+
+    def test_remote_trace_state_removed_before_queue_and_at_receiver(self):
+        from opentelemetry.trace import SpanContext, TraceFlags, TraceState, NonRecordingSpan, set_span_in_context
+        parent = SpanContext(123, 456, True, TraceFlags(1), TraceState([('secret', SECRET)]))
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                with runtime.tracer.start_as_current_span('rag.query', context=set_span_in_context(NonRecordingSpan(parent))) as span:
+                    child = span.get_span_context()
+                processor = runtime.providers[0]._active_span_processor._span_processors[0]._batch_processor
+                queued = processor._queue[0]
+                for clean, original in ((queued.context, child), (queued.parent, parent)):
+                    self.assertFalse(clean.trace_state)
+                    self.assertEqual((clean.trace_id, clean.span_id, clean.trace_flags, clean.is_remote),
+                                     (original.trace_id, original.span_id, original.trace_flags, original.is_remote))
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/traces']
+                self.assertNotIn(SECRET.encode(), payload)
+                exported = ExportTraceServiceRequest.FromString(payload).resource_spans[0].scope_spans[0].spans[0]
+                self.assertEqual(int.from_bytes(exported.parent_span_id, 'big'), 456)
+                self.assertEqual(int.from_bytes(exported.trace_id, 'big'), 123)
+            finally:
+                runtime.shutdown()
+
+    def test_metric_admission_invariants_at_real_wire_boundary(self):
+        from opentelemetry.proto.metrics.v1.metrics_pb2 import Metric
+        def numeric(kind='gauge', value=7):
+            metric = Metric(name='rag.telemetry.check')
+            data = getattr(metric, kind)
+            if kind == 'sum': data.aggregation_temporality = 2
+            data.data_points.add(as_double=value)
+            return metric
+        def histogram(**changes):
+            metric = Metric(name='rag.telemetry.check')
+            metric.histogram.aggregation_temporality = 2
+            values = dict(count=3, sum=4, min=0, max=3, bucket_counts=[1,1,1], explicit_bounds=[1,2])
+            values.update(changes)
+            metric.histogram.data_points.add(**values)
+            return metric
+        invalid = [Metric(name='rag.telemetry.check'), numeric(value=float('nan')), numeric(value=float('inf'))]
+        for kind in ('gauge', 'sum', 'histogram'):
+            metric = histogram() if kind == 'histogram' else numeric(kind)
+            getattr(metric, kind).data_points.add().CopyFrom(getattr(metric, kind).data_points[0])
+            invalid.append(metric)
+            empty = Metric(name='rag.telemetry.check'); getattr(empty, kind).SetInParent(); invalid.append(empty)
+        missing = Metric(name='rag.telemetry.check'); missing.gauge.data_points.add(); invalid.append(missing)
+        bad_temporality = numeric('sum'); bad_temporality.sum.aggregation_temporality = 0; invalid.append(bad_temporality)
+        for changes in (dict(explicit_bounds=[2,1]), dict(explicit_bounds=[1,1]),
+                        dict(explicit_bounds=[1,float('inf')]), dict(explicit_bounds=[float('nan'),2]),
+                        dict(sum=float('nan')), dict(min=float('-inf')), dict(max=float('inf')),
+                        dict(min=4,max=3), dict(count=4), dict(bucket_counts=[1,2]),
+                        dict(explicit_bounds=list(range(32)),bucket_counts=[0]*33,count=0)):
+            invalid.append(histogram(**changes))
+        # Protobuf uint64 fields reject negative values before sanitizer admission.
+        for changes in (dict(count=-1), dict(bucket_counts=[-1,2,2])):
+            with self.assertRaises(ValueError): histogram(**changes)
+        with receiver() as (env, records):
+            config = Config.from_env({**env, 'RAG_OTEL_BATCH_SIZE':'1'})
+            with _session('metrics', config) as session:
+                for bad in invalid:
+                    source = ExportMetricsServiceRequest()
+                    metrics = source.resource_metrics.add().scope_metrics.add().metrics
+                    metrics.add().CopyFrom(bad); metrics.add().CopyFrom(numeric())
+                    response = session.post('', data=source.SerializeToString())
+                    self.assertEqual(response.status_code, 200)
+                    output = ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual(len(output), 1)
+                    self.assertEqual(output[0].WhichOneof('data'), 'gauge')
+                    self.assertEqual(output[0].gauge.data_points[0].as_double, 7)
+                absent_statistics = histogram()
+                for field in ('sum', 'min', 'max'):
+                    absent_statistics.histogram.data_points[0].ClearField(field)
+                for good in (numeric('sum'), histogram(), absent_statistics,
+                             histogram(count=0,sum=0,min=0,max=0,bucket_counts=[0,0,0])):
+                    source = ExportMetricsServiceRequest()
+                    source.resource_metrics.add().scope_metrics.add().metrics.add().CopyFrom(good)
+                    session.post('', data=source.SerializeToString())
+                    output = ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual(len(output), 1)
+                    self.assertEqual(output[0], good)
+
     def test_real_sdk_all_signals_safe_on_receiver(self):
         with receiver() as (env, records), patch.dict(os.environ, {'OTEL_RESOURCE_ATTRIBUTES': 'secret='+SECRET,
                  'OTEL_SERVICE_NAME': SECRET, 'OTEL_EXPORTER_OTLP_HEADERS': 'authorization='+SECRET}):
@@ -134,7 +233,7 @@ class TelemetryTests(unittest.TestCase):
         point=metric.histogram.data_points.add(count=40, sum=40)
         point.bucket_counts.extend([1]*40);point.explicit_bounds.extend(range(39))
         result=ExportMetricsServiceRequest.FromString(sanitize_wire(source.SerializeToString(),'metrics',Config()))
-        self.assertFalse(result.resource_metrics[0].scope_metrics[0].metrics[0].histogram.data_points)
+        self.assertFalse(result.resource_metrics[0].scope_metrics[0].metrics)
 
     def test_bounded_queue_under_blocked_export(self):
         from opentelemetry.sdk.trace.export import SpanExportResult

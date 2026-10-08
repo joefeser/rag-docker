@@ -752,7 +752,9 @@ Service metadata is explicitly operator-selected public telemetry data: use
 non-sensitive identifiers (1–64 ASCII letters, digits, dots, underscores or
 hyphens, starting with a letter/digit). Do not put customer names or secrets in
 these fields. Headers belong in an uncommitted mounted secret file, never in
-service metadata. Exporter transport ignores ambient proxies/netrc and uses TLS
+service metadata. Credential headers require HTTPS, including loopback destinations;
+HTTP is accepted only without credentials. Header names are case-insensitive and
+duplicate names (including repeated JSON keys) are rejected. Exporter transport ignores ambient proxies/netrc and uses TLS
 verification; redirects are refused. Other `OTEL_*` variables are not a supported
 configuration interface for this private runtime.
 
@@ -772,8 +774,12 @@ links, trace state, status descriptions, log severity text and arbitrary log
 bodies are removed; log body becomes `rag.operation`. Trace/span IDs remain
 correlation fields, never authentication. The foundation metric allowlist is
 `rag.telemetry.check`; SDK views remove all metric dimensions before aggregation,
-and export removes descriptions, units and exemplars. Larger/invalid histograms
-(over 31 boundaries) are dropped. Later stories extend this schema deliberately.
+and export removes descriptions, units and exemplars. Export admits exactly one
+finite data point per metric; empty, malformed and multi-point metrics are
+rejected before consuming batch capacity. Multi-point input cannot be merged
+safely after removing dimensions. Histograms require at most 31 finite, strictly
+increasing boundaries, consistent bucket totals and finite optional sum/min/max
+with min no greater than max. Invalid histograms are dropped. Later stories extend this schema deliberately.
 Do not pass content into instrumentation even though the exporter excludes it:
 active SDK spans may retain inputs until completion.
 
