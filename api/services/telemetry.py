@@ -721,8 +721,8 @@ class Operation:
                     return True
         except Exception:
             pass
-        if self.runtime.meter is not None:
-            self.runtime._active_health.suppress(name)
+        # The facade owns suppression at SDK/factory exception boundaries.
+        # False also means local validation rejection, which must not taint it.
         return False
 
     def enter(self):

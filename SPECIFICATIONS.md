@@ -2350,3 +2350,4 @@ retry or fabricate a reset. Independent instruments and completion logs remain
 available. Suppression loses active-instrument availability until restart; it
 does not reconstruct concurrency or retract prior backend history or exports
 already in flight. The two-instrument suppression registry is finite and local.
+Local validation rejection returns false without changing instrument health.
