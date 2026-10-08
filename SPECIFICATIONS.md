@@ -2215,7 +2215,13 @@ Overlap retains internal whitespace-only windows to preserve exact character cov
 The backend owns one optional private OpenTelemetry runtime initialized before
 startup clients and always closed on failed startup or shutdown. It is disabled
 by default with no exporter construction or telemetry egress. Enabled invalid
-configuration fails with field-only errors. Configuration and finite safe schema
+configuration fails with field-only errors. Enabled RAG telemetry rejects a real
+process `OTEL_SDK_DISABLED` value whose stripped, lowercase value is `true`,
+before secret access or exporter construction, because all three pinned SDK
+providers otherwise silently disable signals. Explicit configuration mappings
+cannot mask this conflict; disabled RAG telemetry still returns a no-op. The
+runtime must not mutate the process environment or global providers.
+Configuration and finite safe schema
 are specified in README.md, “Optional backend telemetry”. No global providers,
 automatic request instrumentation, application log bridge or collector deployment
 are included in this foundation.

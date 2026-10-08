@@ -53,6 +53,45 @@ class TelemetryTests(unittest.TestCase):
             self.assertTrue(runtime.force_flush())
             self.assertTrue(runtime.shutdown())
 
+    def test_ambient_sdk_disable_conflict_fails_before_side_effects(self):
+        for ambient in ('true', 'TRUE', ' TrUe '):
+            with self.subTest(ambient=ambient), patch.dict(os.environ, {'OTEL_SDK_DISABLED':ambient}):
+                before = dict(os.environ)
+                env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:4318',
+                       'RAG_OTEL_HEADERS_FILE':SECRET, 'OTEL_SDK_DISABLED':'false'}
+                with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
+                    for signals in ({}, {'RAG_OTEL_TRACES':'false'}, {'RAG_OTEL_LOGS':'false'}, {'RAG_OTEL_METRICS':'false'}):
+                        with self.assertRaises(TelemetryConfigError) as error:
+                            bootstrap({**env, **signals})
+                        self.assertEqual(str(error.exception), 'RAG_OTEL_ENABLED conflicts with OTEL_SDK_DISABLED')
+                        self.assertNotIn(SECRET, str(error.exception))
+                    runtime = bootstrap({**env, 'RAG_OTEL_ENABLED':'false'})
+                    self.assertFalse(runtime.config.enabled)
+                    self.assertEqual(runtime.providers, [])
+                    self.assertTrue(runtime.force_flush())
+                    self.assertTrue(runtime.shutdown())
+                self.assertEqual(dict(os.environ), before)
+
+    def test_non_disabling_process_env_exports_all_signals_despite_mapping(self):
+        for ambient in (None, 'false'):
+            with self.subTest(ambient=ambient), patch.dict(os.environ):
+                if ambient is None:
+                    os.environ.pop('OTEL_SDK_DISABLED', None)
+                else:
+                    os.environ['OTEL_SDK_DISABLED'] = ambient
+                before = dict(os.environ)
+                with receiver() as (env, records):
+                    runtime = bootstrap({**env, 'OTEL_SDK_DISABLED':'true'})
+                    try:
+                        with runtime.tracer.start_as_current_span('rag.query'):
+                            runtime.logger.emit(body='rag.operation')
+                        runtime.meter.create_counter('rag.telemetry.check').add(1)
+                        self.assertTrue(runtime.force_flush())
+                    finally:
+                        self.assertTrue(runtime.shutdown())
+                    self.assertEqual({path for path, _ in records}, {'/v1/traces', '/v1/logs', '/v1/metrics'})
+                self.assertEqual(dict(os.environ), before)
+
     def test_invalid_configuration_is_value_free(self):
         fields = {'ENABLED': '1', 'PROTOCOL': 'grpc', 'ENDPOINT': 'http://user:secret@example.com',
                   'SERVICE_NAME': SECRET, 'SAMPLE_RATIO': 'nan', 'QUEUE_SIZE': '0', 'BATCH_SIZE': '5000',
