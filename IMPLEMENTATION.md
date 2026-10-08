@@ -11224,6 +11224,41 @@ launchers use synthetic dependencies to prove handled outcomes preserve durable
 status. No live application content, external model or hosted collector is used.
 Exporter error and malformed-wire cases check bounded failure isolation;
 collector deployment acceptance remains #285.
+
+## Optional Collector acceptance (#285)
+
+```sh
+bash scripts/verify/stack.sh run
+bash scripts/verify/stack.sh run --telemetry
+# Targeted enabled acceptance, after the same guarded disposable startup:
+bash scripts/verify/stack.sh run --telemetry 15
+```
+
+Run these serially. The default run's registered `15_telemetry` suite verifies
+the API is disabled and explicitly reports enabled capture as unexercised.
+The enabled full run uses trusted overlays, the pinned private Collector and a
+bounded private protobuf receiver using the API image. Only the proxy publishes
+a host port. Narrow guard additions allow resource/log bounds only on these two
+services; live image, network, mount and port restrictions remain enforced.
+
+The suite recreates only the disposable API through a guarded `telemetry-mode`
+command under the inherited lock to compare enabled/disabled settings. It submits
+real synthetic uploads, queries and concurrent export jobs; inspects actual
+received traces/metrics/logs, parent relationships, correlation and planted
+sentinels; stops/restarts only disposable services; and tests a slow receiver.
+Capture is memory-bounded (16 MiB, 1000 batches, 1 MiB/request, 16 handlers); overflow
+fails inspection. Raw payloads are synthetic and temporary. Summary output records
+five warm-ups and 20 timed health requests plus one query/two jobs per mode,
+latency distributions, sampled container stats and shutdown timing. Health timings
+include host guard overhead; samples are observations, not performance SLOs.
+`RAG_SKIP_SLOW=1` explicitly skips model-dependent enabled acceptance and cannot
+satisfy full telemetry acceptance. No real backend account or external egress is
+needed once dependencies/images/models are available.
+
+Focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
+configuration only), `python scripts/tests/test_telemetry_capture.py` (locked API
+dependencies), and the existing verify-stack tests. These complement, not replace,
+both full runs.
 ````
 
 ### scripts/verify/all.sh
@@ -11331,7 +11366,7 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [suite ...]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry] [suite ...]
 #   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
 #   bash scripts/verify/stack.sh down
 #
@@ -11409,15 +11444,26 @@ private_problem() {
 # ── arguments, checked before any Docker command ─────────────────────────────
 [ "$#" -ge 1 ] || usage
 CMD="$1"; shift
-case "$CMD" in up|down|run) ;; *) usage ;; esac
+case "$CMD" in up|down|run|telemetry-mode) ;; *) usage ;; esac
+if [ "$CMD" = telemetry-mode ]; then
+  [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "telemetry-mode requires an inherited verification lock"
+fi
 CHECKOUT="$HARNESS"
 PULL=""
+TELEMETRY=0
+OTEL_ENABLED=true
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --checkout)
       [ "$CMD" != down ] && [ "$#" -ge 2 ] || usage
       CHECKOUT="$2"; shift 2 ;;
+    --telemetry)
+      [ "$CMD" != down ] || usage
+      TELEMETRY=1; shift ;;
+    --disabled)
+      [ "$CMD" = telemetry-mode ] || usage
+      OTEL_ENABLED=false; shift ;;
     --pull)
       [ "$CMD" = up ] || usage
       PULL=1; shift ;;
@@ -11493,6 +11539,16 @@ trap 'exit 143' TERM
 unset COMPOSE_PATH_SEPARATOR
 export COMPOSE_PROJECT_NAME="$PROJECT"
 export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$HARNESS/docker-compose.verify.yml"
+# Ignore ambient Compose profiles; only this explicit option enables telemetry.
+unset COMPOSE_PROFILES
+export RAG_VERIFY_TELEMETRY="$TELEMETRY"
+export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
+export RAG_VERIFY_HARNESS="$HARNESS"
+export RAG_VERIFY_CHECKOUT="$CHECKOUT"
+if [ "$TELEMETRY" = 1 ]; then
+  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
+  export COMPOSE_PROFILES=telemetry
+fi
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -11618,7 +11674,7 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
@@ -11665,8 +11721,16 @@ if config.get('name') != 'rag-verify':
 
 # (h) service keys: only the base file's
 for svc, service in services.items():
-    if extra(service, SERVICE_KEYS):
-        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, SERVICE_KEYS)}")
+    allowed = SERVICE_KEYS
+    if svc in ('otel-collector', 'otel-capture'):
+        allowed = allowed | {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
+    if extra(service, allowed):
+        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, allowed)}")
+if {'otel-collector', 'otel-capture'} & services.keys():
+    import runpy
+    harness = sys.argv[5] if len(sys.argv) > 5 else checkout
+    guard = runpy.run_path(os.path.join(harness, 'scripts/verify/telemetry_guard.py'))
+    problems.extend(guard['check'](config, harness))
 
 # (i) builds: only a context and a Dockerfile, both inside the checkout
 for svc, service in services.items():
@@ -11833,13 +11897,23 @@ do_up() {
   done
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
+  if [ "$TELEMETRY" = 1 ]; then
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+      printf 'export %s=%q\n' "$var" "${!var}"
+    done
+  fi
   printf '\n'
 }
 
 case "$CMD" in
+  telemetry-mode)
+    # Called only by a suite under the inherited lock and explicit opt-in.
+    [ "$TELEMETRY" = 1 ] || fail "telemetry-mode requires --telemetry"
+    do_guard
+    docker compose -p "$PROJECT" up -d --no-deps --no-build --pull never --wait --wait-timeout 120 api || fail "API telemetry reconfiguration failed" ;;
   down)
     do_down || exit 2 ;;
   up)
@@ -12726,6 +12800,8 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
 check "OTel operational metrics and sanitized correlated logs" $?
+python3 "$REPO_ROOT/scripts/tests/test_service_inventory.py"
+check "exact default/telemetry infrastructure inventory policy" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
 
@@ -12801,9 +12877,18 @@ for svc in api weaviate; do
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
-# ── five services, all reporting healthy where a healthcheck exists ──────────
-running=$( (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) | grep -c .)
-check_eq "five services are running" "$running" "5"
+# ── exact service inventory for this guarded verification mode ──────────────
+# The default is exactly api/ollama/proxy/ui/weaviate. Only --telemetry adds
+# otel-collector and otel-capture; arbitrary five/seven services cannot pass.
+verify_service_inventory() {
+  (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) > "$RAG_INFRA_TMP/vfy_running_services" || return 1
+  (cd "$REPO_ROOT" && docker compose ps --all --services) > "$RAG_INFRA_TMP/vfy_all_services" || return 1
+  python3 "$REPO_ROOT/scripts/verify/service_inventory.py" \
+    "$RAG_INFRA_TMP/vfy_compose.json" "$RAG_INFRA_TMP/vfy_running_services" "$RAG_INFRA_TMP/vfy_all_services" \
+    --mode "${RAG_VERIFY_TELEMETRY:-0}" --project "${COMPOSE_PROJECT_NAME:-}" --profiles "${COMPOSE_PROFILES:-}"
+}
+verify_service_inventory
+check "exact configured and running service inventory for verification mode" $?
 unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
@@ -12902,6 +12987,8 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Wait up to twice the limit, so a slow restart is still timed (#130).
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   restart_timing_check "$restart_limit" "$elapsed"
+  verify_service_inventory
+  check "exact service inventory survives restart" $?
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -12992,6 +13079,8 @@ ENDPY
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
   check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
+  verify_service_inventory
+  check "exact service inventory survives snapshot restart" $?
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
@@ -21553,6 +21642,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 FILES = [('api/main.py', 'python'), ('api/services/telemetry.py', 'python'), ('api/requirements.in', 'text'), ('api/requirements.txt', 'text'), ('scripts/tests/test_telemetry.py', 'python'), ('scripts/tests/test_telemetry_implementation.py', 'python'), ('scripts/tests/test_tracing.py', 'python'), ('scripts/tests/test_telemetry_operations.py', 'python'), ('scripts/verify/01_infrastructure.sh', 'bash'), ('scripts/verify/README.md', 'markdown'), ('api/services/batch_write.py', 'python'), ('api/services/chunker.py', 'python'), ('api/services/collection_recovery.py', 'python'), ('api/services/exporter.py', 'python'), ('api/services/goldstandard.py', 'python'), ('api/services/importer.py', 'python'), ('api/services/ingest_pipeline.py', 'python'), ('api/services/ollama_client.py', 'python'), ('api/services/packager.py', 'python'), ('api/services/rag_pipeline.py', 'python'), ('api/services/sources.py', 'python'), ('api/services/tuning.py', 'python'), ('api/services/weaviate_client.py', 'python')]
+FILES += [('scripts/verify/stack.sh', 'bash'), ('scripts/verify/service_inventory.py', 'python'), ('scripts/tests/test_service_inventory.py', 'python')]
+
 
 class EmbeddedTelemetryTests(unittest.TestCase):
     def test_embedded_files_match(self):
@@ -22274,3 +22365,120 @@ bounded protobuf capture service using the existing API image. Configuration
 checks, focused synthetic tests and real disposable API/collector acceptance are
 separate evidence layers. The controller reports timings and resource samples;
 no production overhead result is implied by implementation or unit tests.
+
+
+### scripts/verify/service_inventory.py
+
+```python
+"""Exact service inventory for the default and guarded telemetry verify modes."""
+import argparse
+from collections import Counter
+import json
+from pathlib import Path
+
+BASE = frozenset(('api', 'ollama', 'proxy', 'ui', 'weaviate'))
+TELEMETRY = frozenset(('otel-collector', 'otel-capture'))
+
+
+def check(config, running, all_services, mode='0', project='', profiles=''):
+    if mode not in ('0', '1'):
+        return ['unknown telemetry verification mode']
+    if mode == '1' and (project != 'rag-verify' or config.get('name') != 'rag-verify'
+                        or 'telemetry' not in profiles.split(',')):
+        return ['telemetry inventory requires the guarded rag-verify project and profile']
+    expected = BASE | (TELEMETRY if mode == '1' else frozenset())
+    problems = []
+    if set(config.get('services', {})) != expected:
+        problems.append('configured service inventory differs from the selected verification mode')
+    # Counter equality rejects replacements, unexpected services and duplicate
+    # containers rather than merely accepting any five/seven running names.
+    wanted = Counter({name: 1 for name in expected})
+    if Counter(all_services) != wanted:
+        problems.append('project service inventory has missing, duplicate or unexpected services')
+    if Counter(running) != wanted:
+        problems.append('running service inventory differs from the required exact set')
+    return problems
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('config', type=Path)
+    parser.add_argument('running', type=Path)
+    parser.add_argument('all_services', type=Path)
+    parser.add_argument('--mode', default='0')
+    parser.add_argument('--project', default='')
+    parser.add_argument('--profiles', default='')
+    args = parser.parse_args()
+    problems = check(json.loads(args.config.read_text()), args.running.read_text().splitlines(),
+                     args.all_services.read_text().splitlines(), args.mode, args.project, args.profiles)
+    for problem in problems:
+        print(problem)
+    raise SystemExit(bool(problems))
+
+
+if __name__ == '__main__':
+    main()
+```
+
+
+### scripts/tests/test_service_inventory.py
+
+```python
+"""Default/optional infrastructure inventory acceptance without Docker."""
+import importlib.util
+from pathlib import Path
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location('inventory', ROOT/'scripts/verify/service_inventory.py')
+INVENTORY = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(INVENTORY)
+
+
+class InventoryTests(unittest.TestCase):
+    def fixture(self, telemetry=False):
+        names = sorted(INVENTORY.BASE | (INVENTORY.TELEMETRY if telemetry else frozenset()))
+        config = {'name':'rag-verify', 'services':{name:{} for name in names}}
+        return config,names
+
+    def test_default_exact_five(self):
+        config,names = self.fixture()
+        self.assertEqual(INVENTORY.check(config,names,names),[])
+
+    def test_guarded_telemetry_exact_seven(self):
+        config,names = self.fixture(True)
+        self.assertEqual(INVENTORY.check(config,names,names,'1','rag-verify','telemetry'),[])
+
+    def test_same_count_replacement_does_not_pass(self):
+        for mode in (False,True):
+            with self.subTest(telemetry=mode):
+                config,names = self.fixture(mode)
+                replaced = ['unexpected' if n=='api' else n for n in names]
+                self.assertTrue(INVENTORY.check(config,replaced,replaced,str(int(mode)),'rag-verify','telemetry'))
+
+    def test_missing_stopped_duplicate_or_extra_service_is_refused(self):
+        config,names = self.fixture(True)
+        for running,all_services in [(names[:-1],names),(names,names+['orphan']),
+                                     (names+['api'],names+['api']), (names[:-1],names[:-1])]:
+            with self.subTest(running=running,all_services=all_services):
+                self.assertTrue(INVENTORY.check(config,running,all_services,'1','rag-verify','telemetry'))
+
+    def test_default_cannot_silently_accept_optional_services(self):
+        config,names = self.fixture(True)
+        self.assertTrue(INVENTORY.check(config,names,names))
+
+    def test_mode_requires_project_and_profile(self):
+        config,names = self.fixture(True)
+        for mode,project,profiles in [('1','rag-docker','telemetry'),('1','rag-verify',''),('anything','rag-verify','telemetry')]:
+            with self.subTest(mode=mode,project=project,profiles=profiles):
+                self.assertTrue(INVENTORY.check(config,names,names,mode,project,profiles))
+
+    def test_unexpected_configured_service_refused_even_when_not_running(self):
+        config,names = self.fixture(True)
+        config['services']['surprise'] = {}
+        self.assertTrue(INVENTORY.check(config,names,names,'1','rag-verify','telemetry'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```

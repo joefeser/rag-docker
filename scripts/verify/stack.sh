@@ -534,9 +534,14 @@ do_up() {
   done
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
+  if [ "$TELEMETRY" = 1 ]; then
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+      printf 'export %s=%q\n' "$var" "${!var}"
+    done
+  fi
   printf '\n'
 }
 

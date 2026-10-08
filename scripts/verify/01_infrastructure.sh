@@ -16,6 +16,8 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
 check "OTel operational metrics and sanitized correlated logs" $?
+python3 "$REPO_ROOT/scripts/tests/test_service_inventory.py"
+check "exact default/telemetry infrastructure inventory policy" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
 
@@ -91,9 +93,18 @@ for svc in api weaviate; do
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
-# ── five services, all reporting healthy where a healthcheck exists ──────────
-running=$( (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) | grep -c .)
-check_eq "five services are running" "$running" "5"
+# ── exact service inventory for this guarded verification mode ──────────────
+# The default is exactly api/ollama/proxy/ui/weaviate. Only --telemetry adds
+# otel-collector and otel-capture; arbitrary five/seven services cannot pass.
+verify_service_inventory() {
+  (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) > "$RAG_INFRA_TMP/vfy_running_services" || return 1
+  (cd "$REPO_ROOT" && docker compose ps --all --services) > "$RAG_INFRA_TMP/vfy_all_services" || return 1
+  python3 "$REPO_ROOT/scripts/verify/service_inventory.py" \
+    "$RAG_INFRA_TMP/vfy_compose.json" "$RAG_INFRA_TMP/vfy_running_services" "$RAG_INFRA_TMP/vfy_all_services" \
+    --mode "${RAG_VERIFY_TELEMETRY:-0}" --project "${COMPOSE_PROJECT_NAME:-}" --profiles "${COMPOSE_PROFILES:-}"
+}
+verify_service_inventory
+check "exact configured and running service inventory for verification mode" $?
 unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
@@ -192,6 +203,8 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Wait up to twice the limit, so a slow restart is still timed (#130).
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   restart_timing_check "$restart_limit" "$elapsed"
+  verify_service_inventory
+  check "exact service inventory survives restart" $?
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -282,6 +295,8 @@ ENDPY
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
   check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
+  verify_service_inventory
+  check "exact service inventory survives snapshot restart" $?
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
