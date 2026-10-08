@@ -1252,6 +1252,7 @@ re-ingesting the same document stores one copy and records the extra logical
 name. Storage is proportional to the corpus rather than to upload count.
 """
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -1355,6 +1356,7 @@ def restore_package(package: Path, collection: str) -> None:
     shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
 
 
+@telemetry.traced("rag.retain")
 def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
     """Retain one accepted upload. Returns its sha256."""
     digest = hashlib.sha256(data).hexdigest()
@@ -1633,6 +1635,7 @@ def delete(collection: str) -> None:
 ```python
 """Completed-batch checks with bounded, disk-backed record expectations."""
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -1815,10 +1818,10 @@ class ExpectedRecords:
 
         def stored_objects():
             if exact:
-                yield from collection.iterator(include_vector=True)
+                yield from telemetry.iterate(collection.iterator, include_vector=True)
             else:
                 for ids in self.id_batches():
-                    yield from collection.query.fetch_objects(
+                    yield from telemetry.call("weaviate.query", collection.query.fetch_objects,
                         filters=Filter.by_id().contains_any(ids), limit=len(ids), include_vector=True).objects
 
         for obj in stored_objects():
@@ -1837,7 +1840,7 @@ class ExpectedRecords:
             if stored_vector is None and vector is None:
                 if vectorless_allowed is None:
                     config = getattr(collection, "config", None)
-                    vectorizer = config.get().vectorizer if config is not None else None
+                    vectorizer = telemetry.call("weaviate.config", config.get).vectorizer if config is not None else None
                     vectorless_allowed = getattr(vectorizer, "value", None) == "none"
                 if not vectorless_allowed:
                     raise BatchVerificationError(f"Stored vector is missing or invalid for {key}")
@@ -1857,10 +1860,10 @@ class ExpectedRecords:
 
     def rollback(self, collection):
         for ids in self.id_batches():
-            result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
+            result = telemetry.call("weaviate.query", collection.data.delete_many, where=Filter.by_id().contains_any(ids))
             if result.failed:
                 raise RuntimeError(f"Could not remove {result.failed} owned ingestion object(s)")
-            remaining = collection.query.fetch_objects(filters=Filter.by_id().contains_any(ids), limit=len(ids))
+            remaining = telemetry.call("weaviate.query", collection.query.fetch_objects, filters=Filter.by_id().contains_any(ids), limit=len(ids))
             if remaining.objects:
                 raise RuntimeError("Owned ingestion objects remain after cleanup")
 
@@ -1883,19 +1886,20 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
         expected.capture(factory, expected_count, generated_only=cleanup_owned)
         try:
             queued = 0
-            with collection.batch.dynamic() as batch:
-                for position, record in enumerate(factory()):
-                    record = expected.prepare(position, record)
-                    batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
-                    queued += 1
-                if queued != expected.count:
-                    raise ValueError("Record stream changed after preflight")
-            failed = collection.batch.failed_objects
-            if failed:
-                detail = getattr(failed[0], "message", None)
-                raise RuntimeError(
-                    f"Weaviate rejected {len(failed)} batch object(s)"
-                    + (f": {detail}" if detail else ""))
+            with telemetry.span("weaviate.batch"):
+                with collection.batch.dynamic() as batch:
+                    for position, record in enumerate(factory()):
+                        record = expected.prepare(position, record)
+                        batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
+                        queued += 1
+                    if queued != expected.count:
+                        raise ValueError("Record stream changed after preflight")
+                failed = collection.batch.failed_objects
+                if failed:
+                    detail = getattr(failed[0], "message", None)
+                    raise RuntimeError(
+                        f"Weaviate rejected {len(failed)} batch object(s)"
+                        + (f": {detail}" if detail else ""))
             return expected.verify(collection, exact=exact)
         except Exception as original:
             if cleanup_owned:
@@ -1916,6 +1920,7 @@ allows startup to remove scratch; recovery records survive until explicit
 collection deletion or successful completion of their owning operation.
 """
 from __future__ import annotations
+from services import telemetry
 
 import json
 import logging
@@ -1969,7 +1974,7 @@ def begin(target: str, operation: str, client) -> dict:
     token = uuid.uuid4().hex
     marker = "__importing_" if operation == "import" else "__tuning_"
     staging = f"{target}{marker}{token}"
-    if client.collections.exists(staging):
+    if telemetry.call("weaviate.exists", client.collections.exists, staging):
         raise RuntimeError(f"Recovery name '{staging}' is already in use")
     record = dict(version=1, operation_id=token, operation=operation,
                   target=target, staging=staging, state="scratch")
@@ -2062,17 +2067,17 @@ def _check_tuning_cutover(record: dict, client) -> None:
     """Check the owned target without deleting data based on mutable recovery."""
     from services import batch_write, goldstandard
     target, staging = record["target"], record["staging"]
-    if not client.collections.exists(staging):
+    if not telemetry.call("weaviate.exists", client.collections.exists, staging):
         log.warning("Tuning recovery %r is unavailable; target and journal preserved", staging)
         return
-    if client.collections.exists(target):
+    if telemetry.call("weaviate.exists", client.collections.exists, target):
         collection = client.collections.get(target)
-        if collection.config.get().description != cutover_description(record):
+        if telemetry.call("weaviate.config", collection.config.get).description != cutover_description(record):
             log.warning("Tuning target %r has another instance; preserved", target)
             _finish_cutover_check(record, "other-instance")
             return
         def expected():
-            for obj in client.collections.get(staging).iterator(include_vector=True):
+            for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True):
                 vector = obj.vector
                 if isinstance(vector, dict):
                     if set(vector) != {"default"}:
@@ -2113,8 +2118,8 @@ def discard(record: dict, client) -> None:
         _write(updated)
         record.update(updated)
     name = record["staging"]
-    if client.collections.exists(name):
-        client.collections.delete(name)
+    if telemetry.call("weaviate.exists", client.collections.exists, name):
+        telemetry.call("weaviate.delete", client.collections.delete, name)
     sources.delete(name)
     if sources.collection_dir(name).exists():
         raise OSError(f"Could not remove recovery sources for {name}")
@@ -2184,6 +2189,7 @@ def sweep(client) -> list[str]:
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import logging
 import threading
@@ -2233,7 +2239,7 @@ def get_client() -> weaviate.WeaviateClient:
                     _client.close()
                 except Exception:
                     pass
-            _client = weaviate.connect_to_custom(
+            _client = telemetry.call("weaviate.connect", weaviate.connect_to_custom,
                 http_host=settings.weaviate_host,
                 http_port=settings.weaviate_port,
                 http_secure=False,
@@ -2262,7 +2268,11 @@ def _check_health_sync() -> bool:
     during a total outage of Weaviate functionality.
     """
     client = get_client()
-    return bool(client.is_ready())
+    with telemetry.span("weaviate.health"):
+        ready = bool(client.is_ready())
+        if not ready:
+            telemetry.outcome("error")
+        return ready
 
 
 async def check_health() -> bool:
@@ -2302,7 +2312,7 @@ def _create_collection_sync(
         vectorize_collection_name=False,
     )
 
-    client.collections.create(
+    telemetry.call("weaviate.create", client.collections.create,
         name=name,
         # Set only by import, to bind its in-progress marker to this instance.
         description=description,
@@ -2324,7 +2334,7 @@ async def create_collection(
 
 
 def _collection_exists_sync(name: str) -> bool:
-    return get_client().collections.exists(name)
+    return telemetry.call("weaviate.exists", get_client().collections.exists, name)
 
 
 async def collection_exists(name: str) -> bool:
@@ -2335,9 +2345,9 @@ async def collection_exists(name: str) -> bool:
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
-    canonical_name = coll.config.get().name
-    count = coll.aggregate.over_all(total_count=True).total_count
-    client.collections.delete(canonical_name)
+    canonical_name = telemetry.call("weaviate.config", coll.config.get).name
+    count = telemetry.call("weaviate.aggregate", coll.aggregate.over_all, total_count=True).total_count
+    telemetry.call("weaviate.delete", client.collections.delete, canonical_name)
     collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
@@ -2366,16 +2376,16 @@ async def delete_collection(name: str) -> int:
 
 def _get_collections_sync() -> list[dict]:
     client = get_client()
-    all_cols = client.collections.list_all()
+    all_cols = telemetry.call("weaviate.list", client.collections.list_all)
     result = []
     for col_name in all_cols:
         coll = client.collections.get(col_name)
-        count = coll.aggregate.over_all(total_count=True).total_count or 0
+        count = telemetry.call("weaviate.aggregate", coll.aggregate.over_all, total_count=True).total_count or 0
 
         # list_all() returns _CollectionConfigSimple, which does NOT carry
         # vector_index_config (weaviate-client 4.x dropped it from the reduced
         # config). Fetch the full per-collection config for the index details.
-        vector_config = coll.config.get().vector_index_config
+        vector_config = telemetry.call("weaviate.config", coll.config.get).vector_index_config
         index_name = type(vector_config).__name__.lower()
         hnsw_fields = tuple(
             getattr(vector_config, field, None)
@@ -2426,7 +2436,7 @@ async def sweep_staging() -> list[str]:
 def _meta_sync() -> dict:
     """Server metadata. `version` goes into the export manifest."""
     try:
-        return get_client().get_meta() or {}
+        return telemetry.call("weaviate.meta", get_client().get_meta) or {}
     except Exception:
         return {}
 
@@ -2442,7 +2452,7 @@ def _collection_config_sync(name: str) -> dict:
     recreate the collection by feeding this straight back in.
     """
     coll = get_client().collections.get(name)
-    cfg = coll.config.get()
+    cfg = telemetry.call("weaviate.config", coll.config.get)
     vi = cfg.vector_index_config
     vectorizer = getattr(cfg, "vectorizer_config", None)
     kind = getattr(vectorizer, "vectorizer", None)
@@ -2489,7 +2499,7 @@ async def get_collection_config(name: str) -> dict:
 
 def _validate_reindex_vectorizer_sync(name: str) -> None:
     """Fail before staging if recreation would change the stored vector space."""
-    cfg = get_client().collections.get(name).config.get()
+    cfg = telemetry.call("weaviate.config", get_client().collections.get(name).config.get)
     vectorizer = getattr(cfg, "vectorizer_config", None)
     kind = getattr(vectorizer, "vectorizer", None)
     model = getattr(vectorizer, "model", None)
@@ -2530,6 +2540,7 @@ _INSERT_ATTEMPTS = 3
 _INSERT_RETRY_DELAY = 1.0
 
 
+@telemetry.traced("rag.store")
 @collection_writes.serialized("collection_name")
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
@@ -2560,7 +2571,7 @@ def _near_vector_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.near_vector(
+    result = telemetry.call("weaviate.query", coll.query.near_vector,
         near_vector=vector,
         limit=top_k,
         return_metadata=MetadataQuery(distance=True),
@@ -2589,7 +2600,7 @@ def _near_text_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.near_text(
+    result = telemetry.call("weaviate.query", coll.query.near_text,
         query=query,
         limit=top_k,
         return_metadata=MetadataQuery(distance=True),
@@ -2618,7 +2629,7 @@ def _hybrid_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.hybrid(
+    result = telemetry.call("weaviate.query", coll.query.hybrid,
         query=query,
         alpha=alpha,
         limit=top_k,
@@ -2651,14 +2662,14 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
     from services.chunk_sampling import select_chunk_ids
     request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
-    if not client.collections.exists(collection_name):
+    if not telemetry.call("weaviate.exists", client.collections.exists, collection_name):
         raise CollectionNotFoundError(collection_name)
     coll = client.collections.get(collection_name)
-    objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
+    objects = telemetry.iterate(coll.iterator, include_vector=False, return_properties=[], cache_size=100)
     identities = select_chunk_ids(objects, request.sample_size, request.seed)
     if not identities:
         return []
-    payloads = coll.query.fetch_objects(
+    payloads = telemetry.call("weaviate.query", coll.query.fetch_objects,
         filters=Filter.by_id().contains_any(identities), limit=len(identities),
         include_vector=False, return_properties=["content", "source_file", "chunk_index"],
     ).objects
@@ -2674,6 +2685,7 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import time
 
 import httpx
@@ -2683,6 +2695,7 @@ from config import settings
 _BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
 
 
+@telemetry.traced("ollama.embed")
 async def embed(text: str) -> list[float]:
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
@@ -2693,6 +2706,7 @@ async def embed(text: str) -> list[float]:
         return resp.json()["embedding"]
 
 
+@telemetry.traced("ollama.chat")
 async def chat(system: str, user: str) -> str:
     async with httpx.AsyncClient(timeout=300.0) as client:
         resp = await client.post(
@@ -2710,6 +2724,7 @@ async def chat(system: str, user: str) -> str:
         return resp.json()["message"]["content"]
 
 
+@telemetry.traced("ollama.models")
 async def list_models() -> set[str]:
     """Full names (`name:tag`) of the models Ollama reports."""
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -2718,6 +2733,7 @@ async def list_models() -> set[str]:
         return {m["name"] for m in resp.json().get("models", [])}
 
 
+@telemetry.traced("ollama.health")
 async def check_health() -> dict:
     start = time.monotonic()
     try:
@@ -2728,11 +2744,14 @@ async def check_health() -> dict:
             models = {m["name"].split(":")[0] for m in resp.json().get("models", [])}
             llm_ok = settings.llm_model.split(":")[0] in models
             embed_ok = settings.embed_model.split(":")[0] in models
+            if not (llm_ok and embed_ok):
+                telemetry.outcome("error")
             return {
                 "llm": {"status": "ok" if llm_ok else "error", "latency_ms": latency_ms, "model": settings.llm_model},
                 "embed": {"status": "ok" if embed_ok else "error", "latency_ms": latency_ms, "model": settings.embed_model},
             }
-    except Exception:
+    except Exception as exc:
+        telemetry.outcome("error", exc)
         latency_ms = int((time.monotonic() - start) * 1000)
         return {
             "llm": {"status": "error", "latency_ms": latency_ms, "model": settings.llm_model},
@@ -2744,6 +2763,7 @@ async def check_health() -> dict:
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import threading
 from typing import Any
 from models.schemas import IngestConfig
@@ -2958,6 +2978,7 @@ def chunk_semantic(
     return _enforce_min_chunk_size(chunks, max(min_chunk_size, MIN_SEMANTIC_CHUNK_CHARACTERS))
 
 
+@telemetry.traced("rag.chunk")
 def chunk(
     text: str,
     strategy: str,
@@ -3007,6 +3028,7 @@ def chunk(
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import logging
 import mimetypes
@@ -3041,6 +3063,7 @@ def _save_upload(src, dest: Path) -> None:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
+@telemetry.traced("rag.parse")
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
     ext = path.suffix.lower()
     if ext == ".pdf":
@@ -3068,6 +3091,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+@telemetry.traced("rag.ingest")
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -3136,6 +3160,7 @@ def _process_job_sync(
                 job["chunks_stored"] += len(chunks)
                 job["files_completed"] += 1
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 job["files_failed"] += 1
                 job["errors"].append(f"{path.name}: {exc}")
     finally:
@@ -3145,6 +3170,7 @@ def _process_job_sync(
         job["status"] = "completed"
     elif job["files_failed"] == job["files_total"]:
         job["status"] = "failed"
+        telemetry.outcome("error")
     else:
         job["status"] = "partial"
 
@@ -3231,20 +3257,23 @@ async def start_ingest_job(
         "skipped": skipped,
     }
 
+    @telemetry.admitted
     def _on_done(future: asyncio.Future) -> None:
         if future.cancelled():
             return
         exc = future.exception()
         if exc is not None:
-            _log.error("ingest job %s failed: %s", job_id, exc)
-            job = _jobs.get(job_id)
-            if job and job["status"] not in ("completed", "partial", "failed"):
-                job["status"] = "failed"
-                job["errors"].append(str(exc))
+            with telemetry.span("rag.failure_report"):
+                telemetry.outcome("error", exc)
+                _log.error("ingest job %s failed: %s", job_id, exc)
+                job = _jobs.get(job_id)
+                if job and job["status"] not in ("completed", "partial", "failed"):
+                    job["status"] = "failed"
+                    job["errors"].append(str(exc))
 
     future = asyncio.get_running_loop().run_in_executor(
         None,
-        _process_job_sync,
+        telemetry.admitted(_process_job_sync),
         job_id,
         file_paths,
         tmp_dir,
@@ -3264,6 +3293,7 @@ async def start_ingest_job(
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import time
 
 from models.schemas import QueryRequest
@@ -3306,6 +3336,7 @@ def _build_context_engineer(chunks: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+@telemetry.traced("rag.query")
 async def run_query(
     question: str,
     collection: str,
@@ -3320,26 +3351,29 @@ async def run_query(
                           response_format=response_format)
     retrieval_mode, top_k, alpha, response_format = (
         config.retrieval_mode, config.top_k, config.alpha, config.response_format)
-    reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
-    reformulated = reformulated.strip()
+    with telemetry.span("rag.reformulate"):
+        reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
+        reformulated = reformulated.strip()
 
     t0 = time.monotonic()
-    if retrieval_mode in ("hnsw", "flat"):
-        vector = await ollama.embed(reformulated)
-        chunks = await wc.near_vector_query(collection, vector, top_k)
-    elif retrieval_mode == "hybrid":
-        chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
-    elif retrieval_mode == "semantic":
-        chunks = await wc.near_text_query(collection, reformulated, top_k)
+    with telemetry.span("rag.retrieval"):
+        if retrieval_mode in ("hnsw", "flat"):
+            vector = await ollama.embed(reformulated)
+            chunks = await wc.near_vector_query(collection, vector, top_k)
+        elif retrieval_mode == "hybrid":
+            chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
+        elif retrieval_mode == "semantic":
+            chunks = await wc.near_text_query(collection, reformulated, top_k)
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()
-    if response_format == "engineer":
-        context = _build_context_engineer(chunks)
-        answer = await ollama.chat(SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
-    else:
-        context = _build_context_end_user(chunks)
-        answer = await ollama.chat(SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+    with telemetry.span("rag.synthesis"):
+        if response_format == "engineer":
+            context = _build_context_engineer(chunks)
+            answer = await ollama.chat(SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+        else:
+            context = _build_context_end_user(chunks)
+            answer = await ollama.chat(SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
     llm_ms = int((time.monotonic() - t1) * 1000)
 
     citations = None
@@ -3412,6 +3446,7 @@ def select_chunk_ids(objects, limit: int, seed: int | None = None) -> list[str]:
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import json
 import logging
@@ -4102,6 +4137,7 @@ _GENERATION_ATTEMPTS = 3
 _REGENERATION_TIMEOUT_SECONDS = 1800
 
 
+@telemetry.traced("rag.pair")
 async def _generate_pair(chunk: dict) -> dict:
     user_msg = f"Chunk:\n{chunk['content']}"
     data = None
@@ -4162,11 +4198,13 @@ def _publish_generation_failure(session_id: str, exc: Exception, write_error: Ex
         _store_revision += 1
 
 
+@telemetry.traced("rag.failure_report")
 async def _record_generation_failure(session_id: str, exc: Exception) -> None:
     try:
         await asyncio.to_thread(_update_session_sync, session_id,
                                 lambda current: _failed_generation(current, exc))
     except Exception as write_error:
+        telemetry.outcome("error", write_error)
         log.exception("Could not durably report failed generation for %s", session_id)
         # Otherwise `generating` stays in the cache for as long as the fault
         # lasts, and the UI polls it forever. The cache runs ahead of disk;
@@ -4178,6 +4216,7 @@ async def _record_generation_failure(session_id: str, exc: Exception) -> None:
             log.exception("Could not publish failed generation for %s", session_id)
 
 
+@telemetry.traced("rag.evaluation")
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
     cancelled = False
     persistence_failure = None
@@ -4189,6 +4228,7 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
                 cancelled = True
                 raise
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 log.warning("Gold-standard pair generation failed: %s", reason, exc_info=True)
                 def failed(current):
@@ -4216,6 +4256,8 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
             if current.get("status") == "generating":
                 current["status"] = ("cancelled" if cancelled else
                     "failed" if not current["pairs"] and current.get("errors") else "completed")
+            if current.get("status") == "failed":
+                telemetry.outcome("error")
         await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
@@ -4264,14 +4306,16 @@ async def start_generation(
         _prepare_generation_sync, collection, request.sample_size, request.seed)
     session_id = session["session_id"]
 
-    task = asyncio.create_task(_run_generation(session_id, all_chunks))
+    task = asyncio.create_task(telemetry.admitted(_run_generation)(session_id, all_chunks))
     _tasks.add(task)
+
+    report_failure = telemetry.admitted(_record_generation_failure)
 
     def _on_task_done(t: asyncio.Task) -> None:
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            reporter = asyncio.create_task(report_failure(session_id, exc))
             _tasks.add(reporter)
             reporter.add_done_callback(_tasks.discard)
 
@@ -4295,6 +4339,7 @@ async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | No
     return await asyncio.to_thread(_update_session_sync, session_id, change)
 
 
+@telemetry.traced("rag.regenerate")
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     session = get_session(session_id)
     if session is None:
@@ -4419,6 +4464,7 @@ from drifting.
 Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 """
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -4509,7 +4555,7 @@ def read_chunks(collection: str) -> Iterator[dict]:
         for name in entry.get("filenames", []):
             by_filename.setdefault(name, []).append(digest)
 
-    for obj in col.iterator(include_vector=True):
+    for obj in telemetry.iterate(col.iterator, include_vector=True):
         vector = obj.vector
         # Verified against the live stack: iterator() yields a dict keyed by
         # vector name, not a bare list. Code written for a list breaks here.
@@ -4673,6 +4719,7 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"answer style `{cfg['response_format']}`.")
 
 
+@telemetry.traced("rag.package")
 def build(
     collection: str,
     include_models: bool = False,
@@ -4963,6 +5010,7 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     tar.extractall(dest)
 
 
+@telemetry.traced("rag.package")
 def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
@@ -5010,6 +5058,7 @@ def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     return pkg, manifest
 
 
+@telemetry.traced("rag.validate")
 def verify_digests(pkg: Path, manifest: dict) -> None:
     """Check 3 of spec §6.2. Names the first file that fails."""
     for rel, expected in sorted(manifest.get("files", {}).items()):
@@ -5054,6 +5103,7 @@ never overlap — they would race on the staging directory and the temporary
 archive.
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import logging
@@ -5079,6 +5129,7 @@ def active_job_for(collection: str) -> str | None:
         return _active.get(collection)
 
 
+@telemetry.traced("rag.export")
 def _run(job_id: str, collection: str, include_models: bool) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -5089,10 +5140,12 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
     except packager.PackageError as exc:
+        telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
         job.update(status="failed", error=f"PackageError: {exc.message}",
                    error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
+        telemetry.outcome("error", exc)
         _log.exception("Export of %r failed", collection)
         job["status"] = "failed"
         job["error"] = f"{type(exc).__name__}: {exc}"
@@ -5147,7 +5200,7 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
     return job_id
 ```
 
@@ -5177,6 +5230,7 @@ depending on whether there is anything to protect:
   is recoverable rather than lost.
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import json
@@ -5359,7 +5413,7 @@ def sweep_interrupted_imports() -> list[str]:
                     expected.load_snapshot(snapshot, data["expected_chunks"])
                     if wc._collection_exists_sync(collection):
                         col = wc.get_client().collections.get(collection)
-                        if col.config.get().description != _instance_description(data["instance"]):
+                        if telemetry.call("weaviate.config", col.config.get).description != _instance_description(data["instance"]):
                             # Created after the import stopped, for example while
                             # an earlier start could not resolve this marker.
                             _log.warning("Collection %r is not the one the interrupted import "
@@ -5368,7 +5422,7 @@ def sweep_interrupted_imports() -> list[str]:
                             try:
                                 expected.verify(col, exact=True)
                             except batch_write.BatchVerificationError:
-                                wc.get_client().collections.delete(collection)
+                                telemetry.call("weaviate.delete", wc.get_client().collections.delete, collection)
                                 removed.append(f"{collection} (persisted records did not match import)")
             # Cleanup is an explicit durable phase: failure here never converts
             # a verified target back into a candidate for backend deletion.
@@ -5661,6 +5715,7 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     return written
 
 
+@telemetry.traced("rag.validate")
 def _validate_package_sources(pkg: Path, manifest: dict) -> None:
     """Check source identities after verify_digests, before any live mutation."""
     source_dir = pkg / "sources"
@@ -5816,6 +5871,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     return notes
 
 
+@telemetry.traced("rag.rebuild")
 @collection_writes.serialized("target")
 def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | None = None) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
@@ -5825,7 +5881,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
     except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
-            wc.get_client().collections.delete(target)
+            telemetry.call("weaviate.delete", wc.get_client().collections.delete, target)
         except Exception as cleanup:
             raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
                                f"partial target cleanup failed ({cleanup})",
@@ -5833,6 +5889,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
+@telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -5931,6 +5988,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                        notes=notes)
 
     except PackageError as exc:
+        telemetry.outcome("error", exc)
         job.update(status="failed", error_code=exc.code, error=exc.message,
                    error_detail=exc.detail)
         if staged and temp_collection:
@@ -5941,6 +5999,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
+        telemetry.outcome("error", exc)
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
                    error=f"{type(exc).__name__}: {exc}")
@@ -5991,7 +6050,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
     return job_id
 ```
 
@@ -6278,6 +6337,7 @@ the collection `stale`, with a reason and a timestamp. Sessions are never
 deleted and never remapped (spec §7.3).
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import copy
@@ -6317,7 +6377,7 @@ def get_job(job_id: str) -> dict | None:
 def _existing_chunks(collection: str) -> list[dict]:
     """Stored properties, without vectors. Used when re-embedding chunk text."""
     col = wc.get_client().collections.get(collection)
-    return [dict(o.properties or {}) for o in col.iterator()]
+    return [dict(o.properties or {}) for o in telemetry.iterate(col.iterator)]
 
 
 def _existing_records(collection: str) -> list[dict]:
@@ -6328,7 +6388,7 @@ def _existing_records(collection: str) -> list[dict]:
 def _iter_existing_records(collection: str):
     seen = set()
     col = wc.get_client().collections.get(collection)
-    for obj in col.iterator(include_vector=True):
+    for obj in telemetry.iterate(col.iterator, include_vector=True):
         identity = str(obj.uuid)
         vector = obj.vector
         if isinstance(vector, dict):
@@ -6349,12 +6409,13 @@ def _iter_existing_records(collection: str):
 def _write_records(collection: str, records: list[dict]) -> None:
     """Supply exact records, drain the batch, then compare backend readback."""
     col = wc.get_client().collections.get(collection)
-    with col.batch.dynamic() as batch:
-        for record in records:
-            batch.add_object(properties=copy.deepcopy(record["properties"]),
-                             uuid=record["id"], vector=copy.deepcopy(record["vector"]))
-    if batch.number_errors:
-        raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
+    with telemetry.span("weaviate.batch"):
+        with col.batch.dynamic() as batch:
+            for record in records:
+                batch.add_object(properties=copy.deepcopy(record["properties"]),
+                                 uuid=record["id"], vector=copy.deepcopy(record["vector"]))
+        if batch.number_errors:
+            raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
     _verify_records(collection, records)
 
 
@@ -6385,7 +6446,7 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
             by_filename.setdefault(filename, []).append(digest)
     seen: dict[str, set] = {}
     uncovered = set()
-    for obj in wc.get_client().collections.get(collection).iterator():
+    for obj in telemetry.iterate(wc.get_client().collections.get(collection).iterator):
         props = obj.properties or {}
         filename = props.get("source_file")
         if not isinstance(filename, str) or not filename:
@@ -6420,6 +6481,7 @@ def can_rechunk(collection: str) -> bool:
     return not _uncovered_source_files(collection, documents)
 
 
+@telemetry.traced("rag.chunk")
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -6508,6 +6570,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
+@telemetry.traced("rag.rebuild")
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None,
@@ -6520,7 +6583,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
-    hnsw = config.get("hnsw_config") or {}
+    hnsw = telemetry.call("weaviate.config", config.get, "hnsw_config") or {}
     client = wc.get_client()
     ownership = collection_recovery.begin(collection, "tune", client)
     staging = ownership["staging"]
@@ -6536,7 +6599,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             _verify_records(collection, records)
         else:
             wc._insert_chunks_sync(staging, properties)
-            staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+            staged_count = telemetry.call("weaviate.aggregate", client.collections.get(staging).aggregate.over_all, total_count=True).total_count
             if staged_count != len(properties):
                 raise RuntimeError(f"staged {staged_count} chunks but expected {len(properties)}")
         if source_collection != collection:
@@ -6547,7 +6610,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             before_replace()
         collection_recovery.begin_cutover(ownership)
         cutover_started = True
-        client.collections.delete(collection)
+        telemetry.call("weaviate.delete", client.collections.delete, collection)
         wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True,
                                    description=collection_recovery.cutover_description(ownership))
         if records is not None:
@@ -6558,7 +6621,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 return (
                     {"id": str(obj.uuid), "vector": (obj.vector or {}).get("default"),
                      "properties": dict(obj.properties or {})}
-                    for obj in client.collections.get(staging).iterator(include_vector=True)
+                    for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True)
                 )
             written = batch_write.insert(client.collections.get(collection), staged,
                                          expected_count=len(properties))
@@ -6604,8 +6667,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 _log.exception("Could not remove owned staging collection %r", staging)
 
 
+@telemetry.traced("rag.tuning")
 @collection_writes.serialized("collection")
 def _run(job_id: str, collection: str, operation: str, params: dict, *, source_collection: str | None = None) -> None:
+    telemetry.attribute("rag.tuning_operation", operation)
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
@@ -6682,9 +6747,11 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         job.update(status="completed", chunks_written=written, notes=notes)
 
     except PackageError as exc:
+        telemetry.outcome("error", exc)
         job.update(status="failed", error_code=exc.code, error=exc.message,
                    error_detail=exc.detail)
     except Exception as exc:                          # noqa: BLE001
+        telemetry.outcome("error", exc)
         _log.exception("Tuning %r on %r failed", operation, collection)
         job.update(status="failed", error_code="TUNE_FAILED",
                    error=f"{type(exc).__name__}: {exc}")
@@ -6714,7 +6781,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, operation, params, source_collection=source_collection))
     return job_id
 ```
 
@@ -8190,12 +8257,15 @@ async def request_validation_error(request, exc):
               for error in exc.errors()]
     return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
+from services.telemetry import RequestTracing
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestTracing)
 
 from routers import help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
@@ -11132,7 +11202,15 @@ Suite 01 runs `scripts/tests/test_telemetry.py` in the built API image with
 Checks cover SDK traces/logs/metrics, sentinel privacy across schema surfaces,
 configuration/no-op behavior, overload and bounded lifecycle failure. It also
 checks embedded copies with `scripts/tests/test_telemetry_implementation.py`.
-This does not claim application request/job instrumentation or collector setup.
+Suite 01 also runs `scripts/tests/test_tracing.py` for #283 in the same isolated
+API image. Synthetic real ASGI and service launchers exercise all five background
+job families, raw executor/task/thread propagation, correlation after 202,
+concurrent isolation, partial/handled errors, generation failure reporting,
+regeneration timeout, async cancellation and a surviving thread waiter. Tests
+cover actual Ollama client errors, iterator/batch boundaries, finite routes,
+untrusted headers, disabled/failing telemetry and sanitized OTLP links. Backend
+operations are faked; no collector setup or full deployed end-to-end claim is
+made by these offline tests.
 ````
 
 ### scripts/verify/all.sh
@@ -12631,6 +12709,8 @@ section "§10.5 Infrastructure"
 # external network is needed and no request payload from the stack is captured.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry.py)
 check "OTel configuration, safe OTLP export and bounded lifecycle" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_tracing.py)
+check "OTel request, worker and dependency trace continuity" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
 
@@ -20409,10 +20489,24 @@ class Config:
 # Finite value vocabularies prevent sensitive values hidden under approved keys.
 ENUMS = {
     "rag.operation": frozenset(("startup", "query", "ingest", "export", "import", "tuning", "evaluation")),
-    "rag.outcome": frozenset(("ok", "error", "cancelled")),
+    "rag.outcome": frozenset(("ok", "error", "cancelled", "partial")),
     "error.type": frozenset(("timeout", "connection", "validation", "internal")),
 }
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
+
+# Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ENUMS.update({"http.route": ROUTES | {"unmatched"},
+              "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
+              "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
+SPAN_NAMES |= ROUTES | frozenset(("rag.request", "rag.reformulate", "rag.retrieval", "rag.synthesis",
+    "rag.parse", "rag.chunk", "rag.store", "rag.retain", "rag.package", "rag.validate",
+    "rag.rebuild", "rag.pair", "rag.regenerate", "rag.failure_report",
+    "ollama.chat", "ollama.embed", "ollama.models", "ollama.health",
+    "weaviate.connect", "weaviate.health", "weaviate.create", "weaviate.delete",
+    "weaviate.exists", "weaviate.list", "weaviate.meta", "weaviate.config",
+    "weaviate.aggregate", "weaviate.query", "weaviate.iterate", "weaviate.batch"))
+
 METRIC_NAMES = frozenset(("rag.telemetry.check",))
 
 
@@ -20463,6 +20557,9 @@ def sanitize_wire(data, signal, config):
                     dest.kind = record.kind
                     dest.status.code = record.status.code
                     attrs(record.attributes, dest.attributes)
+                    for link in record.links[:1]:
+                        if len(link.trace_id) == 16 and any(link.trace_id) and len(link.span_id) == 8 and any(link.span_id):
+                            dest.links.add(trace_id=link.trace_id, span_id=link.span_id, flags=link.flags & 1)
                 elif signal == "logs":
                     dest.time_unix_nano, dest.observed_time_unix_nano = record.time_unix_nano, record.observed_time_unix_nano
                     dest.trace_id, dest.span_id = record.trace_id, record.span_id
@@ -20617,6 +20714,7 @@ def bootstrap(env=None):
             clean = ReadableSpan(
                 name=span.name if span.name in SPAN_NAMES else "rag.operation",
                 context=span.context, parent=span.parent, resource=resource,
+                links=safe_links(span.links),
                 attributes=safe_attributes(span.attributes), kind=span.kind,
                 status=Status(span.status.status_code), start_time=span.start_time,
                 end_time=span.end_time, instrumentation_scope=span.instrumentation_scope)
@@ -20650,7 +20748,7 @@ def bootstrap(env=None):
         if config.traces:
             provider = TracerProvider(resource=resource, shutdown_on_exit=False, meter_provider=internal_meter,
                                      sampler=TraceIdRatioBased(config.sample_ratio),
-                                     span_limits=SpanLimits(max_attributes=16, max_events=0, max_links=0,
+                                     span_limits=SpanLimits(max_attributes=16, max_events=0, max_links=1,
                                                             max_attribute_length=128))
             runtime.providers.append(provider)
             provider.add_span_processor(SafeBatchSpans(exporter(OTLPSpanExporter, "traces"), **batch))
@@ -20673,6 +20771,274 @@ def bootstrap(env=None):
         runtime.shutdown()
         raise TelemetryConfigError("Telemetry initialization failed") from None
     return runtime
+
+
+# App-scoped manual instrumentation. No global provider or request baggage.
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
+import inspect
+
+_runtime = ContextVar("rag_telemetry_runtime", default=None)
+
+
+def safe_links(links):
+    from opentelemetry.trace import Link, SpanContext, TraceFlags, TraceState
+    result = []
+    for link in links[:1]:
+        c = link.context
+        if c.is_valid:
+            clean = SpanContext(c.trace_id, c.span_id, c.is_remote,
+                                TraceFlags(int(c.trace_flags) & 1), TraceState())
+            result.append(Link(clean))
+    return result
+
+
+def capture():
+    runtime = _runtime.get()
+    if runtime is None or runtime.tracer is None:
+        return runtime, None
+    from opentelemetry.trace import get_current_span
+    try:
+        return runtime, get_current_span().get_span_context()
+    except Exception:
+        return runtime, None
+
+
+@contextmanager
+def bind(snapshot):
+    runtime, parent = snapshot
+    token = _runtime.set(runtime)
+    attached = None
+    try:
+        try:
+            if runtime is not None and runtime.tracer is not None:
+                from opentelemetry import context, trace
+                clean = context.Context()
+                if parent is not None and parent.is_valid:
+                    clean = trace.set_span_in_context(trace.NonRecordingSpan(parent), clean)
+                attached = context.attach(clean)
+        except Exception:
+            pass
+        yield
+    finally:
+        if attached is not None:
+            try:
+                context.detach(attached)
+            except Exception:
+                pass
+        _runtime.reset(token)
+
+
+def admitted(fn):
+    """Capture now, bind inside actual execution (including raw executors)."""
+    snapshot = capture()
+    if inspect.iscoroutinefunction(fn):
+        @wraps(fn)
+        async def run(*args, **kwargs):
+            with bind(snapshot):
+                return await fn(*args, **kwargs)
+    else:
+        @wraps(fn)
+        def run(*args, **kwargs):
+            with bind(snapshot):
+                return fn(*args, **kwargs)
+    return run
+
+
+def error_type(exc):
+    import asyncio
+    import httpx
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)) or isinstance(exc.__cause__, (TimeoutError, httpx.TimeoutException)):
+        return "timeout"
+    if isinstance(exc, (ConnectionError, httpx.TransportError)):
+        return "connection"
+    if isinstance(exc, ValueError):
+        return "validation"
+    return "internal"
+
+
+def attribute(key, value, target=None):
+    if key not in ENUMS or value not in ENUMS[key]:
+        return
+    try:
+        if target is None:
+            runtime = _runtime.get()
+            if runtime is None or runtime.tracer is None:
+                return
+            from opentelemetry.trace import get_current_span
+            target = get_current_span()
+        target.set_attribute(key, value)
+    except Exception:
+        pass
+
+
+def outcome(value, exc=None, target=None):
+    runtime = _runtime.get()
+    if runtime is None or runtime.tracer is None:
+        return
+    try:
+        from opentelemetry import trace
+        span = target if target is not None else trace.get_current_span()
+        span.set_attribute("rag.outcome", value)
+        if value != "ok":
+            span.set_status(trace.Status(trace.StatusCode.ERROR))
+        if exc is not None:
+            span.set_attribute("error.type", error_type(exc))
+    except Exception:
+        pass
+
+
+@contextmanager
+def span(name, *, links=(), server=False):
+    runtime = _runtime.get()
+    current = None
+    token = None
+    try:
+        if runtime is not None and runtime.tracer is not None:
+            from opentelemetry import trace, context
+            kind = trace.SpanKind.SERVER if server else (trace.SpanKind.CLIENT if name.startswith(("ollama.", "weaviate.")) else trace.SpanKind.INTERNAL)
+            current = runtime.tracer.start_span(name, kind=kind, links=links,
+                                                attributes={"rag.outcome": "ok"})
+            token = context.attach(trace.set_span_in_context(current))
+    except Exception:
+        pass
+    try:
+        yield current
+    except BaseException as exc:
+        import asyncio
+        outcome("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc, current)
+        raise
+    finally:
+        if token is not None:
+            try:
+                context.detach(token)
+            except Exception:
+                pass
+        if current is not None:
+            try:
+                current.end()
+            except Exception:
+                pass
+
+
+def traced(name):
+    def decorate(fn):
+        if inspect.iscoroutinefunction(fn):
+            @wraps(fn)
+            async def run(*args, **kwargs):
+                with span(name):
+                    return await fn(*args, **kwargs)
+        else:
+            @wraps(fn)
+            def run(*args, **kwargs):
+                with span(name):
+                    return fn(*args, **kwargs)
+        return run
+    return decorate
+
+
+def call(name, fn, /, *args, **kwargs):
+    with span(name):
+        return fn(*args, **kwargs)
+
+
+def iterate(fn, /, *args, **kwargs):
+    # Keep one bounded span for the iterator, but activate it only while pulling
+    # an item: generator yield must never leave context attached in its caller.
+    runtime = _runtime.get()
+    if runtime is None or runtime.tracer is None:
+        yield from fn(*args, **kwargs)
+        return
+    from opentelemetry import trace, context
+    try:
+        current = runtime.tracer.start_span("weaviate.iterate", kind=trace.SpanKind.CLIENT,
+                                            attributes={"rag.outcome": "ok"})
+    except Exception:
+        yield from fn(*args, **kwargs)
+        return
+    iterator = None
+    try:
+        iterator = iter(fn(*args, **kwargs))
+        while True:
+            token = None
+            try:
+                token = context.attach(trace.set_span_in_context(current))
+            except Exception:
+                pass
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            except BaseException as exc:
+                outcome("error", exc)
+                raise
+            finally:
+                if token is not None:
+                    try:
+                        context.detach(token)
+                    except Exception:
+                        pass
+            yield item
+    except Exception as exc:
+        outcome("error", exc, current)
+        raise
+    finally:
+        try:
+            current.end()
+        except Exception:
+            pass
+
+
+def remote_link(headers):
+    value = None
+    for key, candidate in headers:
+        if key.lower() == b"traceparent":
+            if value is not None or len(candidate) != 55:
+                return ()
+            value = candidate
+    if value is None or not re.fullmatch(rb"00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]", value):
+        return ()
+    from opentelemetry.trace import SpanContext, TraceFlags, TraceState, Link
+    _, tid, sid, flags = value.split(b"-")
+    c = SpanContext(int(tid, 16), int(sid, 16), True, TraceFlags(int(flags, 16)), TraceState())
+    return (Link(c),) if c.is_valid else ()
+
+
+class RequestTracing:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        runtime = getattr(getattr(scope.get("app"), "state", None), "telemetry", None)
+        if scope["type"] != "http" or runtime is None or runtime.tracer is None:
+            return await self.app(scope, receive, send)
+        # Always a local root. External IDs can correlate but cannot sample it.
+        with bind((runtime, None)):
+            with span("rag.request", links=remote_link(scope.get("headers", ())), server=True) as request_span:
+                async def traced_send(message):
+                    if message["type"] == "http.response.start":
+                        status = message["status"]
+                        if request_span is not None:
+                            attribute("http.status_class", str(status // 100) + "xx", request_span)
+                        if status >= 400:
+                            outcome("error")
+                    await send(message)
+                try:
+                    await self.app(scope, receive, traced_send)
+                except Exception:
+                    attribute("http.status_class", "5xx", request_span)
+                    raise
+                finally:
+                    route = getattr(scope.get("route"), "path", "")
+                    label = scope.get("method", "") + " " + route
+                    if request_span is not None:
+                        attribute("http.route", label if label in ROUTES else "unmatched", request_span)
+                        if label in ROUTES:
+                            try:
+                                request_span.update_name(label)
+                            except Exception:
+                                pass
 ```
 
 ### scripts/tests/test_telemetry.py
@@ -20919,12 +21285,7 @@ from pathlib import Path
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-FILES = [('api/main.py', 'python'), ('api/services/telemetry.py', 'python'),
-         ('api/requirements.in', 'text'), ('api/requirements.txt', 'text'),
-         ('scripts/tests/test_telemetry.py', 'python'),
-         ('scripts/tests/test_telemetry_implementation.py', 'python'),
-         ('scripts/verify/01_infrastructure.sh', 'bash'),
-         ('scripts/verify/README.md', 'markdown')]
+FILES = [('api/main.py', 'python'), ('api/services/telemetry.py', 'python'), ('api/requirements.in', 'text'), ('api/requirements.txt', 'text'), ('scripts/tests/test_telemetry.py', 'python'), ('scripts/tests/test_telemetry_implementation.py', 'python'), ('scripts/tests/test_tracing.py', 'python'), ('scripts/verify/01_infrastructure.sh', 'bash'), ('scripts/verify/README.md', 'markdown'), ('api/services/batch_write.py', 'python'), ('api/services/chunker.py', 'python'), ('api/services/collection_recovery.py', 'python'), ('api/services/exporter.py', 'python'), ('api/services/goldstandard.py', 'python'), ('api/services/importer.py', 'python'), ('api/services/ingest_pipeline.py', 'python'), ('api/services/ollama_client.py', 'python'), ('api/services/packager.py', 'python'), ('api/services/rag_pipeline.py', 'python'), ('api/services/sources.py', 'python'), ('api/services/tuning.py', 'python'), ('api/services/weaviate_client.py', 'python')]
 
 class EmbeddedTelemetryTests(unittest.TestCase):
     def test_embedded_files_match(self):
@@ -20939,5 +21300,365 @@ class EmbeddedTelemetryTests(unittest.TestCase):
                 self.assertEqual(document[start:end], (ROOT/name).read_text().rstrip('\n'))
 
 if __name__ == '__main__':
+    unittest.main()
+```
+
+
+### scripts/tests/test_tracing.py
+
+```python
+"""Synthetic #283 producer/worker tests; no backend or hosted collector."""
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import io
+import os
+from pathlib import Path
+import sys
+import tempfile
+import threading
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import patch, AsyncMock
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+from services import telemetry as ot, exporter, importer, tuning, goldstandard as gs
+from services import ingest_pipeline as ingest, weaviate_client as wc, ollama_client as ollama
+from config import settings
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+import httpx
+from fastapi import FastAPI
+from routers import query, ingest as ingest_router, transfer, tuning as tuning_router, goldstandard
+
+SECRET = 'SENTINEL-secret-document-path-prompt'
+
+
+class TracingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.stack = contextlib.ExitStack()
+        for field in ('upload_dir', 'sources_dir', 'exports_dir'):
+            self.stack.enter_context(patch.object(settings, field, self.temp.name))
+        self.memory = InMemorySpanExporter()
+        self.provider = TracerProvider(sampler=TraceIdRatioBased(1), shutdown_on_exit=False)
+        self.provider.add_span_processor(SimpleSpanProcessor(self.memory))
+        self.runtime = ot.Runtime(ot.Config())
+        self.runtime.tracer = self.provider.get_tracer('test')
+        self.app = FastAPI()
+        self.app.state.telemetry = self.runtime
+        self.app.add_middleware(ot.RequestTracing)
+        for router in (query.router, ingest_router.router, transfer.router, tuning_router.router, goldstandard.router):
+            self.app.include_router(router)
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url='http://test')
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        self.provider.shutdown()
+        self.stack.close()
+        self.temp.cleanup()
+
+    def spans(self, name=None):
+        result = self.memory.get_finished_spans()
+        return [s for s in result if name is None or s.name == name or (name == 'rag.request' and s.kind == trace.SpanKind.SERVER)]
+
+    def wire(self):
+        payload = encode_spans(self.spans()).SerializeToString()
+        clean = ot.sanitize_wire(payload, 'traces', ot.Config(batch_size=512))
+        self.assertNotIn(SECRET.encode(), clean)
+        return ExportTraceServiceRequest.FromString(clean).resource_spans[0].scope_spans[0].spans
+
+    async def until(self, predicate):
+        for _ in range(1000):
+            if predicate():
+                return
+            await asyncio.sleep(.002)
+        self.fail('worker did not complete')
+
+    def lineage(self, job_name):
+        jobs = self.spans(job_name)
+        requests = {s.context.span_id: s for s in self.spans('rag.request')}
+        self.assertTrue(jobs)
+        for job in jobs:
+            self.assertIn(job.parent.span_id, requests)
+            self.assertEqual(job.context.trace_id, requests[job.parent.span_id].context.trace_id)
+        self.wire()
+
+    async def test_query_real_pipeline_and_dependency_error(self):
+        collection = NS(query=NS(near_vector=lambda **kw: NS(objects=[])))
+        fake_client = NS(collections=NS(get=lambda name: collection))
+        async def chat(*args):
+            return SECRET
+        async def embed(*args):
+            return [1.0]
+        with patch.object(wc, 'collection_exists', AsyncMock(return_value=True)), patch.object(wc, 'get_client', return_value=fake_client), patch.object(ollama, 'chat', ot.traced('ollama.chat')(chat)), patch.object(ollama, 'embed', ot.traced('ollama.embed')(embed)):
+            response = await self.client.post('/query', json={'question': SECRET, 'collection': 'Corpus', 'retrieval_mode': 'hnsw'})
+        self.assertEqual(response.status_code, 200, response.text)
+        for name in ('rag.query', 'rag.reformulate', 'rag.retrieval', 'rag.synthesis', 'weaviate.query'):
+            self.assertTrue(self.spans(name), name)
+        dep = self.spans('weaviate.query')[0]
+        self.assertGreater(dep.end_time, dep.start_time)
+        self.assertEqual(next(s.name for s in self.spans() if s.context.span_id == dep.parent.span_id), 'rag.retrieval')
+        self.wire()
+        with ot.bind((self.runtime, None)), self.assertRaises(TimeoutError):
+            ot.call('weaviate.query', lambda: (_ for _ in ()).throw(TimeoutError(SECRET)))
+        self.assertEqual(self.spans('weaviate.query')[-1].attributes['error.type'], 'timeout')
+
+    async def test_headers_routes_and_external_sampling(self):
+        tid, sid = 'a' * 32, 'b' * 16
+        good = f'00-{tid}-{sid}-00'
+        response = await self.client.get('/export/job/' + SECRET, headers={'traceparent': good, 'baggage': SECRET, 'tracestate': SECRET})
+        self.assertEqual(response.status_code, 404)
+        server = self.spans('rag.request')[-1]
+        self.assertIsNone(server.parent)
+        self.assertNotEqual(server.context.trace_id, int(tid, 16))
+        self.assertEqual(server.links[0].context.trace_id, int(tid, 16))
+        self.assertEqual(server.attributes['http.route'], 'GET /export/job/{job_id}')
+        self.assertEqual(server.attributes['http.status_class'], '4xx')
+        for headers in ({'traceparent': 'x' * 10000}, {'traceparent': good.upper()}, {'traceparent': f'00-{tid}-'+ '0'*16+'-01'}, [('traceparent', good), ('traceparent', good)], {'traceparent': good.replace('00-', 'ff-', 1)}):
+            await self.client.get('/'+SECRET, headers=headers)
+            self.assertFalse(self.spans('rag.request')[-1].links)
+            self.assertEqual(self.spans('rag.request')[-1].attributes['http.route'], 'unmatched')
+        self.wire()
+        self.runtime.tracer = TracerProvider(sampler=TraceIdRatioBased(0)).get_tracer('zero')
+        count = len(self.spans())
+        await self.client.get('/'+SECRET, headers={'traceparent': good[:-2]+'01'})
+        self.assertEqual(len(self.spans()), count)
+
+    async def test_export_admission_concurrency_and_after_response(self):
+        release = threading.Event()
+        entered = []
+        def build(collection, **kwargs):
+            entered.append(trace.get_current_span().get_span_context().trace_id)
+            if not release.wait(3):
+                raise TimeoutError('test synchronization')
+            ot.call('weaviate.query', lambda: None)
+            return dict(filename=SECRET, size_bytes=1, chunk_count=1, source_document_count=0,
+                        fidelity='chunks-only', models_bundled=False, retrieve_script=False, warnings=[])
+        try:
+            with patch.object(wc, 'collection_exists', AsyncMock(return_value=True)), patch.object(exporter.packager, 'build', build):
+                a = await self.client.post('/export', json={'collection':'TraceA'})
+                b = await self.client.post('/export', json={'collection':'TraceB'})
+                self.assertEqual((a.status_code,b.status_code),(202,202))
+                await self.until(lambda: len(entered)==2)
+                self.assertFalse(self.spans('rag.export'))
+                self.assertEqual(len(set(entered)),2)
+                release.set()
+                await self.until(lambda: len(self.spans('rag.export'))==2)
+        finally:
+            release.set()
+        self.lineage('rag.export')
+        request_ends = {s.context.span_id:s.end_time for s in self.spans('rag.request')}
+        self.assertTrue(all(s.end_time > request_ends[s.parent.span_id] for s in self.spans('rag.export')))
+
+    async def test_ingest_real_executor_partial_failure(self):
+        def parse(path):
+            if path.name.startswith('bad'):
+                raise ValueError(SECRET)
+            return SECRET, []
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(ingest,'_parse_file',ot.traced('rag.parse')(parse)), patch.object(ingest,'do_chunk',return_value=[SECRET]), patch.object(wc,'_insert_chunks_sync',side_effect=lambda *a: ot.call('weaviate.batch',lambda: None)), patch.object(ingest.sources,'store'):
+            response = await self.client.post('/ingest/upload', data={'collection':'TraceIngest'}, files=[('files',('good.txt',b'data')),('files',('bad.txt',b'data'))])
+            self.assertEqual(response.status_code,202,response.text)
+            job_id=response.json()['job_id']
+            await self.until(lambda: ingest.get_job(job_id)['status'] in ('partial','failed','completed'))
+            await self.until(lambda: bool(self.spans('rag.ingest')))
+        self.assertEqual(ingest.get_job(job_id)['status'],'partial')
+        self.assertEqual(self.spans('rag.ingest')[0].attributes['rag.outcome'],'partial')
+        self.lineage('rag.ingest')
+
+    async def test_import_and_tuning_real_launchers_handled_failure(self):
+        with patch.object(importer.packager,'open_package',side_effect=importer.PackageError('INVALID',SECRET)), patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(tuning,'_existing_chunks',side_effect=ValueError(SECRET)):
+            a=await self.client.post('/import',json={'filename':SECRET+'.tar.gz','on_conflict':'abort'})
+            b=await self.client.post('/tune/reembed',json={'collection':'TraceTune'})
+            self.assertEqual((a.status_code,b.status_code),(202,202))
+            await self.until(lambda: bool(self.spans('rag.import')) and bool(self.spans('rag.tuning')))
+        self.assertEqual(importer.get_job(a.json()['job_id'])['status'],'failed')
+        self.assertEqual(tuning.get_job(b.json()['job_id'])['status'],'failed')
+        self.lineage('rag.import'); self.lineage('rag.tuning')
+        for name in ('rag.import','rag.tuning'):
+            self.assertEqual(self.spans(name)[0].attributes['rag.outcome'],'error')
+
+    async def test_generation_real_task_and_regeneration_timeout(self):
+        session={'session_id':'synthetic','status':'generating','pairs':[], 'pairs_total':1,'pairs_completed':0,'pairs_failed':0,'pairs_attempted':0}
+        def update(sid,change):
+            return change(session)
+        ready=asyncio.Event()
+        async def model(*args):
+            await ready.wait()
+            return '{"question":"synthetic","answer":"synthetic","ground_truth":"synthetic"}'
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+            response=await self.client.post('/goldstandard/generate',json={'collection':'TraceGold','sample_size':1})
+            self.assertEqual(response.status_code,202,response.text)
+            ready.set()
+            await self.until(lambda: bool(self.spans('rag.evaluation')))
+        self.assertEqual(session['status'],'completed')
+        self.lineage('rag.evaluation')
+        pair={'pair_id':'pair','contexts':[SECRET],'source_file':SECRET,'chunk_index':0}
+        async def slow(*args):
+            await asyncio.sleep(10)
+        with patch.object(gs,'get_session',return_value={'pairs':[pair],'status':'completed'}), patch.object(gs,'_REGENERATION_TIMEOUT_SECONDS',.005), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+            response=await self.client.post('/goldstandard/regenerate',json={'session_id':'session','pair_id':'pair'})
+        self.assertEqual(response.status_code,504,response.text)
+        self.assertEqual(self.spans('rag.regenerate')[-1].attributes['error.type'],'timeout')
+        self.assertTrue(any(s.attributes.get('rag.outcome')=='cancelled' for s in self.spans('rag.pair')))
+        self.wire()
+
+    async def test_thread_waiter_cancel_and_context_restore(self):
+        entered=threading.Event(); release=threading.Event()
+        @ot.traced('rag.export')
+        def work():
+            entered.set();release.wait(3)
+        with ot.bind((self.runtime,None)), ot.span('rag.request') as parent:
+            captured=ot.admitted(work)
+        task=asyncio.create_task(asyncio.to_thread(captured))
+        await self.until(entered.is_set)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertFalse(self.spans('rag.export'))
+        release.set()
+        await self.until(lambda: bool(self.spans('rag.export')))
+        self.assertEqual(self.spans('rag.export')[0].parent.span_id,parent.get_span_context().span_id)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            await asyncio.get_running_loop().run_in_executor(pool,captured)
+            context=await asyncio.get_running_loop().run_in_executor(pool,ot.capture)
+        self.assertEqual(context,(None,None))
+
+    async def test_iterator_batch_boundaries_and_no_context_leak(self):
+        def rows():
+            yield 1
+            raise ConnectionError(SECRET)
+        with ot.bind((self.runtime,None)),ot.span('rag.export') as parent:
+            iterator=ot.iterate(rows)
+            self.assertEqual(next(iterator),1)
+            self.assertEqual(trace.get_current_span(),parent)
+            with self.assertRaises(ConnectionError):next(iterator)
+        self.assertEqual(self.spans('weaviate.iterate')[0].attributes['error.type'],'connection')
+        self.wire()
+
+    async def test_telemetry_fault_and_disabled_do_not_repeat_work(self):
+        for tracer in (None, NS(start_span=lambda *a,**k: (_ for _ in ()).throw(RuntimeError(SECRET)))):
+            self.runtime.tracer=tracer
+            calls=[]
+            with ot.bind((self.runtime,None)):
+                self.assertEqual(ot.call('weaviate.query',lambda: calls.append(1) or 7),7)
+                self.assertEqual(list(ot.iterate(lambda:iter([1,2]))),[1,2])
+            self.assertEqual(calls,[1])
+        self.assertEqual(ot.capture(),(None,None))
+
+    async def test_generation_cancellation_and_failure_reporter(self):
+        session={'session_id':'cancel-session','status':'generating','pairs':[], 'pairs_total':1,'pairs_completed':0,'pairs_failed':0,'pairs_attempted':0}
+        def update(sid,change): return change(session)
+        entered=asyncio.Event()
+        async def slow(*args):
+            entered.set()
+            await asyncio.sleep(10)
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+            response=await self.client.post('/goldstandard/generate',json={'collection':'TraceCancel','sample_size':1})
+            self.assertEqual(response.status_code,202)
+            await entered.wait()
+            tasks=list(gs._tasks)
+            for task in tasks: task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
+        self.assertEqual(session['status'],'cancelled')
+        self.assertEqual(self.spans('rag.evaluation')[-1].attributes['rag.outcome'],'cancelled')
+        # Real done callback creates the failure reporter with captured origin.
+        session['status']='generating'
+        async def model(*args): return '{"question":"q","answer":"a","ground_truth":"g"}'
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',side_effect=gs.GoldStandardError('STORE_FAILED',SECRET,500)), patch.object(gs,'_publish_generation_failure'), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+            await self.client.post('/goldstandard/generate',json={'collection':'TraceFailed','sample_size':1})
+            await self.until(lambda: bool(self.spans('rag.failure_report')))
+        self.lineage('rag.failure_report')
+        self.assertEqual(self.spans('rag.failure_report')[-1].attributes['rag.outcome'],'error')
+
+    async def test_ollama_real_client_error_and_nested_asyncio_run(self):
+        class Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self,*args): pass
+            async def post(self,*args,**kwargs): raise httpx.ReadTimeout(SECRET)
+            async def get(self,*args,**kwargs): raise httpx.ConnectError(SECRET)
+        with patch.object(ollama.httpx,'AsyncClient',return_value=Client()), ot.bind((self.runtime,None)), ot.span('rag.import') as parent:
+            # This is the actual importer's synchronous bridge into a fresh loop.
+            result=await asyncio.to_thread(importer._probe_dimensions)
+            self.assertIsNone(result)
+            health=await ollama.check_health()
+        self.assertEqual(health['llm']['status'],'error')
+        self.assertEqual(self.spans('ollama.embed')[-1].parent.span_id,parent.get_span_context().span_id)
+        self.assertEqual(self.spans('ollama.embed')[-1].attributes['error.type'],'timeout')
+        self.assertEqual(self.spans('ollama.health')[-1].attributes['error.type'],'connection')
+        self.wire()
+
+    async def test_streaming_request_cancellation_and_validation(self):
+        from fastapi.responses import StreamingResponse
+        entered=asyncio.Event()
+        @self.app.get('/stream')
+        async def stream():
+            async def chunks():
+                yield b'first'
+                entered.set()
+                await asyncio.sleep(10)
+            return StreamingResponse(chunks())
+        task=asyncio.create_task(self.client.get('/stream'))
+        await entered.wait()
+        self.assertFalse(self.spans('rag.request'))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError): await task
+        self.assertEqual(self.spans('rag.request')[-1].attributes['rag.outcome'],'cancelled')
+        response=await self.client.post('/query',json={'question':SECRET})
+        self.assertEqual(response.status_code,422)
+        self.assertEqual(self.spans('rag.request')[-1].attributes['http.status_class'],'4xx')
+        self.wire()
+
+    async def test_actual_batch_failure_and_export_iterator_paths(self):
+        from services import batch_write, packager
+        class Batch:
+            number_errors=0
+            def __enter__(self): return self
+            def __exit__(self,*args):
+                self.finished=True
+            def add_object(self,**kwargs): pass
+        batch=Batch()
+        coll=NS(batch=NS(dynamic=lambda:batch,failed_objects=[NS(message=SECRET)]))
+        records=[{'id':'00000000-0000-0000-0000-000000000001','properties':{'content':SECRET},'vector':[1.0]}]
+        with ot.bind((self.runtime,None)),ot.span('rag.ingest'),self.assertRaises(RuntimeError):
+            batch_write.insert(coll,records)
+        self.assertTrue(batch.finished)
+        self.assertEqual(self.spans('weaviate.batch')[-1].attributes['rag.outcome'],'error')
+        obj=NS(uuid='00000000-0000-0000-0000-000000000001',properties={'content':SECRET,'source_file':SECRET},vector=[1.0])
+        coll=NS(iterator=lambda **kw:iter([obj]))
+        with patch.object(wc,'get_client',return_value=NS(collections=NS(get=lambda name:coll))),patch.object(packager.sources,'load_index',return_value={'documents':{}}),ot.bind((self.runtime,None)),ot.span('rag.export') as parent:
+            self.assertEqual(len(list(packager.read_chunks('Synthetic'))),1)
+            self.assertEqual(trace.get_current_span(),parent)
+        self.assertTrue(self.spans('weaviate.iterate'))
+        self.wire()
+
+    async def test_real_export_link_sanitization_both_boundaries(self):
+        from test_telemetry import receiver
+        from opentelemetry.trace import Link, SpanContext, TraceFlags, TraceState
+        with receiver() as (env,records):
+            env.update(RAG_OTEL_LOGS='false',RAG_OTEL_METRICS='false')
+            runtime=ot.bootstrap(env)
+            try:
+                context=SpanContext(1,2,True,TraceFlags(1),TraceState([('private',SECRET)]))
+                with ot.bind((runtime,None)),ot.span('rag.request',links=[Link(context,{'secret':SECRET}),Link(context)]):
+                    pass
+                self.assertTrue(runtime.force_flush())
+            finally:
+                runtime.shutdown()
+        traces=[payload for path,payload in records if path=='/v1/traces']
+        self.assertTrue(traces)
+        for payload in traces:
+            self.assertNotIn(SECRET.encode(),payload)
+            spans=ExportTraceServiceRequest.FromString(payload).resource_spans[0].scope_spans[0].spans
+            self.assertEqual(len(spans[0].links),1)
+            self.assertEqual(spans[0].links[0].trace_id,b'\x00'*15+b'\x01')
+            self.assertEqual(spans[0].links[0].trace_state,'')
+            self.assertFalse(spans[0].links[0].attributes)
+
+if __name__=='__main__':
     unittest.main()
 ```
