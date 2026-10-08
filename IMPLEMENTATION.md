@@ -6583,7 +6583,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
-    hnsw = telemetry.call("weaviate.config", config.get, "hnsw_config") or {}
+    hnsw = config.get("hnsw_config") or {}
     client = wc.get_client()
     ownership = collection_recovery.begin(collection, "tune", client)
     staging = ownership["staging"]
@@ -22444,6 +22444,43 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             zero.shutdown()
 
+    async def test_rebuild_config_span_tracks_only_backend_fetch(self):
+        config_api = NS(get=lambda: None)
+        client = NS(collections=NS(get=lambda name: NS(config=config_api)))
+        hnsw = {'efConstruction': 64, 'maxConnections': 16, 'ef': 32}
+        config = NS(vector_index_config=NS(ef_construction=64, max_connections=16, ef=32,
+                                          distance_metric=wc.VectorDistances.COSINE),
+                    properties=[], vectorizer=None, vectorizer_config=None)
+        for fetch_fails in (False, True):
+            with self.subTest(fetch_fails=fetch_fails):
+                # Stop at staging creation, after the real fetch and local lookup.
+                # This covers the producer without performing collection writes.
+                failure = ValueError(SECRET) if fetch_fails else RuntimeError(SECRET)
+                before = len(self.spans('weaviate.config'))
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(wc, 'get_client', return_value=client))
+                    fetch = stack.enter_context(patch.object(config_api, 'get',
+                        return_value=config, side_effect=failure if fetch_fails else None))
+                    stack.enter_context(patch.object(tuning.collection_recovery, 'begin',
+                        return_value={'staging': 'Scratch', 'state': 'scratch'}))
+                    stack.enter_context(patch.object(tuning.collection_recovery, 'discard'))
+                    create = stack.enter_context(patch.object(wc, '_create_collection_sync', side_effect=failure))
+                    stack.enter_context(ot.bind((self.runtime, None)))
+                    with self.assertRaises(type(failure)) as caught:
+                        tuning._rebuild('Synthetic', [], None, None, None)
+                self.assertIs(caught.exception, failure)
+                fetch.assert_called_once_with()
+                if fetch_fails:
+                    create.assert_not_called()
+                else:
+                    create.assert_called_once_with('Scratch', 'hnsw', 'cosine', hnsw, preserve_hnsw=True)
+                emitted = self.spans('weaviate.config')[before:]
+                self.assertEqual(len(emitted), 1)
+                self.assertEqual(emitted[0].kind, trace.SpanKind.CLIENT)
+                self.assertEqual(emitted[0].parent.span_id, self.spans('rag.rebuild')[-1].context.span_id)
+                self.assertEqual(emitted[0].attributes['rag.outcome'], 'error' if fetch_fails else 'ok')
+        self.wire()
+
     async def test_export_admission_concurrency_and_after_response(self):
         release = threading.Event()
         entered = []
@@ -23077,6 +23114,22 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
         await tracing_fixture.TracingTests.test_export_admission_concurrency_and_after_response(self)
         self.assert_jobs({('export','ok'):2})
         self.assertEqual(len({r['attributes']['rag.job_token'] for r in self.logs if r['body']=='rag.job.completed'}),2)
+
+    async def test_real_tuning_config_metrics_count_only_remote_fetch(self):
+        await tracing_fixture.TracingTests.test_rebuild_config_span_tracks_only_backend_fetch(self)
+        data=self.reader.get_metrics_data()
+        metrics={m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+        points=[p for p in metrics['rag.dependency.calls'].data.data_points
+                if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual({p.attributes['rag.outcome']:p.value for p in points},{'ok':1,'error':1})
+        durations=[p for p in metrics['rag.dependency.duration'].data.data_points
+                   if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual(sum(p.count for p in durations),2)
+        errors=[p for p in metrics['rag.dependency.errors'].data.data_points
+                if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual(sum(p.value for p in errors),1)
+        self.assertEqual(len([r for r in self.logs
+            if r['attributes'].get('rag.dependency')=='weaviate.config']),2)
 
     async def test_real_iterator_terminal_cancellation_metrics(self):
         await tracing_fixture.TracingTests.test_iterator_terminal_outcomes_and_context(self)

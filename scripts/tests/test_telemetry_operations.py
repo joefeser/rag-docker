@@ -395,6 +395,22 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assert_jobs({('export','ok'):2})
         self.assertEqual(len({r['attributes']['rag.job_token'] for r in self.logs if r['body']=='rag.job.completed'}),2)
 
+    async def test_real_tuning_config_metrics_count_only_remote_fetch(self):
+        await tracing_fixture.TracingTests.test_rebuild_config_span_tracks_only_backend_fetch(self)
+        data=self.reader.get_metrics_data()
+        metrics={m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+        points=[p for p in metrics['rag.dependency.calls'].data.data_points
+                if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual({p.attributes['rag.outcome']:p.value for p in points},{'ok':1,'error':1})
+        durations=[p for p in metrics['rag.dependency.duration'].data.data_points
+                   if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual(sum(p.count for p in durations),2)
+        errors=[p for p in metrics['rag.dependency.errors'].data.data_points
+                if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual(sum(p.value for p in errors),1)
+        self.assertEqual(len([r for r in self.logs
+            if r['attributes'].get('rag.dependency')=='weaviate.config']),2)
+
     async def test_real_iterator_terminal_cancellation_metrics(self):
         await tracing_fixture.TracingTests.test_iterator_terminal_outcomes_and_context(self)
         self.assert_jobs({('export','ok'):13})
