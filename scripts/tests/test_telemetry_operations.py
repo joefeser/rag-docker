@@ -200,6 +200,34 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls,[1])
         finally:provider.shutdown()
 
+    async def test_rebuilt_queue_preserves_operational_bodies_and_job_correlation(self):
+        with receiver() as (env,records):
+            runtime=ot.bootstrap({**env,'RAG_OTEL_METRICS':'false','RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                with ot.bind((runtime,None)),ot.span('rag.request',server=True,method='GET') as request:
+                    with ot.span('rag.export'):
+                        ot.call('weaviate.query',lambda:None)
+                provider=next(p for p in runtime.providers if hasattr(p,'_multi_log_record_processor'))
+                processor=provider._multi_log_record_processor._log_record_processors[0]._batch_processor
+                queued=list(processor._queue)
+                self.assertEqual({r.log_record.body for r in queued},ot.LOG_BODIES)
+                jobs=[r.log_record for r in queued if r.log_record.body!='rag.api.completed']
+                self.assertEqual(len(jobs),2)
+                self.assertEqual(len({r.attributes['rag.job_token'] for r in jobs}),1)
+                for record in queued:
+                    log=record.log_record
+                    self.assertEqual(log.trace_id,request.get_span_context().trace_id)
+                    self.assertNotEqual(log.span_id,0)
+                    self.assertFalse(log.context)
+                    self.assertIsNone(log.exception)
+                    self.assertEqual(record.instrumentation_scope.name,'rag.telemetry')
+                    self.assertFalse(record.instrumentation_scope.attributes)
+                self.assertTrue(runtime.force_flush())
+                wire=ExportLogsServiceRequest.FromString(dict(records)['/v1/logs']).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual({r.body.string_value for r in wire},ot.LOG_BODIES)
+                self.assertEqual(len([r for r in wire if 'rag.job_token' in dimensions(r)]),2)
+            finally:runtime.shutdown()
+
     async def test_real_wire_all_instruments_multiple_series_and_log_correlation(self):
         with receiver() as (env,records):
             # Tiny trace/log batches must not truncate the set of metrics.
