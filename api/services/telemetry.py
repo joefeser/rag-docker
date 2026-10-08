@@ -5,6 +5,7 @@ redaction: arbitrary text is never a telemetry field in this foundation.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import json
 import math
@@ -149,7 +150,9 @@ METRIC_NAMES = frozenset(("rag.telemetry.check",))
 
 
 def safe_attributes(attributes):
-    return {k: v for k, v in (attributes or {}).items()
+    if not isinstance(attributes, Mapping):
+        return {}
+    return {k: v for k, v in attributes.items()
             if k in ENUMS and isinstance(v, str) and v in ENUMS[k]}
 
 
@@ -395,13 +398,23 @@ def bootstrap(env=None):
         def __init__(self, logger):
             self._logger = logger
 
-        def emit(self, record=None, **kwargs):
+        def emit(self, record=None, *, timestamp=None, observed_timestamp=None,
+                 context=None, severity_number=None, severity_text=None, body=None,
+                 attributes=None, event_name=None, exception=None):
             if record is not None:
                 import copy
-                record = copy.copy(record)
-                if isinstance(record, ReadWriteLogRecord):
-                    record.log_record = copy.copy(record.log_record)
-            return self._logger.emit(record, **kwargs)
+                target = copy.copy(record.log_record if isinstance(record, ReadWriteLogRecord) else record)
+            else:
+                target = LogRecord(timestamp=timestamp, observed_timestamp=observed_timestamp,
+                                   context=context, severity_number=severity_number,
+                                   severity_text=severity_text, body=body, attributes=attributes,
+                                   event_name=event_name, exception=exception)
+            target.attributes = safe_attributes(target.attributes)
+            # Every form must bypass SDK default wrappers, which read ambient
+            # limits before our batch processor can sanitize or repair data.
+            wrapped = ReadWriteLogRecord(log_record=target, resource=resource,
+                                         instrumentation_scope=scope, limits=log_limits)
+            return self._logger.emit(wrapped)
 
     class SafeBatchLogs(BatchLogRecordProcessor):
         def on_emit(self, record):
