@@ -354,6 +354,70 @@ class TelemetryTests(unittest.TestCase):
             finally:
                 self.assertTrue(runtime.shutdown())
 
+    def test_emit_forms_preserve_caller_inputs_with_and_without_exceptions(self):
+        from types import MappingProxyType
+        from opentelemetry._logs import LogRecord, SeverityNumber
+        from opentelemetry.sdk._logs import ReadWriteLogRecord
+        from opentelemetry.attributes import BoundedAttributes
+        from opentelemetry.context import Context
+        from opentelemetry.trace import SpanContext, NonRecordingSpan, TraceFlags, set_span_in_context
+        context = set_span_in_context(NonRecordingSpan(SpanContext(123, 456, False, TraceFlags(1))),
+                                      Context({'secret':SECRET}))
+        factories = (dict, MappingProxyType,
+                     lambda values: BoundedAttributes(maxlen=8, attributes=values, immutable=False))
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                for form in ('wrapper', 'plain', 'keyword'):
+                    for has_exception in (False, True):
+                        for factory in factories:
+                            with self.subTest(form=form, exception=has_exception, mapping=factory):
+                                attributes = factory({'rag.outcome':'error', 'secret':SECRET})
+                                values = dict(attributes)
+                                exception = RuntimeError(SECRET) if has_exception else None
+                                fields = dict(timestamp=123, observed_timestamp=456, context=context,
+                                              severity_number=SeverityNumber.ERROR, severity_text=SECRET,
+                                              body=SECRET, attributes=attributes, event_name=SECRET, exception=exception)
+                                source = LogRecord(**fields)
+                                wrapper = ReadWriteLogRecord(source) if form == 'wrapper' else None
+                                # Public writable records can carry any supported attribute mapping.
+                                source.attributes = attributes
+                                before = dict(source.__dict__)
+                                wrapper_before = dict(wrapper.__dict__) if wrapper else None
+                                if form == 'keyword':
+                                    runtime.logger.emit(**fields)
+                                elif form == 'wrapper':
+                                    runtime.logger.emit(record=wrapper)
+                                else:
+                                    runtime.logger.emit(source)
+                                self.assertEqual(source.__dict__, before)
+                                self.assertIs(source.attributes, attributes)
+                                self.assertEqual(dict(attributes), values)
+                                self.assertIs(source.context, context)
+                                self.assertIs(source.exception, exception)
+                                if wrapper:
+                                    self.assertEqual(wrapper.__dict__, wrapper_before)
+                                    self.assertIs(wrapper.log_record, source)
+                                queued = processor._queue[0].log_record
+                                self.assertEqual(dict(queued.attributes), {'rag.outcome':'error'})
+                                self.assertEqual((queued.trace_id, queued.span_id), (123,456))
+                                self.assertEqual((queued.timestamp, queued.observed_timestamp), (123,456))
+                                self.assertEqual(queued.severity_number, SeverityNumber.ERROR)
+                                self.assertEqual(queued.body, 'rag.operation')
+                                self.assertIsNone(queued.exception)
+                                self.assertFalse(queued.context)
+                                self.assertFalse(queued.event_name)
+                                self.assertFalse(queued.severity_text)
+                self.assertEqual(len(processor._queue), 18)
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/logs']
+                self.assertNotIn(SECRET.encode(), payload)
+                logs = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual(len(logs), 18)
+            finally:
+                self.assertTrue(runtime.shutdown())
+
     def test_caller_selected_span_scope_is_rebuilt_before_queue(self):
         with receiver() as (env, records):
             runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
