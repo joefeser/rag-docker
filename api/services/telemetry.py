@@ -508,7 +508,7 @@ def bootstrap(env=None):
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.sdk._logs import LoggerProvider
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics import MeterProvider, AlwaysOffExemplarFilter
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.metrics.view import View, DropAggregation, ExplicitBucketHistogramAggregation
     from opentelemetry.exporter.otlp.proto.http import Compression
@@ -575,6 +575,7 @@ def bootstrap(env=None):
                                                   export_interval_millis=config.interval_ms,
                                                   export_timeout_millis=config.timeout_ms)
             provider = MeterProvider(resource=resource, shutdown_on_exit=False, metric_readers=[reader],
+                                     exemplar_filter=AlwaysOffExemplarFilter(),
                                      views=[View(instrument_name="*", aggregation=DropAggregation()),
                                             *[View(instrument_name=name, attribute_keys=set(schema[2]),
                                                    aggregation=ExplicitBucketHistogramAggregation(BUCKETS) if schema[0] == "create_histogram" else None)

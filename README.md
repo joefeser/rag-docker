@@ -787,7 +787,10 @@ At most one link survives, containing only fixed-size nonzero trace/span IDs and
 a sampled flag. Trace/span IDs remain correlation fields, never authentication.
 The operational metric allowlist and finite dimensions are documented below.
 The private meter validates values before SDK aggregation; instrument-specific
-views and the final export boundary enforce its schema. Export removes arbitrary
+views and the final export boundary enforce its schema. An explicit always-off
+exemplar filter prevents original measurement attributes from entering SDK
+exemplar reservoirs, even with ambient `OTEL_METRICS_EXEMPLAR_FILTER=always_on`.
+Export removes arbitrary
 descriptions and exemplars and preserves only fixed declared units. The original
 dimensionless `rag.telemetry.check` remains a one-point synthetic schema probe.
 All points in a metric are validated before admitting the record. Histograms
