@@ -2307,8 +2307,10 @@ Finite dimensions are validated before aggregation, restricted per instrument
 by SDK views, and checked again during protobuf rebuilding. Valid multiple
 series survive export even with tiny trace/log batches. Malformed, duplicate or
 excess metric data rejects its record before admission. Other valid records
-remain eligible, and each valid name is admitted once; valid multi-series
-measurements are never truncated. Histogram statistics must be finite when
+remain eligible. Compatible same-name records merge distinct approved point
+identities; repeated identities retain the first snapshot without summation.
+Incompatible kinds, temporality or monotonicity reject the later record. Valid
+disjoint series are never truncated. Histogram statistics must be finite when
 present and preserve their optional presence, with ordered boundaries and
 consistent bucket totals.
 No job IDs, trace exemplars, collection names, user IDs, paths, content or raw
@@ -2318,7 +2320,9 @@ Structured operation completion logs have fixed bodies and finite attributes,
 current trace/span context when available, and a newly generated opaque job
 execution token for job/dependency correlation. No durable or supplied job ID
 is exported. Context survives admitted worker handoffs without leaking across
-concurrent jobs or into caller code across iterator yields. Sanitization occurs
+concurrent jobs or into caller code across iterator yields. Iterators capture
+runtime, parent span and job token at construction, rebind them around lazy
+factory/iter/pulls and completion, and emit nothing if never consumed. Sanitization occurs
 before queueing and at the wire boundary. Existing Python logs are not bridged.
 The log and metric schemas do not change application errors, durable statuses,
 cancellation behavior or existing latency responses. Partial status normalizes
@@ -2331,3 +2335,18 @@ series, disabled/sampled-out tracing, telemetry faults and receiver errors.
 Synthetic dependencies require no hosted service; deployment acceptance remains
 #285. Abrupt process death or surviving workers after shutdown may lose final
 records; operational telemetry is not durable audit storage (#29).
+
+### Operational instrumentation failure contract
+
+SafeMeter is restricted to the registered counter, histogram and up/down
+factories, names and dimensions. Unknown names or wrong factory/name pairs
+return inert instruments; gauge/observable factories and arbitrary custom
+metrics are unsupported. This is not a general SDK Meter compatibility API.
+
+An active-instrument SDK factory/update failure suppresses the entire affected
+instrument for that runtime lifetime, including further updates and later wire
+exports. Both pre-mutation and mutate-then-raise failures are ambiguous: never
+retry or fabricate a reset. Independent instruments and completion logs remain
+available. Suppression loses active-instrument availability until restart; it
+does not reconstruct concurrency or retract prior backend history or exports
+already in flight. The two-instrument suppression registry is finite and local.

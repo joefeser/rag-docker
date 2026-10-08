@@ -890,14 +890,20 @@ as errors. Dependency errors exclude cancellation; their error type is
 import, tuning and evaluation generation. Dependency operations are the finite
 `ollama.*` and `weaviate.*` names in the same source registry. Iterator duration
 covers its entire consumption lifetime, including time between pulls; premature
-close is cancellation. Model token usage is not available and is not invented.
+close is cancellation. Iterator construction captures the originating runtime,
+parent span and job token; factory execution and pulls remain lazy and rebind
+that context without leaking it across yields. An unconsumed iterator emits
+nothing. Model token usage is not available and is not invented.
 
 Histograms use explicit boundaries in seconds: 0.005, 0.01, 0.025, 0.05, 0.1,
 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300 (plus the implicit overflow bucket).
 All valid finite series survive export regardless of the trace/log batch size.
 Malformed, duplicate or excess points reject their entire metric record before
 admission; later valid records remain eligible, including the same metric name.
-Each valid name is admitted once. No valid multi-series record is truncated. SDK aggregation cannot
+Compatible same-name records merge their distinct approved series across scopes
+and resources; repeated identities keep the first snapshot without summing.
+Later records with incompatible kinds, temporality or monotonicity are rejected.
+No valid disjoint series is truncated. SDK aggregation cannot
 allocate a series for arbitrary values under permitted keys. Job IDs, user IDs,
 collection names, filenames, prompts, raw exceptions and trace exemplars never
 become metric dimensions.
@@ -908,6 +914,19 @@ Cancelling a thread's waiter does not finish its running worker. A task cancelle
 before execution has no started/completed measurement. Process death resets
 active state and cannot synthesize historical completions. Existing job status
 and `/metrics/latency` contracts are unchanged.
+
+If an active-instrument SDK factory or update fails, its mutation state is
+unknown. That entire active instrument is suppressed for the runtime lifetime,
+including subsequent measurements and later wire exports. There is no retry or
+invented reset; other instruments and completion logs continue. This sacrifices
+active-instrument availability until restart, and does not reconstruct correct
+concurrency or remove previously exported backend history or in-flight exports.
+
+The private `SafeMeter` is a restricted finite-schema interface. It supports
+only the counter, histogram and up/down factories listed above. Unknown names
+and wrong factory/name combinations return inert instruments; gauge and
+observable factories are unsupported. It does not promise general SDK Meter
+compatibility or arbitrary custom metrics.
 
 Explicit structured completion logs use `rag.api.completed`,
 `rag.dependency.completed` or `rag.job.completed` bodies, INFO for successful

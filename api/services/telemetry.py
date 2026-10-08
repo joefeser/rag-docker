@@ -209,9 +209,28 @@ def metric_series_limit(name):
     return math.prod(len(metric_values(name, key)) for key in METRICS[name][2])
 
 
+class ActiveHealth:
+    """Bounded runtime-local loss of availability after ambiguous SDK failure."""
+    NAMES = frozenset(("rag.api.active", "rag.job.active"))
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self._suppressed = set()
+
+    def suppress(self, name):
+        with self.lock:
+            if name in self.NAMES:
+                self._suppressed.add(name)
+
+    def snapshot(self):
+        with self.lock:
+            return frozenset(self._suppressed)
+
+
 class SafeInstrument:
-    def __init__(self, name, instrument=None):
+    def __init__(self, name, instrument=None, health=None):
         self.name, self.instrument = name, instrument
+        self._health = health if health is not None else ActiveHealth()
 
     def _measure(self, method, value, attributes):
         if self.instrument is None:
@@ -222,10 +241,19 @@ class SafeInstrument:
                 return False
             if METRICS[self.name][0] != "create_up_down_counter" and value < 0:
                 return False
-            getattr(self.instrument, method)(value, clean)
-            return True
         except Exception:
             return False
+        # Input rejection does not taint an instrument. Once the SDK is called,
+        # a raised error cannot tell us whether it already changed aggregation.
+        with self._health.lock:
+            if self.name in self._health.snapshot():
+                return False
+            try:
+                getattr(self.instrument, method)(value, clean)
+                return True
+            except Exception:
+                self._health.suppress(self.name)
+                return False
 
     def add(self, amount, attributes=None, context=None):
         return self._measure("add", amount, attributes)
@@ -235,9 +263,14 @@ class SafeInstrument:
 
 
 class SafeMeter:
-    """Private validated facade: even direct instrumentation has finite series."""
-    def __init__(self, meter):
+    """Restricted finite-schema factories, not a general SDK Meter interface.
+
+    Unknown names or mismatched factories return inert instruments. Gauge and
+    observable factories are intentionally unsupported.
+    """
+    def __init__(self, meter, health=None):
         self._meter = meter
+        self._health = health if health is not None else ActiveHealth()
         self._instruments = {}
         self._lock = threading.Lock()
 
@@ -247,8 +280,15 @@ class SafeMeter:
             return SafeInstrument(name)
         with self._lock:
             if name not in self._instruments:
-                instrument = getattr(self._meter, kind)(name, unit=schema[1])
-                self._instruments[name] = SafeInstrument(name, instrument)
+                with self._health.lock:
+                    if name in self._health.snapshot():
+                        return SafeInstrument(name)
+                    try:
+                        instrument = getattr(self._meter, kind)(name, unit=schema[1])
+                    except Exception:
+                        self._health.suppress(name)
+                        return SafeInstrument(name)
+                    self._instruments[name] = SafeInstrument(name, instrument, self._health)
             return self._instruments[name]
 
     def create_counter(self, name, unit="", description="", **kwargs):
@@ -326,7 +366,7 @@ def _valid_metric(record):
     return True
 
 
-def sanitize_wire(data, signal, config):
+def sanitize_wire(data, signal, config, suppressed_metrics=()):
     """Rebuild protobuf, dropping all fields not explicitly copied below."""
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
     from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
@@ -353,18 +393,30 @@ def sanitize_wire(data, signal, config):
                 dst.add().CopyFrom(a)
                 seen.add(a.key)
     count = 0
-    metric_records = set()
+    metric_records = {}
     for rs in getattr(source, resources):
         for ss in getattr(rs, scopes):
             for record in getattr(ss, records):
                 if signal != "metrics" and count >= config.batch_size:
                     break
                 if signal == "metrics":
-                    if not _valid_metric(record) or record.name in metric_records:
+                    if record.name in suppressed_metrics or not _valid_metric(record):
                         continue
-                    metric_records.add(record.name)
+                    kind = record.WhichOneof("data")
+                    src_data = getattr(record, kind)
+                    metadata = (kind, getattr(src_data, "aggregation_temporality", None),
+                                getattr(src_data, "is_monotonic", None))
+                    if record.name in metric_records:
+                        dest, admitted_metadata, identities = metric_records[record.name]
+                        if metadata != admitted_metadata:
+                            continue
+                    else:
+                        dest = getattr(scope, records).add()
+                        identities = set()
+                        metric_records[record.name] = (dest, metadata, identities)
+                else:
+                    dest = getattr(scope, records).add()
                 count += 1
-                dest = getattr(scope, records).add()
                 if signal == "traces":
                     dest.name = record.name if record.name in SPAN_NAMES else "rag.operation"
                     dest.trace_id, dest.span_id, dest.parent_span_id = record.trace_id, record.span_id, record.parent_span_id
@@ -390,8 +442,13 @@ def sanitize_wire(data, signal, config):
                         dst_data.aggregation_temporality = src_data.aggregation_temporality
                     if kind == "sum":
                         dst_data.is_monotonic = src_data.is_monotonic
-                    # Admission validated all finite series; preserve them all.
+                    # Merge disjoint series across scopes/resources. Repeated
+                    # identities retain the first snapshot; never sum snapshots.
                     for point in src_data.data_points:
+                        identity = tuple(sorted(_metric_point_attributes(record.name, point).items()))
+                        if identity in identities:
+                            continue
+                        identities.add(identity)
                         dp = dst_data.data_points.add()
                         dp.start_time_unix_nano, dp.time_unix_nano = point.start_time_unix_nano, point.time_unix_nano
                         for key, value in _metric_point_attributes(record.name, point).items():
@@ -409,7 +466,7 @@ def sanitize_wire(data, signal, config):
     return output.SerializeToString()
 
 
-def _session(signal, config):
+def _session(signal, config, health=None):
     import requests
     class SafeSession(requests.Session):
         def __init__(self):
@@ -420,7 +477,7 @@ def _session(signal, config):
             result.status_code = 400  # SDK treats this as non-retryable.
             result._content = b"telemetry export failed"
             try:
-                payload = sanitize_wire(data, signal, config)
+                payload = sanitize_wire(data, signal, config, health.snapshot() if health is not None else ())
                 # Explicit arguments override ambient OTEL_* TLS/header options.
                 self.cookies.clear()
                 self.headers.clear()
@@ -443,6 +500,7 @@ class Runtime:
     def __init__(self, config):
         self.config = config
         self._providers = []
+        self._active_health = ActiveHealth()
         self.tracer = self.logger = self.meter = None
         self._lock = threading.Lock()
         self._worker = None
@@ -589,7 +647,7 @@ def bootstrap(env=None):
         return cls(endpoint=config.endpoint + "/v1/" + signal,
                    headers={"Content-Type": "application/x-protobuf"},
                    timeout=config.timeout_ms / 1000, compression=Compression.NoCompression,
-                   session=_session(signal, config), meter_provider=internal_meter)
+                   session=_session(signal, config, runtime._active_health), meter_provider=internal_meter)
     batch = dict(max_queue_size=config.queue_size, max_export_batch_size=config.batch_size,
                  schedule_delay_millis=config.interval_ms, export_timeout_millis=config.timeout_ms,
                  meter_provider=internal_meter)
@@ -618,7 +676,7 @@ def bootstrap(env=None):
                                                    aggregation=ExplicitBucketHistogramAggregation(BUCKETS) if schema[0] == "create_histogram" else None)
                                               for name, schema in METRICS.items()]])
             runtime._providers.append(provider)
-            runtime.meter = SafeMeter(provider.get_meter("rag.telemetry"))
+            runtime.meter = SafeMeter(provider.get_meter("rag.telemetry"), runtime._active_health)
     except Exception:
         runtime.shutdown()
         raise TelemetryConfigError("Telemetry initialization failed") from None
@@ -657,9 +715,14 @@ class Operation:
             if self.runtime.meter is not None:
                 kind = METRICS[name][0]
                 instrument = getattr(self.runtime.meter, kind)(name)
-                return (instrument.record if kind == "create_histogram" else instrument.add)(value, attributes) is not False
+                if name in self.runtime._active_health.snapshot():
+                    return False
+                if (instrument.record if kind == "create_histogram" else instrument.add)(value, attributes) is not False:
+                    return True
         except Exception:
             pass
+        if self.runtime.meter is not None:
+            self.runtime._active_health.suppress(name)
         return False
 
     def enter(self):
@@ -891,65 +954,66 @@ def call(name, fn, /, *args, **kwargs):
 
 
 def iterate(fn, /, *args, **kwargs):
-    # One lifetime, activated only during pulls. Neither tracing nor operation
-    # context may escape a generator yield into the consuming caller.
-    runtime = _runtime.get()
+    # Admission is eager, execution lazy. An unconsumed iterator starts no work.
+    return _iterate(capture(), _job_token.get(), fn, args, kwargs)
+
+
+def _iterate(snapshot, job_token, fn, args, kwargs):
+    runtime, parent = snapshot
     current = None
-    if runtime is not None and runtime.tracer is not None:
-        try:
-            from opentelemetry import trace, context
-            current = runtime.tracer.start_span("weaviate.iterate", kind=trace.SpanKind.CLIENT,
-                                                attributes={"rag.outcome": "ok"})
-        except Exception:
-            pass
-    state = Operation(runtime, "weaviate.iterate", current) if runtime is not None else None
-    job_token = _job_token.get()
-    def mark(value, exc):
-        state_context = _operation.set(state)
-        try:
-            outcome(value, exc, current)
-        finally:
-            _operation.reset(state_context)
-    try:
-        iterator = iter(fn(*args, **kwargs))
-        while True:
-            token = None
-            state_context = _operation.set(state)
+    with bind(snapshot, job_token=job_token):
+        if runtime is not None and runtime.tracer is not None:
             try:
-                if current is not None:
-                    token = context.attach(trace.set_span_in_context(current))
+                from opentelemetry import trace
+                current = runtime.tracer.start_span("weaviate.iterate", kind=trace.SpanKind.CLIENT,
+                                                    attributes={"rag.outcome": "ok"})
             except Exception:
                 pass
+    state = Operation(runtime, "weaviate.iterate", current) if runtime is not None else None
+
+    @contextmanager
+    def activate():
+        with bind((runtime, current.get_span_context() if current is not None else parent), job_token=job_token):
+            state_context = _operation.set(state)
+            attached = None
             try:
-                item = next(iterator)
-            except StopIteration:
-                return
+                if current is not None:
+                    from opentelemetry import context, trace
+                    attached = context.attach(trace.set_span_in_context(current))
+                yield
             finally:
+                if attached is not None:
+                    context.detach(attached)
                 _operation.reset(state_context)
-                if token is not None:
-                    try:
-                        context.detach(token)
-                    except Exception:
-                        pass
+
+    try:
+        with activate():
+            iterator = iter(fn(*args, **kwargs))
+        while True:
+            with activate():
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return
+            # Neither tracing nor operational context may escape into caller.
             yield item
     except BaseException as exc:
         import asyncio
-        mark("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc)
+        with activate():
+            outcome("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc, current)
         raise
     finally:
-        job_context = _job_token.set(job_token)
-        try:
-            if state is not None:
-                state.finish()
-        except Exception:
-            pass
-        finally:
-            _job_token.reset(job_context)
-        if current is not None:
+        with activate():
             try:
-                current.end()
+                if state is not None:
+                    state.finish()
             except Exception:
                 pass
+            if current is not None:
+                try:
+                    current.end()
+                except Exception:
+                    pass
 
 
 def remote_link(headers):
