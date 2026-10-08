@@ -922,6 +922,7 @@ including subsequent measurements and later wire exports. There is no retry or
 invented reset; other instruments and completion logs continue. This sacrifices
 active-instrument availability until restart, and does not reconstruct correct
 concurrency or remove previously exported backend history or in-flight exports.
+Local validation rejection does not suppress a healthy instrument.
 
 The private `SafeMeter` is a restricted finite-schema interface. It supports
 only the counter, histogram and up/down factories listed above. Unknown names

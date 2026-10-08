@@ -456,6 +456,36 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('rag.job.active',{m.name for m in metrics})
             self.assertTrue({'rag.job.completed','rag.job.duration'}<={m.name for m in metrics})
 
+    async def test_operation_local_rejection_keeps_active_instruments_available(self):
+        from unittest.mock import Mock
+        from opentelemetry.exporter.otlp.proto.common.metrics_encoder import encode_metrics
+        for name,scope,valid in (
+                ('rag.api.active','rag.request',{'http.method':'GET'}),
+                ('rag.job.active','rag.export',{'rag.operation':'export'})):
+            operation=ot.Operation(self.runtime,scope)
+            instrument=self.runtime.meter.create_up_down_counter(name)
+            updates=Mock(wraps=instrument.instrument.add)
+            instrument.instrument=NS(add=updates)
+            key=next(iter(valid))
+            invalid=[(1,None),(1,{}),(1,[]),(1,[('unapproved','value')]),
+                     (1,object()),(1,{key:SECRET}),(1,{key:None}),
+                     (1,{key:True}),(1,{key:[]}),
+                     (True,valid),(None,valid),('1',valid),([],valid),
+                     (float('nan'),valid),(float('inf'),valid),(float('-inf'),valid)]
+            for value,attrs in invalid:
+                with self.subTest(name=name,value=repr(value),attrs=repr(attrs)):
+                    self.assertFalse(operation.measure(name,value,attrs))
+                    self.assertFalse(self.runtime._active_health.snapshot())
+                    updates.assert_not_called()
+            self.assertTrue(operation.measure(name,1,valid))
+            self.assertTrue(operation.measure(name,-1,valid))
+            self.assertEqual(updates.call_count,2)
+        data=encode_metrics(self.reader.get_metrics_data()).SerializeToString()
+        clean=ot.sanitize_wire(data,'metrics',self.runtime.config,self.runtime._active_health.snapshot())
+        metrics=ExportMetricsServiceRequest.FromString(clean).resource_metrics[0].scope_metrics[0].metrics
+        self.assertEqual({m.name for m in metrics},ot.ActiveHealth.NAMES)
+        self.assertTrue(all(len(m.sum.data_points)==1 and m.sum.data_points[0].as_int==0 for m in metrics))
+
     async def test_active_direct_and_factory_failures_are_bounded_and_input_rejection_is_safe(self):
         from unittest.mock import Mock
         health=ot.ActiveHealth();raw=Mock();meter=ot.SafeMeter(raw,health)
