@@ -774,7 +774,10 @@ the runtime drops arbitrary text. Queue records use runtime-owned resources and
 fixed scopes; log wrappers also use fixed limits and discard exception objects
 and context references. The runtime logger copies supplied plain records and both
 layers of supplied wrappers before SDK normalization or exception expansion,
-so caller-owned records remain unchanged. Keyword emission is also supported.
+so caller-owned records remain unchanged. For supplied records and keyword
+emission, only schema-approved attribute strings are snapshotted before SDK
+delegation; forbidden mutable values are discarded, not recursively copied.
+Callers must not mutate their mappings while that snapshot is being constructed.
 Wire resources contain only the three explicit
 service fields; scope is `rag.telemetry`. Span names are `rag.` plus startup,
 query, ingest, export, import, tuning or evaluation (unknown names become
