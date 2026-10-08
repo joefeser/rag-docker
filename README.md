@@ -770,7 +770,8 @@ errors. No global OTel provider or root logging handler is installed. Manual
 request, worker and dependency instrumentation uses `app.state.telemetry`'s private tracer, logger and meter.
 
 Before trace/log queueing and again at the final protobuf transport boundary,
-the runtime drops arbitrary text. Wire resources contain only the three explicit
+the runtime drops arbitrary text and rebuilds queued scope/resource metadata,
+context and log limits without retaining exception objects. Wire resources contain only the three explicit
 service fields; scope is `rag.telemetry`. Request names use the fixed registered
 HTTP method and route template, with `rag.request` for unmatched routes. Dynamic
 path values and query strings are never recorded. Other names are finite
@@ -788,7 +789,9 @@ a sampled flag. Trace/span IDs remain correlation fields, never authentication.
 The operational metric allowlist and finite dimensions are documented below.
 The private meter validates values before SDK aggregation; instrument-specific
 views and the final export boundary enforce its schema. Export removes arbitrary
-descriptions and exemplars and preserves only fixed declared units. The original
+descriptions and exemplars and preserves only fixed declared units. Metric
+exemplar sampling is explicitly disabled, regardless of ambient exemplar settings,
+so dropped attributes never enter an exemplar reservoir. The original
 dimensionless `rag.telemetry.check` remains a one-point synthetic schema probe.
 All points in a metric are validated before admitting the record. Histograms
 require at most 31 finite, strictly increasing boundaries, consistent bucket

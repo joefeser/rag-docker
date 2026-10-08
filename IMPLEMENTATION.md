@@ -20898,9 +20898,12 @@ def bootstrap(env=None):
     from opentelemetry.sdk.trace import TracerProvider, SpanLimits
     from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.sdk._logs import LoggerProvider
+    from opentelemetry.sdk._logs import LoggerProvider, ReadWriteLogRecord, LogRecordLimits
+    from opentelemetry._logs import LogRecord
+    from opentelemetry.context import Context
+    from opentelemetry.sdk.util.instrumentation import InstrumentationScope
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics import MeterProvider, AlwaysOffExemplarFilter
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.metrics.view import View, DropAggregation, ExplicitBucketHistogramAggregation
     from opentelemetry.exporter.otlp.proto.http import Compression
@@ -20921,24 +20924,32 @@ def bootstrap(env=None):
                 links=safe_links(span.links),
                 attributes=safe_attributes(span.attributes), kind=span.kind,
                 status=Status(span.status.status_code), start_time=span.start_time,
-                end_time=span.end_time, instrumentation_scope=span.instrumentation_scope)
+                end_time=span.end_time, instrumentation_scope=scope)
             super().on_end(clean)
 
     class SafeBatchLogs(BatchLogRecordProcessor):
         def on_emit(self, record):
-            # Sanitize before the queue as well as at the wire boundary so a
-            # large log body cannot occupy every bounded queue slot.
-            import copy
-            clean = copy.copy(record)
-            clean.log_record = copy.copy(record.log_record)
-            clean.log_record.body = record.log_record.body if isinstance(record.log_record.body, str) and record.log_record.body in LOG_BODIES else "rag.operation"
-            clean.log_record.severity_text = ""
-            clean.log_record.event_name = None
-            clean.log_record.attributes = safe_attributes(record.log_record.attributes)
+            # Rebuild both layers: shallow copies retain caller-owned metadata
+            # and exception objects, even after the visible attributes are safe.
+            source = record.log_record
+            clean_record = LogRecord(
+                timestamp=source.timestamp, observed_timestamp=source.observed_timestamp,
+                severity_number=source.severity_number,
+                body=source.body if isinstance(source.body, str) and source.body in LOG_BODIES else "rag.operation",
+                attributes=safe_attributes(source.attributes))
+            clean_record.context = Context()
+            clean_record.trace_id = source.trace_id
+            clean_record.span_id = source.span_id
+            clean_record.trace_flags = source.trace_flags
+            clean = ReadWriteLogRecord(log_record=clean_record, resource=resource,
+                                       instrumentation_scope=scope, limits=log_limits)
             super().on_emit(clean)
 
     resource = Resource({"service.name": config.service, "service.version": config.version,
                          "deployment.environment.name": config.environment})
+    scope = InstrumentationScope("rag.telemetry")
+    log_limits = LogRecordLimits(max_attributes=16, max_attribute_length=128,
+                                max_log_record_attributes=16, max_log_record_attribute_length=128)
     internal_meter = NoOpMeterProvider()
     def exporter(cls, signal):
         return cls(endpoint=config.endpoint + "/v1/" + signal,
@@ -20967,6 +20978,7 @@ def bootstrap(env=None):
                                                   export_interval_millis=config.interval_ms,
                                                   export_timeout_millis=config.timeout_ms)
             provider = MeterProvider(resource=resource, shutdown_on_exit=False, metric_readers=[reader],
+                                     exemplar_filter=AlwaysOffExemplarFilter(),
                                      views=[View(instrument_name="*", aggregation=DropAggregation()),
                                             *[View(instrument_name=name, attribute_keys=set(schema[2]),
                                                    aggregation=ExplicitBucketHistogramAggregation(BUCKETS) if schema[0] == "create_histogram" else None)
@@ -21615,6 +21627,132 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(len(metric.sum.data_points), 1)
             self.assertFalse(metric.sum.data_points[0].attributes)
             self.assertEqual(metric.sum.data_points[0].as_int, 200)
+
+    def test_exemplar_reservoir_never_receives_dropped_attributes(self):
+        from opentelemetry.sdk.metrics._internal.exemplar.exemplar_reservoir import FixedSizeExemplarReservoirABC
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+        original_offer = FixedSizeExemplarReservoirABC.offer
+        original_export = OTLPMetricExporter.export
+        for ambient in (None, 'always_on'):
+            with self.subTest(ambient=ambient), patch.dict(os.environ):
+                if ambient is None:
+                    os.environ.pop('OTEL_METRICS_EXEMPLAR_FILTER', None)
+                else:
+                    os.environ['OTEL_METRICS_EXEMPLAR_FILTER'] = ambient
+                collected = []
+                def capture(exporter, metrics_data, *args, **kwargs):
+                    collected.append(metrics_data)
+                    return original_export(exporter, metrics_data, *args, **kwargs)
+                with receiver() as (env, records), patch.object(
+                        FixedSizeExemplarReservoirABC, 'offer', autospec=True, side_effect=original_offer) as offer, patch.object(
+                        OTLPMetricExporter, 'export', autospec=True, side_effect=capture):
+                    runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+                    try:
+                        counter = runtime.meter.create_counter('rag.telemetry.check')
+                        with runtime.tracer.start_as_current_span('rag.query') as span:
+                            self.assertTrue(span.get_span_context().trace_flags.sampled)
+                            counter.add(2, {'secret':SECRET})
+                        counter.add(3, {'secret':SECRET+'-outside-span'})
+                        # Before collection/serialization, nothing entered a reservoir.
+                        offer.assert_not_called()
+                        self.assertTrue(runtime.force_flush())
+                        points = [point for data in collected for resource in data.resource_metrics
+                                  for scope in resource.scope_metrics for metric in scope.metrics
+                                  for point in metric.data.data_points]
+                        self.assertTrue(points)
+                        for point in points:
+                            self.assertEqual(point.value, 5)
+                            self.assertFalse(point.attributes)
+                            self.assertFalse(point.exemplars)
+                        payload = dict(records)['/v1/metrics']
+                        self.assertNotIn(SECRET.encode(), payload)
+                        metric = ExportMetricsServiceRequest.FromString(payload).resource_metrics[0].scope_metrics[0].metrics[0]
+                        self.assertEqual(metric.sum.data_points[0].as_int, 5)
+                    finally:
+                        self.assertTrue(runtime.shutdown())
+                    offer.assert_not_called()
+
+    def test_log_queue_rebuilds_wrapper_and_exception_without_mutating_input(self):
+        from opentelemetry._logs import LogRecord, SeverityNumber
+        from opentelemetry.sdk._logs import ReadWriteLogRecord, LogRecordLimits
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.util.instrumentation import InstrumentationScope
+        from opentelemetry.context import Context
+        hostile_resource = Resource({'secret':SECRET}, schema_url=SECRET)
+        hostile_scope = InstrumentationScope(SECRET, version=SECRET, schema_url=SECRET, attributes={'secret':SECRET})
+        hostile_limits = LogRecordLimits(max_attributes=128, max_attribute_length=1024)
+        hostile_limits.private_note = SECRET
+        original = LogRecord(body=SECRET, severity_text=SECRET, event_name=SECRET,
+                             severity_number=SeverityNumber.ERROR, context=Context({'secret':SECRET}),
+                             attributes={'secret':SECRET, 'rag.outcome':'error'})
+        wrapper = ReadWriteLogRecord(log_record=original, resource=hostile_resource,
+                                     instrumentation_scope=hostile_scope, limits=hostile_limits)
+        before = dict(original.__dict__)
+        before['attributes'] = dict(original.attributes)
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                runtime.logger.emit(record=wrapper)
+                try:
+                    raise RuntimeError(SECRET)
+                except RuntimeError as error:
+                    exception_record = LogRecord(body=SECRET, exception=error, attributes={'rag.outcome':'error'})
+                    runtime.logger.emit(record=exception_record)
+                    self.assertIs(exception_record.exception, error)
+                    self.assertEqual(dict(exception_record.attributes), {'rag.outcome':'error'})
+                processor = runtime.providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                self.assertEqual(len(processor._queue), 2)
+                for queued in processor._queue:
+                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.1.0', 'deployment.environment.name':'development'})
+                    self.assertFalse(queued.resource.schema_url)
+                    self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
+                    self.assertFalse(queued.instrumentation_scope.version)
+                    self.assertFalse(queued.instrumentation_scope.schema_url)
+                    self.assertFalse(queued.instrumentation_scope.attributes)
+                    self.assertIsNot(queued.limits, hostile_limits)
+                    self.assertNotIn(SECRET, repr(vars(queued.limits)))
+                    self.assertFalse(queued.log_record.context)
+                    self.assertIsNone(queued.log_record.exception)
+                    self.assertEqual(queued.log_record.body, 'rag.operation')
+                    self.assertFalse(queued.log_record.severity_text)
+                    self.assertFalse(queued.log_record.event_name)
+                    self.assertEqual(dict(queued.log_record.attributes), {'rag.outcome':'error'})
+                self.assertEqual(original.__dict__, before)
+                self.assertIs(wrapper.resource, hostile_resource)
+                self.assertIs(wrapper.instrumentation_scope, hostile_scope)
+                self.assertIs(wrapper.limits, hostile_limits)
+                self.assertEqual(hostile_limits.private_note, SECRET)
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/logs']
+                self.assertNotIn(SECRET.encode(), payload)
+                logs = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual(len(logs), 2)
+                self.assertIn(SeverityNumber.ERROR.value, [log.severity_number for log in logs])
+            finally:
+                self.assertTrue(runtime.shutdown())
+
+    def test_caller_selected_span_scope_is_rebuilt_before_queue(self):
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                tracer = runtime.providers[0].get_tracer(SECRET, instrumenting_library_version=SECRET,
+                                                       schema_url=SECRET, attributes={'secret':SECRET})
+                with tracer.start_as_current_span('rag.query') as original:
+                    pass
+                self.assertEqual(original.instrumentation_scope.name, SECRET)
+                processor = runtime.providers[0]._active_span_processor._span_processors[0]._batch_processor
+                queued = processor._queue[0]
+                self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
+                self.assertFalse(queued.instrumentation_scope.version)
+                self.assertFalse(queued.instrumentation_scope.schema_url)
+                self.assertFalse(queued.instrumentation_scope.attributes)
+                self.assertEqual(queued.context.trace_id, original.context.trace_id)
+                self.assertEqual(queued.context.span_id, original.context.span_id)
+                self.assertEqual(dict(original.instrumentation_scope.attributes), {'secret':SECRET})
+                self.assertTrue(runtime.force_flush())
+                self.assertNotIn(SECRET.encode(), dict(records)['/v1/traces'])
+            finally:
+                self.assertTrue(runtime.shutdown())
 
     def test_wire_rebuilds_scope_resource_and_free_text(self):
         source = ExportTraceServiceRequest()
@@ -22334,6 +22472,34 @@ class OperationsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(list(ot.iterate(lambda:iter([1,2]))),[1,2])
             self.assertEqual(calls,[1])
         finally:provider.shutdown()
+
+    async def test_rebuilt_queue_preserves_operational_bodies_and_job_correlation(self):
+        with receiver() as (env,records):
+            runtime=ot.bootstrap({**env,'RAG_OTEL_METRICS':'false','RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                with ot.bind((runtime,None)),ot.span('rag.request',server=True,method='GET') as request:
+                    with ot.span('rag.export'):
+                        ot.call('weaviate.query',lambda:None)
+                provider=next(p for p in runtime.providers if hasattr(p,'_multi_log_record_processor'))
+                processor=provider._multi_log_record_processor._log_record_processors[0]._batch_processor
+                queued=list(processor._queue)
+                self.assertEqual({r.log_record.body for r in queued},ot.LOG_BODIES)
+                jobs=[r.log_record for r in queued if r.log_record.body!='rag.api.completed']
+                self.assertEqual(len(jobs),2)
+                self.assertEqual(len({r.attributes['rag.job_token'] for r in jobs}),1)
+                for record in queued:
+                    log=record.log_record
+                    self.assertEqual(log.trace_id,request.get_span_context().trace_id)
+                    self.assertNotEqual(log.span_id,0)
+                    self.assertFalse(log.context)
+                    self.assertIsNone(log.exception)
+                    self.assertEqual(record.instrumentation_scope.name,'rag.telemetry')
+                    self.assertFalse(record.instrumentation_scope.attributes)
+                self.assertTrue(runtime.force_flush())
+                wire=ExportLogsServiceRequest.FromString(dict(records)['/v1/logs']).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual({r.body.string_value for r in wire},ot.LOG_BODIES)
+                self.assertEqual(len([r for r in wire if 'rag.job_token' in dimensions(r)]),2)
+            finally:runtime.shutdown()
 
     async def test_real_wire_all_instruments_multiple_series_and_log_correlation(self):
         with receiver() as (env,records):
