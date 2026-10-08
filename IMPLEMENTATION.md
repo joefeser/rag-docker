@@ -22258,3 +22258,19 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__=='__main__':unittest.main()
 ```
+
+
+## Optional collector integration (#285)
+
+The telemetry overlay and profile wire the API to the private pinned Collector;
+operator setup, offline identity verification and bounds are in
+`telemetry/README.md`. `scripts/collector_offline.py` checks trusted platform
+config/layer hashes and sanitizes image archives before optional offline loading.
+The default Compose file and five-image path do not enable telemetry.
+
+`15_telemetry` is explicitly registered in the verification dispatcher. Enabled
+acceptance requires `stack.sh run --telemetry`, whose trusted overlay adds a
+bounded protobuf capture service using the existing API image. Configuration
+checks, focused synthetic tests and real disposable API/collector acceptance are
+separate evidence layers. The controller reports timings and resource samples;
+no production overhead result is implied by implementation or unit tests.

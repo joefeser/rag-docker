@@ -2302,3 +2302,30 @@ series, disabled/sampled-out tracing, telemetry faults and receiver errors.
 Synthetic dependencies require no hosted service; deployment acceptance remains
 #285. Abrupt process death or surviving workers after shutdown may lose final
 records; operational telemetry is not durable audit storage (#29).
+
+## Optional Collector and end-to-end telemetry (#285)
+
+The explicit `docker-compose.telemetry.yml` overlay plus `telemetry` profile adds
+a digest-pinned local Collector and passes supported settings into the API.
+Base startup remains five services with telemetry disabled. Collector ingestion
+has no host-published ports and no application health dependency. Resource limits,
+finite queues/retries, local summary-only diagnostics and optional standard OTLP
+export with runtime mounted secrets are documented in `telemetry/README.md`.
+
+Optional offline packaging includes only the selected platform image. Before
+loading, validate its config identity against the tracked pin allow-list and
+layer hashes against that config; never trust archive tags or image overrides.
+Missing/mismatched optional images fail without pulling. Default offline behavior
+remains unchanged.
+
+The registered disposable telemetry suite distinguishes default-mode checks from
+explicit `--telemetry` acceptance. Enabled acceptance must decode received
+protobuf after the actual Collector: a real synthetic query and concurrent jobs
+have connected request/operation/worker/dependency spans and matching completion
+logs, finite safe metrics and no planted credential/content sentinels. Capture
+overflow is failed acceptance. Disabled mode emits zero application exports;
+Collector refusal and a slow destination preserve usable query/job work with
+bounded configuration and reported latency/resource observations. Restart and
+shutdown evidence does not imply job draining, durable queues or cross-restart
+trace continuity. Full default and enabled runs and their actual limitations are
+required; a resolved Compose file alone is not runtime acceptance.

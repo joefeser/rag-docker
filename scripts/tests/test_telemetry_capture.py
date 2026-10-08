@@ -1,0 +1,115 @@
+"""Receiver and decoded evidence assertions, run with the locked API dependencies."""
+import base64
+import importlib.util
+import json
+import copy
+from pathlib import Path
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
+
+
+class CaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load('capture', 'scripts/verify/telemetry_capture.py')
+        self.server = self.m.Server(('127.0.0.1', 0), self.m.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        self.addCleanup(self.server.server_close); self.addCleanup(self.server.shutdown)
+        self.url = 'http://127.0.0.1:'+str(self.server.server_port)
+
+    def post(self, path, data=b''):
+        return urllib.request.urlopen(urllib.request.Request(self.url+path, data=data), timeout=2)
+
+    def test_real_protobuf_decodes_and_reset_zeros_counts(self):
+        msg = ExportTraceServiceRequest()
+        msg.resource_spans.add().scope_spans.add().spans.add(name='POST /query', trace_id=b'a'*16, span_id=b'b'*8)
+        self.assertEqual(self.post('/v1/traces', msg.SerializeToString()).status, 200)
+        data = json.load(urllib.request.urlopen(self.url+'/snapshot'))
+        self.assertEqual(data['requests'], 1)
+        self.assertEqual(data['batches'][0]['data']['resource_spans'][0]['scope_spans'][0]['spans'][0]['name'], 'POST /query')
+        self.post('/reset')
+        self.assertEqual(json.load(urllib.request.urlopen(self.url+'/snapshot'))['requests'], 0)
+
+    def test_capture_overflow_is_explicit_failure(self):
+        self.m.MAX_BATCHES = 1
+        self.post('/v1/traces')
+        with self.assertRaises(urllib.error.HTTPError) as exc:
+            self.post('/v1/traces')
+        self.assertEqual(exc.exception.code, 503)
+        self.assertEqual(self.m.capture.overflow, 1)
+
+    def test_oversized_body_refused(self):
+        self.m.MAX_BODY = 8
+        with self.assertRaises(urllib.error.HTTPError) as exc:
+            self.post('/v1/traces', b'0123456789')
+        self.assertEqual(exc.exception.code, 413)
+
+
+class EvidenceTests(unittest.TestCase):
+    def fixture(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        def attr(key, value):
+            return {'key':key, 'value':{'string_value':value}}
+        root = {'trace_id':'trace1', 'span_id':'root', 'name':'POST /export', 'links':[{'trace_id':'remote1'}]}
+        job = {'trace_id':'trace1', 'span_id':'job', 'parent_span_id':'root', 'name':'rag.export'}
+        dep = {'trace_id':'trace1', 'span_id':'dep', 'parent_span_id':'job', 'name':'weaviate.iterate'}
+        logs = [{'trace_id':'trace1', 'span_id':span, 'body':{'string_value':body},
+                 'attributes':[] if span=='root' else [attr('rag.job_token','a'*32)]}
+                for span, body in [('root','rag.api.completed'),('job','rag.job.completed'),('dep','rag.dependency.completed')]]
+        metrics = []
+        for name in ('rag.api.requests','rag.api.duration','rag.dependency.calls','rag.job.completed'):
+            attributes = [attr(k, sorted(m.SCHEMA['metric_values'](name,k))[0]) for k in m.SCHEMA['METRICS'][name][2]]
+            kind = 'histogram' if m.SCHEMA['METRICS'][name][0] == 'create_histogram' else 'sum'
+            metrics.append({'name':name, kind:{'data_points':[{'as_int':'1','attributes':attributes}]}})
+        snapshot = {'overflow':0,'batches':[
+            {'signal':'traces','data':{'resource_spans':[{'scope_spans':[{'spans':[root,job,dep]}]}]}},
+            {'signal':'logs','data':{'resource_logs':[{'scope_logs':[{'log_records':logs}]}]}},
+            {'signal':'metrics','data':{'resource_metrics':[{'scope_metrics':[{'metrics':metrics}]}]}}]}
+        return m, snapshot, [('remote1','rag.export')]
+
+    def test_connected_received_tree_is_accepted(self):
+        m,snapshot,expected = self.fixture()
+        m.inspect(snapshot, expected)
+
+    def test_dependency_sibling_is_not_worker_lineage(self):
+        m,snapshot,expected = self.fixture()
+        m.records(snapshot,'traces')[2]['parent_span_id'] = 'root'
+        with self.assertRaisesRegex(AssertionError,'parent chain'):
+            m.inspect(snapshot,expected)
+
+    def test_concurrent_job_context_leak_rejected(self):
+        m,snapshot,expected = self.fixture()
+        m.records(snapshot,'logs')[2]['attributes'][0]['value']['string_value'] = 'b'*32
+        with self.assertRaisesRegex(AssertionError,'crossed trace trees'):
+            m.inspect(snapshot,expected)
+
+    def test_trace_identity_metric_label_rejected(self):
+        m,snapshot,expected = self.fixture()
+        metric = m.records(snapshot,'metrics')[0]
+        metric['sum']['data_points'][0]['attributes'].append({'key':'trace_id','value':{'string_value':'trace1'}})
+        with self.assertRaisesRegex(AssertionError,'schema mismatch'):
+            m.inspect(snapshot,expected)
+
+    def test_content_sentinel_prevents_acceptance(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        with self.assertRaisesRegex(AssertionError, 'sentinel'):
+            m.inspect({'overflow': 0, 'batches': [{'data':m.SENTINELS[0]}]}, [])
+
+    def test_capture_overflow_prevents_acceptance(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        with self.assertRaisesRegex(AssertionError, 'overflow'):
+            m.inspect({'overflow': 1, 'batches': []}, [])
+
+
+if __name__ == '__main__':
+    unittest.main()

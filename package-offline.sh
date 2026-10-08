@@ -18,6 +18,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+TELEMETRY=0
+if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
+[ "$#" -le 1 ] || { echo "Usage: bash package-offline.sh [--telemetry] [output.tar]" >&2; exit 2; }
 OUT="${1:-rag-docker-offline.tar}"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 
@@ -58,7 +61,7 @@ tar cf - \
   --exclude='*/.venv/*' --exclude='*/venv/*' \
   --exclude='./.env' --exclude='*/.env' --exclude='*/.env.*' \
   --exclude='./.git/*' --exclude='*.tar' --exclude='*.zip' \
-  --exclude='./offline/*' \
+  --exclude='./offline/*' --exclude='./dev-docs/*' --exclude='./telemetry/secrets/*' \
   --exclude='./ingest-inbox/*' \
   --exclude='./exports/*' \
   . | ( cd "$STAGE/rag-docker" && tar xf - )
@@ -73,6 +76,11 @@ touch "$STAGE/rag-docker/exports/.gitkeep"
 
 echo "==> Saving images (this is the slow part)"
 docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
+
+if [ "$TELEMETRY" = 1 ]; then
+  echo "==> Saving optional pinned collector (Python 3.11+ required)"
+  python3 scripts/collector_offline.py package "$STAGE/rag-docker/offline"
+fi
 
 echo "==> Exporting model weights from volume '$MODELVOL'"
 # Uses the ollama image itself as the tar helper: it ships /usr/bin/tar and is

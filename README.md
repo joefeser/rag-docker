@@ -892,3 +892,13 @@ still emit, with absent trace/span IDs. Logs can be disabled independently.
 Existing application log messages are not forwarded to OTLP: exception text,
 credentials, document content and arbitrary bodies remain excluded. Telemetry
 measurement or logger failures do not change application results.
+
+### Optional local Collector and offline acceptance (#285)
+
+[Collector setup](telemetry/README.md) provides the explicit Compose overlay and
+profile, private HTTP/protobuf receiver, bounded local diagnostics, optional OTLP
+destination with runtime secret injection, and optional offline image packaging.
+The default five-service stack still disables application telemetry. Collector
+health is independent of API health. Run the full disposable suite both normally
+and with `--telemetry` to exercise actual query/job exports, content exclusions,
+concurrency, restart and receiver outages with measured overhead.
