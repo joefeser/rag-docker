@@ -2207,3 +2207,28 @@ Overlap retains internal whitespace-only windows to preserve exact character cov
       *Controlled restart cases in `test_batch_recovery.py`; startup deliberately does not delete targets using mutable recovery data.*
 
 - [x] After an interrupted tuning cutover is checked, startup durably records the outcome (`complete`, `stale`, or `other-instance`) and clears `cutover_pending`, preserving the recovery collection and journal. Later startups do not compare or re-flag that operation. An undecidable check or failed outcome write remains pending for retry.
+
+## Optional telemetry foundation (#282)
+
+The backend owns one optional private OpenTelemetry runtime initialized before
+startup clients and always closed on failed startup or shutdown. It is disabled
+by default with no exporter construction or telemetry egress. Enabled invalid
+configuration fails with field-only errors. Configuration and finite safe schema
+are specified in README.md, “Optional backend telemetry”. No global providers,
+automatic request instrumentation, application log bridge or collector deployment
+are included in this foundation.
+
+Only explicit service resource metadata, fixed instrumentation scope, finite
+operation/outcome/error values and trace identifiers may leave through OTLP.
+Prompts, answers, request/response bodies, credentials, filenames, paths,
+document text, free-form errors/events and metric dimensions are excluded. The
+export boundary rebuilds protobuf records; trace/log queue inputs are sanitized
+as well. Existing application logging remains unchanged. Bounded SDK queues,
+one-attempt HTTP export and bounded lifecycle caller waits keep collector outages
+independent of application work; OS DNS cancellation is not guaranteed.
+
+Infrastructure verification runs real SDK traces/logs/metrics through a synthetic
+loopback OTLP receiver with sentinel content and checks disabled behavior,
+configuration validation, resources, sampling/signals, overload, export failure,
+flush/shutdown, and embedded implementation consistency. It requires no collector
+or external provider. Full acceptance runs only in the disposable verify project.
