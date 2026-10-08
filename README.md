@@ -770,7 +770,9 @@ errors. No global OTel provider or root logging handler is installed. Future
 instrumentation uses `app.state.telemetry`'s private tracer, logger and meter.
 
 Before trace/log queueing and again at the final protobuf transport boundary,
-the runtime drops arbitrary text. Wire resources contain only the three explicit
+the runtime drops arbitrary text. Queue records use runtime-owned resources and
+fixed scopes; log wrappers also use fixed limits and discard exception objects
+and context references without modifying the caller's record. Wire resources contain only the three explicit
 service fields; scope is `rag.telemetry`. Span names are `rag.` plus startup,
 query, ingest, export, import, tuning or evaluation (unknown names become
 `rag.operation`). Allowed attributes are `rag.operation` with those operation

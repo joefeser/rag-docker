@@ -344,7 +344,10 @@ def bootstrap(env=None):
     from opentelemetry.sdk.trace import TracerProvider, SpanLimits
     from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.sdk._logs import LoggerProvider
+    from opentelemetry.sdk._logs import LoggerProvider, ReadWriteLogRecord, LogRecordLimits
+    from opentelemetry._logs import LogRecord
+    from opentelemetry.context import Context
+    from opentelemetry.sdk.util.instrumentation import InstrumentationScope
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider, AlwaysOffExemplarFilter
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
@@ -366,24 +369,31 @@ def bootstrap(env=None):
                 context=clean_context(span.context), parent=clean_context(span.parent), resource=resource,
                 attributes=safe_attributes(span.attributes), kind=span.kind,
                 status=Status(span.status.status_code), start_time=span.start_time,
-                end_time=span.end_time, instrumentation_scope=span.instrumentation_scope)
+                end_time=span.end_time, instrumentation_scope=scope)
             super().on_end(clean)
 
     class SafeBatchLogs(BatchLogRecordProcessor):
         def on_emit(self, record):
-            # Sanitize before the queue as well as at the wire boundary so a
-            # large log body cannot occupy every bounded queue slot.
-            import copy
-            clean = copy.copy(record)
-            clean.log_record = copy.copy(record.log_record)
-            clean.log_record.body = "rag.operation"
-            clean.log_record.severity_text = ""
-            clean.log_record.event_name = None
-            clean.log_record.attributes = safe_attributes(record.log_record.attributes)
+            # Rebuild both layers: shallow copies retain caller-owned metadata
+            # and exception objects, even after the visible attributes are safe.
+            source = record.log_record
+            clean_record = LogRecord(
+                timestamp=source.timestamp, observed_timestamp=source.observed_timestamp,
+                severity_number=source.severity_number, body="rag.operation",
+                attributes=safe_attributes(source.attributes))
+            clean_record.context = Context()
+            clean_record.trace_id = source.trace_id
+            clean_record.span_id = source.span_id
+            clean_record.trace_flags = source.trace_flags
+            clean = ReadWriteLogRecord(log_record=clean_record, resource=resource,
+                                       instrumentation_scope=scope, limits=log_limits)
             super().on_emit(clean)
 
     resource = Resource({"service.name": config.service, "service.version": config.version,
                          "deployment.environment.name": config.environment})
+    scope = InstrumentationScope("rag.telemetry")
+    log_limits = LogRecordLimits(max_attributes=16, max_attribute_length=128,
+                                max_log_record_attributes=16, max_log_record_attribute_length=128)
     internal_meter = NoOpMeterProvider()
     def exporter(cls, signal):
         return cls(endpoint=config.endpoint + "/v1/" + signal,

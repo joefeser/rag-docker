@@ -2231,7 +2231,9 @@ operation/outcome/error values and trace identifiers may leave through OTLP.
 Prompts, answers, request/response bodies, credentials, filenames, paths,
 document text, free-form errors/events and metric dimensions are excluded. The
 export boundary rebuilds protobuf records; trace/log queue inputs are sanitized
-as well. The private meter provider explicitly disables exemplar sampling so
+as well, including runtime-owned resource/scope metadata and log limits; queued
+logs retain neither exception objects nor caller context references. Processor
+sanitization must not modify caller-owned records. The private meter provider explicitly disables exemplar sampling so
 attributes removed by metric views cannot remain in exemplar reservoirs; ambient
 exemplar filter settings cannot override this policy. Existing application logging
 remains unchanged. Bounded SDK queues,
