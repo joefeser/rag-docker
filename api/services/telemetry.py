@@ -51,6 +51,11 @@ class Config:
             return raw == "true"
         if not boolean("ENABLED", False):
             return cls()  # No other configuration or secret file is examined.
+        # All pinned SDK providers read the real process environment, even when
+        # callers supply a separate RAG configuration mapping. Reject the
+        # conflict before creating exporters rather than mutate global state.
+        if os.environ.get("OTEL_SDK_DISABLED", "").lower().strip() == "true":
+            raise TelemetryConfigError("RAG_OTEL_ENABLED conflicts with OTEL_SDK_DISABLED")
         def number(key, default, low, high, integer=True):
             try:
                 raw = value(key, default)

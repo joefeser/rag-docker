@@ -755,7 +755,13 @@ these fields. Headers belong in an uncommitted mounted secret file, never in
 service metadata. Credential headers require HTTPS, including loopback destinations;
 HTTP is accepted only without credentials. Header names are case-insensitive and
 duplicate names (including repeated JSON keys) are rejected. Exporter transport ignores ambient proxies/netrc and uses TLS
-verification; redirects are refused. Other `OTEL_*` variables are not a supported
+verification; redirects are refused. An enabled runtime rejects a process-level
+`OTEL_SDK_DISABLED` value that the SDK recognizes as true (case-insensitive,
+ignoring surrounding whitespace), before reading secrets or creating exporters.
+Remove that setting or set it to false to enable RAG telemetry. Explicit bootstrap
+configuration mappings cannot override this process-level conflict. Disabled RAG
+telemetry remains a no-op regardless of that setting. The runtime never mutates
+the process environment. Other `OTEL_*` variables are not a supported
 configuration interface for this private runtime.
 
 Disabled mode creates no providers, workers or exporters and does not read the
