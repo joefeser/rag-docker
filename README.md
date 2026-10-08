@@ -767,7 +767,11 @@ configuration interface for this private runtime.
 Disabled mode creates no providers, workers or exporters and does not read the
 secret file. Invalid enabled configuration fails API startup with field-only
 errors. No global OTel provider or root logging handler is installed. Manual
-request, worker and dependency instrumentation uses `app.state.telemetry`'s private tracer, logger and meter.
+request, worker and dependency instrumentation uses `app.state.telemetry.tracer`,
+`.logger` and `.meter`, with `force_flush()` and `shutdown()` for lifecycle.
+Raw SDK providers are internal implementation details and are not part of the
+supported runtime API. This encapsulation is not a security boundary against
+Python private-state access.
 
 Before trace/log queueing and again at the final protobuf transport boundary,
 the runtime drops arbitrary text. Queue records use runtime-owned resources and

@@ -2224,7 +2224,10 @@ runtime must not mutate the process environment or global providers.
 Configuration and finite safe schema
 are specified in README.md, “Optional backend telemetry”. No global providers,
 automatic request instrumentation, application log bridge or collector deployment
-are included in this foundation.
+are included in this foundation. Raw SDK providers remain internal; supported
+instrumentation uses the runtime tracer, safe logger and meter, with lifecycle
+through force_flush/shutdown. Python private-state access is outside this API
+contract, not prevented by a security sandbox.
 
 Only explicit service resource metadata, fixed instrumentation scope, finite
 operation/outcome/error values and trace identifiers may leave through OTLP.
