@@ -16,6 +16,14 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
 check "OTel operational metrics and sanitized correlated logs" $?
+# Collector evidence and packaging regressions run in both default and enabled
+# modes. Only the Compose-only class needs the host CLI; it never starts services.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_capture.py)
+check "OTel capture evidence, identity and transition regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo/scripts/tests "$(docker compose images -q api)" python -m unittest test_collector.Offline test_collector.Installer test_collector.Packager)
+check "OTel offline identity, installer and package regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_collector.py" Compose
+check "OTel Compose isolation and verification configuration" $?
 python3 "$REPO_ROOT/scripts/tests/test_service_inventory.py"
 check "exact default/telemetry infrastructure inventory policy" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"

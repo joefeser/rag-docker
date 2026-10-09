@@ -11255,7 +11255,13 @@ include host guard overhead; samples are observations, not performance SLOs.
 satisfy full telemetry acceptance. No real backend account or external egress is
 needed once dependencies/images/models are available.
 
-Focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
+Suite 01 always runs capture/evidence regressions and offline/installer/package
+regressions in the built API image with network disabled, in both default and
+telemetry-enabled runs. Compose-only collector checks run on the host without
+starting services. Exact inventory and embedded-source checks also remain
+mandatory in suite 01.
+
+Standalone focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
 configuration only), `python scripts/tests/test_telemetry_capture.py` (locked API
 dependencies), and the existing verify-stack tests. These complement, not replace,
 both full runs.
@@ -12812,6 +12818,14 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
 check "OTel operational metrics and sanitized correlated logs" $?
+# Collector evidence and packaging regressions run in both default and enabled
+# modes. Only the Compose-only class needs the host CLI; it never starts services.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_capture.py)
+check "OTel capture evidence, identity and transition regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo/scripts/tests "$(docker compose images -q api)" python -m unittest test_collector.Offline test_collector.Installer test_collector.Packager)
+check "OTel offline identity, installer and package regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_collector.py" Compose
+check "OTel Compose isolation and verification configuration" $?
 python3 "$REPO_ROOT/scripts/tests/test_service_inventory.py"
 check "exact default/telemetry infrastructure inventory policy" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"

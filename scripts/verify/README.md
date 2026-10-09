@@ -488,7 +488,13 @@ include host guard overhead; samples are observations, not performance SLOs.
 satisfy full telemetry acceptance. No real backend account or external egress is
 needed once dependencies/images/models are available.
 
-Focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
+Suite 01 always runs capture/evidence regressions and offline/installer/package
+regressions in the built API image with network disabled, in both default and
+telemetry-enabled runs. Compose-only collector checks run on the host without
+starting services. Exact inventory and embedded-source checks also remain
+mandatory in suite 01.
+
+Standalone focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
 configuration only), `python scripts/tests/test_telemetry_capture.py` (locked API
 dependencies), and the existing verify-stack tests. These complement, not replace,
 both full runs.
