@@ -239,6 +239,8 @@ def inspect_records(snapshot, requests):
     wire = json.dumps(snapshot)
     assert all(s not in wire for s in SENTINELS), 'content/credential sentinel exported'
     spans, logs, metrics = (records(snapshot, s) for s in ('traces', 'logs', 'metrics'))
+    identities = [(span['trace_id'], span['span_id']) for span in spans]
+    assert len(set(identities)) == len(identities), 'duplicate received span identity'
     for item in [*spans, *logs]:
         if 'name' in item:
             assert item['name'] in SCHEMA['SPAN_NAMES'], 'unsafe span name'

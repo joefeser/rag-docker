@@ -110,6 +110,30 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(events,[('enabled',False),('stop','-t','10','otel-collector'),
                                  ('restart','-t','10','otel-capture'),('/reset',True),('start','otel-collector')])
 
+    def test_duplicate_full_span_identities_rejected_before_lineage(self):
+        for index in range(3):
+            for change in ({}, {'parent_span_id':'different'}, {'name':'rag.query'},
+                           {'links':[{'trace_id':'different'}]}):
+                for prepend in (False,True):
+                    with self.subTest(index=index,change=change,prepend=prepend):
+                        m,snapshot,expected=self.fixture()
+                        duplicate=copy.deepcopy(m.records(snapshot,'traces')[index]);duplicate.update(change)
+                        batch={'signal':'traces','data':{'resource_spans':[{'scope_spans':[{'spans':[duplicate]}]}]}}
+                        snapshot['batches'].insert(0 if prepend else len(snapshot['batches']),batch)
+                        with self.assertRaisesRegex(AssertionError,'duplicate received span identity'):
+                            m.inspect(snapshot,expected)
+
+    def test_same_span_id_in_separate_traces_is_valid(self):
+        m,snapshot,expected=self.fixture()
+        other=copy.deepcopy(snapshot['batches'][0])
+        for span in other['data']['resource_spans'][0]['scope_spans'][0]['spans']:
+            span['trace_id']='trace2'
+            if 'links' in span:span['links']=[{'trace_id':'remote2'}]
+        snapshot['batches'].append(other)
+        # Only the original trace is requested; unrelated valid spans still
+        # participate in full received-identity validation.
+        m.inspect(snapshot,expected)
+
     def test_dependency_sibling_is_not_worker_lineage(self):
         m,snapshot,expected = self.fixture()
         m.records(snapshot,'traces')[2]['parent_span_id'] = 'root'
