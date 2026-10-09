@@ -3,6 +3,10 @@ services:
   api:
     environment:
       RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
+      RAG_OTEL_PROTOCOL: http/protobuf
+      RAG_OTEL_SERVICE_VERSION: "1.1.0"
+      RAG_OTEL_QUEUE_SIZE: "256"
+      RAG_OTEL_BATCH_SIZE: "64"
       RAG_OTEL_ENDPOINT: http://otel-collector:4318
       RAG_OTEL_SAMPLE_RATIO: "1"
       RAG_OTEL_INTERVAL_MS: "1000"
@@ -15,7 +19,7 @@ services:
       RAG_OTEL_LOGS: "true"
   otel-collector:
     volumes:
-      - ./scripts/verify/collector.yaml:/etc/otelcol/config.yaml:ro
+      - ${RAG_VERIFY_HARNESS:?harness path required}/scripts/verify/collector.yaml:/etc/otelcol/config.yaml:ro
   otel-capture:
     image: rag-verify-api:latest
     profiles: [telemetry]
@@ -23,7 +27,7 @@ services:
     networks: [rag-internal]
     ports: []
     volumes:
-      - ./scripts/verify:/verify:ro
+      - ${RAG_VERIFY_HARNESS:?harness path required}/scripts/verify:/verify:ro
       - otel_capture:/capture
     mem_limit: 256m
     cpus: 0.5

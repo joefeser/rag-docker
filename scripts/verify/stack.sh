@@ -477,7 +477,10 @@ for svc, service in services.items():
             problems.append(f"(d) service {svc!r} mount {target!r} sets bind options")
         if mount.get('type') != 'bind' or (svc == 'api' and target == '/app/exports'):
             continue  # the api's exports: rule (f)
-        if not (os.path.isabs(source) and inside(source, checkout)):
+        trusted_asset = (
+            svc == 'otel-collector' and source == os.path.join(harness, 'scripts/verify', 'collector.yaml')
+            or svc == 'otel-capture' and source == os.path.join(harness, 'scripts/verify'))
+        if not (os.path.isabs(source) and (inside(source, checkout) or trusted_asset)):
             problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout")
         elif inside(source, checkout_exports) or inside(checkout_exports, source):
             problems.append(f"(d) service {svc!r} binds {source!r}, which is or holds the checkout's exports folder")

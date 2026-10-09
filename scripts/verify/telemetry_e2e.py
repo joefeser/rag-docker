@@ -201,12 +201,40 @@ def records(snapshot, signal):
     resource, scope, field = {'traces': ('resource_spans', 'scope_spans', 'spans'),
         'logs': ('resource_logs', 'scope_logs', 'log_records'),
         'metrics': ('resource_metrics', 'scope_metrics', 'metrics')}[signal]
-    return [row for batch in snapshot['batches'] if batch['signal'] == signal
-            for res in batch['data'].get(resource, []) for sc in res.get(scope, [])
-            for row in sc.get(field, [])]
+    assert isinstance(snapshot, dict), 'invalid capture snapshot'
+    batches = snapshot.get('batches')
+    assert isinstance(batches, list), 'invalid capture batches'
+    result = []
+    for batch in batches:
+        assert isinstance(batch, dict), 'invalid capture batch'
+        assert batch.get('signal') in ('traces', 'logs', 'metrics'), 'invalid capture signal'
+        data = batch.get('data')
+        assert isinstance(data, dict), 'invalid capture data'
+        if batch['signal'] != signal:
+            continue
+        resources = data.get(resource, [])
+        assert isinstance(resources, list), 'invalid capture resources'
+        for res in resources:
+            assert isinstance(res, dict), 'invalid capture resource'
+            scopes = res.get(scope, [])
+            assert isinstance(scopes, list), 'invalid capture scopes'
+            for sc in scopes:
+                assert isinstance(sc, dict), 'invalid capture scope'
+                rows = sc.get(field, [])
+                assert isinstance(rows, list) and all(isinstance(row, dict) for row in rows), 'invalid capture records'
+                result.extend(rows)
+    return result
 
 
 def inspect(snapshot, requests):
+    try:
+        return inspect_records(snapshot, requests)
+    except (TypeError, AttributeError, KeyError) as exc:
+        raise AssertionError('invalid capture evidence shape') from None
+
+
+def inspect_records(snapshot, requests):
+    assert isinstance(snapshot, dict), 'invalid capture snapshot'
     assert snapshot['overflow'] == 0, 'capture overflow: inspection incomplete'
     wire = json.dumps(snapshot)
     assert all(s not in wire for s in SENTINELS), 'content/credential sentinel exported'
@@ -224,7 +252,7 @@ def inspect(snapshot, requests):
             else:
                 assert value in SCHEMA['ENUMS'].get(key, ()), 'unsafe trace/log attribute'
     names = {m['name'] for m in metrics}
-    assert names <= SCHEMA['METRIC_NAMES'], 'unsafe metric name' 
+    assert names <= SCHEMA['METRIC_NAMES'], 'unsafe metric name'
     assert {'rag.api.requests', 'rag.api.duration', 'rag.dependency.calls', 'rag.job.completed'} <= names
     for metric in metrics:
         expected_kind = 'histogram' if SCHEMA['METRICS'][metric['name']][0] == 'create_histogram' else 'sum'
@@ -267,7 +295,7 @@ def inspect(snapshot, requests):
                     if log.get('trace_id') == item['trace_id']:
                         for attr in log.get('attributes', []):
                             if attr['key'] == 'rag.job_token':
-                                assert attr['value']['string_value'] == token, 'job context crossed trace trees' 
+                                assert attr['value']['string_value'] == token, 'job context crossed trace trees'
         dependencies = [s for s in tree.values() if s['name'].startswith(('ollama.', 'weaviate.'))]
         assert dependencies, 'missing dependency spans'
         for operation_span in target:
@@ -309,6 +337,29 @@ def enabled(value):
     if not value:
         args.append('--disabled')
     subprocess.run(args, check=True, timeout=150, stdout=subprocess.DEVNULL)
+
+
+def transition(mode):
+    enabled(mode != 'disabled')
+    if mode == 'disabled':
+        # API replacement terminates the old producer. Terminate both the old
+        # collector queues and capture handlers before opening the zero-traffic
+        # window; elapsed quiet time alone cannot prove a drained pipeline.
+        compose('stop', '-t', '10', 'otel-collector')
+        compose('restart', '-t', '10', 'otel-capture')
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                sink('/reset', True)
+                break
+            except (OSError, subprocess.SubprocessError):
+                if time.monotonic() >= deadline:
+                    raise AssertionError('capture unavailable after disabled transition') from None
+                time.sleep(0.2)
+        compose('start', 'otel-collector')
+    else:
+        time.sleep(3)
+        sink('/reset', True)
 
 
 def samples(collections):
@@ -360,9 +411,7 @@ def main():
             ingest = list(pool.map(upload, collections))
         await_capture([(r, 'rag.ingest') for r in ingest])
         for mode in ('healthy', 'disabled', 'unavailable', 'slow'):
-            enabled(mode != 'disabled')
-            time.sleep(3)
-            sink('/reset', True)
+            transition(mode)
             if mode == 'unavailable':
                 compose('stop', '-t', '10', 'otel-collector')
             if mode == 'slow':

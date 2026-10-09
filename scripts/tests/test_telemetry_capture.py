@@ -83,6 +83,33 @@ class EvidenceTests(unittest.TestCase):
         m,snapshot,expected = self.fixture()
         m.inspect(snapshot, expected)
 
+    def test_malformed_capture_shapes_fail_controlled(self):
+        m,valid,expected=self.fixture()
+        cases=[None,[],{'overflow':0,'batches':1}]
+        for path in (('batches',0),('batches',0,'data'),('batches',0,'data','resource_spans'),
+                     ('batches',0,'data','resource_spans',0),
+                     ('batches',0,'data','resource_spans',0,'scope_spans'),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0,'spans'),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0,'spans',0)):
+            for invalid in (None, 1, 'bad'):
+                value=copy.deepcopy(valid); target=value
+                for key in path[:-1]:target=target[key]
+                target[path[-1]]=invalid;cases.append(value)
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(AssertionError):m.inspect(value,expected)
+        with patch.object(m,'sink',side_effect=[cases[-1],valid]),patch.object(m.time,'sleep'):
+            self.assertIs(m.await_capture(expected),valid)
+
+    def test_disabled_transition_terminates_old_pipeline_before_reset(self):
+        m,_,_=self.fixture(); events=[]
+        with patch.object(m,'enabled',side_effect=lambda value:events.append(('enabled',value))), \
+             patch.object(m,'compose',side_effect=lambda *args:events.append(args)), \
+             patch.object(m,'sink',side_effect=lambda *args:events.append(args)):
+            m.transition('disabled')
+        self.assertEqual(events,[('enabled',False),('stop','-t','10','otel-collector'),
+                                 ('restart','-t','10','otel-capture'),('/reset',True),('start','otel-collector')])
+
     def test_dependency_sibling_is_not_worker_lineage(self):
         m,snapshot,expected = self.fixture()
         m.records(snapshot,'traces')[2]['parent_span_id'] = 'root'

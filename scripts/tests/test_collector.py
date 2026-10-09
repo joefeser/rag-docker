@@ -14,6 +14,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -78,6 +79,46 @@ class Offline(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             self.module.sanitize(self.input, self.output, 'arm64')
 
+    def test_tar_terminators_and_trailing_bytes(self):
+        archive(self.input, self.config)
+        original = self.input.read_bytes()
+        with tarfile.open(self.input) as tar:
+            list(tar)
+            end = tar.offset
+        for suffix in (b'', bytes(512), bytes(1023), bytes(1024)+b'x', bytes(1024)+b'x'*512):
+            with self.subTest(length=len(suffix)):
+                self.input.write_bytes(original[:end]+suffix)
+                with self.assertRaisesRegex(ValueError, 'terminator'):
+                    self.module.sanitize(self.input,self.output,'arm64')
+                self.assertFalse(self.output.exists())
+        for padding in (1024, 2048):
+            self.input.write_bytes(original[:end]+bytes(padding))
+            self.module.sanitize(self.input,self.output,'arm64')
+            self.output.unlink()
+
+    def test_manifest_shapes_and_missing_references(self):
+        for image in (None, [], 'bad', {}, {'Config':None,'Layers':[]},
+                      {'Config':'config','Layers':None}, {'Config':'config','Layers':['']},
+                      {'Config':'config','Layers':[1]}, {'Config':'missing','Layers':[]},
+                      {'Config':'config','Layers':['missing']}):
+            with self.subTest(image=image):
+                with tarfile.open(self.input,'w') as tar:
+                    for name, data in [('manifest.json',json.dumps([image]).encode()),('config',self.config)]:
+                        item=tarfile.TarInfo(name); item.size=len(data);tar.addfile(item,io.BytesIO(data))
+                with self.assertRaises(ValueError):
+                    self.module.sanitize(self.input,self.output,'arm64')
+                self.assertFalse(self.output.exists())
+
+    def test_prepare_metadata_shapes(self):
+        for data in (None, [], 'bad', 42, True):
+            with self.subTest(data=data):
+                Path(self.temp.name,'collector.json').write_text(json.dumps(data))
+                with patch('sys.argv',['collector_offline','prepare',self.temp.name,'--output',str(self.output)]), \
+                     patch.object(self.module.subprocess,'check_output',return_value='arm64'):
+                    with self.assertRaisesRegex(ValueError,'metadata object'):
+                        self.module.main()
+                self.assertFalse(self.output.exists())
+
 
 class Installer(unittest.TestCase):
     def test_default_and_optional_commands_and_missing_payload(self):
@@ -131,21 +172,46 @@ elif a[:2]==['compose','ps'] and '--services' in a:
                     self.assertNotIn('--pull=never',restore)
 
 
+class Packager(unittest.TestCase):
+    def test_printed_install_command_matches_bundle_mode(self):
+        for telemetry in (False,True):
+            with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
+                shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
+                (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
+                stub=root/'bin/docker'
+                stub.write_text("""#!/usr/bin/env python3
+import sys,json,pathlib
+args=sys.argv[1:]
+if args[:2]==['compose','config']:print(json.dumps({'name':'fixture'}))
+if args[:1]==['run']:
+ for arg in args:
+  if arg.endswith(':/out'):pathlib.Path(arg[:-5],'ollama_models.tar.gz').touch()
+""")
+                stub.chmod(0o755)
+                result=subprocess.run(['bash',str(root/'package-offline.sh'),*(['--telemetry'] if telemetry else []),'bundle.tar'],
+                    env={**os.environ,'PATH':str(root/'bin')+os.pathsep+os.environ['PATH']},text=True,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout.splitlines()[-1],'  bash install-offline.sh'+(' --telemetry' if telemetry else ''))
+                with tarfile.open(root/'bundle.tar') as tar:
+                    self.assertEqual('rag-docker/offline/collector.tar' in tar.getnames(),telemetry)
+
+
 class Compose(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.env = {**os.environ, 'RAG_VERIFY_PORT': '18081', 'RAG_EXPORTS_DIR': '/tmp/collector-test-exports',
-                   'COMPOSE_PROFILES': 'telemetry'}
+                   'COMPOSE_PROFILES': 'telemetry', 'RAG_VERIFY_HARNESS': str(ROOT)}
         cls.cmd = ['docker', 'compose', '-p', 'rag-verify', '-f', str(ROOT/'docker-compose.yml'),
                    '-f', str(ROOT/'docker-compose.telemetry.yml'), '-f', str(ROOT/'docker-compose.verify.yml'),
                    '-f', str(ROOT/'docker-compose.telemetry.verify.yml'), 'config', '--format', 'json']
         cls.config = json.loads(subprocess.check_output(cls.cmd, env=cls.env))
         cls.guard = re.findall(r"python3 - [^\n]*<<'GUARDPY'\n(.*?)\nGUARDPY", (ROOT/'scripts/verify/stack.sh').read_text(), re.S)[0]
 
-    def run_guard(self, config):
+    def run_guard(self, config, checkout=ROOT):
         with tempfile.NamedTemporaryFile(mode='w') as file:
             json.dump(config, file); file.flush()
-            return subprocess.run(['python3', '-', str(ROOT), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT)],
+            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT)],
                                   input=self.guard, text=True, capture_output=True)
 
     def test_optional_config_passes_full_guard(self):
@@ -161,8 +227,33 @@ class Compose(unittest.TestCase):
         self.assertEqual(len(value['services']), 5)
         self.assertNotIn('RAG_OTEL_ENABLED', value['services']['api']['environment'])
 
+    def test_ambient_inputs_and_distinct_checkout(self):
+        hostile={k:'invalid' for k in self.config['services']['api']['environment'] if k.startswith('RAG_OTEL_')}
+        config=json.loads(subprocess.check_output(self.cmd,env={**self.env,**hostile}))
+        self.assertEqual(config,self.config)
+        with tempfile.TemporaryDirectory() as folder:
+            checkout=Path(folder)
+            for name in ('docker-compose.yml','docker-compose.telemetry.yml'):
+                shutil.copy(ROOT/name,checkout/name)
+            cmd=[str(checkout/Path(x).name) if x in (str(ROOT/'docker-compose.yml'),str(ROOT/'docker-compose.telemetry.yml')) else x for x in self.cmd]
+            value=json.loads(subprocess.check_output(cmd,env=self.env))
+            for service in ('otel-collector','otel-capture'):
+                mount=next(v for v in value['services'][service]['volumes'] if v['type']=='bind')
+                self.assertTrue(mount['source'].startswith(str(ROOT/'scripts/verify')))
+            result=self.run_guard(value,checkout)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            guard=load('guard','scripts/verify/telemetry_guard.py')
+            self.assertEqual(guard.check(value,ROOT),[])
+            for service in ('otel-collector','otel-capture'):
+                changed=copy.deepcopy(value)
+                next(v for v in changed['services'][service]['volumes'] if v['type']=='bind')['source']=str(checkout/'scripts/verify')
+                self.assertTrue(guard.check(changed,ROOT))
+
     def test_unsafe_variants_still_refused(self):
         mutations = [
+            lambda c: c['services']['otel-collector'].update(command=['--config=http://outside.invalid/config']),
+            lambda c: c['services']['otel-capture'].update(command=['python', '/tmp/replacement.py']),
+            lambda c: c['services']['otel-capture'].update(entrypoint=['sh']),
             lambda c: c['services']['otel-collector'].update(ports=[{'target':4318, 'published':'4318'}]),
             lambda c: c['services']['otel-collector'].update(mem_limit='0'),
             lambda c: c['services']['otel-collector'].update(image='evil:latest'),

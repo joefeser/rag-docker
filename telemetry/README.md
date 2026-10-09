@@ -127,3 +127,7 @@ Collector and slow downstream receiver. Capture overflow fails inspection.
 It records latency samples and CPU/memory observations; it does not claim zero
 overhead, lossless export or production performance. Source/configuration tests
 alone do not establish this end-to-end acceptance.
+
+Offline preparation rejects truncated TAR end markers, nonzero trailing bytes
+and malformed image/sidecar metadata before emitting an archive to load.
+The optional package prints the matching `install-offline.sh --telemetry` command.

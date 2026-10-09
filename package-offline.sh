@@ -102,4 +102,8 @@ echo "  model weights:$(du -h "$STAGE/rag-docker/offline/ollama_models.tar.gz" |
 echo
 echo "On the target Mac (no internet required):"
 echo "  tar xf $(basename "$OUT") && cd rag-docker"
-echo "  bash install-offline.sh"
+if [ "$TELEMETRY" = 1 ]; then
+  echo "  bash install-offline.sh --telemetry"
+else
+  echo "  bash install-offline.sh"
+fi

@@ -474,7 +474,7 @@ bounded private protobuf receiver using the API image. Only the proxy publishes
 a host port. Narrow guard additions allow resource/log bounds only on these two
 services; live image, network, mount and port restrictions remain enforced.
 
-The suite recreates only the disposable API through a guarded `telemetry-mode`
+The suite recreates the disposable API through a guarded `telemetry-mode`
 command under the inherited lock to compare enabled/disabled settings. It submits
 real synthetic uploads, queries and concurrent export jobs; inspects actual
 received traces/metrics/logs, parent relationships, correlation and planted
@@ -492,3 +492,12 @@ Focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compo
 configuration only), `python scripts/tests/test_telemetry_capture.py` (locked API
 dependencies), and the existing verify-stack tests. These complement, not replace,
 both full runs.
+
+Verification telemetry assets are absolute harness-owned paths, including when
+`--checkout` selects another source tree. Their exact read-only bind identities
+are checked; this preserves harness provenance, not a hostile-code sandbox.
+Protocol, version and export budgets are fixed in the verification overlay,
+independent of ambient operator telemetry variables. Before disabled-mode counting,
+the old API, Collector queues and capture handlers terminate; a fresh Collector
+and capture process isolate the zero-traffic observation from earlier exports.
+Malformed capture shapes fail as incomplete evidence, never partial success.

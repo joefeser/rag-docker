@@ -22,13 +22,25 @@ def sha(data):
 
 
 def read_member(archive, name, limit=LIMIT):
-    member = archive.getmember(name)
+    if not isinstance(name, str) or not name:
+        raise ValueError('invalid collector member reference')
+    try:
+        member = archive.getmember(name)
+    except KeyError:
+        raise ValueError('missing collector archive member') from None
     if not member.isfile() or member.size > limit:
         raise ValueError('collector archive member is not a bounded regular file')
     return archive.extractfile(member).read()
 
 
 def sanitize(source, destination, architecture):
+    try:
+        return _sanitize(source, destination, architecture)
+    except tarfile.TarError:
+        raise ValueError("invalid collector TAR archive") from None
+
+
+def _sanitize(source, destination, architecture):
     expected = PIN['config_ids'][architecture]
     if Path(source).stat().st_size > LIMIT:
         raise ValueError('collector archive is oversized')
@@ -39,12 +51,23 @@ def sanitize(source, destination, architecture):
             total += member.size
             if len(entries) > 40 or total > LIMIT:
                 raise ValueError('collector archive is oversized')
+        # tarfile accepts EOF without end markers and ignores bytes after them.
+        # Docker save produces an uncompressed TAR with two zero end blocks.
+        with Path(source).open('rb') as raw:
+            raw.seek(archive.offset)
+            tail = raw.read()
+        if len(tail) < 1024 or len(tail) % 512 or any(tail):
+            raise ValueError('invalid collector archive terminator/trailing bytes')
         if len({e.name for e in entries}) != len(entries):
             raise ValueError('duplicate collector archive members')
         manifest = json.loads(read_member(archive, 'manifest.json', 65536))
         if not isinstance(manifest, list) or len(manifest) != 1:
             raise ValueError('expected exactly one collector image')
         image = manifest[0]
+        if (not isinstance(image, dict) or not isinstance(image.get('Config'), str)
+                or not image['Config'] or not isinstance(image.get('Layers'), list)
+                or not all(isinstance(name, str) and name for name in image['Layers'])):
+            raise ValueError('invalid collector image manifest')
         config = read_member(archive, image['Config'], 65536)
         if sha(config) != expected:
             raise ValueError('collector image differs from trusted platform pin')
@@ -100,6 +123,8 @@ def main():
         if metadata_path.stat().st_size > 4096:
             raise ValueError('collector metadata is oversized')
         metadata = json.loads(metadata_path.read_text())
+        if not isinstance(metadata, dict):
+            raise ValueError('invalid collector metadata object')
         target = args.folder / 'collector.tar'
         if target.stat().st_size > LIMIT:
             raise ValueError('collector archive is oversized')

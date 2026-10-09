@@ -2378,3 +2378,9 @@ bounded configuration and reported latency/resource observations. Restart and
 shutdown evidence does not imply job draining, durable queues or cross-restart
 trace continuity. Full default and enabled runs and their actual limitations are
 required; a resolved Compose file alone is not runtime acceptance.
+
+Collector verification binds exact harness-owned assets across alternate checkouts
+and pins verification protocol/version/export budgets. Disabled-mode observation
+requires termination of previous producer, Collector queues and capture handlers.
+Malformed decoded evidence is incomplete acceptance; malformed archive metadata
+and incomplete TAR framing are rejected before offline reconstruction.
