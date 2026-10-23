@@ -1,4 +1,5 @@
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import errno
 import gzip
@@ -499,6 +500,7 @@ def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
     return "\n\n".join(records), [Text(text=record) for record in records]
 
 
+@telemetry.traced("rag.parse")
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
     if _is_jsonl(path.name):
         return _parse_jsonl(path)
@@ -641,6 +643,7 @@ def _remove_earlier(collection: str, name: str, created_at: datetime,
         return getattr(exc, "deleted", 0), str(exc) or type(exc).__name__
 
 
+@telemetry.traced("rag.ingest")
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -754,6 +757,7 @@ def _process_job_sync(
                 deleted = True
                 break
             except _StaleMarkFailed as exc:
+                telemetry.outcome("partial", exc)
                 job["files_failed"] += 1
                 job["errors"].append(
                     f"{label}: could not mark gold-standard sessions stale before replacing "
@@ -766,6 +770,7 @@ def _process_job_sync(
                     f"earlier chunks, so nothing was changed: {exc}")
                 _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 # Name the file the way the user knows it (a ZIP member by its
                 # archive and path), and never leave the reason blank.
                 job["files_failed"] += 1
@@ -778,6 +783,7 @@ def _process_job_sync(
         collection_writes.end_job("ingest", job_id)
 
     if deleted:
+        telemetry.outcome("error")
         job["errors"].append(f"collection '{collection}' was deleted while this job was running")
         job["status"] = "failed"
         return
@@ -786,7 +792,9 @@ def _process_job_sync(
         job["status"] = "completed"
     elif job["files_failed"] == job["files_total"]:
         job["status"] = "failed"
+        telemetry.outcome("error")
     else:
+        telemetry.outcome("partial")
         job["status"] = "partial"
 
 
@@ -978,6 +986,17 @@ def _member_name(filename: str) -> str | None:
     return name
 
 
+def _is_macos_metadata(logical: str) -> bool:
+    """Whether a ZIP member is macOS metadata rather than a document (#378).
+
+    Finder's Compress stores each file's resource fork and extended attributes
+    as an AppleDouble file, __MACOSX/<folder>/._<name>, and other macOS tools
+    write ._<name> beside the file. Either keeps the real file's suffix, so the
+    suffix check would queue it as a document of its own."""
+    path = PurePosixPath(logical)
+    return path.parts[0] == "__MACOSX" or path.name.startswith("._")
+
+
 def _limit_text(limit: int) -> str:
     mib = 1024 * 1024
     if limit >= mib and limit % mib == 0:
@@ -1004,7 +1023,8 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
-    them; nothing is repaired, and nothing from it is ingested (#290).
+    them; nothing is repaired, and nothing from it is ingested (#290). macOS
+    metadata members (__MACOSX/, ._*) are skipped like unsupported ones (#378).
 
     The request's ZIPs may expand to at most the budget (#298): the sizes this
     ZIP declares are checked before anything is read, then the bytes actually
@@ -1070,6 +1090,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
         for member, logical in members:
             basename = PurePosixPath(logical).name
+            if _is_macos_metadata(logical):
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} (macOS metadata (AppleDouble), not a document)")
+                continue
             if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
                     or _is_json_gz(basename) or _is_jsonl_gz(basename)):
                 queue.skipped.append(
@@ -1124,7 +1148,8 @@ async def start_ingest_job(
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int) -> str:
-    tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
+    # The prefix is how the startup sweep finds a killed job's staging (#377).
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
     # Files the caller sent that this build cannot parse, and inputs replaced by
     # a later one with the same name. Dropping them without a word makes a ZIP
     # of 8 files silently report 6, with nothing saying which two or why.
@@ -1203,6 +1228,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
 
+    @telemetry.admitted
     def _on_done(future: asyncio.Future) -> None:
         # The worker ends its registration itself; this covers a job cancelled
         # before it ran and an error that escaped the worker.
@@ -1211,20 +1237,22 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             return
         exc = future.exception()
         if exc is not None:
-            _log.error("ingest job %s failed: %s", job_id, exc)
-            job = _jobs.get(job_id)
-            # This write stays on the event loop (#309): a done callback is
-            # synchronous and can't await a thread, it runs only when an error
-            # escaped the worker, and it saves one record of about 1 KB.
-            if job and job["status"] not in ("completed", "partial", "failed"):
-                # The error first: the status change is the write that saves
-                # the record (#23), and an in-place append is not seen alone.
-                job["errors"].append(str(exc))
-                job["status"] = "failed"
+            with telemetry.span("rag.failure_report"):
+                telemetry.outcome("error", exc)
+                _log.error("ingest job %s failed: %s", job_id, exc)
+                job = _jobs.get(job_id)
+                # This write stays on the event loop (#309): a done callback is
+                # synchronous and can't await a thread, it runs only when an error
+                # escaped the worker, and it saves one record of about 1 KB.
+                if job and job["status"] not in ("completed", "partial", "failed"):
+                    # The error first: the status change is the write that saves
+                    # the record (#23), and an in-place append is not seen alone.
+                    job["errors"].append(str(exc))
+                    job["status"] = "failed"
 
     future = asyncio.get_running_loop().run_in_executor(
         None,
-        _process_job_sync,
+        telemetry.admitted(_process_job_sync),
         job_id,
         file_paths,
         tmp_dir,
