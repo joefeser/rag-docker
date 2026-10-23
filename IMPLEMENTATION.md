@@ -22987,6 +22987,9 @@ if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
   exit 1
 fi
 
+TELEMETRY=0
+if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
+[ "$#" -le 1 ] || { echo "Usage: bash package-offline.sh [--telemetry] [output.tar]" >&2; exit 2; }
 OUT="${1:-rag-docker-offline.tar}"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 
@@ -23028,6 +23031,11 @@ git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 echo "==> Saving images (this is the slow part)"
 docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
 
+if [ "$TELEMETRY" = 1 ]; then
+  echo "==> Saving optional pinned collector (Python 3.11+ required)"
+  python3 scripts/collector_offline.py package "$STAGE/rag-docker/offline"
+fi
+
 echo "==> Exporting model weights from volume '$MODELVOL'"
 # Uses the ollama image itself as the tar helper: it ships /usr/bin/tar and is
 # already part of the bundle, so no extra image is needed here or on the target.
@@ -23048,7 +23056,11 @@ echo "  model weights:$(du -h "$STAGE/rag-docker/offline/ollama_models.tar.gz" |
 echo
 echo "On the target Mac (no internet required):"
 echo "  tar xf $(basename "$OUT") && cd rag-docker"
-echo "  bash install-offline.sh"
+if [ "$TELEMETRY" = 1 ]; then
+  echo "  bash install-offline.sh --telemetry"
+else
+  echo "  bash install-offline.sh"
+fi
 ```
 
 ### install-offline.sh
@@ -34337,6 +34349,15 @@ if args[:1]==['run']:
   if arg.endswith(':/out'):pathlib.Path(arg[:-5],'ollama_models.tar.gz').touch()
 """)
                 stub.chmod(0o755)
+                # The packager archives committed source, so exercise a real
+                # scratch checkout while keeping Docker stubbed.
+                git = ['git', '-c', 'core.hooksPath=/dev/null',
+                       '-c', 'commit.gpgsign=false', '-c', 'user.name=Test',
+                       '-c', 'user.email=test@example.invalid']
+                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts'],
+                             ['commit', '-qm', 'fixture']):
+                    subprocess.run(git + args, cwd=root, check=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 result=subprocess.run(['bash',str(root/'package-offline.sh'),*(['--telemetry'] if telemetry else []),'bundle.tar'],
                     env={**os.environ,'PATH':str(root/'bin')+os.pathsep+os.environ['PATH']},text=True,capture_output=True)
                 self.assertEqual(result.returncode,0,result.stderr)

@@ -189,6 +189,15 @@ if args[:1]==['run']:
   if arg.endswith(':/out'):pathlib.Path(arg[:-5],'ollama_models.tar.gz').touch()
 """)
                 stub.chmod(0o755)
+                # The packager archives committed source, so exercise a real
+                # scratch checkout while keeping Docker stubbed.
+                git = ['git', '-c', 'core.hooksPath=/dev/null',
+                       '-c', 'commit.gpgsign=false', '-c', 'user.name=Test',
+                       '-c', 'user.email=test@example.invalid']
+                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts'],
+                             ['commit', '-qm', 'fixture']):
+                    subprocess.run(git + args, cwd=root, check=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 result=subprocess.run(['bash',str(root/'package-offline.sh'),*(['--telemetry'] if telemetry else []),'bundle.tar'],
                     env={**os.environ,'PATH':str(root/'bin')+os.pathsep+os.environ['PATH']},text=True,capture_output=True)
                 self.assertEqual(result.returncode,0,result.stderr)
