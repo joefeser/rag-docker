@@ -16,15 +16,41 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
 check "OTel operational metrics and sanitized correlated logs" $?
+# Collector evidence and packaging regressions run in both default and enabled
+# modes. Compose needs the host Docker CLI; Packager needs Git for its scratch
+# checkout. Neither class starts services (Packager stubs Docker).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_capture.py)
+check "OTel capture evidence, identity and transition regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo/scripts/tests "$(docker compose images -q api)" python -m unittest test_collector.Offline test_collector.Installer)
+check "OTel offline identity and installer regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_collector.py" Compose Packager
+check "OTel Compose isolation, verification configuration and package regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_service_inventory.py"
+check "exact default/telemetry infrastructure inventory policy" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
+# Both distribution scripts in a scratch git repository, docker stubbed (#384).
+python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
+check "Distribution archives hold only the tracked files of HEAD (#384)" $?
+python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
+check "the verify suites run the test files #386 registered" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
+# The same envelope through the proxy on the running stack (#373).
+check_eq "an unknown API route answers 404 through the proxy (#373)" \
+  "$(api_code "$API/no-such-route-373")" "404"
+check_eq "  ... in the envelope, code NOT_FOUND" \
+  "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
+check_eq "a wrong method answers 405 METHOD_NOT_ALLOWED through the proxy (#373)" \
+  "$(curl -s -m 120 -X PUT "$API/query" | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
 # /health's 503 body for a missing model or an unreachable dependency, which the
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
 check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -98,9 +124,18 @@ for svc in api weaviate; do
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
-# ── five services, all reporting healthy where a healthcheck exists ──────────
-running=$( (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) | grep -c .)
-check_eq "five services are running" "$running" "5"
+# ── exact service inventory for this guarded verification mode ──────────────
+# The default is exactly api/ollama/proxy/ui/weaviate. Only --telemetry adds
+# otel-collector and otel-capture; arbitrary five/seven services cannot pass.
+verify_service_inventory() {
+  (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) > "$RAG_INFRA_TMP/vfy_running_services" || return 1
+  (cd "$REPO_ROOT" && docker compose ps --all --services) > "$RAG_INFRA_TMP/vfy_all_services" || return 1
+  python3 "$REPO_ROOT/scripts/verify/service_inventory.py" \
+    "$RAG_INFRA_TMP/vfy_compose.json" "$RAG_INFRA_TMP/vfy_running_services" "$RAG_INFRA_TMP/vfy_all_services" \
+    --mode "${RAG_VERIFY_TELEMETRY:-0}" --project "${COMPOSE_PROJECT_NAME:-}" --profiles "${COMPOSE_PROFILES:-}"
+}
+verify_service_inventory
+check "exact configured and running service inventory for verification mode" $?
 unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
@@ -199,6 +234,8 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Wait up to twice the limit, so a slow restart is still timed (#130).
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   restart_timing_check "$restart_limit" "$elapsed"
+  verify_service_inventory
+  check "exact service inventory survives restart" $?
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -289,6 +326,8 @@ ENDPY
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
   check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
+  verify_service_inventory
+  check "exact service inventory survives snapshot restart" $?
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
@@ -330,6 +369,11 @@ finally:
     wc.close_client()
 '))
 check_eq "no abandoned owned scratch collections" "$staging" "0"
+
+# Ingest, query, metrics and health API paths (#399). Last: its opt-in first-start
+# check removes the project's volumes.
+bash ./16_api_paths.sh
+check "API path checks (16_api_paths.sh, #399)" $?
 
 drop_collection "$C"
 cleanup_prefixed
