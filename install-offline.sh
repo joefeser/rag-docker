@@ -23,9 +23,7 @@ if [ "$TELEMETRY" = 1 ]; then
   # Validate bytes against tracked platform identities before docker load sees them.
   COLLECTOR_STAGE="$(mktemp -d)"
   trap 'rm -rf "$COLLECTOR_STAGE"' EXIT
-  COLLECTOR_ID="$(python3 scripts/collector_offline.py prepare offline --output "$COLLECTOR_STAGE/collector.tar")"
-  docker load -i "$COLLECTOR_STAGE/collector.tar"
-  [ "$(docker image inspect "$COLLECTOR_ID" --format '{{.Id}}')" = "$COLLECTOR_ID" ]
+  COLLECTOR_ID="$(python3 scripts/collector_offline.py install offline --output "$COLLECTOR_STAGE/collector.tar")"
   printf 'services:\n  otel-collector:\n    image: %s\n' "$COLLECTOR_ID" > "$COLLECTOR_STAGE/offline.yml"
   export COMPOSE_FILE="$PWD/docker-compose.yml:$PWD/docker-compose.telemetry.yml:$COLLECTOR_STAGE/offline.yml"
   export COMPOSE_PROFILES=telemetry

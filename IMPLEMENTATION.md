@@ -23088,6 +23088,19 @@ cd "$(dirname "$0")"
 [ -f offline/images.tar.gz ] || { echo "ERROR: offline/images.tar.gz missing. This is the source-only package, not the offline bundle (see package-offline.sh)." >&2; exit 1; }
 [ -f offline/ollama_models.tar.gz ] || { echo "ERROR: offline/ollama_models.tar.gz missing." >&2; exit 1; }
 
+TELEMETRY=0
+if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
+[ "$#" = 0 ] || { echo "Usage: bash install-offline.sh [--telemetry]" >&2; exit 2; }
+if [ "$TELEMETRY" = 1 ]; then
+  # Validate bytes against tracked platform identities before docker load sees them.
+  COLLECTOR_STAGE="$(mktemp -d)"
+  trap 'rm -rf "$COLLECTOR_STAGE"' EXIT
+  COLLECTOR_ID="$(python3 scripts/collector_offline.py install offline --output "$COLLECTOR_STAGE/collector.tar")"
+  printf 'services:\n  otel-collector:\n    image: %s\n' "$COLLECTOR_ID" > "$COLLECTOR_STAGE/offline.yml"
+  export COMPOSE_FILE="$PWD/docker-compose.yml:$PWD/docker-compose.telemetry.yml:$COLLECTOR_STAGE/offline.yml"
+  export COMPOSE_PROFILES=telemetry
+fi
+
 docker info >/dev/null 2>&1 || { echo "ERROR: Docker is not running. Start Docker Desktop and retry." >&2; exit 1; }
 
 echo "==> Loading Docker images (no network used)"
@@ -23097,24 +23110,30 @@ echo "==> Restoring Ollama model weights"
 # `compose run` resolves the project's ollama_models volume for us, so this does
 # not depend on the directory name. The ollama image ships tar and was just
 # loaded above, so no extra image needs pulling.
-docker compose run --rm --no-deps --entrypoint sh \
+RESTORE_PULL=""
+[ "$TELEMETRY" = 0 ] || RESTORE_PULL="--pull=never"
+docker compose run --rm --no-deps ${RESTORE_PULL:+$RESTORE_PULL} --entrypoint sh \
   -v "$PWD/offline:/backup:ro" \
   ollama -c 'tar xzf /backup/ollama_models.tar.gz -C /root/.ollama && ls /root/.ollama'
 
 echo "==> Starting the stack (--no-build: nothing is compiled or pulled)"
-docker compose up -d --no-build
+if [ "$TELEMETRY" = 1 ]; then
+  docker compose up -d --no-build --pull never
+else
+  docker compose up -d --no-build
+fi
 
 echo
 echo "Waiting for services to report healthy..."
 for i in $(seq 1 60); do
   running=$(docker compose ps --services --filter status=running | wc -l | tr -d ' ')
-  [ "$running" = 5 ] && break
+  [ "$running" = "$((5 + TELEMETRY))" ] && break
   sleep 5
 done
 docker compose ps
 
 echo
-echo "If all five services are up, open http://localhost:8080"
+echo "If the requested services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
 ```
@@ -31980,7 +31999,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FILES = [('api/main.py', 'python'), ('api/services/telemetry.py', 'python'), ('api/requirements.in', 'text'), ('api/requirements.txt', 'text'), ('scripts/tests/test_telemetry.py', 'python'), ('scripts/tests/test_telemetry_implementation.py', 'python'), ('scripts/tests/test_tracing.py', 'python'), ('scripts/tests/test_telemetry_operations.py', 'python'), ('scripts/verify/01_infrastructure.sh', 'bash'), ('scripts/verify/README.md', 'markdown'), ('api/services/batch_write.py', 'python'), ('api/services/chunker.py', 'python'), ('api/services/collection_recovery.py', 'python'), ('api/services/exporter.py', 'python'), ('api/services/goldstandard.py', 'python'), ('api/services/importer.py', 'python'), ('api/services/ingest_pipeline.py', 'python'), ('api/services/ollama_client.py', 'python'), ('api/services/packager.py', 'python'), ('api/services/rag_pipeline.py', 'python'), ('api/services/sources.py', 'python'), ('api/services/tuning.py', 'python'), ('api/services/weaviate_client.py', 'python')]
 FILES += [('scripts/verify/stack.sh', 'bash'), ('scripts/verify/service_inventory.py', 'python'), ('scripts/tests/test_service_inventory.py', 'python')]
 
-FILES += [('scripts/verify/telemetry_e2e.py', 'python'), ('scripts/verify/telemetry_guard.py', 'python'), ('scripts/collector_offline.py', 'python'), ('scripts/tests/test_collector.py', 'python'), ('scripts/tests/test_telemetry_capture.py', 'python'), ('docker-compose.telemetry.verify.yml', 'yaml'), ('package-offline.sh', 'bash')]
+FILES += [('scripts/verify/telemetry_e2e.py', 'python'), ('scripts/verify/telemetry_guard.py', 'python'), ('scripts/collector_offline.py', 'python'), ('scripts/tests/test_collector.py', 'python'), ('scripts/tests/test_telemetry_capture.py', 'python'), ('docker-compose.telemetry.verify.yml', 'yaml'), ('package-offline.sh', 'bash'), ('install-offline.sh', 'bash')]
 
 class EmbeddedTelemetryTests(unittest.TestCase):
     def test_normative_telemetry_dependencies_match_inputs_and_lock(self):
@@ -31998,8 +32017,9 @@ class EmbeddedTelemetryTests(unittest.TestCase):
             with self.subTest(name=name):
                 fence = '````' if language == 'markdown' else '```'
                 # Existing dependency fences are intentionally plain text.
-                header = '### '+name+'\n\n'+fence
-                start = document.index('\n', document.index(header)+len(header))+1
+                header = '### '+name+'\n'
+                opening = document.index(fence, document.index(header)+len(header))
+                start = document.index('\n', opening)+1
                 end = document.index('\n'+fence+'\n', start)
                 self.assertEqual(document[start:end], (ROOT/name).read_text().rstrip('\n'))
 
@@ -34022,11 +34042,15 @@ indexes, repository tags, and unrelated image records never reach docker load.
 """
 import argparse
 import hashlib
+import gzip
 import io
 import json
 from pathlib import Path
 import subprocess
 import tarfile
+import tempfile
+import re
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = json.loads((ROOT / 'telemetry/image.json').read_text())
@@ -34049,14 +34073,14 @@ def read_member(archive, name, limit=LIMIT):
     return archive.extractfile(member).read()
 
 
-def sanitize(source, destination, architecture):
+def sanitize(source, destination, architecture, *, tag=None):
     try:
-        return _sanitize(source, destination, architecture)
+        return _sanitize(source, destination, architecture, tag=tag)
     except tarfile.TarError:
         raise ValueError("invalid collector TAR archive") from None
 
 
-def _sanitize(source, destination, architecture):
+def _sanitize(source, destination, architecture, *, tag=None):
     expected = PIN['config_ids'][architecture]
     if Path(source).stat().st_size > LIMIT:
         raise ValueError('collector archive is oversized')
@@ -34095,12 +34119,24 @@ def _sanitize(source, destination, architecture):
             raise ValueError('collector layer count mismatch')
         # Verify all bytes before producing an archive Docker will see.
         layers = []
+        expanded = 0
         for name, digest in zip(image['Layers'], diff_ids):
             data = read_member(archive, name)
+            # containerd saves compressed OCI blobs; classic Docker saves TARs.
+            # diff_ids authenticate uncompressed layer bytes in either format.
+            if data.startswith(b'\x1f\x8b'):
+                try:
+                    with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+                        data = compressed.read(LIMIT - expanded + 1)
+                except (OSError, EOFError):
+                    raise ValueError('invalid compressed collector layer') from None
+            expanded += len(data)
+            if expanded > LIMIT:
+                raise ValueError('expanded collector layers are oversized')
             if sha(data) != digest:
                 raise ValueError('collector layer differs from trusted image config')
             layers.append(data)
-    clean = {'Config': 'config.json', 'RepoTags': None,
+    clean = {'Config': 'config.json', 'RepoTags': [tag] if tag else None,
              'Layers': [f'layer-{i}.tar' for i in range(len(layers))]}
     with tarfile.open(destination, 'w') as out:
         for name, data in [('config.json', config), ('manifest.json', json.dumps([clean]).encode()),
@@ -34113,17 +34149,22 @@ def _sanitize(source, destination, architecture):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['package', 'prepare'])
+    parser.add_argument('mode', choices=['package', 'prepare', 'install'])
     parser.add_argument('folder', type=Path)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     if args.mode == 'package':
         inspected = json.loads(subprocess.check_output(['docker', 'image', 'inspect', PIN['image']]))[0]
         arch = inspected['Architecture']
-        if inspected['Id'] != PIN['config_ids'].get(arch) or inspected['Os'] != 'linux':
+        if arch not in PIN['config_ids'] or inspected['Os'] != 'linux':
             raise ValueError('local collector does not match trusted platform pin')
         target = args.folder / 'collector.tar'
-        subprocess.run(['docker', 'image', 'save', '-o', str(target), PIN['image']], check=True)
+        # Local Id can be a config or index digest, depending on Docker's store.
+        # Only the saved config/layer bytes establish the trusted identity.
+        with tempfile.TemporaryDirectory() as stage:
+            saved = Path(stage) / 'saved.tar'
+            subprocess.run(['docker', 'image', 'save', '-o', str(saved), PIN['image']], check=True)
+            sanitize(saved, target, arch)
         with target.open('rb') as stream:
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         metadata = {'architecture': arch, 'archive_sha256': digest}
@@ -34148,7 +34189,24 @@ def main():
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         if metadata.get('architecture') != architecture or metadata.get('archive_sha256') != digest:
             raise ValueError('collector archive checksum/platform mismatch')
-        print(sanitize(target, args.output, architecture))
+        if args.mode == 'prepare':
+            print(sanitize(target, args.output, architecture))
+        else:
+            # A locally generated tag locates the loaded image on both stores.
+            # Never retain a tag supplied by the offline archive.
+            tag = 'rag-offline-collector:' + PIN['config_ids'][architecture].split(':')[1]
+            sanitize(target, args.output, architecture, tag=tag)
+            subprocess.run(['docker', 'load', '-i', str(args.output)], check=True, stdout=sys.stderr)
+            identity = subprocess.check_output(
+                ['docker', 'image', 'inspect', tag, '--format', '{{.Id}}'], text=True).strip()
+            if not re.fullmatch(r'sha256:[0-9a-f]{64}', identity):
+                raise ValueError('invalid loaded collector identity')
+            # Check the exact immutable reference Compose will use, not the tag.
+            with tempfile.TemporaryDirectory() as stage:
+                saved = Path(stage) / 'loaded.tar'
+                subprocess.run(['docker', 'image', 'save', '-o', str(saved), identity], check=True)
+                sanitize(saved, Path(stage) / 'checked.tar', architecture)
+            print(identity)
 
 
 if __name__ == '__main__':
@@ -34164,6 +34222,7 @@ No application container is started by these checks.
 """
 import copy
 import hashlib
+import gzip
 import importlib.util
 import io
 import json
@@ -34270,6 +34329,40 @@ class Offline(unittest.TestCase):
                     self.module.sanitize(self.input,self.output,'arm64')
                 self.assertFalse(self.output.exists())
 
+    def test_package_checks_content_for_both_image_stores(self):
+        self.module.PIN['image'] = 'collector@sha256:' + 'a'*64
+        for identity in (self.module.sha(self.config), 'sha256:'+'b'*64):
+            for tampered in (False, True):
+                with self.subTest(identity=identity, tampered=tampered):
+                    layer = b'wrong' if tampered else b'synthetic layer'
+                    if identity != self.module.sha(self.config):
+                        layer = gzip.compress(layer)
+                    archive(self.input, self.config, layer)
+                    def save(command, **kwargs):
+                        self.assertEqual(command[-1], self.module.PIN['image'])
+                        shutil.copy(self.input, command[command.index('-o')+1])
+                    metadata = Path(self.temp.name)/'collector.json'
+                    metadata.unlink(missing_ok=True)
+                    with patch('sys.argv', ['collector_offline', 'package', self.temp.name]), \
+                         patch.object(self.module.subprocess, 'check_output', return_value=json.dumps([
+                             {'Id':identity, 'Architecture':'arm64', 'Os':'linux'}]).encode()), \
+                         patch.object(self.module.subprocess, 'run', side_effect=save):
+                        if tampered:
+                            with self.assertRaisesRegex(ValueError, 'layer differs'):
+                                self.module.main()
+                            self.assertFalse(metadata.exists())
+                        else:
+                            self.module.main()
+                            self.assertEqual(json.loads(metadata.read_text())['architecture'], 'arm64')
+                            self.module.sanitize(Path(self.temp.name)/'collector.tar', self.output, 'arm64')
+
+    def test_compressed_layer_expansion_is_bounded(self):
+        archive(self.input, self.config, gzip.compress(b'x'*100000))
+        with patch.object(self.module, 'LIMIT', 20000):
+            with self.assertRaisesRegex(ValueError, 'expanded collector layers'):
+                self.module.sanitize(self.input, self.output, 'arm64')
+        self.assertFalse(self.output.exists())
+
     def test_prepare_metadata_shapes(self):
         for data in (None, [], 'bad', 42, True):
             with self.subTest(data=data):
@@ -34283,7 +34376,7 @@ class Offline(unittest.TestCase):
 
 class Installer(unittest.TestCase):
     def test_default_and_optional_commands_and_missing_payload(self):
-        for mode in ('default', 'optional', 'missing'):
+        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 for sub in ('scripts', 'telemetry', 'offline', 'bin'):
@@ -34297,27 +34390,44 @@ class Installer(unittest.TestCase):
                 (root/'telemetry/image.json').write_text(json.dumps({'config_ids':{'arm64':identity}}))
                 (root/'offline/images.tar.gz').touch()
                 (root/'offline/ollama_models.tar.gz').touch()
-                if mode == 'optional':
+                if mode in ('optional', 'containerd', 'wrong-loaded'):
                     target = root/'offline/collector.tar'
                     archive(target, config, layer)
                     (root/'offline/collector.json').write_text(json.dumps({'architecture':'arm64',
                         'archive_sha256':hashlib.sha256(target.read_bytes()).hexdigest()}))
                 stub = root/'bin/docker'
                 stub.write_text(r"""#!/usr/bin/env python3
-import json,os,sys
+import json,os,sys,shutil,tarfile
 with open(os.environ['TEST_LOG'],'a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
 a=sys.argv[1:]
 if a[:1]==['info'] and '--format' in a: print('aarch64')
+elif a[:1]==['load'] and a[-1].endswith('collector.tar'):
+ with tarfile.open(a[-1]) as tar:
+  manifest=json.load(tar.extractfile('manifest.json'))
+  assert manifest[0]['RepoTags']==['rag-offline-collector:'+os.environ['TEST_CONFIG'].split(':')[1]]
+  assert 'index.json' not in tar.getnames()
 elif a[:2]==['image','inspect']: print(os.environ['TEST_ID'])
+elif a[:2]==['image','save']:
+ assert a[-1]==os.environ['TEST_ID']
+ shutil.copy('offline/collector.tar',a[a.index('-o')+1])
+ if os.environ['TEST_MODE']=='wrong-loaded':
+  with tarfile.open(a[a.index('-o')+1], 'a') as tar:
+   import io
+   data=b'wrong'; item=tarfile.TarInfo('config'); item.size=len(data)
+   tar.addfile(item,io.BytesIO(data))
 elif a[:2]==['compose','ps'] and '--services' in a:
  for i in range(int(os.environ['TEST_COUNT'])): print('service'+str(i))
 """)
                 stub.chmod(0o755)
                 env = {**os.environ, 'PATH':str(root/'bin')+os.pathsep+os.environ['PATH'],
-                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity, 'TEST_COUNT':'5' if mode=='default' else '6'}
+                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode=='optional' else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode, 'TEST_COUNT':'5' if mode=='default' else '6'}
                 run = subprocess.run(['bash', str(root/'install-offline.sh'), *([] if mode=='default' else ['--telemetry'])],
                                      env=env, text=True, capture_output=True)
                 calls = [json.loads(x) for x in (root/'calls').read_text().splitlines()]
+                if mode == 'wrong-loaded':
+                    self.assertNotEqual(run.returncode,0)
+                    self.assertFalse(any(x[:1]==['compose'] for x in calls))
+                    continue
                 if mode == 'missing':
                     self.assertNotEqual(run.returncode,0)
                     self.assertFalse(any(x[0]=='load' or x[:2]==['compose','up'] for x in calls))
@@ -34325,7 +34435,7 @@ elif a[:2]==['compose','ps'] and '--services' in a:
                 self.assertEqual(run.returncode,0,run.stderr)
                 up = next(x for x in calls if x[:2]==['compose','up'])
                 restore = next(x for x in calls if x[:2]==['compose','run'])
-                if mode == 'optional':
+                if mode in ('optional', 'containerd', 'wrong-loaded'):
                     self.assertIn('--pull',up); self.assertIn('never',up)
                     self.assertIn('--pull=never',restore)
                 else:

@@ -3,6 +3,7 @@ No application container is started by these checks.
 """
 import copy
 import hashlib
+import gzip
 import importlib.util
 import io
 import json
@@ -109,6 +110,40 @@ class Offline(unittest.TestCase):
                     self.module.sanitize(self.input,self.output,'arm64')
                 self.assertFalse(self.output.exists())
 
+    def test_package_checks_content_for_both_image_stores(self):
+        self.module.PIN['image'] = 'collector@sha256:' + 'a'*64
+        for identity in (self.module.sha(self.config), 'sha256:'+'b'*64):
+            for tampered in (False, True):
+                with self.subTest(identity=identity, tampered=tampered):
+                    layer = b'wrong' if tampered else b'synthetic layer'
+                    if identity != self.module.sha(self.config):
+                        layer = gzip.compress(layer)
+                    archive(self.input, self.config, layer)
+                    def save(command, **kwargs):
+                        self.assertEqual(command[-1], self.module.PIN['image'])
+                        shutil.copy(self.input, command[command.index('-o')+1])
+                    metadata = Path(self.temp.name)/'collector.json'
+                    metadata.unlink(missing_ok=True)
+                    with patch('sys.argv', ['collector_offline', 'package', self.temp.name]), \
+                         patch.object(self.module.subprocess, 'check_output', return_value=json.dumps([
+                             {'Id':identity, 'Architecture':'arm64', 'Os':'linux'}]).encode()), \
+                         patch.object(self.module.subprocess, 'run', side_effect=save):
+                        if tampered:
+                            with self.assertRaisesRegex(ValueError, 'layer differs'):
+                                self.module.main()
+                            self.assertFalse(metadata.exists())
+                        else:
+                            self.module.main()
+                            self.assertEqual(json.loads(metadata.read_text())['architecture'], 'arm64')
+                            self.module.sanitize(Path(self.temp.name)/'collector.tar', self.output, 'arm64')
+
+    def test_compressed_layer_expansion_is_bounded(self):
+        archive(self.input, self.config, gzip.compress(b'x'*100000))
+        with patch.object(self.module, 'LIMIT', 20000):
+            with self.assertRaisesRegex(ValueError, 'expanded collector layers'):
+                self.module.sanitize(self.input, self.output, 'arm64')
+        self.assertFalse(self.output.exists())
+
     def test_prepare_metadata_shapes(self):
         for data in (None, [], 'bad', 42, True):
             with self.subTest(data=data):
@@ -122,7 +157,7 @@ class Offline(unittest.TestCase):
 
 class Installer(unittest.TestCase):
     def test_default_and_optional_commands_and_missing_payload(self):
-        for mode in ('default', 'optional', 'missing'):
+        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 for sub in ('scripts', 'telemetry', 'offline', 'bin'):
@@ -136,27 +171,44 @@ class Installer(unittest.TestCase):
                 (root/'telemetry/image.json').write_text(json.dumps({'config_ids':{'arm64':identity}}))
                 (root/'offline/images.tar.gz').touch()
                 (root/'offline/ollama_models.tar.gz').touch()
-                if mode == 'optional':
+                if mode in ('optional', 'containerd', 'wrong-loaded'):
                     target = root/'offline/collector.tar'
                     archive(target, config, layer)
                     (root/'offline/collector.json').write_text(json.dumps({'architecture':'arm64',
                         'archive_sha256':hashlib.sha256(target.read_bytes()).hexdigest()}))
                 stub = root/'bin/docker'
                 stub.write_text(r"""#!/usr/bin/env python3
-import json,os,sys
+import json,os,sys,shutil,tarfile
 with open(os.environ['TEST_LOG'],'a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
 a=sys.argv[1:]
 if a[:1]==['info'] and '--format' in a: print('aarch64')
+elif a[:1]==['load'] and a[-1].endswith('collector.tar'):
+ with tarfile.open(a[-1]) as tar:
+  manifest=json.load(tar.extractfile('manifest.json'))
+  assert manifest[0]['RepoTags']==['rag-offline-collector:'+os.environ['TEST_CONFIG'].split(':')[1]]
+  assert 'index.json' not in tar.getnames()
 elif a[:2]==['image','inspect']: print(os.environ['TEST_ID'])
+elif a[:2]==['image','save']:
+ assert a[-1]==os.environ['TEST_ID']
+ shutil.copy('offline/collector.tar',a[a.index('-o')+1])
+ if os.environ['TEST_MODE']=='wrong-loaded':
+  with tarfile.open(a[a.index('-o')+1], 'a') as tar:
+   import io
+   data=b'wrong'; item=tarfile.TarInfo('config'); item.size=len(data)
+   tar.addfile(item,io.BytesIO(data))
 elif a[:2]==['compose','ps'] and '--services' in a:
  for i in range(int(os.environ['TEST_COUNT'])): print('service'+str(i))
 """)
                 stub.chmod(0o755)
                 env = {**os.environ, 'PATH':str(root/'bin')+os.pathsep+os.environ['PATH'],
-                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity, 'TEST_COUNT':'5' if mode=='default' else '6'}
+                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode=='optional' else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode, 'TEST_COUNT':'5' if mode=='default' else '6'}
                 run = subprocess.run(['bash', str(root/'install-offline.sh'), *([] if mode=='default' else ['--telemetry'])],
                                      env=env, text=True, capture_output=True)
                 calls = [json.loads(x) for x in (root/'calls').read_text().splitlines()]
+                if mode == 'wrong-loaded':
+                    self.assertNotEqual(run.returncode,0)
+                    self.assertFalse(any(x[:1]==['compose'] for x in calls))
+                    continue
                 if mode == 'missing':
                     self.assertNotEqual(run.returncode,0)
                     self.assertFalse(any(x[0]=='load' or x[:2]==['compose','up'] for x in calls))
@@ -164,7 +216,7 @@ elif a[:2]==['compose','ps'] and '--services' in a:
                 self.assertEqual(run.returncode,0,run.stderr)
                 up = next(x for x in calls if x[:2]==['compose','up'])
                 restore = next(x for x in calls if x[:2]==['compose','run'])
-                if mode == 'optional':
+                if mode in ('optional', 'containerd', 'wrong-loaded'):
                     self.assertIn('--pull',up); self.assertIn('never',up)
                     self.assertIn('--pull=never',restore)
                 else:
